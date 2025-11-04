@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 # ================================================================
-# File: 05_download_nlcd_from_gee.py
-# Purpose: Download NLCD land cover and forest cover (canopy) layers
-#          from Google Earth Engine for all available years (>=2000)
-#          using the most recent NLCD collection.
+# File: 05_download_lcms_from_gee.py
+# Purpose: Download LCMS land use, cover, and change layers
+#          from Google Earth Engine for all available years (>=2010)
+#          using the most recent LCMS collection.
 # NOTE: THIS DOESN'T DOWNLOAD OFF OF GOOGLE DRIVE, YOU NEED TO DO THAT
 #
 # Dataset:
-#   - USGS National Land Cover Database (NLCD)
-#     https://developers.google.com/earth-engine/datasets/catalog/USGS_NLCD_RELEASES_2021_REL_NLCD
+#   - USFS Landscape Change Monitoring System (LCMS)
+#     https://developers.google.com/earth-engine/datasets/catalog/USFS_GTAC_LCMS_v2024-10
 #
 # Notes:
-#   - Land cover products are available for 2001, 2004, 2006, 2008,
-#     2011, 2013, 2016, 2019, 2021 
-#   - Canopy cover (forest percent) is available for 2000, 2003,
-#     2006, 2009, 2013, 2016, 2019, 2021
 #   - This script uses the Earth Engine Python API to export both
 #     layers to Google Drive or Cloud Storage for a user-defined AOI.
 #
@@ -36,7 +32,7 @@
 import ee
 from utils.log import log, fail, ensure
 from utils.io import ensure_dir
-from utils.gee import get_state_geometry, ee_init
+from utils.gee import get_state_geometry
 
 # ------------------------------------------------
 # Initialize GEE
@@ -45,7 +41,11 @@ from utils.gee import get_state_geometry, ee_init
 # KEY_FILE = "/home/nnagle/.config/earthengine/service-account.json"
 
 # credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
-ee_init9)
+try:
+  ee.Initialize(project="ee-nnnagle")
+  log("Initialized Earth Engine API successfully.")
+except Exception as e:
+  fail(f"Failed to initialize Earth Engine: {e}")
 
 # ------------------------------------------------
 # Configurable parameters
@@ -59,48 +59,50 @@ region = get_state_geometry(STATE_NAME)
 # ------------------------------------------------
 # NLCD Collections
 # ------------------------------------------------
-nlcd_canopy = ee.ImageCollection("USGS/NLCD_RELEASES/2023_REL/TCC/v2023-5")
+lcms = ee.ImageCollection("USFS/GTAC/LCMS/v2024-10")
 
-
-tcc_year_range = list(range(2010, 2024)) 
+lcms_year_range = list(range(2011, 2012)) 
 
 # ------------------------------------------------
 # Export function
 # ------------------------------------------------
-def export_nlcd(image, year, layer_type):
-    desc = f"NLCD_{layer_type}_{year}_{STATE_NAME.replace(' ', '_')}"
-    out_path = f"{OUT_DIR}/{desc}.tif"
-    log("Preparing export: %s", desc)
-    task = ee.batch.Export.image.toDrive(
-        image=image,
-        description=desc,
-        folder="nlcd_exports",
-        fileNamePrefix=desc,
-        region=region,
-        scale=30,
-        crs="EPSG:5070",
-        maxPixels=1e13
-    )
-    task.start()
-    log("Export started for %s", desc)
+def export_lcms(image, year, layer_type):
+  desc = f"LCMS_{layer_type}_{year}_{STATE_NAME.replace(' ', '_')}"
+  out_path = f"{OUT_DIR}/{desc}.tif"
+  log("Preparing export: %s", desc)
+  task = ee.batch.Export.image.toDrive(
+    image=image,
+    description=desc,
+    folder="lcms_exports",
+    fileNamePrefix=desc,
+    region=region,
+    scale=30,
+    crs="EPSG:5070",
+    maxPixels=1e13
+  )
+  task.start()
+  log("Export started for %s", desc)
 
 # ------------------------------------------------
 # Loop over years and export both layers
 # ------------------------------------------------
-img = nlcd_canopy.first()
+img = lcms.first()
 props = img.propertyNames().getInfo()
-print("TCC Metadata keys:", props)
+print("LCMS Metadata keys:", props)
 
-#for key in props:
-#    print(key, ":", img.get(key).getInfo())
+for key in props:
+    print(key, ":", img.get(key).getInfo())
 
-for yr in tcc_year_range:
-    img = nlcd_canopy.filter(ee.Filter.eq("year",int(yr))).filter(ee.Filter.eq("study_area", "CONUS"))
-    if img.size().getInfo() == 0:
-        log("WARNING: No TCC image for year %d over study_area=CONUS", yr)
-        continue
-    img = img.first().clip(region)
-    export_nlcd(img.select("Science_Percent_Tree_Canopy_Cover"), yr, "TreeCanopy")
- 
+for yr in lcms_year_range:
+  img = lcms.filter(ee.Filter.eq("year",int(yr))).filter(ee.Filter.eq("study_area", "CONUS"))
+  if img.size().getInfo() == 0:
+    log("WARNING: No LCMS image for year %d over study_area=CONUS", yr)
+    continue
+  img = img.first().clip(region)
+  export_lcms(img.select("Land_Cover"), yr, "LandCover")
+  export_lcms(img.select("Land_Use"), yr, "LandUse")
+  export_lcms(img.select("Change"), yr, "Change")
+
+
 log("All export tasks have been submitted to Earth Engine.")
 

@@ -1,0 +1,58 @@
+# Example configuration for the raster->Zarr pipeline and VQ-VAE training.
+# Save as config.yaml and run e.g.:
+#   python build_zarr.py --config config.yaml
+#   python train_vqvae.py --config config.yaml
+#
+# You can keep both sections in one file. Each script will read only its own section.
+
+build_zarr:
+  mask: data/mask/mask.tif
+  features_csv: data/input_file_locations.txt   # columns: year,kind(int|cat),fid(optional),file_path
+  naip_path: /data/VA_NAIP/2021/va_naip_2021_chm_filled_not_smoothed_10m_mosaic_albers.img
+  end_years: [2021]
+  window_len: 5
+  out_zarr: out/cube.zarr
+  chunks: "time=5,y=32,x=32,feature=128,krow=3,kcol=3"
+  naip_dtype: float32                # e.g., float32 or uint16
+  compress: "lz4:9"                 # e.g., zstd:5, lz4:9, zlib:5
+
+train_vqvae:
+  zarr: out/cube.zarr
+  run_dir: runs/exp_001
+
+  # Data/loader
+  batch_size: 64
+  num_workers: 16
+  steps_per_epoch: 2000
+  epochs: 5
+  eager: false
+
+  # Schema (exposure-aware collapse)
+  min_hits_per_epoch: 100
+  mass_coverage: 0.999
+  vocab_cap: 5000
+
+  # Model
+  codebook_size: 256
+  emb_dim: 128
+  hidden: 128
+  cat_emb_dim: 8
+  beta: 0.25
+
+  # Optim
+  lr: 0.0003
+  min_lr: 0.00003
+  weight_decay: 0.0001
+  clip_grad: 1.0
+
+  # Loss weights
+  lambda_cont: 1.0
+  lambda_cat: 1.0
+  lambda_canopy: 1.0
+  lambda_vq: 1.0
+
+  # Logging & hardware
+  log_every: 50
+  no_amp: false # false means that amp is used.
+  bf16: false # false is quicker, but turning on bf16 can be more reliable
+  cpu: false
