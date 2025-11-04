@@ -1,13 +1,52 @@
-#!/usr/bin/env python3
-# =============================================================================
-# utils/loader_utils.py — Encoding/decoding + normalization helpers
-#
-# What belongs here vs in loader.py?
-#   - This file is *stateless* helper logic: converting codes to IDs,
-#     continuous normalization math, NAIP scaling math, and their inverses.
-#   - loader.py holds the *stateful* Dataset that opens the Zarr, indexes
-#     mask locations, and calls these helpers per-sample.
-# =============================================================================
+"""
+utils/loader_utils.py
+----------------------
+Stateless feature encoding, normalization, and NAIP scaling helpers
+used by `utils/loader.py`.
+
+Purpose
+    Provide pure, dependency-minimal utilities for converting raw feature
+    vectors (from Zarr) into model-ready representations. These helpers are
+    side-effect-free and deterministic, ensuring identical results for the
+    same inputs across workers and epochs.
+
+Used by
+    - utils/loader.py (VQVAEDataset)
+    - scripts/build_zarr.py for schema introspection or verification
+
+Key functions
+    build_cat_maps(feature_meta)
+        → {feature_name: {raw_code: dense_id}}
+        Dense IDs reserve 0=MISS, 1=UNK, observed codes begin at 2.
+
+    encode_categorical_row(raw_vec, cat_indices, feature_names, cat_maps)
+        → np.ndarray[int64], dense categorical vector per sample row.
+
+    extract_cont_stats(feature_meta)
+        → {feature_name: {min,max,mean,std,q01,q99}}
+        Returns numeric summary stats used for normalization.
+
+    norm_continuous_row(raw_vec, cont_indices, feature_names, cont_stats)
+        → (z, nan_mask)
+        Clips each value to [q01,q99], applies z-score (mean/std), replaces NaN with 0.
+
+    scale_naip_patch(patch, q01, q99)
+        → (scaled, nan_mask)
+        Robust min–max scaling of NAIP imagery to [0,1] per band.
+
+Design notes
+    - Stateless: no global variables, no I/O, no Zarr dependencies.
+    - Safe: guards against NaNs, degenerate stats, and missing quantiles.
+    - Compatible: accepts both [krow,kcol,band] and [band,krow,kcol] NAIP layouts.
+
+Conventions
+    - MISS_ID = 0, UNK_ID = 1 are reserved and consistent across the repo.
+    - Continuous normalization uses q01/q99 clipping, not min/max, to resist outliers.
+    - Returned masks (e.g., nan_mask) are float arrays of 1.0 where invalid.
+
+These routines define the mathematical contract for how features are transformed
+between disk representation and model inputs.
+"""
 
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple

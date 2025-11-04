@@ -1,20 +1,59 @@
-#!/usr/bin/env python3
-# =============================================================================
-# utils/loader.py — Zarr → PyTorch Dataset (trainer-compatible)
-#
-# - Robust scaling for continuous (clip to [q01,q99] then z-score)
-# - Robust min-max for NAIP per band using q01/q99 → [0,1]
-# - Dense IDs for categorical: MISS=0, UNK=1, observed codes → 2...
-# - Emits masks: cont_nan_mask, naip_nan_mask
-# - Emits cat_target with IGNORE_INDEX for loss masking
-#
-# Trainer expectations satisfied:
-#   - ctor: VQVAEDataset(zarr_path, schema_path:str|None, eager:bool, ignore_unk_in_loss:bool)
-#   - attributes: cat_names, cont_names, schema_cat, naip
-#   - method: class_weights_by_cat_name(name)->Tensor
-#   - collate: default_collate_fn
-#   - const: IGNORE_INDEX
-# =============================================================================
+"""
+utils/loader.py
+----------------
+Zarr → PyTorch Dataset (trainer-compatible) with robust scaling, categorical
+densification, optional NAIP normalization, and chunk-aware sampling metadata.
+
+Purpose
+    Expose geospatial time-series from a chunked Zarr cube as a PyTorch
+    Dataset for VQ-VAE training/eval. Handles per-feature normalization,
+    categorical re-indexing (MISS/UNK), masking, and provides batch-friendly
+    signals (xy_by_chunk) to keep I/O local to a single Zarr chunk.
+
+Constructor
+    VQVAEDataset(zarr_path: str,
+                 schema_path: str | None = None,
+                 *,
+                 eager: bool = False,
+                 ignore_unk_in_loss: bool = True)
+
+Per-sample output (dict of tensors)
+    cont            : [T, C_cont]   robust z-scored continuous features
+    cont_nan_mask   : [T, C_cont]   1 where value was NaN before scaling
+    cat             : [T, C_cat]    dense ids (0=MISS, 1=UNK, 2..=observed)
+    cat_target      : [T, C_cat]    same as `cat`, with MISS/UNK→IGNORE_INDEX
+    naip            : [bands, krow, kcol]  scaled to [0,1] via q01/q99 (if present)
+    naip_nan_mask   : [bands, krow, kcol]  1 where NAIP was NaN
+    years           : [T]           integer years (shared across samples)
+    yx              : [2]           (y, x) pixel coordinate
+
+Trainer contract
+    - Attributes: cont_names, cat_names, schema_cat, naip (or None)
+    - Method   : class_weights_by_cat_name(name) -> torch.Tensor
+    - Collate  : default_collate_fn (keeps `years` from first sample)
+    - Const    : IGNORE_INDEX = -100 (for CE masking)
+
+Normalization & encoding
+    - Continuous: clip to [q01, q99] (from feature_meta) then z-score (mean/std)
+    - Categorical: dense id mapping per feature; MISS=0, UNK=1, observed codes ≥2
+    - NAIP: per-band robust min-max using q01/q99 attrs → [0,1]
+
+Chunk-aware sampling (performance)
+    - Builds `xy_by_chunk` from dask `.chunks` of `attrs_raw[:, y, x, :]`
+      to support batch samplers that keep all samples in one (y,x) chunk.
+    - Handles ragged edge chunks (uses actual per-axis chunk sizes).
+
+Assumptions / required Zarr layout
+    Variables: attrs_raw[time, y, x, feature], mask[y, x], years[time]
+               (optional) naip_patch[y, x, krow, kcol, band] or equivalent
+    Coords/attrs: feature_names, feature_kinds, feature_meta (JSON or dict)
+                  NAIP q01/q99 stored on `naip_patch` attrs if present.
+
+Notes
+    - `eager=True` forces immediate mask load; otherwise mask is computed lazily.
+    - `ignore_unk_in_loss=True` maps UNK to IGNORE_INDEX in `cat_target`.
+    - Use a chunk-locked BatchSampler with `xy_by_chunk` to minimize I/O.
+"""
 
 from __future__ import annotations
 from typing import Dict, List, Tuple, Optional

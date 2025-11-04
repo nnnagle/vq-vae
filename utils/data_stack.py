@@ -1,11 +1,31 @@
-# utils/data_stack.py
-# ======================================================================
-# Data orchestration utilities for building the Zarr cube:
-# - Year selection from (end_years, window_len)
-# - Input indexing & consistency checks (robust CSV parsing)
-# - Spatial stacking into attrs_raw (Dask-lazy; never fully in RAM)
-# - Feature metadata (stats for continuous, code counts for categorical)
-# ======================================================================
+"""
+utils/data_stack.py
+-------------
+Builds feature stacks and metadata for the raster → Zarr training pipeline.
+
+Purpose
+    Provides the data-layer assembly functions that read per-feature rasters,
+    validate cross-year consistency, and construct lazy Dask/xarray arrays
+    suitable for downstream VQ-VAE training. Handles ragged chunks, mixed
+    feature types (continuous and categorical), and metadata summarization.
+
+Used by
+    - build_zarr.py : orchestrates the cube creation using stack_attrs_raw_spatial()
+    - train_vqvae.py : consumes the resulting Zarr archive
+
+Design notes
+    * Indexes input rasters via CSV descriptors; tolerant to header aliases.
+    * Enforces consistent feature identity and order across all years.
+    * Uses Dask-lazy operations for large rasters — no full in-memory load.
+    * Computes per-feature statistics for schema and normalization.
+    * Treats chunk boundaries explicitly to avoid misaligned samples.
+
+Assistant guidance
+    When extending:
+        - Preserve idempotency of CSV parsing and array construction.
+        - Do not eagerly compute Dask arrays; return lazily-evaluated graphs.
+        - Keep feature kind semantics stable ("int" = continuous, "cat" = categorical).
+"""
 
 from typing import List, Dict, Tuple, Optional
 import os
