@@ -58,12 +58,12 @@ Design rules
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import time
-from pathlib import Path
+
 from typing import Dict, List, Any, Optional
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -73,26 +73,27 @@ from torch.utils.data import DataLoader
 import xarray as xr
 
 # ---- project utils (expected layout under utils/)
-from utils.schema import (
-    build_categorical_schema,
-    attach_continuous_stats,
-    save_schema,
-)
 
-from utils.train_debug_utils import StepTimers, print_device_summary, maybe_sync_cuda
+
+from vqvae.train_debug_utils import StepTimers, print_device_summary, maybe_sync_cuda
 
 
 # IGNORE_INDEX fallback in case the loader doesn't export it
 try:
-    from utils.loader import VQVAEDataset, default_collate_fn, IGNORE_INDEX
+    from vqvae.loader import VQVAEDataset, default_collate_fn, IGNORE_INDEX
 except Exception:  # pragma: no cover
-    from utils.loader import VQVAEDataset, default_collate_fn
+    from vqvae.loader import VQVAEDataset, default_collate_fn
     IGNORE_INDEX = -100
 
 from utils.weights import cat_class_weights
 from utils.argyaml import parse_args_with_yaml
 from utils.samplers import ChunkBatchSampler
 from vqvae.model import VQVAE
+from vqvae.preprocess import (
+  build_and_save_schema, 
+  read_feature_meta_from_zarr,
+  maybe_compute_canopy_target_from_batch,
+  )
 
 # -------------------------------------------------------------------
 # Enable optimized matrix math on Ada / Ampere GPUs (like RTX 4060)
@@ -109,31 +110,6 @@ def make_run_dir(run_dir: str) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def read_feature_meta_from_zarr(zarr_path: str) -> Dict[str, Any]:
-    ds = xr.open_zarr(zarr_path, consolidated=True)
-    raw = ds.attrs.get("feature_meta", "{}")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"feature_meta not found or invalid: {e}")
-
-def build_and_save_schema(zarr_path: str, run_dir: Path,
-                          batch_size: int, steps_per_epoch: int,
-                          min_hits_per_epoch: int, mass_coverage: Optional[float],
-                          vocab_cap: Optional[int]) -> Path:
-    fm = read_feature_meta_from_zarr(zarr_path)
-    cat_schema = build_categorical_schema(
-        fm, batch_size=batch_size, steps_per_epoch=steps_per_epoch,
-        min_hits_per_epoch=min_hits_per_epoch,
-        mass_coverage=mass_coverage, vocab_cap=vocab_cap
-    )
-    schema = attach_continuous_stats(cat_schema, fm)
-    schema_path = run_dir / "schema.json"
-    save_schema(schema, str(schema_path))
-    # also save raw feature_meta for provenance
-    with open(run_dir / "feature_meta.json", "w") as f:
-        json.dump(fm, f, indent=2)
-    return schema_path
 
 def count_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -151,31 +127,6 @@ def mse_ignore_nan(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 # ------------------------------ Training --------------------------------
 
-def maybe_compute_canopy_target_from_batch(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    """
-    Robust canopy target:
-      - If 'canopy' exists in batch, use it.
-      - Else compute a **NaN-safe** mean over the 3x3 NAIP patch.
-        Prefer weighted mean using 'naip_nan_mask' when present; otherwise use torch.nanmean.
-    """
-    if "canopy" in batch:
-        return batch["canopy"]
-
-    naip = batch["naip"]  # [B,Bn,3,3] or [B,Bn,H,W]
-    if "naip_nan_mask" in batch:
-        # mask: 1 where NaN in original; valid weights = 1 - mask
-        mask = batch["naip_nan_mask"].to(naip.dtype)
-        w = (1.0 - mask)
-        num = (naip * w).sum(dim=(-1, -2))              # sum over spatial
-        den = w.sum(dim=(-1, -2)).clamp_min(1.0)
-        canopy = (num / den)                             # [B,Bn]
-    else:
-        canopy = torch.nanmean(naip, dim=(-1, -2))      # [B,Bn]
-
-    # pick band 0 if multi-band
-    if canopy.ndim == 2 and canopy.size(1) >= 1:
-        canopy = canopy[:, 0]
-    return canopy  # [B]
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -204,20 +155,6 @@ def train(args):
       replacement_within_chunk=False,   # flip to True if strong class imbalance
       seed=42
     )
-    # loader = DataLoader(
-    #     ds, 
-    #     batch_size=args.batch_size, 
-    #     shuffle=True,
-    #     #num_workers=0, # No workers to debug
-    #     num_workers=args.num_workers, 
-    #     pin_memory=True, # not needed on CPU 
-    #     collate_fn=default_collate_fn,
-    #     persistent_workers=True,
-    #     prefetch_factor=4,
-    #     drop_last=False,
-    #     multiprocessing_context="spawn",
-    #     timeout=300 # no timeout while debugging
-    # )
     loader = DataLoader(
       ds,
       batch_sampler=batch_sampler,

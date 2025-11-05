@@ -1,0 +1,13 @@
+I want you to create a VQ-VAE.
+The unit of modeling is a 30x30m pixel
+The inputs are
+K1 Time series of categorical rasters for times 1..T with resolution 30x30
+K2 Time series of integer valued rasters for times 1..T with resolution 30x30
+A NAIP raster at only time T that has resolution 10x10 so there is a 3x3 patch for each raster input
+
+Each of the categorical K1 should be modeled as a D dimensional embedding
+Each of the integer K2 should be normalized 
+The NAIP should be normalized.
+
+The codebook should be a representation with 1) a times series for each K1, and each K2
+and 2) a value of the mean NAIP.
