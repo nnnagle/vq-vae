@@ -117,3 +117,34 @@ python -m scripts.train_vqvae --config scripts/config.yaml
 # Run sampler tests
 pytest tests/test_samplers.py -v
 
+```
+
+---
+
+## House Style
+Use this template for utility headers.  See scripts/data_stack.py for example. 
+"""
+utils/<module>.py
+-----------------
+<One-line summary of what this file does.>
+
+Purpose
+    - <Bullet 1>
+    - <Bullet 2>
+    - <Bullet 3>
+
+Used by
+    - <script_or_module_a.py> : <very short why>
+    - <script_or_module_b.py> : <very short why>
+
+Design notes
+    - <Non-obvious constraint or invariant>
+    - <Evaluation strategy / performance note>
+    - <Shape/dtype conventions if relevant>
+
+Assistant guidance
+    When extending:
+        - <Actionable rule 1>
+        - <Actionable rule 2>
+        - <Actionable rule 3>
+"""
