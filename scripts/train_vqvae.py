@@ -1,21 +1,59 @@
-#!/usr/bin/env python3
-# =============================================================================
-# scripts/train_vqvae.py — End-to-end training for mixed geospatial VQ-VAE
-#
-# Workflow
-#   1) Read feature_meta from the Zarr → build exposure-aware schema → save
-#   2) Create VQVAEDataset/DataLoader using that schema
-#   3) Define model: MixedInputEncoder → VectorQuantizer → MixedDecoder heads
-#        - Decoder predicts: continuous features, categorical logits, canopy scalar (final T)
-#   4) Train with AMP, class-weighted CE (cats), MSE (cont), canopy MSE, VQ loss
-#
-# CLI (example)
-#   python train_vqvae.py \
-#     --zarr data/cube.zarr --run_dir runs/exp_001 \
-#     --batch_size 64 --steps_per_epoch 10000 --epochs 5 \
-#     --min_hits_per_epoch 100 --mass_coverage 0.999 --vocab_cap 5000 \
-#     --codebook_size 256 --emb_dim 128 --beta 0.25
-# =============================================================================
+"""
+scripts/train_vqvae.py
+----------------------
+End-to-end training for a mixed-input geospatial VQ-VAE (continuous + categorical + NAIP).
+
+Purpose
+    Orchestrate the full training loop:
+      1) Read feature_meta from the Zarr and build an exposure-aware schema
+         (dense categorical IDs, continuous stats) → persist to run_dir.
+      2) Construct VQVAEDataset/DataLoader (chunk-aware sampling, masks).
+      3) Build the model: MixedInputEncoder → VectorQuantizer → MixedDecoder heads.
+      4) Train with AMP, class-weighted CE (categoricals), MSE (continuous),
+         canopy scalar MSE, and VQ loss; checkpoint and log progress.
+
+Key I/O
+    Inputs:
+      • --zarr: consolidated Zarr cube with attrs_raw, mask, years, (optional) naip_patch
+      • --config: YAML with a 'train_vqvae' section (overrides CLI where present)
+    Outputs (under --run_dir):
+      • schema.json            (categorical vocab + continuous stats)
+      • feature_meta.json      (raw feature meta for provenance)
+      • ckpt_epochXXX.pt       (epoch checkpoints)
+      • ckpt_best.pt           (best-so-far by running loss)
+
+Trainer contract
+    Dataset provides:
+      • tensors: cont, cat, cat_target, naip, naip_nan_mask, years, yx
+      • schema_cat (name → num_ids), cont_names, cat_names
+      • default_collate_fn and IGNORE_INDEX for CE masking
+    Model returns:
+      • cont_pred [B,T,C_cont], cat_logits {name: [B,T,num_ids]}, canopy_pred [B]
+      • vq_loss (scalar), perplexity (monitoring)
+
+Losses
+    total = λ_cont * MSE(cont) + λ_cat * Σ CE(cat, class_weights, ignore_index)
+            + λ_canopy * MSE(canopy) + λ_vq * VQ
+    NaN-safe handling for continuous/NAIP via masks and torch.nan_to_num.
+
+Performance notes
+    • Chunk-locked BatchSampler to reduce Zarr I/O thrash.
+    • CUDA autocast (fp16 or bf16) + GradScaler on GPU.
+    • Cosine LR schedule from --lr → --min_lr over total steps.
+    • TF32 enabled on Ampere/Ada for fast matmul/conv.
+
+Quick start (CLI)
+    python -m scripts.train_vqvae \\
+      --zarr out/cube.zarr --run_dir runs/exp_001 \\
+      --batch_size 64 --steps_per_epoch 10000 --epochs 5 \\
+      --min_hits_per_epoch 100 --mass_coverage 0.999 --vocab_cap 5000 \\
+      --codebook_size 256 --emb_dim 128 --beta 0.25
+
+Design rules
+    • Keep schema the single source of truth for vocab/stats (not zarr_info).
+    • Deterministic mappings and logging; fail loudly on empty datasets.
+    • Prefer spawn multiprocessing for DataLoader workers.
+"""
 
 from __future__ import annotations
 

@@ -30,31 +30,33 @@ Key functions
         → (z, nan_mask)
         Clips each value to [q01,q99], applies z-score (mean/std), replaces NaN with 0.
 
+    denorm_continuous_row(z_vec, cont_indices, feature_names, cont_stats)
+        → x_raw approximation from z-scores (inverse of z-score step; unclipped).
+
     scale_naip_patch(patch, q01, q99)
         → (scaled, nan_mask)
         Robust min–max scaling of NAIP imagery to [0,1] per band.
 
+    build_id_maps_inverse(cat_maps)
+        → {feature_name: {dense_id: raw_code}} for observed codes (ids ≥ 2).
+
+    decode_categorical_row(dense_ids, cat_indices, feature_names, id_maps_inv)
+        → float array of raw codes with NaN for MISS/UNK by default.
+
+    decode_categorical_batch(dense_ids_2d, ...)
+        → vectorized inverse for [T, C_cat].
+
 Design notes
-    - Stateless: no global variables, no I/O, no Zarr dependencies.
+    - Stateless: no global I/O or Zarr deps.
     - Safe: guards against NaNs, degenerate stats, and missing quantiles.
-    - Compatible: accepts both [krow,kcol,band] and [band,krow,kcol] NAIP layouts.
-
-Conventions
-    - MISS_ID = 0, UNK_ID = 1 are reserved and consistent across the repo.
-    - Continuous normalization uses q01/q99 clipping, not min/max, to resist outliers.
-    - Returned masks (e.g., nan_mask) are float arrays of 1.0 where invalid.
-
-These routines define the mathematical contract for how features are transformed
-between disk representation and model inputs.
+    - Conventions: MISS_ID=0, UNK_ID=1; masks are float arrays of 1.0 where invalid.
 """
 
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-
 MISS_ID, UNK_ID = 0, 1  # reserved for categorical encodings
-
 
 # ----------------------- CATEGORICAL ENCODING ---------------------------
 def build_cat_maps(feature_meta: Dict) -> Dict[str, Dict[int, int]]:
@@ -99,6 +101,71 @@ def encode_categorical_row(
         m = cat_maps.get(name, {})
         out.append(m.get(code, UNK_ID))
     return np.asarray(out, dtype=np.int64)
+
+
+# ----------------------- CATEGORICAL DECODING (inverse) ----------------
+def build_id_maps_inverse(cat_maps: Dict[str, Dict[int, int]]) -> Dict[str, Dict[int, int]]:
+    """
+    Invert code->dense-id maps to dense-id->code for each categorical feature.
+    Only observed codes (ids >= 2) are invertible. MISS/UNK handled by caller.
+
+    Returns:
+        { feature_name: {dense_id: raw_code, ...}, ... }
+    """
+    inv: Dict[str, Dict[int, int]] = {}
+    for name, code2id in cat_maps.items():
+        inv[name] = {dense_id: raw_code for raw_code, dense_id in code2id.items() if dense_id >= 2}
+    return inv
+
+
+def decode_categorical_row(
+    dense_ids: np.ndarray,             # shape [C_cat], values in {0=MISS,1=UNK,>=2 observed}
+    cat_indices: List[int],
+    feature_names: List[str],
+    id_maps_inv: Dict[str, Dict[int, int]],
+    *,
+    miss_value: float = np.nan,        # value to emit for MISS (0)
+    unk_value: float = np.nan          # value to emit for UNK (1)
+) -> np.ndarray:
+    """
+    Convert dense IDs back to raw categorical codes for a single row.
+    Returns float array (so NaN is representable). Cast to int after handling NaNs if needed.
+    """
+    out = []
+    for j, i in enumerate(cat_indices):
+        name = feature_names[i]
+        did = int(dense_ids[j])
+        if did == MISS_ID:
+            out.append(miss_value)
+        elif did == UNK_ID:
+            out.append(unk_value)
+        else:
+            code = id_maps_inv.get(name, {}).get(did, unk_value)
+            out.append(float(code) if code is not np.nan else np.nan)
+    return np.asarray(out, dtype=np.float32)
+
+
+def decode_categorical_batch(
+    dense_ids_2d: np.ndarray,          # shape [T, C_cat]
+    cat_indices: List[int],
+    feature_names: List[str],
+    id_maps_inv: Dict[str, Dict[int, int]],
+    *,
+    miss_value: float = np.nan,
+    unk_value: float = np.nan
+) -> np.ndarray:
+    """
+    Vectorized inverse for a [T, C_cat] matrix of dense IDs.
+    Returns float32 array shape [T, C_cat] with NaN for MISS/UNK by default.
+    """
+    T, C = dense_ids_2d.shape
+    out = np.empty((T, C), dtype=np.float32)
+    for t in range(T):
+        out[t] = decode_categorical_row(
+            dense_ids_2d[t], cat_indices, feature_names, id_maps_inv,
+            miss_value=miss_value, unk_value=unk_value
+        )
+    return out
 
 
 # ----------------------- CONTINUOUS NORMALIZATION ----------------------
@@ -149,6 +216,28 @@ def norm_continuous_row(
         z_list.append(z)
         nan_mask.append(0.0)
     return np.asarray(z_list, dtype=np.float32), np.asarray(nan_mask, dtype=np.float32)
+
+
+def denorm_continuous_row(
+    z_vec: np.ndarray,
+    cont_indices: List[int],
+    feature_names: List[str],
+    cont_stats: Dict[str, Dict[str, float]],
+) -> np.ndarray:
+    """
+    Inverse of z-score step: x ≈ z * std + mean, without re-applying clip.
+    Useful for mapping normalized values back to original units for reporting.
+    Returns array shape [C_cont].
+    """
+    x_list = []
+    for i in cont_indices:
+        name = feature_names[i]
+        s = cont_stats.get(name, {})
+        mu = float(s.get("mean", 0.0) or 0.0)
+        sd = float(s.get("std", 1.0) or 1.0)
+        x = float(z_vec[i]) * (sd if sd != 0 else 1.0) + mu
+        x_list.append(x)
+    return np.asarray(x_list, dtype=np.float32)
 
 
 # ----------------------- NAIP SCALING ----------------------------------

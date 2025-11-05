@@ -1,22 +1,59 @@
-#!/usr/bin/env python3
-# =============================================================================
-# utils/schema.py — Build and persist categorical + continuous schema
-#
-# Purpose
-#   Construct a policy record ("schema") the *loader* will use to:
-#     - collapse categorical codes to dense, consecutive IDs per feature
-#     - standardize/denormalize continuous features
-#   The policy depends on training knobs (batch_size, steps_per_epoch, etc.),
-#   not on zarr_info. Keep this the single source of truth.
-#
-# Exposed API
-#   build_categorical_schema(feature_meta, batch_size, steps_per_epoch,
-#                            min_hits_per_epoch=100, mass_coverage=0.999,
-#                            vocab_cap=5000) -> dict
-#   attach_continuous_stats(schema, feature_meta) -> dict
-#   save_schema(schema, path) -> None
-#   load_schema(path) -> dict
-# =============================================================================
+"""
+utils/schema.py
+----------------
+Build and persist the feature schema used by the loader and trainer:
+exposure-aware categorical vocabularies and continuous normalization stats.
+
+Purpose
+    Provide a single source of truth (“schema”) that the Dataset uses to:
+      • collapse categorical raw codes to dense, consecutive IDs per feature
+      • record exposure policy (batch_size, steps_per_epoch, min_hits, coverage, caps)
+      • attach continuous stats (mean/std and q01/q99) for normalization/denorm
+    The schema depends on training knobs, not on Zarr structure. Keep it small,
+    explicit, and reproducible.
+
+Exposed API
+    build_categorical_schema(feature_meta, batch_size, steps_per_epoch,
+                             min_hits_per_epoch=100, mass_coverage=0.999,
+                             vocab_cap=5000) -> dict
+        - Constructs per-feature vocabularies with exposure thresholds and optional
+          mass coverage/cap. IDs are dense and per-feature: 0=MISS, 1=UNK, 2..=kept codes.
+
+    attach_continuous_stats(schema, feature_meta) -> dict
+        - Adds per-feature continuous stats: {mean, std, q01, q99}.
+
+    save_schema(schema, path) -> None
+    load_schema(path) -> dict
+
+Schema shape (selected keys)
+    {
+      "policy": {
+        "batch_size", "steps_per_epoch", "min_hits_per_epoch",
+        "mass_coverage", "vocab_cap", "miss_id", "unk_id", "N_epoch"
+      },
+      "categorical": {
+        "<feature>": {
+          "num_ids", "kept_codes", "code2id", "id2code",
+          "min_count", "coverage", "counts_per_id"
+        }, ...
+      },
+      "continuous": {
+        "<feature>": {"mean","std","q01","q99"}, ...
+      }
+    }
+
+Conventions
+    • MISS_ID = 0, UNK_ID = 1 (reserved across the codebase).
+    • Categorical IDs are dense per feature; do not share mappings between features.
+    • Continuous normalization elsewhere uses clip[x ∈ (q01,q99)] then z-score.
+      Denormalization uses x ≈ z*std + mean (no re-clip).
+
+Design notes
+    • Exposure threshold: keep codes expected to appear ≥ min_hits_per_epoch given
+      N_epoch = batch_size * steps_per_epoch.
+    • Deterministic: kept codes sorted numerically; mappings are reproducible.
+    • Counts are stored aligned to IDs (index 0..num_ids-1) for fast weighting.
+"""
 
 from __future__ import annotations
 
