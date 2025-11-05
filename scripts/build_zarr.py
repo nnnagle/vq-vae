@@ -1,77 +1,56 @@
-#!/usr/bin/env python3
-# ======================================================================
-# File: build_zarr.py
-# Purpose:
-#   Orchestrate construction of a geospatial Zarr “feature cube” for
-#   VQ-VAE training by **spatially cropping** inputs to a mask AOI.
-#
-# What it does:
-#   • Uses a 30 m binary mask (1=keep, else drop) as the TEMPLATE
-#     (CRS, transform, bounds, and (H,W) grid).
-#   • Reads yearly 30 m single-band rasters (mixed continuous/categorical)
-#     from a CSV (year,type(int|cat),file_path[,fid]) and crops them to the mask
-#     via bounds intersection & raster windows (no reprojection).
-#   • Reads a 10 m NAIP mosaic, aligns it to a 10 m template derived from
-#     the mask (3× resolution), and reshapes into 3×3 patches per 30 m cell.
-#   • Deduplicates years implied by (end_years, window_len) and writes:
-#        attrs_raw(time,y,x,feature)     RAW values (float; nodata→NaN)
-#        mask(y,x)                       uint8
-#        years(time)                     int
-#        feature_names(feature)          string
-#        feature_kinds(feature)          {"int"|"cat"}
-#        naip_patch(y,x,krow,kcol,band)  float32/uint16 (3×3 per 30 m cell)
-#   • Stores skew-aware summaries for continuous vars and class counts for
-#     categorical vars in dataset attrs as JSON, and sidecar JSON on disk.
-#
-# Streaming / memory behavior:
-#   • attrs_raw and naip_patch are Dask-backed. All reductions (stats, histograms,
-#     quantiles) are chunk-wise and streaming; the code never materializes the
-#     full rasters in memory.
-#
-# Example usage
-#   1) Minimal run with typical chunks and Zstd compression:
-#        python build_zarr.py \
-#          --mask data/mask_30m.tif \
-#          --features_csv data/features.csv \
-#          --naip_path /data/naip/naip_2021_10m.tif \
-#          --end_years 2020 2022 \
-#          --window_len 4 \
-#          --out_zarr out/cube.zarr \
-#          --chunks time=1,y=1024,x=1024,feature=64,krow=3,kcol=3 \
-#          --compress zstd:5 \
-#          --naip_dtype float32
-#
-#   2) Heavier spatial chunking for huge AOIs, faster band IO:
-#        python build_zarr.py \
-#          --mask data/mask_30m.tif \
-#          --features_csv data/features.csv \
-#          --naip_path /data/naip/naip_2021_10m.tif \
-#          --end_years 2018 2019 2020 2021 2022 \
-#          --window_len 5 \
-#          --out_zarr out/cube_big.zarr \
-#          --chunks time=1,y=2048,x=2048,feature=128,krow=3,kcol=3 \
-#          --compress zstd:7
-#
-#   3) Integer NAIP storage (smaller on disk), still streaming:
-#        python build_zarr.py \
-#          --mask data/mask_30m.tif \
-#          --features_csv data/features.csv \
-#          --naip_path /data/naip/naip_2021_10m_uint16.tif \
-#          --end_years 2022 \
-#          --window_len 3 \
-#          --out_zarr out/cube_uint16.zarr \
-#          --naip_dtype uint16
-#
-# CSV format (features_csv):
-#   Required columns: year, kind, file_path
-#   Optional column:  fid  (stable feature ID/name; defaults to file stem)
-#   Example:
-#     year,kind,fid,file_path
-#     2019,int,canopy_height,/data/30m/2019/canopy_height.tif
-#     2019,cat,landcover,/data/30m/2019/landcover_codes.tif
-#     2020,int,canopy_height,/data/30m/2020/canopy_height.tif
-#     2020,cat,landcover,/data/30m/2020/landcover_codes.tif
-# ======================================================================
+"""
+scripts/build_zarr.py
+---------------------
+Construct a geospatial Zarr *feature cube* for VQ-VAE training by aligning all
+inputs to a 30 m mask grid and streaming them into chunked, compressed arrays.
+
+Purpose
+    • Use a 30 m binary mask (1=keep) as the spatial template (CRS, transform, H×W).
+    • For each end year and window length, stack yearly rasters (mixed int/cat)
+      into a time axis to form: attrs_raw[time, y, x, feature].
+    • Align a 10 m NAIP mosaic to the mask grid, and reshape into 3×3 patches
+      per 30 m cell: naip_patch[y, x, krow=3, kcol=3, band].
+    • Compute streaming feature metadata:
+        – continuous: robust stats (q01, q99, mean, std)
+        – categorical: per-code counts
+    • Persist metadata into Zarr attrs (JSON) + sidecar JSON files.
+
+Outputs (Zarr variables)
+    • attrs_raw(time, y, x, feature)   – raw values (float, nodata→NaN), Dask-backed
+    • mask(y, x)                        – uint8 (1=keep)
+    • years(time)                       – int16
+    • feature_names(feature)            – str
+    • feature_kinds(feature)            – {"int"|"cat"}
+    • naip_patch(y, x, krow, kcol, band)– float32/uint16 (3×3 per 30 m cell)
+
+Performance & chunking
+    • Fully streaming: reductions (stats/quantiles/histograms) are chunk-wise;
+      no full-array materialization.
+    • Chunk spec controls time/y/x/feature and NAIP krow/kcol partitioning.
+    • Compression via Blosc (zstd/lz4/etc) with bit-shuffle.
+
+CLI (examples)
+    Minimal:
+        pythion -m scripts.build_zarr \\
+          --config scripts/config.yaml
+        python -m scripts.build_zarr \\
+          --mask data/mask_30m.tif \\
+          --features_csv data/features.csv \\
+          --naip_path /data/naip_2021_10m.tif \\
+          --end_years 2020 2022 \\
+          --window_len 4 \\
+          --out_zarr out/cube.zarr \\
+          --chunks time=1,y=1024,x=1024,feature=64,krow=3,kcol=3 \\
+          --compress zstd:5 --naip_dtype float32
+
+CSV schema (features_csv)
+    Required: year, kind(int|cat), file_path
+    Optional: fid (stable feature ID; defaults to file stem)
+    Example:
+        year,kind,fid,file_path
+        2019,int,canopy_height,/data/30m/2019/canopy_height.tif
+        2019,cat,landcover,/data/30m/2019/landcover_codes.tif
+"""
 
 
 import os
@@ -91,6 +70,7 @@ from utils.data_stack import (
     enforce_consistent_features,
     stack_attrs_raw_spatial,     # Dask-lazy
     compute_feature_metadata,    # streaming reductions
+    compute_naip_metadata,
 )
 from utils.raster_ops import (
     load_mask_template,
@@ -204,21 +184,12 @@ def main():
 
     # 6) Persist NAIP metadata (source + structure + robust per-band quantiles)
     log("Attaching NAIP metadata and robust q01/q99 (streaming reductions)...")
-    naip_attrs = {
-        "source": os.path.abspath(args.naip_path),
-        "kshape": (3, 3),
-        "bands": int(naip_patch.sizes["band"]),
-        "dtype": str(naip_patch.dtype),
-    }
-    try:
-        m = mask_da.astype(bool)
-        q = naip_patch.where(m).quantile([0.01, 0.99], dim=("y", "x", "krow", "kcol"), skipna=True)
-        # Compute scalars; Dask reduces per-chunk, no full array materialization
-        naip_attrs["q01"] = q.sel(quantile=0.01).compute().values.tolist()
-        naip_attrs["q99"] = q.sel(quantile=0.99).compute().values.tolist()
-    except Exception as e:
-        log("NAIP quantiles skipped due to: %s", e)
-    naip_patch.attrs.update(naip_attrs)
+    naip_meta = compute_naip_metadata(
+      naip_patch=naip_patch,
+      mask_da=mask_da,
+      include_source=os.path.abspath(args.naip_path),
+    )
+    naip_patch.attrs.update(naip_meta)
 
     # 7) Feature metadata (all streaming)
     log("Computing feature metadata (continuous & categorical) with streaming reductions...")

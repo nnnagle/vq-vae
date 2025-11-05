@@ -40,7 +40,7 @@ from utils.log import log, warn, fail, ensure
 from utils.raster_ops import read_into_mask_grid
 
 # ----------------------------------------------------------------------
-# Time selection
+# Time selection: Select all years necessary for end_years and window_len
 # ----------------------------------------------------------------------
 def select_years(end_years: List[int], window_len: int) -> List[int]:
     years = set()
@@ -319,7 +319,7 @@ def compute_feature_metadata(
 ) -> Dict:
     """
     Compute metadata for each feature, masked by mask_da==1:
-      - For continuous ('int'): min,max,mean,std, q01,q99 (all Dask reductions)
+      - For continuous ('int'): min,max,mean,std, q01,q25,250,q75,q99 (all Dask reductions)
       - For categorical ('cat'): histogram via Dask (fixed bins 0..254)
     Returns a JSON-serializable dict. No full array materialization.
     """
@@ -332,13 +332,16 @@ def compute_feature_metadata(
     for i, (name, kind) in enumerate(zip(feature_names, feature_kinds)):
         v = attrs_raw.isel(feature=i).where(m)  # (time,y,x)
         if kind == "int":
-            q = v.quantile([0.01, 0.99], dim=("time", "y", "x"), skipna=True)
+            q = v.quantile([0.01, 0.25, 0.50, 0.75, 0.99], dim=("time", "y", "x"), skipna=True)
             stats = {
                 "min": float(v.min(dim=("time", "y", "x"), skipna=True).compute().values),
                 "max": float(v.max(dim=("time", "y", "x"), skipna=True).compute().values),
                 "mean": float(v.mean(dim=("time", "y", "x"), skipna=True).compute().values),
                 "std": float(v.std(dim=("time", "y", "x"), skipna=True).compute().values),
                 "q01": float(q.sel(quantile=0.01).compute().values),
+                "q25": float(q.sel(quantile=0.25).compute().values),
+                "q50": float(q.sel(quantile=0.50).compute().values),
+                "q75": float(q.sel(quantile=0.75).compute().values),
                 "q99": float(q.sel(quantile=0.99).compute().values),
             }
             meta["features"].append({"name": name, "kind": "int", "stats": stats})
@@ -353,3 +356,61 @@ def compute_feature_metadata(
             meta["features"].append({"name": name, "kind": "cat", "classes": classes})
 
     return meta
+
+def compute_naip_metadata(
+    naip_patch: xr.DataArray,
+    mask_da: xr.DataArray,
+    *,
+    reduce_dims: Tuple[str, ...] = ("y", "x", "krow", "kcol"),
+    include_source: Optional[str] = None,
+) -> Dict:
+    """
+    Compute NAIP per-band robust quantiles (q01/q99) and basic structure, masked by mask_da==1.
+    Streaming/Dask-safe: no full-array materialization.
+
+    Parameters
+      naip_patch : xr.DataArray with dims including ("y","x","krow","kcol","band")
+      mask_da    : xr.DataArray (y,x) binary mask; broadcast-aligned automatically
+      reduce_dims: dims to reduce over when computing quantiles (default: spatial + patch)
+      include_source: optional absolute path to embed as metadata
+
+    Returns
+      {
+        "q01": [float,...],     # per-band
+        "q99": [float,...],     # per-band
+        "bands": int,
+        "kshape": (int,int),
+        "dtype": str,
+        "source": str (optional)
+      }
+    """
+    # Basic structure
+    bands = int(naip_patch.sizes.get("band", 0))
+    krow  = int(naip_patch.sizes.get("krow", 0))
+    kcol  = int(naip_patch.sizes.get("kcol", 0))
+    out = {
+        "bands": bands,
+        "kshape": (krow, kcol),
+        "dtype": str(naip_patch.dtype),
+    }
+    if include_source:
+        out["source"] = include_source
+
+    # Mask and quantiles (Dask reductions; no full materialization)
+    m = mask_da.astype(bool)
+    v = naip_patch.where(m)  # (y,x,krow,kcol,band) masked; xarray will align dims
+
+    q = v.quantile([0.01, 0.25, 0.50, 0.75, 0.99], dim=reduce_dims, skipna=True)  # -> (quantile, band)
+    # Compute to scalars/lists; still band-wise, not full array
+    q01 = q.sel(quantile=0.01).compute().values.tolist()
+    q25 = q.sel(quantile=0.25).compute().values.tolist()
+    q50 = q.sel(quantile=0.50).compute().values.tolist()
+    q75 = q.sel(quantile=0.75).compute().values.tolist()
+    q99 = q.sel(quantile=0.99).compute().values.tolist()
+
+    out["q01"] = [float(x) if x is not None else None for x in q01]
+    out["q25"] = [float(x) if x is not None else None for x in q25]
+    out["q50"] = [float(x) if x is not None else None for x in q50]
+    out["q75"] = [float(x) if x is not None else None for x in q75]
+    out["q99"] = [float(x) if x is not None else None for x in q99]
+    return out
