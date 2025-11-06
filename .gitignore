@@ -28,5 +28,6 @@ dist/
 
 # Data / Models
 data/
+runs/
 models/
 out/

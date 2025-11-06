@@ -69,8 +69,7 @@ from utils.data_stack import (
     index_inputs,
     enforce_consistent_features,
     stack_attrs_raw_spatial,     # Dask-lazy
-    compute_feature_metadata,    # streaming reductions
-    compute_naip_metadata,
+    compute_metadata,
 )
 from utils.raster_ops import (
     load_mask_template,
@@ -132,6 +131,30 @@ def make_compressor(spec: str) -> Blosc:
 # Main
 # -----------------------------------------------------------------------
 def main():
+    """
+    Orchestrate the end-to-end build of a VQ-VAE-ready Zarr cube.
+
+    Workflow
+    --------
+    1. Load the 30 m mask raster (defines spatial template).
+    2. Determine the required time window years.
+    3. Index and validate input feature rasters by year and kind.
+    4. Construct lazy Dask-backed arrays for attrs_raw (feature cube) and
+       NAIP 3×3 patches aligned to mask grid.
+    5. Compute per-feature metadata and NAIP stats using streaming reductions.
+    6. Assemble the full xarray.Dataset with attributes and encodings.
+    7. Write compressed Zarr to disk, consolidate metadata, and dump sidecars.
+
+    Outputs
+    -------
+    • Zarr directory (args.out_zarr) with chunked arrays and consolidated metadata.
+    • feature_meta.json and naip_meta.json sidecars for reference.
+
+    Notes
+    -----
+    Designed for large-scale streaming; no in-memory raster stacks are created.
+    """
+
     args = parse_args()
     chunks = parse_chunk_spec(args.chunks)
     compressor = make_compressor(args.compress)
@@ -183,22 +206,35 @@ def main():
     )
 
     # 6) Persist NAIP metadata (source + structure + robust per-band quantiles)
-    log("Attaching NAIP metadata and robust q01/q99 (streaming reductions)...")
-    naip_meta = compute_naip_metadata(
-      naip_patch=naip_patch,
-      mask_da=mask_da,
-      include_source=os.path.abspath(args.naip_path),
-    )
-    naip_patch.attrs.update(naip_meta)
+    # log("Attaching NAIP metadata and robust q01/q99 (streaming reductions)...")
+    # naip_meta = compute_naip_metadata(
+    #   naip_patch=naip_patch,
+    #   mask_da=mask_da,
+    #   include_source=os.path.abspath(args.naip_path),
+    # )
+    # naip_patch.attrs.update(naip_meta)
 
     # 7) Feature metadata (all streaming)
     log("Computing feature metadata (continuous & categorical) with streaming reductions...")
-    feature_meta = compute_feature_metadata(
-        attrs_raw=attrs_raw,
-        feature_names=feature_ids,
-        feature_kinds=feature_kinds,
-        mask_da=mask_da,
+    # feature_meta = compute_feature_metadata(
+    #     attrs_raw=attrs_raw,
+    #     feature_names=feature_ids,
+    #     feature_kinds=feature_kinds,
+    #     mask_da=mask_da,
+    # )
+    
+    # 7) Compute unified feature metadata (includes NAIP bands)
+    feature_meta = compute_metadata(
+      attrs_raw=attrs_raw,
+      feature_names=feature_ids,
+      feature_kinds=feature_kinds,
+      naip_patch=naip_patch,
+      mask_da=mask_da,
+      naip_source=os.path.abspath(args.naip_path),
     )
+    # Optional: keep per-var attrs for convenience
+    naip_patch.attrs.update(feature_meta.get("naip", {}))
+
 
     # 8) Assemble Dataset
     years_da = xr.DataArray(np.array(needed_years, dtype=np.int16), dims=("time",), name="years")
@@ -215,9 +251,9 @@ def main():
             feature_kinds=feature_kinds_da,
         ),
         attrs={
-            "feature_meta": json.dumps(feature_meta, separators=(",", ":"), ensure_ascii=False),
-            "template_crs": str(template["crs"]),
-            "template_transform": tuple(template["transform"][:6]),
+          "cube_meta": json.dumps(feature_meta, separators=(",", ":"), ensure_ascii=False),
+          "template_crs": str(template["crs"]),
+          "template_transform": tuple(template["transform"][:6]),
         },
     )
 
@@ -235,16 +271,21 @@ def main():
     zarr.convenience.consolidate_metadata(args.out_zarr)
 
     # 10) Sidecar JSON
-    meta_path = os.path.join(args.out_zarr, "feature_meta.json")
+    meta_path = os.path.join(args.out_zarr, "cube_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(feature_meta, f, indent=2, ensure_ascii=False)
+      json.dump(feature_meta, f, indent=2, ensure_ascii=False)
     log("Done. Zarr written and consolidated. Sidecar: %s", meta_path)
-
-    naip_attrs = dict(ds["naip_patch"].attrs)
-    naip_meta_path = os.path.join(args.out_zarr, "naip_meta.json")
-    with open(naip_meta_path, "w") as f:
-      json.dump(naip_attrs, f, indent=2)
-    log(f"Wrote NAIP metadata to {naip_meta_path}")
+    
+    # meta_path = os.path.join(args.out_zarr, "feature_meta.json")
+    # with open(meta_path, "w", encoding="utf-8") as f:
+    #     json.dump(feature_meta, f, indent=2, ensure_ascii=False)
+    # log("Done. Zarr written and consolidated. Sidecar: %s", meta_path)
+    # 
+    # naip_attrs = dict(ds["naip_patch"].attrs)
+    # naip_meta_path = os.path.join(args.out_zarr, "naip_meta.json")
+    # with open(naip_meta_path, "w") as f:
+    #   json.dump(naip_attrs, f, indent=2)
+    # log(f"Wrote NAIP metadata to {naip_meta_path}")
 
 if __name__ == "__main__":
     main()

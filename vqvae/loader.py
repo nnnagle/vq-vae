@@ -1,5 +1,5 @@
 """
-utils/loader.py
+vqvae/loader.py
 ----------------
 Zarr → PyTorch Dataset (trainer-compatible) with robust scaling, categorical
 densification, optional NAIP normalization, and chunk-aware sampling metadata.
@@ -88,7 +88,7 @@ class VQVAEDataset(Dataset):
         self.ds = xr.open_zarr(zarr_path, consolidated=True)
 
         # parse feature meta
-        raw = self.ds.attrs.get("feature_meta", "{}")
+        raw = self.ds.attrs.get("cube_meta", "{}")
         self.feature_meta = json.loads(raw) if isinstance(raw, str) else raw
 
         # feature axis descriptors

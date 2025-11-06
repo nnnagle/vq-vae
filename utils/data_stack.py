@@ -414,3 +414,33 @@ def compute_naip_metadata(
     out["q75"] = [float(x) if x is not None else None for x in q75]
     out["q99"] = [float(x) if x is not None else None for x in q99]
     return out
+
+
+def compute_metadata(
+    *,
+    attrs_raw: xr.DataArray,
+    feature_names: List[str],
+    feature_kinds: List[str],
+    naip_patch: xr.DataArray,
+    mask_da: xr.DataArray,
+    naip_source: Optional[str] = None,
+) -> Dict:
+    """
+    Returns:
+      {
+        "features": [...],   # from compute_feature_metadata(...)
+        "naip": { ... }      # from compute_naip_metadata(...)
+      }
+    """
+    feat = compute_feature_metadata(
+        attrs_raw=attrs_raw,
+        feature_names=feature_names,
+        feature_kinds=feature_kinds,
+        mask_da=mask_da,
+    )
+    naip = compute_naip_metadata(
+        naip_patch=naip_patch,
+        mask_da=mask_da,
+        include_source=naip_source,
+    )
+    return {"features": feat.get("features", []), "naip": naip}

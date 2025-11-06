@@ -1,3 +1,5 @@
+# vqvae/preprocess.py
+
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -30,7 +32,7 @@ def build_and_save_schema(zarr_path: str, run_dir: Path,
   
 def read_feature_meta_from_zarr(zarr_path: str) -> Dict[str, Any]:
     ds = xr.open_zarr(zarr_path, consolidated=True)
-    raw = ds.attrs.get("feature_meta", "{}")
+    raw = ds.attrs.get("cube_meta", ds.attrs.get("feature_meta", "{}"))
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
