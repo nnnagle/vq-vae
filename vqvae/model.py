@@ -113,7 +113,7 @@ class MixedInputEncoder(nn.Module):
         z_e = self.fuse(fused)                               # [B,T,D]
         return z_e
 
-class VectorQuantizer(nn.Module):
+class VectorQuantizerST(nn.Module):
     """Straight-Through Vector Quantizer (ST-VQ)."""
     def __init__(self, codebook_size: int, emb_dim: int, beta: float = 0.25):
         super().__init__()
@@ -141,6 +141,75 @@ class VectorQuantizer(nn.Module):
             one_hot = F.one_hot(indices, num_classes=self.codebook_size).float()
             avg_probs = one_hot.mean(dim=0)
             perplexity = torch.exp(- (avg_probs * (avg_probs + 1e-12).log()).sum())
+
+        return z_q_st, indices.view(z_e.shape[:-1]), loss_vq, perplexity
+
+# put this next to VectorQuantizer in model.py
+
+class VectorQuantizerEMA(nn.Module):
+    """
+    Vector Quantizer with Exponential Moving Average (EMA) updates.
+    Matches the ST interface:
+      forward(z_e) -> (z_q_st, indices, vq_loss, perplexity)
+
+    z_e: [B, T, D] (any leading shape, last dim = emb_dim)
+    """
+    def __init__(self, codebook_size: int, emb_dim: int, decay: float = 0.99, eps: float = 1e-5, beta: float = 0.25):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.emb_dim = emb_dim
+        self.decay = decay
+        self.eps = eps
+        self.beta = beta
+
+        # codebook parameters (not updated by gradient; we assign with EMA)
+        embed = torch.randn(codebook_size, emb_dim) * 0.05
+        self.codebook = nn.Parameter(embed, requires_grad=False)
+
+        # EMA statistics
+        self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
+        self.register_buffer("ema_embed_sum", torch.zeros(codebook_size, emb_dim))
+
+    def forward(self, z_e: torch.Tensor):
+        D = self.emb_dim
+        z = z_e.reshape(-1, D)  # [N, D]
+
+        # nearest neighbors
+        z_sq = (z ** 2).sum(dim=1, keepdim=True)              # [N,1]
+        e_sq = (self.codebook ** 2).sum(dim=1)                # [K]
+        distances = z_sq + e_sq.unsqueeze(0) - 2 * (z @ self.codebook.t())
+        indices = torch.argmin(distances, dim=1)              # [N]
+        z_q = self.codebook.index_select(0, indices).view_as(z_e)
+
+        # commitment loss (no codebook loss—EMA handles updates)
+        commitment = F.mse_loss(z_e, z_q.detach(), reduction="mean")
+        loss_vq = self.beta * commitment
+
+        # straight-through estimator
+        z_q_st = z_e + (z_q - z_e).detach()
+
+        # perplexity (usage diversity)
+        with torch.no_grad():
+            one_hot = F.one_hot(indices, num_classes=self.codebook_size).to(z.dtype)
+            avg_probs = one_hot.mean(dim=0)
+            perplexity = torch.exp(-torch.sum(avg_probs * (avg_probs + 1e-12).log()))
+
+        # EMA updates
+        with torch.no_grad():
+            # batch stats
+            cluster_size_batch = one_hot.sum(dim=0)                           # [K]
+            embed_sum_batch = one_hot.t() @ z                                  # [K,D]
+
+            # decay running stats
+            self.ema_cluster_size.mul_(self.decay).add_(cluster_size_batch, alpha=1.0 - self.decay)
+            self.ema_embed_sum.mul_(self.decay).add_(embed_sum_batch, alpha=1.0 - self.decay)
+
+            # Laplace smoothing to avoid empty-code collapse
+            n = self.ema_cluster_size + self.eps * self.codebook_size
+            embed_normalized = self.ema_embed_sum / n.unsqueeze(1)
+
+            # assign into codebook
+            self.codebook.copy_(embed_normalized)
 
         return z_q_st, indices.view(z_e.shape[:-1]), loss_vq, perplexity
 
@@ -191,7 +260,10 @@ class VQVAE(nn.Module):
                  codebook_size: int,
                  beta: float = 0.25,
                  hidden: int = 128,
-                 cat_emb_dim: int = 6):
+                 cat_emb_dim: int = 6,
+                 quantizer: str = "st",        # {"st", "ema"}
+                 ema_decay: float = 0.99,
+                 ema_eps: float = 1e-5):
         super().__init__()
         self.encoder = MixedInputEncoder(
             cont_dim=cont_dim,
@@ -201,7 +273,13 @@ class VQVAE(nn.Module):
             cat_emb_dim=cat_emb_dim,
             hidden=hidden,
         )
-        self.quant = VectorQuantizer(codebook_size=codebook_size, emb_dim=emb_dim, beta=beta)
+        if quantizer.lower() == "st":
+          self.quant = VectorQuantizerST(codebook_size=codebook_size, emb_dim=emb_dim, beta=beta)
+        elif quantizer.lower() == "ema":
+          self.quant = VectorQuantizerEMA(codebook_size=codebook_size, emb_dim=emb_dim,
+                                          decay=ema_decay, eps=ema_eps, beta=beta)
+        else:
+          raise ValueError(f"Unknown quantizer '{quantizer}'. Use 'st' or 'ema'.")
         self.decoder = MixedDecoder(emb_dim=emb_dim, cont_dim=cont_dim,
                                     cat_vocab_sizes=cat_vocab_sizes, hidden=hidden)
 

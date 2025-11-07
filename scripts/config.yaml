@@ -57,6 +57,9 @@ train_vqvae:
   weight_decay: 0.0001
   clip_grad: 1.0
 
+  # Quantizer
+  quantizer: "st"
+
   # Loss weights
   lambda_cont: 1.0
   lambda_cat: 1.0

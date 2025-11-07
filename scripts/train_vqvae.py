@@ -421,6 +421,12 @@ def parse_args():
     p.add_argument("--no_amp", action="store_true", help="Disable AMP (half precision)")
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 in autocast if available")
     p.add_argument("--cpu", action="store_true")
+    
+    # Quantizer
+    p.add_argument("--quantizer", type=str, choices=["st", "ema"], default="st",
+                   help="Vector quantizer type: 'st' (straight-through) or 'ema'")
+    p.add_argument("--ema_decay", type=float, default=0.99, help="EMA decay for EMA quantizer")
+    p.add_argument("--ema_eps", type=float, default=1e-5, help="Numerical epsilon for EMA quantizer")
 
     # Annealer parameters
     # annealing (optional; disabled unless --anneal_vq_enable is set)
