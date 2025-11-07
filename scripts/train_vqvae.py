@@ -94,6 +94,7 @@ from vqvae.preprocess import (
   read_feature_meta_from_zarr,
   maybe_compute_canopy_target_from_batch,
   )
+from vqvae.annealers import LossWeightScheduler, AnnealConfig, load_scheduler
 
 # -------------------------------------------------------------------
 # Enable optimized matrix math on Ada / Ampere GPUs (like RTX 4060)
@@ -209,12 +210,36 @@ def train(args):
     class_weights = {name: ds.class_weights_by_cat_name(name).to(device) for name in ds.cat_names}
 
     # Optimizer / AMP scaler
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    # opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    codebook_params = [p for n,p in model.named_parameters()
+                       if ".quant.codebook" in n or n.endswith("quant.codebook")]
+    other_params    = [p for n,p in model.named_parameters()
+                       if (".quant.codebook" not in n and not n.endswith("quant.codebook"))]
+    opt = torch.optim.AdamW([
+      {"params": other_params, "lr": args.lr, "weight_decay": args.weight_decay, "betas": (0.9, 0.95)},
+      {"params": codebook_params, "lr": args.lr, "weight_decay": 0.0,            "betas": (0.9, 0.95)},
+    ], lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     #scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and not args.no_amp)) # Deprecated
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and not args.no_amp))
 
     # cosine schedule over total steps
     total_steps = args.epochs * args.steps_per_epoch
+    
+    # Optional annealing for loss weights (e.g., lambda_vq)
+    base_weights = {
+        "vq": args.lambda_vq,
+        "cont": args.lambda_cont,
+        "cat": args.lambda_cat,
+        "canopy": args.lambda_canopy,
+    }
+    # avoid passing None for ceil/final into the builder
+    _flat = vars(args).copy()
+    if _flat.get("anneal_vq_ceil") is None:
+        _flat.pop("anneal_vq_ceil", None)
+    if _flat.get("anneal_vq_final") is None:
+        _flat.pop("anneal_vq_final", None)
+    lambda_vq = load_scheduler(base_weights, _flat)
+    
     def lr_at(step):
         if total_steps <= 1: return args.lr
         cos = 0.5 * (1 + math.cos(math.pi * step / total_steps))
@@ -293,7 +318,7 @@ def train(args):
                     args.lambda_cont * loss_cont
                     + args.lambda_cat * loss_cat
                     + args.lambda_canopy * loss_canopy
-                    + args.lambda_vq * loss_vq
+                    + lambda_vq(step=step)["vq"] * loss_vq
                 )
 
             scaler.scale(loss).backward()
@@ -396,6 +421,26 @@ def parse_args():
     p.add_argument("--no_amp", action="store_true", help="Disable AMP (half precision)")
     p.add_argument("--bf16", action="store_true", help="Use bfloat16 in autocast if available")
     p.add_argument("--cpu", action="store_true")
+
+    # Annealer parameters
+    # annealing (optional; disabled unless --anneal_vq_enable is set)
+    p.add_argument("--anneal_vq_enable", action="store_true")
+    p.add_argument("--anneal_vq_schedule", type=str, default="warmup_hold_decay",
+                   choices=["constant", "linear", "cosine", "exponential", "stepwise", "warmup_hold_decay"])
+    p.add_argument("--anneal_vq_start", type=int, default=0)
+    p.add_argument("--anneal_vq_duration", type=int, default=0)
+    p.add_argument("--anneal_vq_floor", type=float, default=0.0)
+    # leave None to inherit args.lambda_vq as the target automatically
+    p.add_argument("--anneal_vq_ceil", type=float, default=0.1)
+    p.add_argument("--anneal_vq_k", type=float, default=5.0) # Steepness of Exponential annealer
+    # warmup/hold/decay for the common 3-phase profile
+    p.add_argument("--anneal_vq_warmup", type=int, default=10000)
+    p.add_argument("--anneal_vq_hold", type=int, default=15000)
+    p.add_argument("--anneal_vq_decay", type=int, default=5000)
+    # leave None to decay back to floor; set to keep some weight after decay
+    p.add_argument("--anneal_vq_final", type=float, default=.08)
+    # e.g. --anneal_vq_milestones 1000:0.01 8000:0.1
+    p.add_argument("--anneal_vq_milestones", type=str, nargs="*", default=None) # Stepwise annealer
 
     return parse_args_with_yaml(p, section="train_vqvae")
 

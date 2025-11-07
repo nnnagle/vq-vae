@@ -23,9 +23,21 @@ train_vqvae:
   # Data/loader
   batch_size: 64
   num_workers: 16
-  steps_per_epoch: 2000
-  epochs: 5
+  steps_per_epoch: 10000
+  epochs: 50
   eager: false
+
+  # Annealer
+  anneal_vq_schedule: "warmup_hold_decay"
+  anneal_vq_start: 50000
+  anneal_vq_floor: 0
+  anneal_vq_ceil: 0.1
+  anneal_vq_final: 0.08
+  anneal_vq_warmup: 150000
+  anneal_vq_hold: 300000
+  anneal_vq_decay: 100000
+  
+  
 
   # Schema (exposure-aware collapse)
   min_hits_per_epoch: 100
@@ -52,7 +64,7 @@ train_vqvae:
   lambda_vq: 1.0
 
   # Logging & hardware
-  log_every: 50
+  log_every: 2500
   no_amp: false # false means that amp is used.
   bf16: false # false is quicker, but turning on bf16 can be more reliable
   cpu: false
