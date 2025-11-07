@@ -82,12 +82,12 @@ When analyzing or generating code:
 
 1. **Respect directory semantics:**  
    - `scripts/` → entry points (`train_vqvae.py`, `build_zarr.py`, etc.)  
-   - `utils/` → supporting logic (`chunking.py`, `samplers.py`, data handling).  
+   - `utils/` → supporting logic (`argyaml.py`, `log.py.py`, `data_stack.py`, etc).  
    - `tests/` → unit and integration tests.  
+   - `vqvae/` → vqvae specific logic (`model.py`, `chunking.py`, etc)
 
 2. **Understand data flow:**  
    - `build_zarr.py` → produces Zarr archive.  
-   - `loader.py` + `samplers.py` → feed samples to the VQ-VAE.  
    - `train_vqvae.py` → orchestrates training.
 
 3. **Assume**: PyTorch training on GPU, PyTorch 2.x, CUDA ≥ 12.  

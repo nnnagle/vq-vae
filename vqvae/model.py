@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 import torch, torch.nn as nn, torch.nn.functional as F
+from .codebook_manager import CodebookManager
 
 class MixedInputEncoder(nn.Module):
     """
@@ -115,12 +116,14 @@ class MixedInputEncoder(nn.Module):
 
 class VectorQuantizerST(nn.Module):
     """Straight-Through Vector Quantizer (ST-VQ)."""
-    def __init__(self, codebook_size: int, emb_dim: int, beta: float = 0.25):
+    def __init__(self, codebook_size: int, emb_dim: int, beta: float = 0.25, 
+                 codebook_manager: Optional[CodebookManager] = None):
         super().__init__()
         self.codebook_size = codebook_size
         self.emb_dim = emb_dim
         self.beta = beta
         self.codebook = nn.Parameter(torch.randn(codebook_size, emb_dim) * 0.05)
+        self.codebook_manager = codebook_manager
 
     def forward(self, z_e: torch.Tensor):
         # flatten
@@ -137,12 +140,22 @@ class VectorQuantizerST(nn.Module):
         z_q_st = z_e + (z_q - z_e).detach()
         loss_vq = codebook + self.beta * commitment
 
-        with torch.no_grad():
-            one_hot = F.one_hot(indices, num_classes=self.codebook_size).float()
-            avg_probs = one_hot.mean(dim=0)
-            perplexity = torch.exp(- (avg_probs * (avg_probs + 1e-12).log()).sum())
+        # --- CodebookManager integration ---
+        if self.training and self.codebook_manager is not None:
+            self.codebook_manager.push_reservoir(z)
+            self.codebook_manager.observe_assignments(indices)
+            self.codebook_manager.maybe_reseed(self.codebook)
 
-        return z_q_st, indices.view(z_e.shape[:-1]), loss_vq, perplexity
+        # Perplexity (always scalar)
+        if self.codebook_manager is not None:
+            perplexity = self.codebook_manager.stats()["perplexity"]
+        else:
+            with torch.no_grad():
+                one_hot = F.one_hot(indices, num_classes=self.codebook_size).float()
+                avg_probs = one_hot.mean(dim=0)
+                perplexity = torch.exp(- (avg_probs * (avg_probs + 1e-12).log()).sum()).item()
+
+        return z_q_st, indices.view(z_e.shape[:-1]), loss_vq, float(perplexity)
 
 # put this next to VectorQuantizer in model.py
 
@@ -154,13 +167,15 @@ class VectorQuantizerEMA(nn.Module):
 
     z_e: [B, T, D] (any leading shape, last dim = emb_dim)
     """
-    def __init__(self, codebook_size: int, emb_dim: int, decay: float = 0.99, eps: float = 1e-5, beta: float = 0.25):
+    def __init__(self, codebook_size: int, emb_dim: int, decay: float = 0.99, eps: float = 1e-5, beta: float = 0.25,
+                 codebook_manager: Optional[CodebookManager] = None):
         super().__init__()
         self.codebook_size = codebook_size
         self.emb_dim = emb_dim
         self.decay = decay
         self.eps = eps
         self.beta = beta
+        self.codebook_manager = codebook_manager
 
         # codebook parameters (not updated by gradient; we assign with EMA)
         embed = torch.randn(codebook_size, emb_dim) * 0.05
@@ -188,30 +203,35 @@ class VectorQuantizerEMA(nn.Module):
         # straight-through estimator
         z_q_st = z_e + (z_q - z_e).detach()
 
-        # perplexity (usage diversity)
-        with torch.no_grad():
-            one_hot = F.one_hot(indices, num_classes=self.codebook_size).to(z.dtype)
-            avg_probs = one_hot.mean(dim=0)
-            perplexity = torch.exp(-torch.sum(avg_probs * (avg_probs + 1e-12).log()))
-
         # EMA updates
         with torch.no_grad():
-            # batch stats
-            cluster_size_batch = one_hot.sum(dim=0)                           # [K]
-            embed_sum_batch = one_hot.t() @ z                                  # [K,D]
+            one_hot = F.one_hot(indices, num_classes=self.codebook_size).to(z.dtype)
+            cluster_size_batch = one_hot.sum(dim=0)
+            embed_sum_batch = one_hot.t() @ z
 
-            # decay running stats
             self.ema_cluster_size.mul_(self.decay).add_(cluster_size_batch, alpha=1.0 - self.decay)
             self.ema_embed_sum.mul_(self.decay).add_(embed_sum_batch, alpha=1.0 - self.decay)
 
-            # Laplace smoothing to avoid empty-code collapse
             n = self.ema_cluster_size + self.eps * self.codebook_size
             embed_normalized = self.ema_embed_sum / n.unsqueeze(1)
-
-            # assign into codebook
             self.codebook.copy_(embed_normalized)
 
-        return z_q_st, indices.view(z_e.shape[:-1]), loss_vq, perplexity
+            # Update manager if provided
+            if self.codebook_manager is not None:
+                self.codebook_manager.push_reservoir(z)
+                self.codebook_manager.observe_assignments(indices)
+                self.codebook_manager.maybe_reseed(self.codebook)
+
+        # Scalar perplexity
+        if self.codebook_manager is not None:
+            perplexity = self.codebook_manager.stats()["perplexity"]
+        else:
+            with torch.no_grad():
+                avg_probs = one_hot.mean(dim=0)
+                perplexity = torch.exp(-torch.sum(avg_probs * (avg_probs + 1e-12).log())).item()
+
+        return z_q_st, indices.view(z_e.shape[:-1]), loss_vq, float(perplexity)
+
 
 class MixedDecoder(nn.Module):
     """
@@ -275,6 +295,7 @@ class VQVAE(nn.Module):
         )
         if quantizer.lower() == "st":
           self.quant = VectorQuantizerST(codebook_size=codebook_size, emb_dim=emb_dim, beta=beta)
+
         elif quantizer.lower() == "ema":
           self.quant = VectorQuantizerEMA(codebook_size=codebook_size, emb_dim=emb_dim,
                                           decay=ema_decay, eps=ema_eps, beta=beta)
@@ -282,6 +303,15 @@ class VQVAE(nn.Module):
           raise ValueError(f"Unknown quantizer '{quantizer}'. Use 'st' or 'ema'.")
         self.decoder = MixedDecoder(emb_dim=emb_dim, cont_dim=cont_dim,
                                     cat_vocab_sizes=cat_vocab_sizes, hidden=hidden)
+        
+        # Placeholder: allow trainer to attach manager post-init
+        self.codebook_manager: Optional[CodebookManager] = None
+
+    def attach_codebook_manager(self, manager: CodebookManager):
+        """Optionally attach a shared CodebookManager (for DDP safety)."""
+        self.codebook_manager = manager
+        if isinstance(self.quant, (VectorQuantizerST, VectorQuantizerEMA)):
+          self.quant.codebook_manager = manager
 
     def forward(self, batch):
         z_e = self.encoder(batch)

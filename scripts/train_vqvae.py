@@ -89,6 +89,7 @@ from utils.weights import cat_class_weights
 from utils.argyaml import parse_args_with_yaml
 from utils.samplers import ChunkBatchSampler
 from vqvae.model import VQVAE
+from vqvae.codebook_manager import CodebookManager
 from vqvae.preprocess import (
   build_and_save_schema, 
   read_feature_meta_from_zarr,
@@ -189,6 +190,9 @@ def train(args):
         hidden=args.hidden,
         cat_emb_dim=args.cat_emb_dim,
     ).to(device)
+    # Attach the codebook manager to the model
+    manager = CodebookManager(num_codes=model.quant.codebook_size, code_dim=model.quant.emb_dim)
+    model.attach_codebook_manager(manager)
     print(f"Model params: {count_params(model)/1e6:.2f}M")
     print(f"\n[Device Summary]")
     if device.type == "cuda":
