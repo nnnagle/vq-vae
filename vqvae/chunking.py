@@ -23,7 +23,6 @@ Design notes:
     * Avoids loading the full raster—only uses precomputed coordinate arrays.
     * Keeps all operations NumPy-side for low overhead.
 
-Author: (your name or lab)
 """
 from __future__ import annotations
 import numpy as np

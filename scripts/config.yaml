@@ -18,7 +18,7 @@ build_zarr:
 
 train_vqvae:
   zarr: out/cube.zarr
-  run_dir: runs/exp_001
+  run_dir: runs/exp_003
 
   # Data/loader
   batch_size: 64
@@ -31,11 +31,11 @@ train_vqvae:
   anneal_vq_schedule: "warmup_hold_decay"
   anneal_vq_start: 50000
   anneal_vq_floor: 0
-  anneal_vq_ceil: 0.1
-  anneal_vq_final: 0.08
-  anneal_vq_warmup: 150000
-  anneal_vq_hold: 300000
-  anneal_vq_decay: 100000
+  anneal_vq_ceil: 0.08
+  anneal_vq_final: 0.06
+  anneal_vq_warmup: 50000
+  anneal_vq_hold: 200000
+  anneal_vq_decay: 50000
   
   
 
@@ -49,7 +49,7 @@ train_vqvae:
   emb_dim: 128
   hidden: 128
   cat_emb_dim: 8
-  beta: 0.25
+  beta: 0.05
 
   # Optim
   lr: 0.0003

@@ -45,7 +45,7 @@ class CodebookManager(nn.Module):
         num_codes: int,
         code_dim: int,
         reservoir_size: int = 65536,
-        ema_decay: float = 0.99,
+        ema_decay: float = 0.995,
         dead_eps: float = 1e-4,
         dead_patience: int = 10000,
         device: torch.device | str = "cuda",
