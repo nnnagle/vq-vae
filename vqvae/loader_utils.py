@@ -277,3 +277,74 @@ def scale_naip_patch(
         out[b] = y.astype(np.float32, copy=False)
         nan_mask[b] = mask.astype(np.float32, copy=False)
     return out, nan_mask
+
+
+# -----------------------------------------------------------------------------
+# VQ-VAE postprocessing utilities
+# -----------------------------------------------------------------------------
+
+import torch
+import numpy as np
+from vqvae.loader_utils import denorm_continuous_row  # ← use the project helper
+
+def decode_codebook_to_original_units(model, ds, device="cuda"):
+    """
+    Returns:
+      cont_orig : [K, C_cont] float32 (denormalized to original units) or None if no continuous features
+      cat_raw   : [K, C_cat] float32 (raw categorical codes; NaN for MISS/UNK if not present in map)
+      canopy    : [K] float32 (unchanged scale)
+    """
+    model = model.to(device).eval()
+
+    # 1) Extract codebook entries (works for EMA/ST quantizers since both expose .codebook)
+    codes = model.quant.codebook.detach().to(device)             # [K, D]  
+    zq = codes.unsqueeze(1)                                      # [K, 1, D]
+
+    # 2) Decode each code as a 1-step sequence
+    with torch.inference_mode():
+        cont_pred, cat_logits, canopy = model.decoder(zq)        # cont:[K,1,C_cont], dict(name->[K,1,V]), canopy:[K]  
+
+    # 3a) Continuous → original scale via denorm_continuous_row (row-by-row on NumPy)
+    cont_orig = None
+    if cont_pred is not None and cont_pred.shape[-1] > 0:
+        cont_pred_np = cont_pred.squeeze(1).cpu().numpy()        # [K, C_cont]
+        # denorm_continuous_row expects a single row; call it per code index   
+        cont_indices   = list(range(len(ds.cont_names)))         # column order = ds.cont_names  
+        feature_names  = ds.cont_names
+        cont_stats     = ds.cont_stats                           # {name: {mean,std,q01,q99,...}}  
+        cont_orig = np.stack([
+            denorm_continuous_row(cont_pred_np[k], cont_indices, feature_names, cont_stats)
+            for k in range(cont_pred_np.shape[0])
+        ]).astype(np.float32)
+
+    # 3b) Categorical logits → dense IDs → raw codes (invert ds.cat_maps)
+    cat_raw = np.zeros((codes.shape[0], len(ds.cat_names)), dtype=np.float32) if ds.cat_names else np.zeros((codes.shape[0], 0), np.float32)
+    if ds.cat_names:
+        # dense IDs per categorical feature (one column per name, K rows)
+        dense_cols = []
+        for name in ds.cat_names:
+            dense = cat_logits[name].argmax(dim=-1).squeeze(1).cpu().numpy().astype(np.int64)  # [K]
+            dense_cols.append(dense)
+        dense_ids_2d = np.stack(dense_cols, axis=1)  # [K, C_cat]
+
+        # build inverse maps: dense_id -> raw_code (only observed codes; 0/1 = MISS/UNK)
+        id_maps_inv = {name: {did: raw for raw, did in ds.cat_maps.get(name, {}).items()} for name in ds.cat_names}
+
+        # vectorized decode over rows (K “time steps”); MISS/UNK become NaN by default
+        # This mirrors the project’s batch decoder pattern. 
+        T, C = dense_ids_2d.shape
+        out = np.empty((T, C), dtype=np.float32)
+        MISS_ID, UNK_ID = 0, 1
+        for t in range(T):
+            row = dense_ids_2d[t]
+            decoded = []
+            for j, name in enumerate(ds.cat_names):
+                did = int(row[j])
+                if did == MISS_ID or did == UNK_ID:
+                    decoded.append(np.nan)
+                else:
+                    decoded.append(float(id_maps_inv.get(name, {}).get(did, np.nan)))
+            out[t] = np.asarray(decoded, dtype=np.float32)
+        cat_raw = out
+
+    return cont_orig, cat_raw, canopy.squeeze(-1).cpu().numpy() if canopy.ndim > 1 else canopy.cpu().numpy()

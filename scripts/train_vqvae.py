@@ -188,7 +188,10 @@ def train(args):
         codebook_size=args.codebook_size,
         beta=args.beta,
         hidden=args.hidden,
+        quantizer = args.quantizer,
         cat_emb_dim=args.cat_emb_dim,
+        ema_decay = args.ema_decay,
+        ema_eps = args.ema_eps,
     ).to(device)
     # Attach the codebook manager to the model
     manager = CodebookManager(num_codes=model.quant.codebook_size, code_dim=model.quant.emb_dim)

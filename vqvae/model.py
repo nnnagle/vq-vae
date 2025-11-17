@@ -124,6 +124,8 @@ class VectorQuantizerST(nn.Module):
         self.beta = beta
         self.codebook = nn.Parameter(torch.randn(codebook_size, emb_dim) * 0.05)
         self.codebook_manager = codebook_manager
+        
+        print(f"Quantizer choice at build: st")
 
     def forward(self, z_e: torch.Tensor):
         # flatten
@@ -184,6 +186,8 @@ class VectorQuantizerEMA(nn.Module):
         # EMA statistics
         self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
         self.register_buffer("ema_embed_sum", torch.zeros(codebook_size, emb_dim))
+        
+        print(f"Quantizer choice at build: ema, ema_decay={decay}")
 
     def forward(self, z_e: torch.Tensor):
         D = self.emb_dim
