@@ -21,13 +21,44 @@ from utils.gee import ee_init, export_img_to_gcs, get_state_geometry
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
-
+ee_init()
 # Years to process (inclusive)
 YEARS = list(range(2015, 2025))  # 2015–2024
 
 # AOI: either a state geometry or a specific rectangle
 STATE_NAME = "Virginia"
-USE_STATE_GEOM = True  # Set True for full state; False keeps small debug AOI
+USE_STATE_GEOM = False  # Set True for full state; False keeps small debug AOI
+
+TARGET_CRS = (
+    "PROJ4:+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 "
+    "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+)
+
+TARGET_CRS = (
+    'PROJCS["AEA_WGS84",'
+    '  GEOGCS["GCS_WGS_1984",'
+    '    DATUM["WGS_1984",'
+    '      SPHEROID["WGS_84",6378137,298.257223563]],'
+    '    PRIMEM["Greenwich",0],'
+    '    UNIT["Degree",0.0174532925199433]],'
+    '  PROJECTION["Albers_Conic_Equal_Area"],'
+    '  PARAMETER["False_Easting",0],'
+    '  PARAMETER["False_Northing",0],'
+    '  PARAMETER["Central_Meridian",-96],'
+    '  PARAMETER["Standard_Parallel_1",29.5],'
+    '  PARAMETER["Standard_Parallel_2",45.5],'
+    '  PARAMETER["Latitude_Of_Origin",23],'
+    '  UNIT["Meter",1]]'
+)
+
+TARGET_TRANSFORM = [30, 0, 1089315, 0, -30, 1966485]
+
+# Region is calculated to give grid size as multiple of 256
+PADDED_REGION = ee.Geometry.Rectangle(
+    [1089315, 1574805, 1795875, 1966485],
+    proj=TARGET_CRS,
+    geodesic=False,
+)
 
 # Small debug AOI (subset over Virginia, safe for development / testing)
 #ee_init()
@@ -417,10 +448,10 @@ def main():
     """
     ee_init()
 
-    if USE_STATE_GEOM:
-        aoi = get_state_geometry(STATE_NAME)
-    else:
-        aoi = DEBUG_AOI
+#    if USE_STATE_GEOM:
+    aoi = get_state_geometry(STATE_NAME)
+#    else:
+#        aoi = DEBUG_AOI
 
     for year in YEARS:
         print(f"Building annual metrics for year={year}")
@@ -431,10 +462,12 @@ def main():
 
         export_img_to_gcs(
             img=annual_img,
-            aoi=aoi,
+            aoi=PADDED_REGION,
             bucket=GCS_BUCKET,
             base_name=base_name,
             gcs_dir=GCS_DIR,
+            crs=TARGET_CRS,
+            crsTransform=TARGET_TRANSFORM,
             # Do not pass crs/crsTransform here if export_img_to_gcs
             # already sets them for you.
         )

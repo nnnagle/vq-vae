@@ -33,10 +33,6 @@ ee_init()
 
 STATE_NAME = "Virginia"
 
-TARGET_CRS = (
-    "PROJ4:+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 "
-    "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
-)
 
 TARGET_CRS = (
     'PROJCS["AEA_WGS84",'
@@ -355,7 +351,6 @@ def main():
             gcs_dir=GCS_DIR,
             crs=TARGET_CRS,
             crsTransform=TARGET_TRANSFORM,
-            # Do not pass crs/crsTransform here — we already enforced NLCD grid.
         )
 
         print(f"Started export for {yr}")

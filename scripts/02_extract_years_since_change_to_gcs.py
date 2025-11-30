@@ -5,15 +5,22 @@ Compute LCMS disturbance history for a given AOI and export as COGs.
 
 Outputs (1985–2024 by default):
 
-- lfcy_<YEAR>: LastFastChangeYear
-    Cumulative "year of most recent fast change" up to and including YEAR.
-    Pixels that have never experienced a fast change retain BASE_NO_CHANGE_YEAR.
+- ysfc_value_<YEAR>:
+    Years since the most recent fast change, as a LOWER BOUND.
+    For pixels with no fast change yet observed by YEAR, this is:
+        YEAR - BASE_NO_CHANGE_YEAR
+    which should be interpreted as "at least this many years since last event".
 
-- ysfc_<YEAR>: YearsSinceFastChange
-    YEAR - LastFastChangeYear, with SENTINEL_NEVER_CHANGED for pixels that
-    have never experienced a fast change in the record.
+- ysfc_censored_<YEAR>:
+    1 where ysfc_value is a censored lower bound
+      (no fast change yet observed in [START_YEAR, YEAR]).
+    0 where ysfc_value is an exact time since the last observed fast change.
 
-Both stacks are exported as Cloud Optimized GeoTIFFs to GCS.
+- cum_event_count:
+    Static (single-band) image: total number of fast changes in
+    [START_YEAR, END_YEAR] at each pixel.
+
+All exports are Cloud Optimized GeoTIFFs to GCS.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from utils.gee import ee_init, export_img_to_gcs, get_state_geometry
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
+ee_init() 
 
 # Turn on to print per-year diagnostics; useful when debugging logic
 DEBUG = False  # set True to print yearly histograms / counts
@@ -52,20 +60,48 @@ FAST_CODES = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 # Conceptually: "no fast change yet" up to the current year.
 BASE_NO_CHANGE_YEAR = 1980
 
-# Sentinel for pixels that NEVER experience a fast change in [START_YEAR, END_YEAR]
-# This is only applied in the YearsSinceFastChange product.
-SENTINEL_NEVER_CHANGED = -1
-
 # Export / AOI config
 GCS_BUCKET = "va_rasters"
 GCS_DIR = "lcms_ysfc"
 
 # Base names of exported rasters (no file extension)
-OUTPUT_PREFIX_LFCY = "lcms_last_fast_change_year_1985_2024"
-OUTPUT_PREFIX_YSFC = "lcms_years_since_fast_change_1985_2024"
+OUTPUT_PREFIX_YSFC_VALUE = "lcms_ysfc_value_1985_2024"
+OUTPUT_PREFIX_YSFC_CENSORED = "lcms_ysfc_censored_1985_2024"
+OUTPUT_PREFIX_CUM_EVENTS = "lcms_cum_event_count_1985_2024"
 
 # AOI: name used by get_state_geometry() in utils.gee
 STATE_NAME = "Virginia"
+
+TARGET_CRS = (
+    "PROJ4:+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 "
+    "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+)
+
+TARGET_CRS = (
+    'PROJCS["AEA_WGS84",'
+    '  GEOGCS["GCS_WGS_1984",'
+    '    DATUM["WGS_1984",'
+    '      SPHEROID["WGS_84",6378137,298.257223563]],'
+    '    PRIMEM["Greenwich",0],'
+    '    UNIT["Degree",0.0174532925199433]],'
+    '  PROJECTION["Albers_Conic_Equal_Area"],'
+    '  PARAMETER["False_Easting",0],'
+    '  PARAMETER["False_Northing",0],'
+    '  PARAMETER["Central_Meridian",-96],'
+    '  PARAMETER["Standard_Parallel_1",29.5],'
+    '  PARAMETER["Standard_Parallel_2",45.5],'
+    '  PARAMETER["Latitude_Of_Origin",23],'
+    '  UNIT["Meter",1]]'
+)
+
+TARGET_TRANSFORM = [30, 0, 1089315, 0, -30, 1966485]
+
+# Region is calculated to give grid size as multiple of 256
+PADDED_REGION = ee.Geometry.Rectangle(
+    [1089315, 1574805, 1795875, 1966485],
+    proj=TARGET_CRS,
+    geodesic=False,
+)
 
 # Alternate debugging AOI (commented out)
 # USE_RECT_AOI = True
@@ -88,8 +124,6 @@ def get_lcms_change_collection(start_year: int, end_year: int) -> ee.ImageCollec
       - study_area == "CONUS"
       - calendar year in [start_year, end_year]
     and then reduced to the 'Change' band only.
-
-    This is the core LCMS disturbance classification we build everything from.
     """
     if start_year > end_year:
         raise ValueError("START_YEAR must be <= END_YEAR")
@@ -107,21 +141,12 @@ def get_year_image(lcms_change: ee.ImageCollection, year: int) -> ee.Image:
     """
     Return LCMS Change image for a given year, with 'year' and
     'system:time_start' properties set.
-
-    The underlying LCMS collection already has a 'year' property; we just:
-      - filter for the requested year
-      - take .first() (there should be exactly one)
-      - explicitly add 'year' and a synthetic mid-year timestamp for
-        consistent temporal metadata.
     """
     y = ee.Number(year)
     img = ee.Image(
         lcms_change.filter(ee.Filter.eq("year", y)).first()
     )
 
-    # Note: .first() always returns an ee.Image; if there is truly nothing,
-    # downstream operations will just be fully masked. We keep a sanity check
-    # but don't rely on it for EE logic.
     img = img.set("year", y)
     # Use July 1 of the given year as the nominal time_start
     img = img.set("system:time_start", ee.Date.fromYMD(year, 7, 1).millis())
@@ -132,30 +157,35 @@ def build_last_fast_change_year_collection(
     start_year: int,
     end_year: int,
     fast_codes: list[int],
-) -> tuple[ee.ImageCollection, ee.Image]:
+) -> tuple[ee.ImageCollection, ee.Image, ee.Image]:
     """
-    Build an ImageCollection where each image has one band: 'LastFastChangeYear'.
+    Build:
+      - an ImageCollection where each image has one band: 'LastFastChangeYear'
+      - a union NPA mask across all years
+      - a static cum_event_count image
 
     Concept:
-      We iterate over years Y in [start_year, end_year], maintaining a
-      cumulative state A per pixel:
-
+      We iterate over years Y in [start_year, end_year], maintaining:
         A(Y) = most recent FAST change year observed up to and including Y.
+        E(Y) = cumulative number of fast-change events up to and including Y.
 
       If no fast change has ever occurred at a pixel up to year Y,
-      that pixel keeps the BASE_NO_CHANGE_YEAR value.
+      that pixel keeps the BASE_NO_CHANGE_YEAR value in A(Y).
 
     Returns:
         lfcy_collection: ImageCollection with one image per year
                          (1985–2024 by default) with band 'LastFastChangeYear'
         npa_union:       ee.Image mask where Change == 16 in ANY year
                          (Non-Processing Area union across years)
+        cum_events:      ee.Image with band 'CumEventCount' (static)
     """
 
     # LCMS Change images for requested period
     lcms_change = get_lcms_change_collection(start_year, end_year)
     years = ee.List.sequence(start_year, end_year)
 
+    # Use the first LCMS Change image as a projection/footprint template
+    template = ee.Image(lcms_change.first()).select("Change")
     # ------------------------------------------------------------------
     # Union NPA mask:
     # Code 16 = Non-Processing Area (NPA). This mask is 1 anywhere that
@@ -171,23 +201,29 @@ def build_last_fast_change_year_collection(
     # ------------------------------------------------------------------
     # Initialize iterative state for fold:
     # A   = cumulative LastFastChangeYear (starts at BASE_NO_CHANGE_YEAR)
+    # E   = cumulative event count (starts at 0)
     # col = growing ImageCollection of per-year outputs
     # ------------------------------------------------------------------
     init_state = ee.Dictionary({
-        "A": ee.Image.constant(BASE_NO_CHANGE_YEAR).rename("LastFastChangeYear"),
-        "col": ee.ImageCollection([])
+      # A: BASE_NO_CHANGE_YEAR everywhere, but in LCMS projection/footprint
+      "A": template.multiply(0).add(BASE_NO_CHANGE_YEAR).rename("LastFastChangeYear"),
+      # E: 0 everywhere, same projection
+      "E": template.multiply(0).rename("CumEventCount"),
+      "col": ee.ImageCollection([])
     })
 
     def yearly_step(year, state):
         """
         Fold step for each year:
-          - Take previous state A (cumulative last-change year)
+          - Take previous A (last fast-change year) and E (cum events)
           - Identify pixels with a fast change in current year
           - Update A where fast change occurs
+          - Update E by adding fast_mask
           - Append current A to output collection
         """
         state = ee.Dictionary(state)
-        A = ee.Image(state.get("A"))      # cumulative last-fast-change year
+        A = ee.Image(state.get("A"))
+        E = ee.Image(state.get("E"))
         col = ee.ImageCollection(state.get("col"))
 
         year = ee.Number(year)
@@ -201,8 +237,11 @@ def build_last_fast_change_year_collection(
             0                     # default: 0
         )
 
-        # If this year is a fast change at a pixel, update A := current year there.
+        # Update last-fast-change year where a fast change occurs this year
         updated_A = A.where(fast_mask.eq(1), ee.Image.constant(year))
+
+        # Update cumulative event count
+        updated_E = E.add(fast_mask).rename("CumEventCount")
 
         # The output for this year is the *current* value of A
         out = updated_A.rename("LastFastChangeYear").copyProperties(
@@ -211,13 +250,14 @@ def build_last_fast_change_year_collection(
         )
 
         new_col = col.merge(ee.ImageCollection([out]))
-        return ee.Dictionary({"A": updated_A, "col": new_col})
+        return ee.Dictionary({"A": updated_A, "E": updated_E, "col": new_col})
 
-    # Run the fold across years, accumulating both A and the collection
+    # Run the fold across years, accumulating A, E, and the collection
     result = ee.Dictionary(years.iterate(yearly_step, init_state))
     lfcy_collection = ee.ImageCollection(result.get("col"))
+    cum_events = ee.Image(result.get("E")).rename("CumEventCount")
 
-    return lfcy_collection, npa_union
+    return lfcy_collection, npa_union, cum_events
 
 
 def stack_years_to_multiband(
@@ -228,20 +268,6 @@ def stack_years_to_multiband(
     """
     Stack an annual ImageCollection into a single multi-band Image,
     with band names like '<prefix>1985', '<prefix>1986', etc., using toBands().
-
-    Parameters
-    ----------
-    collection : ee.ImageCollection
-        Per-year images, each containing `band_name` and a 'year' property.
-    band_name : str
-        Name of the band to stack from each annual image.
-    prefix : str
-        Prefix for output band names, e.g. "lfcy_" or "ysfc_".
-
-    Returns
-    -------
-    ee.Image
-        Multi-band image with one band per year, named prefix+YYYY.
     """
 
     def rename_for_stack(img):
@@ -256,15 +282,11 @@ def stack_years_to_multiband(
     renamed = collection.sort("year").map(rename_for_stack)
     stacked = ee.ImageCollection(renamed).toBands()
 
-    # After toBands(), EE tends to prepend image IDs etc. to band names.
-    # Band names will look like '..._lfcy_1985', etc.
-    # Normalize to just prefix+year via regex.
+    # Normalize band names to just prefix+year via regex.
     band_names = stacked.bandNames()
 
     def strip_prefix(bn):
         bn = ee.String(bn)
-        # Replace everything up to the final occurrence of prefix with prefix itself.
-        # The pattern '.*' + prefix eats all leading junk.
         return bn.replace('.*' + prefix, prefix)
 
     cleaned_names = band_names.map(strip_prefix)
@@ -272,83 +294,75 @@ def stack_years_to_multiband(
 
     return stacked
 
+def stack_years_to_multiband_with_prefix(
+    collection: ee.ImageCollection,
+    prefix: str,
+) -> ee.Image:
+    """
+    Stack a collection of single-band images whose band names all contain
+    a known prefix (e.g., 'ysfc_value_'), and strip any toBands() cruft.
+    """
+    stacked = ee.ImageCollection(collection).toBands()
+    band_names = stacked.bandNames()
 
-def build_years_since_from_lfcy(
+    def strip_prefix(bn):
+        bn = ee.String(bn)
+        # e.g. '2_0_ysfc_censored_2024' -> 'ysfc_censored_2024'
+        return bn.replace('.*' + prefix, prefix)
+
+    cleaned = band_names.map(strip_prefix)
+    stacked = stacked.rename(cleaned)
+    return stacked
+
+
+def build_ysfc_value_and_censored(
     lfcy_collection: ee.ImageCollection,
     base_no_change_year: int,
-    sentinel_never_changed: int,
-) -> ee.ImageCollection:
+) -> tuple[ee.ImageCollection, ee.ImageCollection]:
     """
-    From a LastFastChangeYear collection, build a YearsSinceFastChange collection.
+    From a LastFastChangeYear collection, build:
 
-    For each year Y:
+      - ysfc_value collection:
+          Y - LastFastChangeYear
+          For pixels where LastFastChangeYear == base_no_change_year,
+          this is a LOWER BOUND (no fast change observed yet).
 
-        YearsSinceFastChange = Y - LastFastChangeYear
+      - ysfc_censored collection:
+          1 where LastFastChangeYear == base_no_change_year
+          0 otherwise.
 
-    but where LastFastChangeYear == base_no_change_year (i.e., no fast change
-    has ever happened up to that year), we use sentinel_never_changed instead.
-
-    This preserves information about "never changed in entire record".
+    Both collections carry 'year' and 'system:time_start' properties.
     """
 
-    def per_year(img):
-        """Compute YearsSinceFastChange for one year image."""
+    def build_value(img):
         img = ee.Image(img)
         year = ee.Number(img.get("year"))
         last_year = img.select("LastFastChangeYear")
-
-        # Raw years since last change: Y - LastFastChangeYear
-        ys_raw = ee.Image.constant(year).subtract(last_year)
-
-        # Replace values that are still at base_no_change_year with sentinel
-        ys = ys_raw.where(
-            last_year.eq(base_no_change_year),
-            sentinel_never_changed
-        ).rename("YearsSinceFastChange")
-
-        return ys.copyProperties(
+        new_band = ee.String("ysfc_value_").cat(year.int().format('%d'))
+        ys_value = last_year.expression(
+            'y - last',
+            {'y': year, 'last': last_year}
+        ).rename(new_band)
+        return ys_value.copyProperties(
             img,
             ["year", "system:time_start"]
         )
 
-    return lfcy_collection.map(per_year)
+    def build_censored(img):
+        img = ee.Image(img)
+        year = ee.Number(img.get("year"))
+        last_year = img.select("LastFastChangeYear")
+        new_band = ee.String("ysfc_censored_").cat(year.int().format('%d'))
+        censored = last_year.eq(base_no_change_year).rename(new_band)
+        return censored.copyProperties(
+            img,
+            ["year", "system:time_start"]
+        )
 
+    ys_value_coll = lfcy_collection.map(build_value)
+    ys_censored_coll = lfcy_collection.map(build_censored)
 
-# ---------------------------------------------------------------------------
-# Optional: manual export helper for a COG
-# (commented out because utils.gee.export_img_to_gcs is used instead)
-# ---------------------------------------------------------------------------
-
-# def export_multiband_cog_to_gcs(
-#     img: ee.Image,
-#     aoi: ee.Geometry,
-#     bucket: str,
-#     prefix: str,
-#     scale: int = EXPORT_SCALE,
-# ):
-#     """
-#     Export a multi-band image as a single COG GeoTIFF to GCS.
-#
-#     This is a lower-level version using ee.batch.Export.image.toCloudStorage.
-#     In practice, we rely on export_img_to_gcs() from utils.gee instead.
-#     """
-#     patch = img.clip(aoi)
-#
-#     task = ee.batch.Export.image.toCloudStorage(
-#         image=patch,
-#         description=prefix,
-#         bucket=bucket,
-#         fileNamePrefix=prefix,
-#         region=aoi,
-#         scale=scale,
-#         maxPixels=EXPORT_MAX_PIXELS,
-#         fileFormat="GeoTIFF",
-#         formatOptions={
-#             "cloudOptimized": True
-#         }
-#     )
-#     task.start()
-#     print(f"Started COG export task: {prefix}, task_id={task.id}")
+    return ys_value_coll, ys_censored_coll
 
 
 def debug_yearly_counts(
@@ -358,15 +372,6 @@ def debug_yearly_counts(
 ):
     """
     Print per-year diagnostics for LCMS Change and the cumulative state.
-
-    For each year, prints:
-      - histogram of Change codes
-      - number of pixels with fast change that year
-      - number of pixels whose LastFastChangeYear has been updated from
-        BASE_NO_CHANGE_YEAR (i.e., have *ever* had a fast change up to that year)
-
-    This is all client-side .getInfo() stuff, so use only on small AOIs
-    or when you enjoy waiting.
     """
     print("=== DEBUG: yearly LCMS Change / fast-change / state counts ===")
 
@@ -437,24 +442,24 @@ def main():
     """
     Entry point:
       1. Initialize EE and AOI
-      2. Build LastFastChangeYear ImageCollection + NPA mask
+      2. Build LastFastChangeYear ImageCollection + NPA mask + cum_event_count
       3. (Optional) print debug stats
-      4. Stack LastFastChangeYear into multiband image
-      5. Derive YearsSinceFastChange per year
-      6. Stack YearsSinceFastChange into multiband image
-      7. Mask NPAs, cast to int16
-      8. Export both stacks to GCS as COG-ready GeoTIFFs (via export_img_to_gcs)
+      4. Build ysfc_value and ysfc_censored collections
+      5. Stack ysfc_value and ysfc_censored into multiband images
+      6. Mask NPAs, cast to int16
+      7. Export ysfc_value, ysfc_censored, and cum_event_count to GCS
     """
     # Initialize Earth Engine authentication/session
     ee_init()
 
     # AOI geometry (state boundary by name). For custom AOI, swap this out.
-    aoi = get_state_geometry(STATE_NAME)
+    # aoi = get_state_geometry(STATE_NAME)
     # if USE_RECT_AOI:
     #     aoi = ee.Geometry.Rectangle(RECT_AOI)
+    aoi = PADDED_REGION
 
-    # 1) Build cumulative LastFastChangeYear collection + NPA mask
-    lfcy_collection, npa_union = build_last_fast_change_year_collection(
+    # 1) Build cumulative LastFastChangeYear collection + NPA mask + cum events
+    lfcy_collection, npa_union, cum_events = build_last_fast_change_year_collection(
         start_year=START_YEAR,
         end_year=END_YEAR,
         fast_codes=FAST_CODES,
@@ -464,52 +469,61 @@ def main():
     if DEBUG:
         debug_yearly_counts(aoi, lfcy_collection, FAST_CODES)
 
-    # 2) Stack LastFastChangeYear into a multiband image
-    lfcy_stacked = stack_years_to_multiband(
-        lfcy_collection,
-        band_name="LastFastChangeYear",
-        prefix="lfcy_",
-    )
-
-    # 3) Build YearsSinceFastChange collection from lfcy_collection
-    ys_collection = build_years_since_from_lfcy(
+    # 2) Build ysfc_value and ysfc_censored collections from lfcy_collection
+    ys_value_coll, ys_censored_coll = build_ysfc_value_and_censored(
         lfcy_collection=lfcy_collection,
         base_no_change_year=BASE_NO_CHANGE_YEAR,
-        sentinel_never_changed=SENTINEL_NEVER_CHANGED,
     )
 
-    # 4) Stack YearsSinceFastChange into a multiband image
-    ysfc_stacked = stack_years_to_multiband(
-        ys_collection,
-        band_name="YearsSinceFastChange",
-        prefix="ysfc_",
+    ys_value_stacked = stack_years_to_multiband_with_prefix(
+        ys_value_coll,
+        prefix="ysfc_value_",
     )
 
-    # 5) Apply union NPA mask and cast to int16 (same mask for both stacks)
+    ys_censored_stacked = stack_years_to_multiband_with_prefix(
+        ys_censored_coll,
+        prefix="ysfc_censored_",
+    )
+
+    # 4) Apply union NPA mask and cast to int16
     # npa_union == 1 where pixel is NPA in any year; we invert to mask them out.
-    lfcy_stacked = lfcy_stacked.updateMask(npa_union.Not()).toInt16()
-    ysfc_stacked = ysfc_stacked.updateMask(npa_union.Not()).toInt16()
+    mask = npa_union.Not()
 
-    # 6) Export YearsSinceFastChange stack (primary for downstream modeling)
+    ys_value_stacked = ys_value_stacked.updateMask(mask).toInt16()
+    ys_censored_stacked = ys_censored_stacked.updateMask(mask).toInt16()
+    cum_events_masked = cum_events.updateMask(mask).toInt16()
+
+    # 5) Export ysfc_value stack
     export_img_to_gcs(
-        img=ysfc_stacked,
+        img=ys_value_stacked,
         aoi=aoi,
         bucket=GCS_BUCKET,
-        base_name=OUTPUT_PREFIX_YSFC,
+        base_name=OUTPUT_PREFIX_YSFC_VALUE,
         gcs_dir=GCS_DIR,
-        # Do not pass crs/crsTransform here if export_img_to_gcs
-        # already sets them for you.
+        crs=TARGET_CRS,
+        crsTransform=TARGET_TRANSFORM,
     )
 
-    # Optional: also export LastFastChangeYear stack
+    # 6) Export ysfc_censored stack
     export_img_to_gcs(
-        img=lfcy_stacked,
+        img=ys_censored_stacked,
         aoi=aoi,
         bucket=GCS_BUCKET,
-        base_name=OUTPUT_PREFIX_LFCY,
+        base_name=OUTPUT_PREFIX_YSFC_CENSORED,
         gcs_dir=GCS_DIR,
-        # Do not pass crs/crsTransform here if export_img_to_gcs
-        # already sets them for you.
+        crs=TARGET_CRS,
+        crsTransform=TARGET_TRANSFORM,
+    )
+
+    # 7) Export cum_event_count (static)
+    export_img_to_gcs(
+        img=cum_events_masked,
+        aoi=aoi,
+        bucket=GCS_BUCKET,
+        base_name=OUTPUT_PREFIX_CUM_EVENTS,
+        gcs_dir=GCS_DIR,
+        crs=TARGET_CRS,
+        crsTransform=TARGET_TRANSFORM,
     )
 
 
