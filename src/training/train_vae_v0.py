@@ -27,7 +27,9 @@ import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torch import optim
+import xarray as xr
 
+from src.data.normalization import build_normalizer_from_zarr
 from src.data.patch_dataset import PatchDataset
 from src.models.vae_v0 import ConvVAE
 
@@ -66,13 +68,48 @@ def vae_loss(recon, x, mu, logvar, beta: float = 1.0):
     total = recon_loss + beta * kl
     return total, recon_loss, kl
 
+def aoi_masked_vae_loss(recon, x, mu, logvar, aoi_mask, beta: float = 1.0):
+    """
+    recon, x:   [B, C_in, H, W]
+    aoi_mask:   [B, H, W] or [B, 1, H, W], True = inside AOI
+    """
+    # Ensure aoi_mask is [B, 1, H, W] and boolean
+    if aoi_mask.dim() == 3:
+        aoi_mask = aoi_mask.unsqueeze(1)  # [B, 1, H, W]
+    aoi_mask = aoi_mask.bool()
+
+    # Broadcast AOI to all channels
+    # x: [B, C_in, H, W], mask: [B, 1, H, W] -> [B, C_in, H, W]
+    mask = aoi_mask.expand(-1, x.size(1), -1, -1)
+
+    diff = (recon - x) * mask
+    valid = mask.sum()
+
+    if valid == 0:
+        recon_loss = torch.tensor(0.0, device=x.device)
+    else:
+        recon_loss = (diff ** 2).sum() / valid
+
+    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    total = recon_loss + beta * kl
+    return total, recon_loss, kl
+
 
 def main():
     # ------------------------------------------------------------------
     # 1. Data: PatchDataset + DataLoader
     # ------------------------------------------------------------------
     # Point this at your built Zarr cube
-    zarr_path = Path("/data/VA/zarr/out.zarr")
+    zarr_path = Path("/data/VA/va_cube.zarr")
+
+    # Build normalizer once from Zarr metadata
+    ds = xr.open_zarr(zarr_path)
+    normalizer = build_normalizer_from_zarr(
+        ds,
+        group="continuous",            # adjust if your group name differs
+        feature_dim="feature_continuous",  # adjust to your coord name
+        enable=True,
+    )
 
     # Dataset: each item is [T, C_cont, 256, 256]
     dataset = PatchDataset(zarr_path, patch_size=256)
@@ -87,7 +124,7 @@ def main():
     )
 
     # Peek at one batch to determine input shape
-    x0 = next(iter(dataloader))        # [B, T, C, H, W]
+    x0, aoi0 = next(iter(dataloader))        # [B, T, C, H, W]
     B, T, C, H, W = x0.shape
     in_channels = T * C               # flatten time × channels for v0
     print(f"[INFO] Batch shape: {x0.shape}  -> in_channels={in_channels}")
@@ -113,21 +150,33 @@ def main():
     while step < max_steps:
         for batch in dataloader:
             # batch: [B, T, C, H, W]
-            x = batch
+            x, aoi = batch
             B, T, C, H, W = x.shape
 
             # Collapse time and channels into a single channel dimension
             # so the ConvVAE sees a standard 2D image:
-            #   [B, T, C, H, W] -> [B, T*C, H, W]
-            x = x.view(B, T * C, H, W).to(device)
+
+            x = x.to(device)  # [B, T, H, W]
+            aoi = aoi.to(device)                         # [B, H, W]
+
+            x_bt = x.view(B * T, C, H, W)      # [B*T, C, H, W]
+            x_bt_norm = normalizer(x_bt)       # [B*T, C, H, W]
+            x_norm = x_bt_norm.view(B, T, C, H, W)
+            x_flat = x_norm.view(B, T * C, H, W)   # [B, T*C, H, W]
+
+            if aoi.dim() == 3:
+              aoi = aoi.unsqueeze(1)  # [B, 1, H, W]
 
             optimizer.zero_grad()
 
             # Forward pass through the VAE
-            recon, mu, logvar = model(x)
+            recon, mu, logvar = model(x_flat)
 
             # Compute VAE loss
-            loss, recon_loss, kl = vae_loss(recon, x, mu, logvar, beta=beta)
+            #loss, recon_loss, kl = vae_loss(recon, x, mu, logvar, beta=beta)
+            loss, recon_loss, kl = aoi_masked_vae_loss(
+                recon, x_flat, mu, logvar, aoi, beta=beta
+            )
 
             # Backprop + update
             loss.backward()
@@ -146,5 +195,46 @@ def main():
                 break
 
 
+    model.eval()
+    with torch.no_grad():
+        x, aoi = next(iter(dataloader))       # [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        x = x.to(device)
+
+        # --- forward preprocessing (same as in training) ---
+        x_bt = x.view(B * T, C, H, W)        # [B*T, C, H, W]
+        x_bt_norm = normalizer(x_bt)         # normalized
+        x_norm = x_bt_norm.view(B, T, C, H, W)
+        x_flat = x_norm.view(B, T * C, H, W) # [B, T*C, H, W]
+
+        recon, mu, logvar = model(x_flat)    # recon is normalized space
+
+        # --- back-transform reconstructions to physical space ---
+        recon_bt = recon.view(B * T, C, H, W)         # [B*T, C, H, W]
+        recon_phys_bt = normalizer.unnormalize(recon_bt)
+        recon_phys = recon_phys_bt.view(B, T, C, H, W)
+
+        x_phys_bt = normalizer.unnormalize(x_bt_norm) # or x_bt_norm
+        x_phys = x_phys_bt.view(B, T, C, H, W)
+
+    # For sanity, look at one example & one feature over time flattened
+    x0_norm = x_flat[0].cpu().numpy()             # normalized, [T*C, H, W] flattened earlier
+    r0_norm = recon[0].cpu().numpy()
+
+    # Back-transformed:
+    x0_phys = x_phys[0].cpu().numpy()            # [T, C, H, W]
+    r0_phys = recon_phys[0].cpu().numpy()
+
+    print("NORMALIZED:")
+    print("  input min/max:", x0_norm.min(), x0_norm.max())
+    print("  recon min/max:", r0_norm.min(), r0_norm.max())
+    print("  input mean/std:", x0_norm.mean(), x0_norm.std())
+    print("  recon mean/std:", r0_norm.mean(), r0_norm.std())
+
+    print("\nPHYSICAL:")
+    print("  input min/max:", x0_phys.min(), x0_phys.max())
+    print("  recon min/max:", r0_phys.min(), r0_phys.max())
+    print("  input mean/std:", x0_phys.mean(), x0_phys.std())
+    print("  recon mean/std:", r0_phys.mean(), r0_phys.std())
 if __name__ == "__main__":
     main()
