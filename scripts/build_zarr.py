@@ -169,26 +169,52 @@ def resolve_multifile_year_patterns(
 
 def open_single_file_time_variable(
     files: Sequence[Path],
-    bandname_template: str,
+    bandname_template: Optional[str],
     years: Sequence[int],
     template: xr.DataArray,
     chunks: Optional[Mapping[str, int]] = None,
+    band_index_start: Optional[int] = None,
+    band_index_year_start: Optional[int] = None,
 ) -> xr.DataArray:
     """
     Open a time-varying variable stored as one or more multiband rasters.
+
+    This supports two mutually exclusive modes for picking bands:
+
+    1. Name-based mode (existing behavior):
+       - `bandname_template` is a format string like 'lcms_lu_{year}'.
+       - For each year in `years`, the code looks up the band whose
+         description matches bandname_template.format(year=year).
+
+    2. Index-based mode (for files without band descriptions):
+       - `bandname_template` is None.
+       - `band_index_start` gives the 1-based band index for the first year.
+       - `band_index_year_start` is the year corresponding to that index.
+         Subsequent years are mapped sequentially:
+             band_index(year) = band_index_start + (year - band_index_year_start)
+
+       This is exactly what you want for a VRT or multiband TIFF where
+       bands are [1985, 1986, 1987, ...] in order but have no names.
 
     Parameters
     ----------
     files : sequence of Path
         Sharded multiband rasters for the same logical layer.
-    bandname_template : str
-        Template for band names, e.g. 'lcms_lu_{year}'.
+    bandname_template : str or None
+        Template for band names, e.g. 'lcms_lu_{year}', or None if using
+        index-based selection.
     years : sequence of int
         Global dense time axis (e.g. 2015..2024).
     template : DataArray
         Spatial template for alignment.
     chunks : dict, optional
         Chunking to pass through to lower-level IO.
+    band_index_start : int, optional
+        1-based band index corresponding to `band_index_year_start`.
+        Used only when `bandname_template` is None.
+    band_index_year_start : int, optional
+        Year corresponding to `band_index_start`. Defaults to the minimum
+        of `years` if not provided and index-based mode is used.
 
     Returns
     -------
@@ -196,39 +222,139 @@ def open_single_file_time_variable(
         Lazily-loaded DataArray(time, y, x), already aligned to template.
         Only years with matching bands will be present in the time axis.
     """
+    # Sanity checks: enforce exactly one selection mode.
+    if bandname_template is None and band_index_start is None:
+        raise ValueError(
+            "open_single_file_time_variable requires either "
+            "bandname_template (name-based mode) or band_index_start "
+            "(index-based mode)."
+        )
+
+    if bandname_template is not None and band_index_start is not None:
+        raise ValueError(
+            "Provide either bandname_template OR band_index_start, not both "
+            f"(got bandname_template={bandname_template!r}, "
+            f"band_index_start={band_index_start!r})."
+        )
+
+    # Default the reference year for index-based mode if not explicitly given.
+    if bandname_template is None and band_index_start is not None:
+        if band_index_year_start is None:
+            # For a typical 1985–2024 VRT, this will use the earliest year
+            # in `years` as the anchor for band_index_start.
+            band_index_year_start = int(min(years))
+
+    # Delegate the actual year→band selection to the rasterio helper.
+    # NOTE: you will need to update `urio.open_multiband_raster_for_years`
+    # to accept these new keyword arguments and implement the index-based
+    # mode there.
     da = urio.open_multiband_raster_for_years(
         files=files,
         bandname_template=bandname_template,
         years=years,
         chunks=chunks,
+        band_index_start=band_index_start,
+        band_index_year_start=band_index_year_start,
     )
+
+    # Align to the common spatial template (CRS, transform, extent).
     da = urio.align_to_template(da, template, resampling="nearest")
     return da
 
 
 def open_multi_file_time_variable(
     year_to_files: Dict[int, Sequence[Path]],
-    bandname: str,
+    bandname: Optional[str],
     full_time: Sequence[int],
     template: xr.DataArray,
     chunks: Optional[Mapping[str, int]] = None,
+    band_index: Optional[int] = None,
 ) -> xr.DataArray:
     """
     Open a time-varying variable stored as separate rasters per year.
 
+    This supports two mutually exclusive selection modes:
+
+    1. Name-based mode (existing behavior)
+       -----------------------------------
+       - `bandname` is a string like "NIR_var_7m" or "lc_class".
+       - For each year, we examine that year's files in `year_to_files[year]`
+         and use `find_band_index_by_name` to locate the band whose
+         DESCRIPTION/NAME matches `bandname`.
+       - Once found, we open the raster lazily and select that band.
+
+    2. Index-based mode (for files with no band descriptions)
+       -------------------------------------------------------
+       - `bandname` is None.
+       - `band_index` is an integer (1-based) indicating which band to use
+         in *every* per-year file.
+       - This is the natural choice for VRTs or plain multiband TIFFs where
+         all per-year rasters share the same band layout but have no useful
+         band names.
+
+    Parameters
+    ----------
+    year_to_files : dict[int, sequence of Path]
+        Mapping from year -> sequence of rasters (tiles, VRTs, etc.) for that year.
+    bandname : str or None
+        Name of the band to extract from each year's files, or None if using
+        fixed band index selection.
+    full_time : sequence of int
+        Global dense time axis (e.g. [2015, ..., 2024]) to which the result
+        will be reindexed. Years that have no data will be filled according
+        to the missing-year policy upstream.
+    template : xarray.DataArray
+        Spatial template for alignment; defines CRS, transform, extent.
+    chunks : dict, optional
+        Dask chunk mapping (e.g. {"y": 256, "x": 256}) passed through to
+        the lower-level IO helper.
+    band_index : int, optional
+        1-based band index to extract from each per-year raster when in
+        index-based mode. Ignored if `bandname` is provided.
+
     Returns
     -------
-    xarray.DataArray(time, y, x) covering `full_time`, sparse positions = NaN.
+    xarray.DataArray
+        DataArray(time, y, x) covering `full_time`, with sparse-time data
+        loaded from the available years and missing years filled via
+        `reindex_to_full_time`.
+
+    Notes
+    -----
+    - The actual per-year reading logic is delegated to
+      `utils.rasterio.open_per_year_rasters`, which must be updated to
+      accept both `bandname` and `band_index` and implement the same
+      selection rules.
     """
-    # Load sparse-time data first
+    # Enforce a clean API: exactly one selection mode.
+    if bandname is None and band_index is None:
+        raise ValueError(
+            "open_multi_file_time_variable requires either a bandname "
+            "(name-based mode) or a band_index (index-based mode)."
+        )
+    if bandname is not None and band_index is not None:
+        raise ValueError(
+            "Provide either bandname OR band_index for multi_file variables, "
+            f"not both (got bandname={bandname!r}, band_index={band_index!r})."
+        )
+
+    # 1. Load sparse-time data first: only the years that actually exist
+    #    in year_to_files are read, and even that is done lazily via dask.
     da_sparse = urio.open_per_year_rasters(
         year_to_files=year_to_files,
         bandname=bandname,
+        band_index=band_index,
         chunks=chunks,
     )
+
+    # 2. Align everything to the spatial template (CRS, transform, extent).
     da_sparse = urio.align_to_template(da_sparse, template, resampling="nearest")
+
+    # 3. Reindex to the full global time axis, inserting appropriate
+    #    fill values for missing years (handled in reindex_to_full_time).
     da = reindex_to_full_time(da_sparse, full_time)
     return da
+
 
 
 # -----------------------------------------------------------------------------
@@ -805,10 +931,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         if t_type == "single_file":
             files = resolve_sharded_files(time_cfg["files"])
-            da = open_single_file_time_variable(
-                files, time_cfg["bandname"], full_time, template, chunks_xy
-            )
 
+            # We now support two modes:
+            #   - bandname_template: e.g. "lcms_lu_{year}"
+            #   - band_index_start + band_index_year_start: bands in strict year order
+            bandname_template = time_cfg.get("bandname")  # may be None
+            band_index_start = time_cfg.get("band_index_start")
+            band_index_year_start = time_cfg.get(
+                "band_index_year_start",
+                time_cfg.get("start", full_time[0]),  # sane default anchor
+            )
+        
+            da = open_single_file_time_variable(
+                files=files,
+                bandname_template=bandname_template,
+                years=full_time,
+                template=template,
+                chunks=chunks_xy,
+                band_index_start=band_index_start,
+                band_index_year_start=band_index_year_start,
+            )
         elif t_type == "multi_file":
             if "years" in time_cfg:
                 years = sorted(set(int(y) for y in time_cfg["years"]) & set(full_time))
@@ -818,8 +960,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 years = [y for y in full_time if start <= y <= end]
 
             year_to_files = resolve_multifile_year_patterns(time_cfg["files"], years)
+            #   - bandname: e.g. "NIR_var_7m"
+            #   - band_index: literal band number to use in each per-year file
+            bandname = time_cfg.get("bandname")         # may be None
+            band_index = time_cfg.get("band_index")     # may be None
+
             da = open_multi_file_time_variable(
-                year_to_files, time_cfg["bandname"], full_time, template, chunks_xy
+                year_to_files=year_to_files,
+                bandname=bandname,
+                full_time=full_time,
+                template=template,
+                chunks=chunks_xy,
+                band_index=band_index,
             )
 
         elif t_type == "constructed":
@@ -859,6 +1011,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             da = da.fillna(np.int16(-1)).astype("int16")
             cat_vars[fid] = da
         elif kind == "mask":
+            if np.issubdtype(da.dtype, np.floating):
+                da = da.fillna(0.0)
             # Treat nodata (-32768 etc.) as False before casting
             nodata = (
                 da.attrs.get("nodata_value", None)
