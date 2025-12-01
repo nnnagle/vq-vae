@@ -39,6 +39,8 @@ from src.training.losses import (
     aoi_masked_vae_loss,
     categorical_recon_loss_from_embeddings,
 )
+from src.training.categorical_eval import print_categorical_histograms  # NEW
+
 
 def main():
     # ------------------------------------------------------------------
@@ -198,8 +200,10 @@ def main():
             step += 1
             if step >= max_steps:
                 break
-
-
+    # ------------------------------------------------------------------
+    # 4. Model evaluation
+    # ------------------------------------------------------------------
+    # Tiny model evaluation
     model.eval()
     with torch.no_grad():
         batch = next(iter(dataloader))
@@ -262,6 +266,18 @@ def main():
     print("  recon min/max:", r0_phys.min(), r0_phys.max())
     print("  input mean/std:", x0_phys.mean(), x0_phys.std())
     print("  recon mean/std:", r0_phys.mean(), r0_phys.std())
+    
+    if (cat_encoder is not None) and (x_cat is not None) and (num_classes is not None):
+        print_categorical_histograms(
+            recon_full=recon_full,
+            x_cat=x_cat,
+            cat_encoder=cat_encoder,
+            num_classes=num_classes,
+            C_cont=C_cont,
+        )
+    else:
+        print("\n[INFO] skipping categorical histograms (no categorical encoder/data).")
+    
 
 if __name__ == "__main__":
     main()
