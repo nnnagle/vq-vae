@@ -76,11 +76,9 @@ def write_tsv(path: str, rows: Iterable[Tuple], header: Tuple[str, ...] | None =
     ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", encoding="utf-8") as f:
         if header:
-            f.write("	".join(header) + " 
-            ")
+            f.write("\t".join(header) + "\n")
         for row in rows:
-            f.write("	".join(map(str, row)) + " 
-            ")
+            f.write("\t".join(map(str, row)) + "\n")
     log("Wrote TSV: %s", path)
 
 # ---------------------------------------------------------------------
@@ -148,4 +146,4 @@ def atomic_write(final_path: str | Path,
         except Exception:
             pass
         fail(f"Atomic write failed for {final}: {e}")
-    """
+    
