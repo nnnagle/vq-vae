@@ -203,37 +203,97 @@ def export_image_drive(
     except Exception as e:
         fail(f"Drive export failed for '{desc}': {e}")
 
+import subprocess
+import ee
 
-def export_image_gcs(
-    image: ee.Image,
-    desc: str,
-    region: ee.Geometry,
-    *,
-    bucket: str,
-    prefix: str = "",
-    scale: int = 30,
-    crs: str = "EPSG:5070",
-    max_pixels: float = 1e13
-) -> ee.batch.Task:
+
+def gcs_file_exists(bucket: str, prefix: str) -> bool:
     """
-    Start a Cloud Storage export; returns the created ee.batch.Task.
-    Objects will be written to: gs://<bucket>/<prefix>/<desc>.*
+    Return True if gs://bucket/prefix.tif already exists.
+
+    `prefix` can include "directories", e.g. "va/lcms_lc_2016_2024".
     """
-    file_prefix = f"{prefix.rstrip('/')}/{desc}" if prefix else desc
+    uri = f"gs://{bucket}/{prefix}.tif"
     try:
-        task = ee.batch.Export.image.toCloudStorage(
-            image=image,
-            description=desc,
-            bucket=bucket,
-            fileNamePrefix=file_prefix,
-            region=region,
-            scale=scale,
-            crs=crs,
-            maxPixels=max_pixels,
+        result = subprocess.run(
+            ["gsutil", "ls", uri],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        task.start()
-        log("GCS export started: desc=%s, gs://%s/%s, scale=%s, crs=%s, task_id=%s",
-            desc, bucket, file_prefix, scale, crs, task.id)
-        return task
-    except Exception as e:
-        fail(f"GCS export failed for '{desc}': {e}")
+        return result.returncode == 0
+    except FileNotFoundError:
+        # gsutil not available; fall back to "assume does not exist"
+        print("WARNING: gsutil not found; skipping GCS existence check.")
+        return False
+
+
+def export_img_to_gcs(
+    img: ee.Image,
+    aoi: ee.Geometry,
+    bucket: str,
+    base_name: str,
+    scale: int = 30,
+    maxPixels: int=1e9,
+    gcs_dir: str | None = None,
+    crs: str | None = None,
+    crsTransform: list[float] | None = None,
+):
+    """
+    Export an image as a single COG GeoTIFF to GCS.
+
+    - Does *not* overwrite: if the target object exists, it skips the export.
+      Because GCS doesn't overwrite anyway. 
+    - If `gcs_dir` is provided, the file is written under that prefix.
+
+    Final object path (no trailing slash on gcs_dir):
+      gs://<bucket>/<gcs_dir>/<base_name>.tif
+    or, if gcs_dir is None:
+      gs://<bucket>/<base_name>.tif
+    """
+    # Build the GCS object prefix (without extension)
+    if gcs_dir:
+        gcs_dir = gcs_dir.rstrip("/")  # avoid double slashes
+        prefix = f"{gcs_dir}/{base_name}"
+    else:
+        prefix = base_name
+
+    # Clip to AOI once
+    patch = img.clip(aoi)
+
+    # Check for existing file
+    if gcs_file_exists(bucket, prefix):
+        print(f"WARNING: GCS file already exists: gs://{bucket}/{prefix}.tif")
+        print("Skipping export.")
+        return
+
+    # Common export args
+    export_kwargs = dict(
+        image=patch,
+        description=base_name,
+        bucket=bucket,
+        fileNamePrefix=prefix,
+        region=aoi,
+        maxPixels=maxPixels,
+        fileFormat="GeoTIFF",
+        formatOptions={"cloudOptimized": True},
+    )
+
+    #Handle crs / crsTransform vs scale:
+    #- If crs_transform is provided: use crs/crsTransform, do NOT set scale.
+    #- Else: use scale (and optional crs).
+    if crsTransform is not None:
+        export_kwargs["crsTransform"] = crsTransform  # EE expects camelCase
+        if crs is not None:
+            export_kwargs["crs"] = crs
+    else:
+        export_kwargs["scale"] = scale
+        if crs is not None:
+            export_kwargs["crs"] = crs
+
+    # Kick off export
+    task = ee.batch.Export.image.toCloudStorage(**export_kwargs)
+    task.start()
+    print(f"Started Tif export task: gs://{bucket}/{prefix}.tif, task_id={task.id}")
+
+
