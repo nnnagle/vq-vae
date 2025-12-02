@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 import yaml
+import csv 
 
 import torch
 from torch.utils.data import DataLoader
@@ -327,6 +328,7 @@ class Trainer:
         Run the full training loop:
           - train/val epochs,
           - best-checkpoint saving,
+          - metrics logging to CSV,
           - final reconstruction diagnostics.
         """
         print(
@@ -334,60 +336,107 @@ class Trainer:
             f"(beta={self.cfg.beta}, lambda_cat={self.cfg.lambda_cat})"
         )
 
-        for epoch in range(self.cfg.num_epochs):
-            train_metrics = train_one_epoch(
-                model=self.model,
-                train_loader=self.train_loader,
-                optimizer=self.optimizer,
-                device=self.device,
-                normalizer=self.normalizer,
-                cat_encoder=self.cat_encoder,
-                beta=self.cfg.beta,
-                lambda_cat=self.cfg.lambda_cat,
+        # Path to metrics CSV inside the run directory
+        metrics_path = self.run_dir / "metrics.csv"
+
+        # Open once for the whole run and write a simple header
+        with open(metrics_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["epoch", "split", "loss", "cont_recon", "cat_loss", "kl"]
             )
 
-            val_metrics = eval_one_epoch(
-                model=self.model,
-                val_loader=self.val_loader,
-                device=self.device,
-                normalizer=self.normalizer,
-                cat_encoder=self.cat_encoder,
-                beta=self.cfg.beta,
-                lambda_cat=self.cfg.lambda_cat,
-            )
-
-            print(
-                f"[epoch {epoch:03d}] "
-                f"train_loss={train_metrics['loss']:.4f}  "
-                f"train_cont={train_metrics['cont_recon']:.4f}  "
-                f"train_cat={train_metrics['cat_loss']:.4f}  "
-                f"train_kl={train_metrics['kl']:.4f}  |  "
-                f"val_loss={val_metrics['loss']:.4f}  "
-                f"val_cont={val_metrics['cont_recon']:.4f}  "
-                f"val_cat={val_metrics['cat_loss']:.4f}  "
-                f"val_kl={val_metrics['kl']:.4f}"
-            )
-
-            # Simple "best model so far" checkpoint on val loss
-            if val_metrics["loss"] < self.best_val_loss:
-                self.best_val_loss = val_metrics["loss"]
-                ckpt_path = self.ckpt_dir / "vae_v0_best.pt"
-                torch.save(
-                    {
-                        "model_state": self.model.state_dict(),
-                        "optimizer_state": self.optimizer.state_dict(),
-                        "epoch": epoch,
-                        "beta": self.cfg.beta,
-                        "lambda_cat": self.cfg.lambda_cat,
-                    },
-                    ckpt_path,
+            for epoch in range(self.cfg.num_epochs):
+                # ------------------------------
+                # Training epoch
+                # ------------------------------
+                train_metrics = train_one_epoch(
+                    model=self.model,
+                    train_loader=self.train_loader,
+                    optimizer=self.optimizer,
+                    device=self.device,
+                    normalizer=self.normalizer,
+                    cat_encoder=self.cat_encoder,
+                    beta=self.cfg.beta,
+                    lambda_cat=self.cfg.lambda_cat,
                 )
+
+                # ------------------------------
+                # Validation epoch
+                # ------------------------------
+                val_metrics = eval_one_epoch(
+                    model=self.model,
+                    val_loader=self.val_loader,
+                    device=self.device,
+                    normalizer=self.normalizer,
+                    cat_encoder=self.cat_encoder,
+                    beta=self.cfg.beta,
+                    lambda_cat=self.cfg.lambda_cat,
+                )
+
+                # Console summary (same as before)
                 print(
-                    f"[Trainer] Saved new best model at epoch {epoch} "
-                    f"(val_loss={self.best_val_loss:.4f}) -> {ckpt_path}"
+                    f"[epoch {epoch:03d}] "
+                    f"train_loss={train_metrics['loss']:.4f}  "
+                    f"train_cont={train_metrics['cont_recon']:.4f}  "
+                    f"train_cat={train_metrics['cat_loss']:.4f}  "
+                    f"train_kl={train_metrics['kl']:.4f}  |  "
+                    f"val_loss={val_metrics['loss']:.4f}  "
+                    f"val_cont={val_metrics['cont_recon']:.4f}  "
+                    f"val_cat={val_metrics['cat_loss']:.4f}  "
+                    f"val_kl={val_metrics['kl']:.4f}"
                 )
 
-        # Final diagnostics
+                # ------------------------------
+                # CSV logging
+                # ------------------------------
+                writer.writerow(
+                    [
+                        epoch,
+                        "train",
+                        train_metrics["loss"],
+                        train_metrics["cont_recon"],
+                        train_metrics["cat_loss"],
+                        train_metrics["kl"],
+                    ]
+                )
+                writer.writerow(
+                    [
+                        epoch,
+                        "val",
+                        val_metrics["loss"],
+                        val_metrics["cont_recon"],
+                        val_metrics["cat_loss"],
+                        val_metrics["kl"],
+                    ]
+                )
+
+                # ------------------------------
+                # Best-checkpoint update
+                # ------------------------------
+                if val_metrics["loss"] < self.best_val_loss:
+                    self.best_val_loss = val_metrics["loss"]
+                    ckpt_path = self.ckpt_dir / "vae_v0_best.pt"
+                    torch.save(
+                        {
+                            "model_state": self.model.state_dict(),
+                            "optimizer_state": self.optimizer.state_dict(),
+                            "epoch": epoch,
+                            "beta": self.cfg.beta,
+                            "lambda_cat": self.cfg.lambda_cat,
+                        },
+                        ckpt_path,
+                    )
+                    print(
+                        f"[Trainer] Saved new best model at epoch {epoch} "
+                        f"(val_loss={self.best_val_loss:.4f}) -> {ckpt_path}"
+                    )
+
+        print(f"[Trainer] Metrics written to {metrics_path}")
+
+        # ------------------------------------------------------------------
+        # Final diagnostics after training
+        # ------------------------------------------------------------------
         self._final_reconstruction_diagnostics()
 
     # ------------------------------------------------------------------
