@@ -2,35 +2,18 @@
 #
 # Minimal end-to-end training script for ConvVAE + PatchDataset.
 #
-# Pipeline:
-#   Zarr cube  ->  PatchDataset  ->  DataLoader  ->  ConvVAE  ->  VAE loss
+# Now uses spatial train/val/test splits from PatchDataset(split=...).
 #
-# This script is deliberately simple:
-#   - Uses only the continuous group (via PatchDataset v0).
-#   - Treats time × channels as a single big channel dimension.
-#   - Runs a short training loop just to confirm:
-#       * data flows correctly,
-#       * model compiles and runs,
-#       * loss is finite and roughly decreases.
-#
-# Once this works, *then* you start adding:
-#   - normalization,
-#   - masks,
-#   - categorical features,
-#   - better architecture,
-#   - logging/metrics, etc.
-
 
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 from torch import optim
 import xarray as xr
 
 from src.data.normalization import build_normalizer_from_zarr
-from src.data.patch_dataset import PatchDataset
+from src.data.patch_dataset import PatchDataset          # <-- uses new split-aware dataset
 from src.data.categorical_meta import infer_categorical_meta_from_zarr
 
 from src.models.categorical_embedding import CategoricalEmbeddingEncoder
@@ -39,22 +22,49 @@ from src.training.losses import (
     aoi_masked_vae_loss,
     categorical_recon_loss_from_embeddings,
 )
-from src.training.categorical_eval import print_categorical_histograms  # NEW
+from src.training.categorical_eval import print_categorical_histograms
 
+DEBUG_WINDOW = True     # Flip to False for full-domain training
+
+# Debug window parameters (used only if DEBUG_WINDOW=True)
+DEBUG_WINDOW_ORIGIN = (256 * 10, 256 * 20)   # (y0, x0)
+DEBUG_WINDOW_SIZE   = (1024, 1024)           # (height, width)
+DEBUG_BLOCK_WIDTH   = 1
+DEBUG_BLOCK_HEIGHT  = 1
+
+# Default block size when not debugging
+DEFAULT_BLOCK_WIDTH  = 7
+DEFAULT_BLOCK_HEIGHT = 7
 
 def main():
+    patch_size = 256
+
+    if DEBUG_WINDOW:
+        window_origin = DEBUG_WINDOW_ORIGIN
+        window_size   = DEBUG_WINDOW_SIZE
+        block_width   = DEBUG_BLOCK_WIDTH
+        block_height  = DEBUG_BLOCK_HEIGHT
+
+        print(f"[INFO] DEBUG WINDOW ENABLED @ origin={window_origin}, size={window_size}")
+    else:
+        window_origin = None
+        window_size   = None
+        block_width   = DEFAULT_BLOCK_WIDTH
+        block_height  = DEFAULT_BLOCK_HEIGHT
+
+        print("[INFO] DEBUG WINDOW DISABLED — using full domain")
+
     # ------------------------------------------------------------------
     # 1. Data: PatchDataset + DataLoader
     # ------------------------------------------------------------------
-    # Point this at your built Zarr cube
     zarr_path = Path("/data/VA/zarr/va_cube.zarr")
 
     # Build normalizer once from Zarr metadata
     ds = xr.open_zarr(zarr_path)
     normalizer = build_normalizer_from_zarr(
         ds,
-        group="continuous",            # adjust if your group name differs
-        feature_dim="feature_continuous",  # adjust to your coord name
+        group="continuous",
+        feature_dim="feature_continuous",
         enable=True,
     )
 
@@ -70,28 +80,72 @@ def main():
         print("[INFO] categorical embedding out_channels:", cat_encoder.out_channels)
     else:
         cat_encoder = None
+        feature_ids = None
+        num_classes = None
         print("[INFO] no categorical group; running continuous-only.")
-        
 
-    # Dataset: each item is [T, C_cont, 256, 256]
-    dataset = PatchDataset(zarr_path, patch_size=256)
+    # ------------------------------------------------------------------
+    # NEW: build separate train/val/test datasets using spatial split
+    # ------------------------------------------------------------------
+    train_dataset = PatchDataset(
+        zarr_path,
+        patch_size=patch_size,
+        split="train",
+        block_width=block_width,
+        block_height=block_height,
+        window_origin=window_origin,
+        window_size=window_size,
+    )
 
-    # DataLoader: small batch size, single worker for v0 debugging
-    dataloader = DataLoader(
-        dataset,
+    val_dataset = PatchDataset(
+        zarr_path,
+        patch_size=patch_size,
+        split="val",
+        block_width=block_width,
+        block_height=block_height,
+        window_origin=window_origin,
+        window_size=window_size,
+    )
+
+    test_dataset = PatchDataset(
+        zarr_path,
+        patch_size=patch_size,
+        split="test",
+        block_width=block_width,
+        block_height=block_height,
+        window_origin=window_origin,
+        window_size=window_size,
+    )
+    print(
+        f"[INFO] dataset sizes: "
+        f"train={len(train_dataset)}, "
+        f"val={len(val_dataset)}, "
+        f"test={len(test_dataset)}"
+    )
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=2,
         shuffle=True,
         num_workers=0,
         pin_memory=True,
     )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
 
-    # Peek at one batch to determine input shape
-    batch0 = next(iter(dataloader))
+    # Peek at one TRAIN batch to determine input shape
+    batch0 = next(iter(train_loader))
     x_cont0 = batch0["x_cont"]   # [B, T, C_cont, H, W]
-    x_cat0  = batch0["x_cat"]     # [B, T, C_cat,  H, W] or None
+    x_cat0  = batch0["x_cat"]    # [B, T, C_cat,  H, W] or None
     aoi0    = batch0["aoi"]      # [B, H, W] (after collation)
     B, T, C_cont, H, W = x_cont0.shape
-    # How many embedding channels will we add?
+
     C_emb = cat_encoder.out_channels if (cat_encoder is not None and x_cat0 is not None) else 0
 
     C_all = C_cont + C_emb
@@ -109,19 +163,17 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     if cat_encoder is not None:
         cat_encoder = cat_encoder.to(device)
-        
-    # ------------------------------------------------------------------
-    # 3. Tiny training loop (smoke test)
-    # ------------------------------------------------------------------
-    # This is not “real training” yet — just enough iterations to see
-    # whether the loss behaves and gradients flow.
-    max_steps = 100
-    beta = 0.1  # smaller KL weight to start
-    lambda_cat = 1.0 # weight on categorical loss
 
+    # ------------------------------------------------------------------
+    # 3. Tiny training loop (smoke test, but now over TRAIN split only)
+    # ------------------------------------------------------------------
+    max_steps = 100
+    beta = 0.1
+    lambda_cat = 1.0
+    
     step = 0
     while step < max_steps:
-        for batch in dataloader:
+        for batch in train_loader:
             # batch: [B, T, C, H, W]
             x_cont = batch["x_cont"]
             x_cat  = batch.get("x_cat", None)   # [B, T, C_cat, H, W] or None
@@ -200,13 +252,19 @@ def main():
             step += 1
             if step >= max_steps:
                 break
+    
     # ------------------------------------------------------------------
     # 4. Model evaluation
     # ------------------------------------------------------------------
     # Tiny model evaluation
     model.eval()
     with torch.no_grad():
-        batch = next(iter(dataloader))
+        # Take one batch from VAL set for now (still “v0-ish” eval)
+        try:
+            val_batch = next(iter(val_loader))
+        except StopIteration:
+            print("[WARN] val_loader is empty; skipping evaluation.")
+            return
 
         x_cont = batch["x_cont"]    # [B, T, C_cont, H, W]
         x_cat  = batch["x_cat"]     # [B, T, C_cat, H, W] or None
