@@ -1,0 +1,28 @@
+# configs/vae_v0.yaml
+
+zarr_path: "/data/VA/zarr/va_cube.zarr"
+
+patch_size: 256
+batch_size: 4
+num_epochs: 20
+lr: 1e-4
+
+beta: 0.1
+lambda_cat: 1.0
+
+debug_window: true
+
+# Used if debug_window: true
+debug_window_origin: [2560, 5120]
+debug_window_size:   [1024, 1024]
+debug_block_dims:    [1, 1]
+
+# Used if debug_window: false
+full_block_dims:     [7, 7]
+
+num_workers: 0
+pin_memory: true
+
+run_root: "runs"
+experiment_name: "vae_v0_full"
+ckpt_dir: "checkpoints"

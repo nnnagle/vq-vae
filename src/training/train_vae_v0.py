@@ -3,13 +3,7 @@
 from src.training.trainer import Trainer, TrainConfig
 
 def main():
-    cfg = TrainConfig(
-        zarr_path="/data/VA/zarr/va_cube.zarr",
-        patch_size=256,
-        num_epochs=5,
-        batch_size=2,
-        debug_window=True,  # flip to False for full domain
-    )
+    cfg = TrainConfig.from_yaml("configs/vae_v0.yaml")
     trainer = Trainer(cfg)
     trainer.run()
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+import yaml
 
 import torch
 from torch.utils.data import DataLoader
@@ -86,7 +87,32 @@ class TrainConfig:
     num_workers: int = 0
     pin_memory: bool = True
 
-    ckpt_dir: str = "checkpoints"
+    run_root: str = "runs"              # parent directory for all experiments
+    experiment_name: str = "vae_v0"     # subdirectory per experiment
+    ckpt_dir: str = "checkpoints"       # subdirectory inside run_dir for checkpoints
+
+
+    @staticmethod
+    def from_yaml(path: str | Path) -> "TrainConfig":
+        """
+        Load TrainConfig from a YAML file and return a populated dataclass.
+        """
+        path = Path(path)
+        with open(path, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        # Coerce some known scalars to the right types in case YAML had quotes.
+        for key in ("lr", "beta", "lambda_cat"):
+            if key in cfg:
+                cfg[key] = float(cfg[key])
+
+        # Tuples: allow YAML lists and convert
+        for key in ("debug_window_origin", "debug_window_size",
+                    "debug_block_dims", "full_block_dims"):
+            if key in cfg:
+                cfg[key] = tuple(cfg[key])
+
+        return TrainConfig(**cfg)
 
 
 class Trainer:
@@ -106,9 +132,24 @@ class Trainer:
 
         # Resolve paths
         self.zarr_path = Path(cfg.zarr_path)
-        self.ckpt_dir = Path(cfg.ckpt_dir)
+        self.run_root = Path(cfg.run_root)
+        self.run_dir = self.run_root / cfg.experiment_name
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Checkpoint directory lives *inside* run_dir
+        self.ckpt_dir = self.run_dir / cfg.ckpt_dir
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        print(f"[Trainer] run_dir: {self.run_dir}")
+        print(f"[Trainer] ckpt_dir: {self.ckpt_dir}")
+
+        # Save a copy of the config into the run directory for reproducibility
+        cfg_out = self.run_dir / "config_resolved.yaml"
+        with open(cfg_out, "w") as f:
+            yaml.safe_dump(self.cfg.__dict__, f)
+        print(f"[Trainer] Saved resolved config to {cfg_out}")
+        
+        
         # Decide on spatial split parameters and debug window
         if cfg.debug_window:
             self.window_origin = cfg.debug_window_origin
