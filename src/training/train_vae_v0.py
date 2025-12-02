@@ -5,7 +5,8 @@
 # Now uses:
 #   - spatial train/val/test splits from PatchDataset(split=...),
 #   - a debug window option for fast experiments,
-#   - simple epoch-based train/val loops with aggregated metrics.
+#   - epoch-based train/val loops (from src.training.loops),
+#   - simple checkpointing + reconstruction diagnostics.
 #
 
 from pathlib import Path
@@ -16,16 +17,13 @@ from torch import optim
 import xarray as xr
 
 from src.data.normalization import build_normalizer_from_zarr
-from src.data.patch_dataset import PatchDataset          # <-- uses new split-aware dataset
+from src.data.patch_dataset import PatchDataset
 from src.data.categorical_meta import infer_categorical_meta_from_zarr
 
 from src.models.categorical_embedding import CategoricalEmbeddingEncoder
 from src.models.vae_v0 import ConvVAE
-from src.training.losses import (
-    aoi_masked_vae_loss,
-    categorical_recon_loss_from_embeddings,
-)
 from src.training.categorical_eval import print_categorical_histograms
+from src.training.loops import train_one_epoch, eval_one_epoch   # <-- NEW import
 
 # ----------------------------------------------------------------------
 # Debug controls
@@ -43,245 +41,6 @@ DEBUG_BLOCK_HEIGHT  = 1
 DEFAULT_BLOCK_WIDTH  = 7
 DEFAULT_BLOCK_HEIGHT = 7
 
-
-# ----------------------------------------------------------------------
-# Epoch-level train/eval helpers (v0-style, but real epochs)
-# ----------------------------------------------------------------------
-
-def train_one_epoch(
-    model,
-    train_loader,
-    optimizer,
-    device,
-    normalizer,
-    cat_encoder,
-    beta: float,
-    lambda_cat: float,
-):
-    """
-    Single training epoch over the TRAIN split.
-
-    Aggregates:
-      - total loss
-      - continuous reconstruction loss
-      - categorical reconstruction loss
-      - KL term
-    """
-    model.train()
-
-    total_loss = 0.0
-    total_cont = 0.0
-    total_cat = 0.0
-    total_kl = 0.0
-    n_batches = 0
-
-    for batch in train_loader:
-        # batch: dictionary of tensors from PatchDataset
-        x_cont = batch["x_cont"]             # [B, T, C_cont, H, W]
-        x_cat  = batch.get("x_cat", None)    # [B, T, C_cat, H, W] or None
-        aoi    = batch["aoi"]                # [B, H, W]
-
-        B, T, C_cont, H, W = x_cont.shape
-
-        # Move to device
-        x_cont = x_cont.to(device, non_blocking=True)
-        if x_cat is not None:
-            x_cat = x_cat.to(device, non_blocking=True)
-        aoi = aoi.to(device, non_blocking=True)    # [B, H, W]
-
-        # Collapse time into batch to apply normalizer
-        x_bt = x_cont.view(B * T, C_cont, H, W)    # [B*T, C_cont, H, W]
-        x_bt_norm = normalizer(x_bt)               # normalized
-        x_cont_norm = x_bt_norm.view(B, T, C_cont, H, W)
-
-        # Optional categorical embeddings
-        if cat_encoder is not None and x_cat is not None:
-            x_cat_emb = cat_encoder(x_cat)         # [B, T, C_emb, H, W]
-            x_all = torch.cat([x_cont_norm, x_cat_emb], dim=2)
-        else:
-            x_all = x_cont_norm
-
-        B, T, C_all, H, W = x_all.shape
-
-        # Flatten time × channels for ConvVAE
-        x_flat_all = x_all.view(B, T * C_all, H, W)          # [B, T*C_all, H, W]
-        x_flat_cont = x_cont_norm.view(B, T * C_cont, H, W)  # [B, T*C_cont, H, W]
-
-        # AOI -> [B,1,H,W]
-        if aoi.dim() == 3:
-            aoi = aoi.unsqueeze(1)
-
-        # ---------------------------
-        # Forward pass + loss
-        # ---------------------------
-        optimizer.zero_grad()
-
-        recon, mu, logvar = model(x_flat_all)     # recon is in normalized space
-
-        recon_full = recon.view(B, T, C_all, H, W)
-        recon_cont = recon_full[:, :, :C_cont, ...]                    # [B,T,C_cont,H,W]
-        # Use reshape here: recon_cont may be non-contiguous after slicing
-        recon_cont_flat = recon_cont.reshape(B, T * C_cont, H, W)      # [B,T*C_cont,H,W]
-
-        vae_total, cont_recon_loss, kl = aoi_masked_vae_loss(
-            recon_cont_flat,
-            x_flat_cont,
-            mu,
-            logvar,
-            aoi,
-            beta=beta,
-        )
-
-        cat_loss = categorical_recon_loss_from_embeddings(
-            recon_full=recon_full,
-            x_cat=x_cat,
-            cat_encoder=cat_encoder,
-            C_cont=C_cont,
-        )
-        if not torch.isfinite(cat_loss):
-            print("[DEBUG] non-finite cat_loss in train_one_epoch, setting to zero.")
-            cat_loss = torch.tensor(0.0, device=recon.device)
-
-        loss = vae_total + lambda_cat * cat_loss
-
-        # Backprop + update
-        loss.backward()
-        optimizer.step()
-
-        # Accumulate metrics
-        total_loss += float(loss.item())
-        total_cont += float(cont_recon_loss.item())
-        total_cat  += float(cat_loss.item())
-        total_kl   += float(kl.item())
-        n_batches  += 1
-
-    # Avoid divide-by-zero if loader is empty
-    if n_batches == 0:
-        return {
-            "loss": float("nan"),
-            "cont_recon": float("nan"),
-            "cat_loss": float("nan"),
-            "kl": float("nan"),
-        }
-
-    return {
-        "loss": total_loss / n_batches,
-        "cont_recon": total_cont / n_batches,
-        "cat_loss": total_cat / n_batches,
-        "kl": total_kl / n_batches,
-    }
-
-
-@torch.no_grad()
-def eval_one_epoch(
-    model,
-    val_loader,
-    device,
-    normalizer,
-    cat_encoder,
-    beta: float,
-    lambda_cat: float,
-):
-    """
-    Single evaluation epoch over the VAL split.
-
-    Mirrors train_one_epoch, but:
-      - no optimizer / gradients
-      - model in eval() mode
-    """
-    model.eval()
-
-    total_loss = 0.0
-    total_cont = 0.0
-    total_cat = 0.0
-    total_kl = 0.0
-    n_batches = 0
-
-    for batch in val_loader:
-        x_cont = batch["x_cont"]             # [B, T, C_cont, H, W]
-        x_cat  = batch.get("x_cat", None)    # [B, T, C_cat, H, W] or None
-        aoi    = batch["aoi"]                # [B, H, W]
-
-        B, T, C_cont, H, W = x_cont.shape
-
-        # Move to device
-        x_cont = x_cont.to(device, non_blocking=True)
-        if x_cat is not None:
-            x_cat = x_cat.to(device, non_blocking=True)
-        aoi = aoi.to(device, non_blocking=True)
-
-        # Normalize continuous
-        x_bt = x_cont.view(B * T, C_cont, H, W)
-        x_bt_norm = normalizer(x_bt)
-        x_cont_norm = x_bt_norm.view(B, T, C_cont, H, W)
-
-        # Optional categorical embeddings
-        if cat_encoder is not None and x_cat is not None:
-            x_cat_emb = cat_encoder(x_cat)
-            x_all = torch.cat([x_cont_norm, x_cat_emb], dim=2)
-        else:
-            x_all = x_cont_norm
-
-        B, T, C_all, H, W = x_all.shape
-        x_flat_all = x_all.view(B, T * C_all, H, W)
-        x_flat_cont = x_cont_norm.view(B, T * C_cont, H, W)
-
-        if aoi.dim() == 3:
-            aoi = aoi.unsqueeze(1)
-
-        recon, mu, logvar = model(x_flat_all)
-
-        recon_full = recon.view(B, T, C_all, H, W)
-        recon_cont = recon_full[:, :, :C_cont, ...]
-        # Use reshape here too
-        recon_cont_flat = recon_cont.reshape(B, T * C_cont, H, W)
-
-        vae_total, cont_recon_loss, kl = aoi_masked_vae_loss(
-            recon_cont_flat,
-            x_flat_cont,
-            mu,
-            logvar,
-            aoi,
-            beta=beta,
-        )
-
-        cat_loss = categorical_recon_loss_from_embeddings(
-            recon_full=recon_full,
-            x_cat=x_cat,
-            cat_encoder=cat_encoder,
-            C_cont=C_cont,
-        )
-        if not torch.isfinite(cat_loss):
-            print("[DEBUG] non-finite cat_loss in eval_one_epoch, setting to zero.")
-            cat_loss = torch.tensor(0.0, device=recon.device)
-
-        loss = vae_total + lambda_cat * cat_loss
-
-        total_loss += float(loss.item())
-        total_cont += float(cont_recon_loss.item())
-        total_cat  += float(cat_loss.item())
-        total_kl   += float(kl.item())
-        n_batches  += 1
-
-    if n_batches == 0:
-        return {
-            "loss": float("nan"),
-            "cont_recon": float("nan"),
-            "cat_loss": float("nan"),
-            "kl": float("nan"),
-        }
-
-    return {
-        "loss": total_loss / n_batches,
-        "cont_recon": total_cont / n_batches,
-        "cat_loss": total_cat / n_batches,
-        "kl": total_kl / n_batches,
-    }
-
-
-# ----------------------------------------------------------------------
-# Main entry point
-# ----------------------------------------------------------------------
 
 def main():
     patch_size = 256
@@ -334,7 +93,7 @@ def main():
         num_classes = None
         print("[INFO] no categorical group; running continuous-only.")
 
-    # NEW: build separate train/val/test datasets using spatial split (+ optional window)
+    # Build separate train/val/test datasets using spatial split (+ optional window)
     train_dataset = PatchDataset(
         zarr_path,
         patch_size=patch_size,
@@ -392,7 +151,6 @@ def main():
     batch0 = next(iter(train_loader))
     x_cont0 = batch0["x_cont"]   # [B, T, C_cont, H, W]
     x_cat0  = batch0["x_cat"]    # [B, T, C_cat,  H, W] or None
-    aoi0    = batch0["aoi"]      # [B, H, W] (after collation)
     B, T, C_cont, H, W = x_cont0.shape
 
     C_emb = cat_encoder.out_channels if (cat_encoder is not None and x_cat0 is not None) else 0
@@ -414,15 +172,14 @@ def main():
         cat_encoder = cat_encoder.to(device)
 
     # ------------------------------------------------------------------
-    # 3. Epoch-based training loop (still v0, but structured)
+    # 3. Epoch-based training loop
     # ------------------------------------------------------------------
-    num_epochs = 5      # small number for now (smoke-test scale)
+    num_epochs = 5      # still small for now
     beta = 0.1
     lambda_cat = 1.0
 
     best_val_loss = float("inf")
 
-    # Optional checkpoint dir
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -460,7 +217,6 @@ def main():
             f"val_kl={val_metrics['kl']:.4f}"
         )
 
-        # Simple "best model so far" checkpoint on val loss
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             ckpt_path = ckpt_dir / "vae_v0_best.pt"
@@ -477,7 +233,7 @@ def main():
             print(f"[INFO] Saved new best model at epoch {epoch} (val_loss={best_val_loss:.4f})")
 
     # ------------------------------------------------------------------
-    # 4. Model evaluation: reconstruction stats on a single VAL batch
+    # 4. Final reconstruction diagnostics on a single VAL batch
     # ------------------------------------------------------------------
     model.eval()
     with torch.no_grad():
@@ -489,21 +245,18 @@ def main():
 
         x_cont = val_batch["x_cont"]    # [B, T, C_cont, H, W]
         x_cat  = val_batch["x_cat"]     # [B, T, C_cat, H, W] or None
-        aoi    = val_batch["aoi"]       # [B, H, W] or [B, 1, H, W]
 
         x_cont = x_cont.to(device)
         if x_cat is not None:
             x_cat = x_cat.to(device)
-        aoi    = aoi.to(device)
 
         B, T, C_cont, H, W = x_cont.shape
 
-        # --- forward preprocessing (same as in training) ---
-        x_bt = x_cont.view(B * T, C_cont, H, W)        # [B*T, C, H, W]
-        x_bt_norm = normalizer(x_bt)                   # normalized
+        # forward preprocessing (same as training)
+        x_bt = x_cont.view(B * T, C_cont, H, W)
+        x_bt_norm = normalizer(x_bt)
         x_cont_norm = x_bt_norm.view(B, T, C_cont, H, W)
 
-        # categorical → embeddings
         if cat_encoder is not None and x_cat is not None:
             x_cat_emb = cat_encoder(x_cat)
             x_all = torch.cat([x_cont_norm, x_cat_emb], dim=2)
@@ -511,28 +264,24 @@ def main():
             x_all = x_cont_norm
 
         B, T, C_all, H, W = x_all.shape
-        x_flat = x_all.view(B, T * C_all, H, W)        # [B, T*C, H, W]
+        x_flat = x_all.view(B, T * C_all, H, W)
 
-        recon, mu, logvar = model(x_flat)              # recon is normalized space
-
+        recon, mu, logvar = model(x_flat)
         recon_full = recon.view(B, T, C_all, H, W)
 
-        # --- back-transform reconstructions to physical space (continuous only) ---
-        recon_cont = recon_full[:, :, :C_cont, ...]       # [B, T, C_cont, H, W]
-        # Use reshape here as well for safety
-        recon_bt = recon_cont.reshape(B * T, C_cont, H, W)   # [B*T, C, H, W]
+        # continuous back-transform
+        recon_cont = recon_full[:, :, :C_cont, ...]
+        recon_bt = recon_cont.reshape(B * T, C_cont, H, W)
         recon_phys_bt = normalizer.unnormalize(recon_bt)
         recon_phys = recon_phys_bt.view(B, T, C_cont, H, W)
 
         x_phys_bt = normalizer.unnormalize(x_bt_norm)
         x_phys = x_phys_bt.view(B, T, C_cont, H, W)
 
-    # For sanity, look at one example & one feature over time flattened
-    x0_norm = x_flat[0].cpu().numpy()             # normalized, [T*C, H, W] flattened earlier
+    x0_norm = x_flat[0].cpu().numpy()
     r0_norm = recon[0].cpu().numpy()
 
-    # Back-transformed:
-    x0_phys = x_phys[0].cpu().numpy()            # [T, C, H, W]
+    x0_phys = x_phys[0].cpu().numpy()
     r0_phys = recon_phys[0].cpu().numpy()
 
     print("NORMALIZED (VAL example):")
@@ -547,7 +296,6 @@ def main():
     print("  input mean/std:", x0_phys.mean(), x0_phys.std())
     print("  recon mean/std:", r0_phys.mean(), r0_phys.std())
 
-    # Optional: categorical histograms if everything is available
     if (cat_encoder is not None) and (x_cat is not None) and (num_classes is not None):
         print_categorical_histograms(
             recon_full=recon_full,
