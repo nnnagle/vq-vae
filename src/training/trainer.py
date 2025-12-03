@@ -35,7 +35,8 @@ from src.data.patch_dataset import PatchDataset
 from src.data.categorical_meta import infer_categorical_meta_from_zarr
 
 from src.models.categorical_embedding import CategoricalEmbeddingEncoder
-from src.models.vae_v0 import ConvVAE
+#from src.models.vae_v0 import ConvVAE
+from src.models.forest_trajectory_ae import ForestTrajectoryAE
 from src.training.categorical_eval import print_categorical_histograms
 from src.training.loops import train_one_epoch, eval_one_epoch
 
@@ -86,6 +87,8 @@ class TrainConfig:
     Args:
         zarr_path:
             Path to the Zarr cube (VA cube).
+        time_steps:
+            Number of temporal steps T in the input trajectories.
         patch_size:
             Spatial patch size in pixels (e.g., 256).
         batch_size:
@@ -117,6 +120,7 @@ class TrainConfig:
     """
     # --- Data / model ------------------------------------------------------
     zarr_path: str
+    time_steps: int = 10
     patch_size: int = 256
     batch_size: int = 2
     num_epochs: int = 5
@@ -191,6 +195,7 @@ class TrainConfig:
         # Top-level scalars
         cfg = TrainConfig(
             zarr_path=raw["zarr_path"],
+            time_steps=int(raw.get("time_steps")),
             patch_size=int(raw.get("patch_size", 256)),
             batch_size=int(raw.get("batch_size", 2)),   # or 4 if you prefer
             num_epochs=int(raw.get("num_epochs", 5)),   # match your defaults
@@ -443,11 +448,29 @@ class Trainer:
         self.C_all = C_all
         self.in_channels = in_channels
 
+
     def _build_model_and_optimizer(self):
-        self.model = ConvVAE(in_channels=self.in_channels, latent_dim=128).to(self.device)
+        # ------------------------------------------------------------------
+        # Build model
+        # ------------------------------------------------------------------
+        # The trainer already computed self.in_channels = T * C_all
+        # So we also need time_steps. You already have it in config.
+        time_steps = self.cfg.time_steps   # or wherever T lives in your YAML
+        
+        self.model = ForestTrajectoryAE(
+            in_channels=self.in_channels,
+            time_steps=time_steps,
+            feature_channels=32,     # or make configurable later
+            temporal_hidden=64,      # or make configurable later
+        ).to(self.device)
+
+        # Keep categorical encoder behavior unchanged
         if self.cat_encoder is not None:
             self.cat_encoder = self.cat_encoder.to(self.device)
-    
+
+        # ------------------------------------------------------------------
+        # Optimizer
+        # ------------------------------------------------------------------
         opt_cfg = self.cfg.optimizer
         if opt_cfg.name.lower() != "adam":
             raise ValueError(f"Unsupported optimizer: {opt_cfg.name}")
@@ -657,6 +680,14 @@ class Trainer:
                     )
 
         print(f"[Trainer] Metrics written to {metrics_path}")
+        print("[Trainer] Training complete. Loading best checkpoint for diagnostics (if present).")
+        best_ckpt = self.ckpt_dir / "vae_v0_best.pt"
+        if best_ckpt.exists():
+            state = torch.load(best_ckpt, map_location=self.device)
+            self.model.load_state_dict(state["model_state"])
+            print(f"[Trainer] Loaded best checkpoint from {best_ckpt}")
+        else:
+            print("[Trainer] No best checkpoint found; using final-epoch weights.")
 
         # ------------------------------------------------------------------
         # Final diagnostics after training
@@ -666,81 +697,146 @@ class Trainer:
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
-
     @torch.no_grad()
     def _final_reconstruction_diagnostics(self):
         """
-        Run a small reconstruction diagnostic on a single VAL batch:
-          - summarize normalized + physical stats,
-          - optionally print categorical histograms.
+        Run a small reconstruction diagnostic on a single VAL batch.
+
+        This method:
+          - pulls one batch from the validation loader,
+          - runs it through the *current* model (ideally best checkpoint),
+          - summarizes normalized and physical-space stats for a single example,
+          - optionally prints categorical reconstruction histograms,
+          - optionally writes a simple spacetime reconstruction grid to disk.
+
+        Notes
+        -----
+        - This should be called after training, ideally after reloading the
+          best checkpoint on validation loss.
+        - The goal here is *sanity checking*, not full evaluation.
         """
+
+        # Put model in eval mode and ensure no gradients are tracked
         self.model.eval()
 
+        # ------------------------------------------------------------------
+        # 1. Get a single validation batch
+        # ------------------------------------------------------------------
         try:
             val_batch = next(iter(self.val_loader))
         except StopIteration:
             print("[Trainer] val_loader is empty; skipping reconstruction diagnostics.")
             return
 
-        x_cont = val_batch["x_cont"]    # [B, T, C_cont, H, W]
-        x_cat  = val_batch["x_cat"]     # [B, T, C_cat, H, W] or None
+        # Continuous features: [B, T, C_cont, H, W]
+        x_cont = val_batch["x_cont"].to(self.device)
 
-        x_cont = x_cont.to(self.device)
+        # Categorical features: [B, T, C_cat, H, W] or None
+        # Some datasets may not have categorical channels.
+        x_cat = val_batch.get("x_cat", None)
         if x_cat is not None:
             x_cat = x_cat.to(self.device)
 
-        B, T, C_cont, H, W = x_cont.shape
+        # Optional AOI mask: [B, H, W] (bool), for masking outside-forest pixels
+        aoi = val_batch.get("aoi", None)
+        if aoi is not None:
+            aoi = aoi.to(self.device)
 
-        # forward preprocessing (same as training)
+        B, T, C_cont, H, W = x_cont.shape
+        print("[Trainer] Running reconstruction diagnostics on VAL batch:")
+        print(f"  x_cont shape: B={B}, T={T}, C_cont={C_cont}, H={H}, W={W}")
+
+        # ------------------------------------------------------------------
+        # 2. Normalize continuous inputs (same as training)
+        # ------------------------------------------------------------------
+        # Training path is: [B, T, C_cont, H, W] -> [B*T, C_cont, H, W]
         x_bt = x_cont.view(B * T, C_cont, H, W)
+
+        # Apply normalizer to continuous channels only
+        # Result is still [B*T, C_cont, H, W] but in normalized space.
         x_bt_norm = self.normalizer(x_bt)
+
+        # Reshape back to [B, T, C_cont, H, W]
         x_cont_norm = x_bt_norm.view(B, T, C_cont, H, W)
 
+        # ------------------------------------------------------------------
+        # 3. Concatenate categorical embeddings, if present
+        # ------------------------------------------------------------------
         if self.cat_encoder is not None and x_cat is not None:
+            # cat_encoder is expected to map [B, T, C_cat, H, W] ->
+            # [B, T, C_emb, H, W]
             x_cat_emb = self.cat_encoder(x_cat)
+            # Concatenate along the channel (feature) dimension
             x_all = torch.cat([x_cont_norm, x_cat_emb], dim=2)
         else:
             x_all = x_cont_norm
 
         B, T, C_all, H, W = x_all.shape
+        print(f"  x_all shape (cont + cat_emb): B={B}, T={T}, C_all={C_all}")
+
+        # ------------------------------------------------------------------
+        # 4. Flatten time + channel for the ConvVAE input and run forward
+        # ------------------------------------------------------------------
+        # Model expects [B, C_in, H, W]; here we treat time × channels as C_in.
         x_flat = x_all.view(B, T * C_all, H, W)
 
+        # Forward pass through model: returns recon in same flattened shape
         recon, mu, logvar = self.model(x_flat)
+
+        # Bring recon back to [B, T, C_all, H, W]
         recon_full = recon.view(B, T, C_all, H, W)
 
-        # continuous back-transform
-        recon_cont = recon_full[:, :, :C_cont, ...]
+        # ------------------------------------------------------------------
+        # 5. Slice out continuous channels and unnormalize
+        # ------------------------------------------------------------------
+        # Continuous outputs: first C_cont channels
+        recon_cont = recon_full[:, :, :C_cont, ...]           # [B, T, C_cont, H, W]
+
+        # For unnormalizing, go back to [B*T, C_cont, H, W]
         recon_bt = recon_cont.reshape(B * T, C_cont, H, W)
+
+        # Unnormalize reconstructions to physical units
         recon_phys_bt = self.normalizer.unnormalize(recon_bt)
         recon_phys = recon_phys_bt.view(B, T, C_cont, H, W)
 
+        # Also unnormalize the (already normalized) inputs for comparison
         x_phys_bt = self.normalizer.unnormalize(x_bt_norm)
         x_phys = x_phys_bt.view(B, T, C_cont, H, W)
 
-        # Flatten one example for summary
-        x0_norm = x_flat[0].cpu().numpy()
-        r0_norm = recon[0].cpu().numpy()
+        # ------------------------------------------------------------------
+        # 6. Print summary stats for a single example (b=0)
+        # ------------------------------------------------------------------
+        # Normalized view: use x_bt_norm / recon_cont
+        x0_norm = x_bt_norm.view(B, T, C_cont, H, W)[0].detach().cpu().numpy()
+        r0_norm = recon_cont[0].detach().cpu().numpy()
 
-        x0_phys = x_phys[0].cpu().numpy()
-        r0_phys = recon_phys[0].cpu().numpy()
+        # Physical view: use x_phys / recon_phys
+        x0_phys = x_phys[0].detach().cpu().numpy()
+        r0_phys = recon_phys[0].detach().cpu().numpy()
 
-        print("NORMALIZED (VAL example):")
-        print("  input min/max:", x0_norm.min(), x0_norm.max())
-        print("  recon min/max:", r0_norm.min(), r0_norm.max())
-        print("  input mean/std:", x0_norm.mean(), x0_norm.std())
-        print("  recon mean/std:", r0_norm.mean(), r0_norm.std())
+        print("\n=== FINAL RECONSTRUCTION DIAGNOSTICS (VAL) ===")
+        print("NORMALIZED (VAL example b=0):")
+        print("  input   min/max:", x0_norm.min(), x0_norm.max())
+        print("  recon   min/max:", r0_norm.min(), r0_norm.max())
+        print("  input   mean/std:", x0_norm.mean(), x0_norm.std())
+        print("  recon   mean/std:", r0_norm.mean(), r0_norm.std())
 
-        print("\nPHYSICAL (VAL example):")
-        print("  input min/max:", x0_phys.min(), x0_phys.max())
-        print("  recon min/max:", r0_phys.min(), r0_phys.max())
-        print("  input mean/std:", x0_phys.mean(), x0_phys.std())
-        print("  recon mean/std:", r0_phys.mean(), r0_phys.std())
+        print("\nPHYSICAL (VAL example b=0):")
+        print("  input   min/max:", x0_phys.min(), x0_phys.max())
+        print("  recon   min/max:", r0_phys.min(), r0_phys.max())
+        print("  input   mean/std:", x0_phys.mean(), x0_phys.std())
+        print("  recon   mean/std:", r0_phys.mean(), r0_phys.std())
 
+        # ------------------------------------------------------------------
+        # 7. Optional categorical reconstruction histograms
+        # ------------------------------------------------------------------
         if (
             (self.cat_encoder is not None)
             and (x_cat is not None)
             and (self.num_classes is not None)
         ):
+            # print_categorical_histograms expects the *full* recon tensor
+            # including continuous + categorical-derived channels.
             print_categorical_histograms(
                 recon_full=recon_full,
                 x_cat=x_cat,
@@ -749,4 +845,42 @@ class Trainer:
                 C_cont=C_cont,
             )
         else:
-            print("[Trainer] skipping categorical histograms (no categorical encoder/data).")
+            print("[Trainer] Skipping categorical histograms "
+                  "(no categorical encoder/data).")
+
+        # ------------------------------------------------------------------
+        # 8. Optional spatial–temporal visualization to disk
+        # ------------------------------------------------------------------
+        # This is intentionally wrapped in a try/except so diagnostics do not
+        # crash training if plotting fails (e.g., missing dependency).
+        try:
+            from src.diagnostics.visualization import save_spacetime_recon_grid
+
+            diagnostics_dir = self.run_dir / "diagnostics"
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+            # Choose a feature to visualize. Here we pick index 0, and try to
+            # recover its name from the normalizer metadata if available.
+            feat_idx = 0
+            feat_name = None
+            if hasattr(self.normalizer, "feature_ids"):
+                if 0 <= feat_idx < len(self.normalizer.feature_ids):
+                    feat_name = self.normalizer.feature_ids[feat_idx]
+
+            out_path = diagnostics_dir / f"val_recon_spacetime_feat{feat_idx}.png"
+
+            print(f"[Trainer] Writing spacetime recon grid to: {out_path}")
+
+            save_spacetime_recon_grid(
+                x_phys=x_phys.detach().cpu(),
+                recon_phys=recon_phys.detach().cpu(),
+                aoi=aoi.detach().cpu() if aoi is not None else None,
+                out_path=out_path,
+                feature_idx=feat_idx,
+                feature_name=feat_name,
+                max_patches=4,
+            )
+        except Exception as e:
+            print(f"[Trainer] Warning: failed to write spacetime recon grid: {e}")
+
+ 
