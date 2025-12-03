@@ -22,6 +22,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+
 # Force a non-interactive backend for headless environments
 import matplotlib
 matplotlib.use("Agg")  # renders directly to files, never touches a display
@@ -36,6 +37,8 @@ def save_spacetime_recon_grid(
     feature_idx: int = 0,
     feature_name: Optional[str] = None,
     max_patches: int = 4,
+    select_most_dynamic: bool = False,
+    show_deltas: bool = False,
 ):
     """
     Save a grid figure comparing input vs. reconstruction for a single
@@ -68,14 +71,32 @@ def save_spacetime_recon_grid(
         Maximum number of patches (examples from the batch) to include in
         the visualization. Helps keep figures readable when batch size is large.
 
+    select_most_dynamic : bool
+        If True, select up to `max_patches` patches with the highest temporal
+        variance for this feature (based on x_phys), rather than the first
+        `max_patches` in the batch.
+
+    show_deltas : bool
+        If True, add extra rows per patch showing temporal differences:
+        x(t) - x(0) and recon(t) - recon(0). This makes temporal changes
+        visually obvious, especially when the base field is mostly stable.
 
     Notes
     -----
-    The layout is:
+    Base layout (show_deltas=False):
         - Rows: for each selected patch, first row = input, second = recon.
         - Columns: time dimension.
-    Each subplot uses a shared vmin/vmax across the whole figure to ensure
-    visual comparability between inputs and reconstructions.
+
+    With show_deltas=True:
+        - Rows per patch:
+            0: input
+            1: recon
+            2: input delta (x(t) - x(0))
+            3: recon delta (recon(t) - recon(0))
+
+    Each subplot uses a shared vmin/vmax across the whole figure for the
+    raw values, and a separate symmetric color range for the deltas to
+    highlight change.
     """
 
     out_path = Path(out_path)
@@ -86,26 +107,67 @@ def save_spacetime_recon_grid(
     r_np = recon_phys.numpy()
     B, T, C, H, W = x_np.shape
 
-    # Limit to the requested subset of patches.
-    b_sel = min(B, max_patches)
-
-    # Extract the single feature channel.
-    x_np = x_np[:b_sel, :, feature_idx]  # -> [b_sel, T, H, W]
-    r_np = r_np[:b_sel, :, feature_idx]
+    # Extract the single feature channel: [B, T, H, W]
+    x_feat = x_np[:, :, feature_idx]
+    r_feat = r_np[:, :, feature_idx]
 
     # AOI mask, if present.
     if aoi is not None:
-        aoi_np = aoi[:b_sel].numpy()  # shape [b_sel, H, W]
+        aoi_np = aoi.numpy()  # shape [B, H, W]
     else:
         aoi_np = None
 
-    # Shared color limits across all subplots.
-    # Using min/max of inputs makes differences more visible.
-    vmin = np.nanmin(x_np)
-    vmax = np.nanmax(x_np)
+    # Determine which patches to plot.
+    if select_most_dynamic and B > 1:
+        # Temporal variance for each patch: mean over H,W of var over T.
+        # x_feat: [B, T, H, W] -> var over T -> [B, H, W] -> mean over H,W -> [B]
+        var_t = np.var(x_feat, axis=1)             # [B, H, W]
+        patch_scores = var_t.mean(axis=(1, 2))     # [B]
+        order = np.argsort(patch_scores)[::-1]     # descending
+    else:
+        # Default: keep original batch order.
+        order = np.arange(B)
 
-    # Number of rows: two per patch (input/recon).
-    nrows = b_sel * 2
+    b_sel = min(B, max_patches)
+    sel_indices = order[:b_sel]
+
+    x_sel = x_feat[sel_indices]        # [b_sel, T, H, W]
+    r_sel = r_feat[sel_indices]        # [b_sel, T, H, W]
+    if aoi_np is not None:
+        aoi_sel = aoi_np[sel_indices]  # [b_sel, H, W]
+    else:
+        aoi_sel = None
+
+    # Shared color limits across all raw-value subplots.
+    # Using min/max of inputs makes differences more visible.
+    vmin = np.nanmin(x_sel)
+    vmax = np.nanmax(x_sel)
+
+    # If we are plotting deltas, precompute them now.
+    if show_deltas:
+        # x(t) - x(0) and recon(t) - recon(0)
+        x0 = x_sel[:, 0:1, :, :]          # [b_sel, 1, H, W]
+        r0 = r_sel[:, 0:1, :, :]
+
+        dx = x_sel - x0                   # [b_sel, T, H, W]
+        dr = r_sel - r0
+
+        # Shared symmetric color range across both input and recon deltas.
+        max_abs = np.nanmax(
+            np.abs(np.concatenate([dx.reshape(-1), dr.reshape(-1)], axis=0))
+        )
+        if max_abs == 0 or not np.isfinite(max_abs):
+            dvmin, dvmax = -1.0, 1.0
+        else:
+            dvmin, dvmax = -max_abs, max_abs
+
+        rows_per_patch = 4
+    else:
+        dx = dr = None
+        dvmin = dvmax = None
+        rows_per_patch = 2
+
+    nrows = b_sel * rows_per_patch
     ncols = T
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(2 * ncols, 2 * nrows))
@@ -117,19 +179,29 @@ def save_spacetime_recon_grid(
         axes = np.expand_dims(axes, 1)
 
     # Populate the subplot grid.
-    for b in range(b_sel):
-        for t in range(T):
-            # Input subplot
-            ax_in = axes[2 * b, t]
-            img_in = x_np[b, t].copy()
+    for i, b in enumerate(sel_indices):
+        # Index in the selected arrays
+        bi = i
 
+        for t in range(T):
+            # Row offsets for this patch
+            base_row = i * rows_per_patch
+
+            # -----------------------------
+            # Input subplot
+            # -----------------------------
+            ax_in = axes[base_row, t]
+            img_in = x_sel[bi, t].copy()
+
+            # -----------------------------
             # Recon subplot
-            ax_re = axes[2 * b + 1, t]
-            img_re = r_np[b, t].copy()
+            # -----------------------------
+            ax_re = axes[base_row + 1, t]
+            img_re = r_sel[bi, t].copy()
 
             # Mask out regions outside AOI (if provided).
-            if aoi_np is not None:
-                mask = ~aoi_np[b]  # True where outside AOI
+            if aoi_sel is not None:
+                mask = ~aoi_sel[bi]  # True where outside AOI
                 img_in[mask] = np.nan
                 img_re[mask] = np.nan
 
@@ -143,17 +215,50 @@ def save_spacetime_recon_grid(
             ax_re.set_xticks([])
             ax_re.set_yticks([])
 
-            # Titles and labels to help navigation.
-            if b == 0:
+            # Titles on the top patch only.
+            if i == 0:
                 ax_in.set_title(f"t={t}")
 
+            # Row labels on the first column only.
             if t == 0:
                 ax_in.set_ylabel(f"patch {b} in", rotation=90)
                 ax_re.set_ylabel(f"patch {b} recon", rotation=90)
 
+            # -----------------------------
+            # Optional delta subplots
+            # -----------------------------
+            if show_deltas:
+                ax_din = axes[base_row + 2, t]
+                ax_dre = axes[base_row + 3, t]
+
+                img_din = dx[bi, t].copy()
+                img_dre = dr[bi, t].copy()
+
+                if aoi_sel is not None:
+                    mask = ~aoi_sel[bi]
+                    img_din[mask] = np.nan
+                    img_dre[mask] = np.nan
+
+                ax_din.imshow(img_din, vmin=dvmin, vmax=dvmax)
+                ax_din.set_xticks([])
+                ax_din.set_yticks([])
+
+                ax_dre.imshow(img_dre, vmin=dvmin, vmax=dvmax)
+                ax_dre.set_xticks([])
+                ax_dre.set_yticks([])
+
+                if t == 0:
+                    ax_din.set_ylabel(f"patch {b} Δ in", rotation=90)
+                    ax_dre.set_ylabel(f"patch {b} Δ recon", rotation=90)
+
     # Figure title: include feature name if available.
     feat_label = feature_name if feature_name is not None else f"feature_{feature_idx}"
-    fig.suptitle(f"Spacetime reconstruction: {feat_label}", fontsize=10)
+    dynamic_note = " (most dynamic patches)" if select_most_dynamic else ""
+    delta_note = " + deltas" if show_deltas else ""
+    fig.suptitle(
+        f"Spacetime reconstruction: {feat_label}{dynamic_note}{delta_note}",
+        fontsize=10,
+    )
 
     # Make layout tight and save the figure.
     fig.tight_layout()

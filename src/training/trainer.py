@@ -879,6 +879,8 @@ class Trainer:
                 feature_idx=feat_idx,
                 feature_name=feat_name,
                 max_patches=4,
+                select_most_dynamic=True,
+                show_deltas=True,
             )
         except Exception as e:
             print(f"[Trainer] Warning: failed to write spacetime recon grid: {e}")
