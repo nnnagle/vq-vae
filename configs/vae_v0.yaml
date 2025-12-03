@@ -4,12 +4,28 @@ zarr_path: "/data/VA/zarr/va_cube.zarr"
 
 patch_size: 256
 batch_size: 4
-num_epochs: 20
-lr: 1e-4
+num_epochs: 200
 
 beta: 0.1
 lambda_cat: 1.0
 
+optimizer:
+  name: adam
+  lr: 1e-4
+  weight_decay: 0.0
+  scheduler:
+    name: cosine
+    T_max_epochs: 150    # often == num_epochs
+    eta_min: 1.0e-6
+
+beta_schedule:
+  enabled: true
+  schedule_type: linear
+  start_epoch: 0
+  end_epoch: 100
+  start_value: 0.1
+  end_value: 1.0
+  
 debug_window: true
 
 # Used if debug_window: true

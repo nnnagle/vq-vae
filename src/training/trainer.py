@@ -9,12 +9,19 @@
 #   - manage a simple "best checkpoint" on validation loss,
 #   - run a final reconstruction diagnostic pass.
 #
+# @dataclass class SchedulerConfig:
+# @dataclass class OptimizerConfig
+# @dataclass class TrainConfig:
+# @dataclass class BetaScheduleConfig
+# class Trainer
+
+
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import yaml
 import csv 
 
@@ -32,7 +39,45 @@ from src.models.vae_v0 import ConvVAE
 from src.training.categorical_eval import print_categorical_histograms
 from src.training.loops import train_one_epoch, eval_one_epoch
 
+@dataclass
+class SchedulerConfig:
+    """
+    Learning rate scheduler configuration.
 
+    Supported:
+      - name="none"
+      - name="cosine": uses T_max_epochs, eta_min
+      - name="step": uses milestones, gamma
+    """
+    name: str = "none"
+    T_max_epochs: Optional[int] = None
+    eta_min: float = 1e-6
+
+    milestones: List[int] = field(default_factory=list)
+    gamma: float = 0.1
+
+@dataclass
+class OptimizerConfig:
+    """
+    Optimizer configuration (currently Adam-only in code).
+    """
+    name: str = "adam"
+    lr: float = 1e-4
+    weight_decay: float = 0.0
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+@dataclass
+class BetaScheduleConfig:
+    """
+    Beta (KL weight) annealing configuration.
+    """
+    enabled: bool = False
+    schedule_type: str = "linear"  # ["linear", "cosine"]
+    start_epoch: int = 0
+    end_epoch: int = 0
+    start_value: float = 0.1
+    end_value: float = 0.1
+    
 @dataclass
 class TrainConfig:
     """
@@ -70,50 +115,139 @@ class TrainConfig:
         ckpt_dir:
             Directory in which to store checkpoints.
     """
+    # --- Data / model ------------------------------------------------------
     zarr_path: str
     patch_size: int = 256
     batch_size: int = 2
     num_epochs: int = 5
-    lr: float = 1e-4
+    
+    # --- Loss weighting ----------------------------------------------------
     beta: float = 0.1
     lambda_cat: float = 1.0
+    beta_schedule: BetaScheduleConfig = field(default_factory=BetaScheduleConfig)
 
+    # --- Optimization ------------------------------------------------------
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+    # --- Spatial / debug ---------------------------------------------------
     debug_window: bool = True
     debug_window_origin: Tuple[int, int] = (256 * 10, 256 * 20)   # (y0, x0)
     debug_window_size: Tuple[int, int] = (1024, 1024)             # (H, W)
     debug_block_dims: Tuple[int, int] = (1, 1)                    # (H_blocks, W_blocks)
-
     full_block_dims: Tuple[int, int] = (7, 7)
 
+    # --- DataLoader --------------------------------------------------------
     num_workers: int = 0
     pin_memory: bool = True
 
-    run_root: str = "runs"              # parent directory for all experiments
-    experiment_name: str = "vae_v0"     # subdirectory per experiment
-    ckpt_dir: str = "checkpoints"       # subdirectory inside run_dir for checkpoints
+    # --- Run management ----------------------------------------------------
+    run_root: str = "runs"
+    experiment_name: str = "vae_v0"
+    ckpt_dir: str = "checkpoints"
 
 
     @staticmethod
     def from_yaml(path: str | Path) -> "TrainConfig":
         """
-        Load TrainConfig from a YAML file and return a populated dataclass.
+        Load TrainConfig from a YAML file with the structured schema.
         """
         path = Path(path)
         with open(path, "r") as f:
-            cfg = yaml.safe_load(f)
+            raw = yaml.safe_load(f)
 
-        # Coerce some known scalars to the right types in case YAML had quotes.
-        for key in ("lr", "beta", "lambda_cat"):
-            if key in cfg:
-                cfg[key] = float(cfg[key])
+        # Convert lists -> tuples for spatial fields
+        for key in (
+            "debug_window_origin",
+            "debug_window_size",
+            "debug_block_dims",
+            "full_block_dims",
+        ):
+            if key in raw and isinstance(raw[key], list):
+                raw[key] = tuple(raw[key])
 
-        # Tuples: allow YAML lists and convert
-        for key in ("debug_window_origin", "debug_window_size",
-                    "debug_block_dims", "full_block_dims"):
-            if key in cfg:
-                cfg[key] = tuple(cfg[key])
+        # Optimizer block
+        opt_raw = raw.get("optimizer", {})
+        sched_raw = opt_raw.get("scheduler", {})
 
-        return TrainConfig(**cfg)
+        scheduler = SchedulerConfig(**sched_raw) if sched_raw else SchedulerConfig()
+        optimizer = OptimizerConfig(
+            name=opt_raw.get("name", "adam"),
+            lr=float(opt_raw.get("lr", 1e-4)),
+            weight_decay=float(opt_raw.get("weight_decay", 0.0)),
+            scheduler=scheduler,
+        )
+
+        # Beta schedule block
+        bs_raw = raw.get("beta_schedule", {})
+        beta_schedule = BetaScheduleConfig(
+            enabled=bool(bs_raw.get("enabled", False)),
+            schedule_type=bs_raw.get("schedule_type", "linear"),
+            start_epoch=int(bs_raw.get("start_epoch", 0)),
+            end_epoch=int(bs_raw.get("end_epoch", raw.get("num_epochs", 20))),
+            start_value=float(bs_raw.get("start_value", raw.get("beta", 0.1))),
+            end_value=float(bs_raw.get("end_value", raw.get("beta", 0.1))),
+        )
+
+        # Top-level scalars
+        cfg = TrainConfig(
+            zarr_path=raw["zarr_path"],
+            patch_size=int(raw.get("patch_size", 256)),
+            batch_size=int(raw.get("batch_size", 2)),   # or 4 if you prefer
+            num_epochs=int(raw.get("num_epochs", 5)),   # match your defaults
+            beta=float(raw.get("beta", 0.1)),
+            lambda_cat=float(raw.get("lambda_cat", 1.0)),
+            beta_schedule=beta_schedule,
+            optimizer=optimizer,
+            debug_window=bool(raw.get("debug_window", True)),
+            debug_window_origin=raw.get("debug_window_origin", (256 * 10, 256 * 20)),
+            debug_window_size=raw.get("debug_window_size", (1024, 1024)),
+            debug_block_dims=raw.get("debug_block_dims", (1, 1)),
+            full_block_dims=raw.get("full_block_dims", (7, 7)),
+            num_workers=int(raw.get("num_workers", 0)),
+            pin_memory=bool(raw.get("pin_memory", True)),
+            run_root=raw.get("run_root", "runs"),
+            experiment_name=raw.get("experiment_name", "vae_v0"),
+            ckpt_dir=raw.get("ckpt_dir", "checkpoints"),
+        )
+
+        return cfg
+
+class BetaScheduler:
+    """
+    Simple epoch-based beta scheduler.
+
+    Supports:
+      - 'linear'
+      - 'cosine'
+    """
+
+    def __init__(self, start_epoch, end_epoch, start_value, end_value, schedule_type="linear"):
+        assert end_epoch >= start_epoch, "end_epoch must be >= start_epoch"
+        self.start_epoch = start_epoch
+        self.end_epoch = end_epoch
+        self.start_value = start_value
+        self.end_value = end_value
+        self.schedule_type = schedule_type.lower()
+
+    def __call__(self, epoch: int) -> float:
+        # Before the ramp
+        if epoch <= self.start_epoch:
+            return self.start_value
+
+        # After the ramp
+        if epoch >= self.end_epoch:
+            return self.end_value
+
+        # Fraction in [0, 1]
+        t = (epoch - self.start_epoch) / max(1, (self.end_epoch - self.start_epoch))
+
+        if self.schedule_type == "cosine":
+            import math
+            cos_t = 0.5 * (1.0 - math.cos(math.pi * t))
+            return self.start_value + (self.end_value - self.start_value) * cos_t
+
+        # Default: linear
+        return self.start_value + (self.end_value - self.start_value) * t
 
 
 class Trainer:
@@ -147,7 +281,7 @@ class Trainer:
         # Save a copy of the config into the run directory for reproducibility
         cfg_out = self.run_dir / "config_resolved.yaml"
         with open(cfg_out, "w") as f:
-            yaml.safe_dump(self.cfg.__dict__, f)
+            yaml.safe_dump(asdict(self.cfg), f)
         print(f"[Trainer] Saved resolved config to {cfg_out}")
         
         
@@ -310,14 +444,86 @@ class Trainer:
         self.in_channels = in_channels
 
     def _build_model_and_optimizer(self):
-        """
-        Build ConvVAE model and optimizer, and move everything to the target device.
-        """
         self.model = ConvVAE(in_channels=self.in_channels, latent_dim=128).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.cfg.lr)
-
         if self.cat_encoder is not None:
             self.cat_encoder = self.cat_encoder.to(self.device)
+    
+        opt_cfg = self.cfg.optimizer
+        if opt_cfg.name.lower() != "adam":
+            raise ValueError(f"Unsupported optimizer: {opt_cfg.name}")
+
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=opt_cfg.lr,
+            weight_decay=opt_cfg.weight_decay,
+        )
+
+
+        # -------------------------------------------------------------
+        # LR Scheduler
+        # -------------------------------------------------------------
+        sched_cfg = opt_cfg.scheduler
+        sched_name = sched_cfg.name.lower()
+
+        self.scheduler = None
+
+        if sched_name == "none":
+            print("[Trainer] No LR scheduler.")
+
+        elif sched_name == "cosine":
+            # Use T_max_epochs if provided, otherwise num_epochs
+            T_max = sched_cfg.T_max_epochs or self.cfg.num_epochs
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=T_max,
+                eta_min=sched_cfg.eta_min,
+            )
+            print(
+                f"[Trainer] LR Scheduler: CosineAnnealingLR("
+                f"T_max={T_max}, eta_min={sched_cfg.eta_min})"
+            )
+
+        elif sched_name == "step":
+            milestones = sched_cfg.milestones
+            if not milestones:
+                # If user didn't supply, default to a single step at 70% of training
+                milestones = [int(0.7 * self.cfg.num_epochs)]
+
+            self.scheduler = optim.lr_scheduler.MultiStepLR(
+                self.optimizer,
+                milestones=milestones,
+                gamma=sched_cfg.gamma,
+            )
+            print(
+                f"[Trainer] LR Scheduler: MultiStepLR("
+                f"milestones={milestones}, gamma={sched_cfg.gamma})"
+            )
+
+        else:
+            raise ValueError(f"Unsupported scheduler: {sched_cfg.name}")
+
+        # -------------------------------------------------------------
+        # Beta scheduler (KL weight annealing)
+        # -------------------------------------------------------------
+        bs = self.cfg.beta_schedule
+
+        if bs.enabled:
+            self.beta_scheduler = BetaScheduler(
+                start_epoch=bs.start_epoch,
+                end_epoch=bs.end_epoch,
+                start_value=bs.start_value,
+                end_value=bs.end_value,
+                schedule_type=bs.schedule_type,
+            )
+            print(
+                f"[Trainer] BetaScheduler enabled: "
+                f"{bs.schedule_type} from {bs.start_value} → {bs.end_value} "
+                f"over epochs {bs.start_epoch}–{bs.end_epoch}"
+            )
+        else:
+            self.beta_scheduler = None
+            print(f"[Trainer] BetaScheduler disabled (constant beta={self.cfg.beta}).")
+
 
     # ------------------------------------------------------------------
     # Public API
@@ -333,7 +539,7 @@ class Trainer:
         """
         print(
             f"[Trainer] Starting training for {self.cfg.num_epochs} epochs "
-            f"(beta={self.cfg.beta}, lambda_cat={self.cfg.lambda_cat})"
+            f"(initial beta={self.cfg.beta}, lambda_cat={self.cfg.lambda_cat})"
         )
 
         # Path to metrics CSV inside the run directory
@@ -343,10 +549,17 @@ class Trainer:
         with open(metrics_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
-                ["epoch", "split", "loss", "cont_recon", "cat_loss", "kl"]
+                ["epoch", "split", "loss", "cont_recon", "cat_loss", "kl", "beta", "lr"]
             )
 
             for epoch in range(self.cfg.num_epochs):
+                # ---- Determine beta for this epoch ----
+                if self.beta_scheduler is not None:
+                    beta = self.beta_scheduler(epoch)
+                else:
+                    beta = self.cfg.beta
+
+            
                 # ------------------------------
                 # Training epoch
                 # ------------------------------
@@ -357,7 +570,7 @@ class Trainer:
                     device=self.device,
                     normalizer=self.normalizer,
                     cat_encoder=self.cat_encoder,
-                    beta=self.cfg.beta,
+                    beta=beta,
                     lambda_cat=self.cfg.lambda_cat,
                 )
 
@@ -370,9 +583,12 @@ class Trainer:
                     device=self.device,
                     normalizer=self.normalizer,
                     cat_encoder=self.cat_encoder,
-                    beta=self.cfg.beta,
+                    beta=beta,
                     lambda_cat=self.cfg.lambda_cat,
                 )
+                
+                # ---- Current LR ----
+                current_lr = self.optimizer.param_groups[0]["lr"]
 
                 # Console summary (same as before)
                 print(
@@ -398,6 +614,8 @@ class Trainer:
                         train_metrics["cont_recon"],
                         train_metrics["cat_loss"],
                         train_metrics["kl"],
+                        beta, 
+                        current_lr,
                     ]
                 )
                 writer.writerow(
@@ -408,8 +626,14 @@ class Trainer:
                         val_metrics["cont_recon"],
                         val_metrics["cat_loss"],
                         val_metrics["kl"],
+                        beta, 
+                        current_lr,
                     ]
                 )
+                
+                # ---- LR scheduler step (epoch-wise schedulers) ----
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
                 # ------------------------------
                 # Best-checkpoint update
@@ -422,7 +646,7 @@ class Trainer:
                             "model_state": self.model.state_dict(),
                             "optimizer_state": self.optimizer.state_dict(),
                             "epoch": epoch,
-                            "beta": self.cfg.beta,
+                            "beta": beta,
                             "lambda_cat": self.cfg.lambda_cat,
                         },
                         ckpt_path,
