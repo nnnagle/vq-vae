@@ -129,7 +129,13 @@ class TrainConfig:
     beta: float = 0.1
     lambda_cat: float = 1.0
     beta_schedule: BetaScheduleConfig = field(default_factory=BetaScheduleConfig)
-
+    lambda_delta: float = 10.0           # weight on delta-from-final loss
+    lambda_deriv: float = 10.0           # weight on temporal derivative loss
+    w_final: float = 2.0                 # extra weight on final timestep in recon
+    change_thresh: float = 0.05          # threshold for |dx| / |d/dt x|
+    time_channels: List[int] = field(    # which continuous channels get temporal loss
+        default_factory=lambda: [0]
+    )
     # --- Optimization ------------------------------------------------------
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
@@ -191,6 +197,12 @@ class TrainConfig:
             start_value=float(bs_raw.get("start_value", raw.get("beta", 0.1))),
             end_value=float(bs_raw.get("end_value", raw.get("beta", 0.1))),
         )
+        
+        lambda_delta = float(raw.get("lambda_delta", 10.0))
+        lambda_deriv = float(raw.get("lambda_deriv", 10.0))
+        w_final = float(raw.get("w_final", 2.0))
+        change_thresh = float(raw.get("change_thresh", 0.05))
+        time_channels = raw.get("time_channels", [0])
 
         # Top-level scalars
         cfg = TrainConfig(
@@ -202,6 +214,11 @@ class TrainConfig:
             beta=float(raw.get("beta", 0.1)),
             lambda_cat=float(raw.get("lambda_cat", 1.0)),
             beta_schedule=beta_schedule,
+            lambda_delta=lambda_delta,
+            lambda_deriv=lambda_deriv,
+            w_final=w_final,
+            change_thresh=change_thresh,
+            time_channels=time_channels,
             optimizer=optimizer,
             debug_window=bool(raw.get("debug_window", True)),
             debug_window_origin=raw.get("debug_window_origin", (256 * 10, 256 * 20)),

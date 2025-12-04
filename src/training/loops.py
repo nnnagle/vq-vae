@@ -20,6 +20,7 @@ import torch
 from torch import Tensor
 from src.training.losses import ForestTrajectoryVAELoss
 
+CHANNEL_INDICES = [0]
 
 def train_one_epoch(
     model: torch.nn.Module,
@@ -30,6 +31,11 @@ def train_one_epoch(
     cat_encoder,
     beta: float,
     lambda_cat: float,
+    lambda_delta: float = 10.0,
+    lambda_deriv: float = 10.0,
+    w_final: float = 2.0,
+    change_thresh: float = 0.05 ,
+    time_channel_indices: list[int] | None = None,
 ) -> Dict[str, float]:
     """
     Single training epoch over the TRAIN split.
@@ -71,12 +77,11 @@ def train_one_epoch(
     loss_fn = ForestTrajectoryVAELoss(
         beta=beta,
         lambda_cat=lambda_cat,
-        # optionally override defaults:
-        # lambda_delta=LAMBDA_DELTA,
-        # lambda_deriv=LAMBDA_DERIV,
-        # w_final=2.0,
-        # channel_indices=[0],
-        # change_thresh=0.05,
+        lambda_delta=lambda_delta,
+        lambda_deriv=lambda_deriv,
+        w_final=w_final,
+        channel_indices=time_channel_indices,
+        change_thresh=change_thresh,
     )
 
     total_loss = 0.0
@@ -189,6 +194,11 @@ def eval_one_epoch(
     cat_encoder,
     beta: float,
     lambda_cat: float,
+    lambda_delta: float =10,
+    lambda_deriv: float = 20,
+    w_final: float = 2.0,
+    change_thresh: float = 0.05 ,
+    time_channel_indices: list[int] | None = None,
 ) -> Dict[str, float]:
     """
     Single evaluation epoch over the VAL split.
@@ -212,7 +222,11 @@ def eval_one_epoch(
     loss_fn = ForestTrajectoryVAELoss(
         beta=beta,
         lambda_cat=lambda_cat,
-        # optional overrides same as in train_one_epoch
+        lambda_delta=lambda_delta,
+        lambda_deriv=lambda_deriv,
+        w_final=w_final,
+        channel_indices=time_channel_indices,
+        change_thresh=change_thresh,
     )
     
     total_loss = 0.0
