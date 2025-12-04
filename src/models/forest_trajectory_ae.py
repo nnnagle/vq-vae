@@ -1,4 +1,3 @@
-#src/model/ForestTrajectoryAE.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -105,12 +104,11 @@ class ForestTrajectoryAE(nn.Module):
       - Reshapes to [B, T, C_per_timestep, H, W].
       - Applies a 1x1 conv "feature embedding" per timestep: C_per_timestep -> feature_channels.
       - Runs a 1D temporal encoder per pixel (sequence over T).
-      - Applies a 2D dilated residual stack over space (spatial context).
-      - Decodes back to [B, C_in, H, W] via a simple temporal decoder + 1x1 conv.
-
-    This is a deterministic autoencoder: we return (recon, mu, logvar) only
-    so we can drop it into the existing VAE trainer. mu/logvar are zeros, so
-    any KL term will be identically zero.
+      - Splits temporal representation into:
+          * z_traj (trajectory-type code, size = feature_channels)
+          * age (scalar "time since event").
+      - Applies a 2D dilated residual stack over space on z_traj.
+      - Decodes using both z_traj (via latent) and age.
     """
 
     def __init__(
@@ -149,7 +147,7 @@ class ForestTrajectoryAE(nn.Module):
         # Temporal encoder (per pixel)
         #   - reshape to [B*H*W, feature_channels, T]
         #   - Conv1d proj + a couple of ResBlock1d
-        #   - mean over time -> [B*H*W, temporal_hidden]
+        #   - learned aggregator over time -> [B*H*W, temporal_hidden]
         # ------------------------------------------------------------------
         self.temporal_proj = nn.Conv1d(
             in_channels=self.feature_channels,
@@ -163,13 +161,25 @@ class ForestTrajectoryAE(nn.Module):
             ]
         )
 
+        # Learned temporal aggregation across the full sequence
+        self.temporal_agg = nn.Conv1d(
+            in_channels=self.temporal_hidden,
+            out_channels=self.temporal_hidden,
+            kernel_size=self.time_steps,  # span entire T
+            padding=0,
+        )
+
+        # Heads: trajectory-type code and age (time-since-event scalar)
+        self.traj_head = nn.Linear(self.temporal_hidden, self.feature_channels)
+        self.age_head = nn.Linear(self.temporal_hidden, 1)
+
         # ------------------------------------------------------------------
         # Spatial context: 2D dilated residual stack
-        # Input:  [B, temporal_hidden, H, W]
+        # Input:  [B, feature_channels, H, W]  (z_traj map)
         # Output: [B, feature_channels, H, W]  (via channel projection)
         # ------------------------------------------------------------------
         self.spatial_blocks = nn.Sequential(
-            ResDilatedBlock2d(self.temporal_hidden, 64, kernel_size=3, dilation=1),
+            ResDilatedBlock2d(self.feature_channels, 64, kernel_size=3, dilation=1),
             ResDilatedBlock2d(64, 64, kernel_size=3, dilation=2),
             ResDilatedBlock2d(64, 64, kernel_size=3, dilation=4),
             ResDilatedBlock2d(64, 64, kernel_size=3, dilation=8),
@@ -179,20 +189,22 @@ class ForestTrajectoryAE(nn.Module):
 
         # ------------------------------------------------------------------
         # Decoder:
-        #   code_to_traj:   [B, feature_channels, H, W] -> [B, 64, H, W]
-        #   temporal_dec:   [B, 64, H, W] -> [B, T*feature_channels, H, W]
+        #   latent: [B, feature_channels, H, W]
+        #   age:    [B, 1, H, W]
+        #   concat -> [B, feature_channels+1, H, W]
+        #   code_to_traj:   -> [B, 64, H, W]
+        #   temporal_dec:   -> [B, T*feature_channels, H, W]
         #   feature_dec:    per-timestep 1x1 conv to C_per_t
         # ------------------------------------------------------------------
         self.code_to_traj = nn.Sequential(
             nn.Conv2d(
-                in_channels=self.feature_channels,
+                in_channels=self.feature_channels + 1,  # +1 for age channel
                 out_channels=64,
                 kernel_size=1,
             ),
             nn.SiLU(),
         )
 
-        # per-pixel linear map 64 -> T*feature_channels with nonlinearity
         self.temporal_decoder = nn.Sequential(
             nn.Conv2d(
                 in_channels=64,
@@ -207,6 +219,7 @@ class ForestTrajectoryAE(nn.Module):
             out_channels=self.c_per_t,
             kernel_size=1,
         )
+
     # ----------------------------------------------------------------------
     # Forward
     # ----------------------------------------------------------------------
@@ -247,39 +260,54 @@ class ForestTrajectoryAE(nn.Module):
             .view(B * H * W, self.feature_channels, T)
         )
 
-        h = self.temporal_proj(x_seq)
+        h = self.temporal_proj(x_seq)  # [B*H*W, temporal_hidden, T]
         for block in self.temporal_blocks:
             h = block(h)
 
-        # "attention pool": simple mean over time
-        h_pool = h.mean(dim=-1)  # [B*H*W, temporal_hidden]
+        # Learned aggregation over time
+        # h: [N, temporal_hidden, T] -> [N, temporal_hidden, 1] -> [N, temporal_hidden]
+        h_pool = self.temporal_agg(h).squeeze(-1)
 
-        # reshape back to spatial feature map [B, temporal_hidden, H, W]
-        h_spatial = (
-            h_pool.view(B, H, W, self.temporal_hidden)
+        # Split into trajectory code and age
+        z_traj = self.traj_head(h_pool)         # [N, feature_channels]
+        age = self.age_head(h_pool)             # [N, 1]
+
+        # Reshape to spatial maps
+        z_traj_map = (
+            z_traj.view(B, H, W, self.feature_channels)
             .permute(0, 3, 1, 2)
             .contiguous()
-        )
+        )  # [B, feature_channels, H, W]
+
+        age_map = (
+            age.view(B, H, W, 1)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )  # [B, 1, H, W]
 
         # --------------------------------------------------------------
-        # Spatial context with dilated residual blocks
+        # Spatial context on trajectory-type code
         # --------------------------------------------------------------
-        h_ctx = self.spatial_blocks(h_spatial)
-        latent = self.channel_proj(h_ctx)  # [B, feature_channels, H, W]
+        h_ctx = self.spatial_blocks(z_traj_map)
+        h_ctx = self.channel_proj(h_ctx)  # [B, feature_channels, H, W]
+        
+        latent = z_traj_map + h_ctx # [B, feature_channels, H, W]
 
         # --------------------------------------------------------------
-        # Decoder
+        # Decoder (conditioned on age)
         # --------------------------------------------------------------
-        d = self.code_to_traj(latent)                # [B, 64, H, W]
-        d = self.temporal_decoder(d)                 # [B, T*feature_channels, H, W]
+        latent_with_age = torch.cat([latent, age_map], dim=1)  # [B, feature_channels+1, H, W]
+
+        d = self.code_to_traj(latent_with_age)          # [B, 64, H, W]
+        d = self.temporal_decoder(d)                    # [B, T*feature_channels, H, W]
         d = d.view(B, T, self.feature_channels, H, W)
 
         # Per-timestep 1x1 conv to original per-time channels
         d_flat = d.view(B * T, self.feature_channels, H, W)
-        out_per_t = self.feature_decoder(d_flat)     # [B*T, C_per_t, H, W]
+        out_per_t = self.feature_decoder(d_flat)        # [B*T, C_per_t, H, W]
 
         recon = out_per_t.view(B, T * self.c_per_t, H, W)
-        
+
         # Dummy mu/logvar so Trainer's VAE code doesn't break
         mu = x.new_zeros(B, 1)
         logvar = x.new_zeros(B, 1)

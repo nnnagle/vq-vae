@@ -4,7 +4,7 @@ zarr_path: "/data/VA/zarr/va_cube.zarr"
 
 time_steps: 10
 patch_size: 256
-batch_size: 1
+batch_size: 2
 num_epochs: 50
 
 beta: 0.1
@@ -47,5 +47,5 @@ num_workers: 0
 pin_memory: true
 
 run_root: "runs"
-experiment_name: "forest_trajectory_v0_debug1"
+experiment_name: "forest_trajectory_v0_debug3"
 ckpt_dir: "checkpoints"
