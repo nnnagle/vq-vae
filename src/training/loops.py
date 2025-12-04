@@ -18,17 +18,7 @@ from typing import Dict, Any
 
 import torch
 from torch import Tensor
-from src.training.losses import (
-    aoi_masked_vae_loss,
-    categorical_recon_loss_from_embeddings,
-    final_frame_weighted_mse, delta_from_final_mse_all,
-    temporal_derivative_mse
-)
-
-
-# Global loss weights for temporal terms
-LAMBDA_DELTA = 10.0      # delta-from-final weight
-LAMBDA_DERIV = 10.0       # temporal-derivative weight (tune as you like)
+from src.training.losses import ForestTrajectoryVAELoss
 
 
 def train_one_epoch(
@@ -77,6 +67,17 @@ def train_one_epoch(
               - "kl"
     """
     model.train()
+    
+    loss_fn = ForestTrajectoryVAELoss(
+        beta=beta,
+        lambda_cat=lambda_cat,
+        # optionally override defaults:
+        # lambda_delta=LAMBDA_DELTA,
+        # lambda_deriv=LAMBDA_DERIV,
+        # w_final=2.0,
+        # channel_indices=[0],
+        # change_thresh=0.05,
+    )
 
     total_loss = 0.0
     total_cont = 0.0
@@ -129,73 +130,23 @@ def train_one_epoch(
         recon_full = recon.view(B, T, C_all, H, W)
         recon_cont = recon_full[:, :, :C_cont, ...]           # [B,T,C_cont,H,W]
 
-        # -------------------------------
-        # Continuous reconstruction loss:
-        #   - final frame upweighted
-        #   - AOI masking
-        # -------------------------------
-        w_final = 2.0  # tune as needed
-        recon_loss = final_frame_weighted_mse(
-            recon_full=recon_cont,
-            x_full=x_cont_norm,    # normalized continuous inputs [B,T,C_cont,H,W]
-            w_final=w_final,
-            aoi_mask=aoi_mask,     # [B,1,H,W]
-        )
-
-        # -------------------------------
-        # Delta-from-final loss on band 0
-        # -------------------------------
-        lambda_delta_final = LAMBDA_DELTA
-        delta_loss = delta_from_final_mse_all(
-            recon_full=recon_cont,
-            x_full=x_cont_norm,
-            aoi_mask=aoi_mask,          # [B,1,H,W]
-            channel_indices=[0],        # or None -> all continuous channels
-            change_thresh=0.05,
-        )
-
-        # -------------------------------
-        # Temporal derivative loss on band 0
-        # -------------------------------
-        lambda_deriv = LAMBDA_DERIV
-        deriv_loss = temporal_derivative_mse(
-            recon_full=recon_cont,
-            x_full=x_cont_norm,
-            aoi_mask=aoi_mask,
-            channel_indices=[0],      # or None for all continuous channels
-            change_thresh=0.05,
-        )
-
-        # -------------------------------
-        # KL term (for ForestTrajectoryAE mu/logvar ~ 0)
-        # -------------------------------
-        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_weighted = beta * kl
-
-        # -------------------------------
-        # Categorical reconstruction loss
-        # -------------------------------
-        cat_loss = categorical_recon_loss_from_embeddings(
+        loss_dict = loss_fn(
             recon_full=recon_full,
+            x_cont_norm=x_cont_norm,
             x_cat=x_cat,
-            cat_encoder=cat_encoder,
+            mu=mu,
+            logvar=logvar,
+            aoi_mask=aoi_mask,
             C_cont=C_cont,
-        )
-        if not torch.isfinite(cat_loss):
-            print("[DEBUG] non-finite cat_loss in train_one_epoch, setting to zero.")
-            cat_loss = torch.tensor(0.0, device=recon.device)
-
-        # -------------------------------
-        # Total loss
-        # -------------------------------
-        loss = (
-            recon_loss
-            + lambda_delta_final * delta_loss
-            + lambda_deriv * deriv_loss
-            + kl_weighted
-            + lambda_cat * cat_loss
+            cat_encoder=cat_encoder,
         )
 
+        loss = loss_dict["loss"]
+        recon_loss = loss_dict["cont_recon"]
+        delta_loss = loss_dict["delta_loss"]
+        deriv_loss = loss_dict["deriv_loss"]
+        cat_loss = loss_dict["cat_loss"]
+        kl = loss_dict["kl"]
         # Backprop + update
         loss.backward()
         optimizer.step()
@@ -258,6 +209,12 @@ def eval_one_epoch(
     """
     model.eval()
 
+    loss_fn = ForestTrajectoryVAELoss(
+        beta=beta,
+        lambda_cat=lambda_cat,
+        # optional overrides same as in train_one_epoch
+    )
+    
     total_loss = 0.0
     total_cont = 0.0
     total_cat = 0.0
@@ -306,73 +263,24 @@ def eval_one_epoch(
         recon_full = recon.view(B, T, C_all, H, W)
         recon_cont = recon_full[:, :, :C_cont, ...]   # [B,T,C_cont,H,W]
 
-        # -------------------------------
-        # Continuous reconstruction loss:
-        #   - final frame upweighted
-        #   - AOI masking
-        # -------------------------------
-        w_final = 2.0
-        recon_loss = final_frame_weighted_mse(
-            recon_full=recon_cont,
-            x_full=x_cont_norm,
-            w_final=w_final,
-            aoi_mask=aoi_mask,          # [B,1,H,W]
-        )
-
-        # -------------------------------
-        # Delta-from-final loss on band 0
-        # -------------------------------
-        lambda_delta_final = LAMBDA_DELTA
-        delta_loss = delta_from_final_mse_all(
-            recon_full=recon_cont,
-            x_full=x_cont_norm,
-            aoi_mask=aoi_mask,
-            channel_indices=[0],   # or None for all continuous channels
-            change_thresh=0.05,
-        )
-
-        # -------------------------------
-        # Temporal derivative loss on band 0
-        # -------------------------------
-        lambda_deriv = LAMBDA_DERIV
-        deriv_loss = temporal_derivative_mse(
-            recon_full=recon_cont,
-            x_full=x_cont_norm,
-            aoi_mask=aoi_mask,
-            channel_indices=[0],
-            change_thresh=0.05,
-        )
-
-        # -------------------------------
-        # KL term
-        # -------------------------------
-        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_weighted = beta * kl
-
-        # -------------------------------
-        # Categorical reconstruction loss
-        # -------------------------------
-        cat_loss = categorical_recon_loss_from_embeddings(
+        loss_dict = loss_fn(
             recon_full=recon_full,
+            x_cont_norm=x_cont_norm,
             x_cat=x_cat,
-            cat_encoder=cat_encoder,
+            mu=mu,
+            logvar=logvar,
+            aoi_mask=aoi_mask,
             C_cont=C_cont,
-        )
-        if not torch.isfinite(cat_loss):
-            print("[DEBUG] non-finite cat_loss in eval_one_epoch, setting to zero.")
-            cat_loss = torch.tensor(0.0, device=recon.device)
-
-        # -------------------------------
-        # Total loss (same structure as train_one_epoch)
-        # -------------------------------
-        loss = (
-            recon_loss
-            + lambda_delta_final * delta_loss
-            + lambda_deriv * deriv_loss
-            + kl_weighted
-            + lambda_cat * cat_loss
+            cat_encoder=cat_encoder,
         )
 
+        loss = loss_dict["loss"]
+        recon_loss = loss_dict["cont_recon"]
+        delta_loss = loss_dict["delta_loss"]
+        deriv_loss = loss_dict["deriv_loss"]
+        cat_loss = loss_dict["cat_loss"]
+        kl = loss_dict["kl"]
+        
         total_loss  += float(loss.item())
         total_cont  += float(recon_loss.item())
         total_delta += float(delta_loss.item())

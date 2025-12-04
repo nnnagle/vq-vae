@@ -369,3 +369,134 @@ def temporal_derivative_mse(
 
     return diff2.sum() / valid
   
+class ForestTrajectoryVAELoss:
+    """
+    Bundle all the per-batch loss logic for the forest trajectory VAE.
+
+    Computes:
+      - continuous recon loss with final-frame weighting
+      - delta-from-final loss
+      - temporal derivative loss
+      - KL
+      - categorical recon loss (via embeddings)
+
+    and returns both the total and individual components.
+    """
+
+    def __init__(
+        self,
+            beta: float,
+            lambda_cat: float,
+            lambda_delta: float = 10.0,
+            lambda_deriv: float = 10.0,
+            w_final: float = 2.0,  # Extra weight on last year
+            channel_indices: list[int] | None = None, # Continuous Channels with time loss
+            change_thresh: float = 0.05, # time deltas less than this incur no loss
+    ):
+        self.beta = beta
+        self.lambda_cat = lambda_cat
+        self.lambda_delta = lambda_delta
+        self.lambda_deriv = lambda_deriv
+        self.w_final = w_final
+        self.channel_indices = channel_indices if channel_indices is not None else [0]
+        self.change_thresh = change_thresh
+
+    def __call__(
+        self,
+        recon_full: torch.Tensor,   # [B, T, C_all, H, W]
+        x_cont_norm: torch.Tensor,  # [B, T, C_cont, H, W]
+        x_cat: torch.Tensor | None,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        aoi_mask: torch.Tensor,     # [B, 1, H, W] or [B, H, W]
+        C_cont: int,
+        cat_encoder: CategoricalEmbeddingEncoder | None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Compute all loss terms for a single batch.
+
+        Returns a dict of scalar tensors:
+          - "loss"
+          - "cont_recon"
+          - "delta_loss"
+          - "deriv_loss"
+          - "cat_loss"
+          - "kl"
+        """
+        # ---------------------------------------
+        # Continuous reconstruction loss
+        # ---------------------------------------
+        recon_cont = recon_full[:, :, :C_cont, ...]  # [B,T,C_cont,H,W]
+        recon_loss = final_frame_weighted_mse(
+            recon_full=recon_cont,
+            x_full=x_cont_norm,
+            w_final=self.w_final,
+            aoi_mask=aoi_mask,
+        )
+
+        # ---------------------------------------
+        # Delta-from-final loss
+        # ---------------------------------------
+        delta_loss = delta_from_final_mse_all(
+            recon_full=recon_cont,
+            x_full=x_cont_norm,
+            aoi_mask=aoi_mask,
+            channel_indices=self.channel_indices,
+            change_thresh=self.change_thresh,
+        )
+
+        # ---------------------------------------
+        # Temporal derivative loss
+        # ---------------------------------------
+        deriv_loss = temporal_derivative_mse(
+            recon_full=recon_cont,
+            x_full=x_cont_norm,
+            aoi_mask=aoi_mask,
+            channel_indices=self.channel_indices,
+            change_thresh=self.change_thresh,
+        )
+
+        # ---------------------------------------
+        # KL
+        # ---------------------------------------
+        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        kl_weighted = self.beta * kl
+
+        # ---------------------------------------
+        # Categorical reconstruction loss
+        # ---------------------------------------
+        cat_loss = categorical_recon_loss_from_embeddings(
+            recon_full=recon_full,
+            x_cat=x_cat,
+            cat_encoder=cat_encoder,
+            C_cont=C_cont,
+        )
+
+        # Handle non-finite cat_loss here so callers don't duplicate logic
+        if not torch.isfinite(cat_loss):
+            if DEBUG_CAT_LOSS:
+                print(
+                    "[DEBUG] non-finite cat_loss in ForestTrajectoryVAELoss; "
+                    "setting to zero."
+                )
+            cat_loss = torch.tensor(0.0, device=recon_full.device)
+
+        # ---------------------------------------
+        # Total loss
+        # ---------------------------------------
+        loss = (
+            recon_loss
+            + self.lambda_delta * delta_loss
+            + self.lambda_deriv * deriv_loss
+            + kl_weighted
+            + self.lambda_cat * cat_loss
+        )
+
+        return {
+            "loss": loss,
+            "cont_recon": recon_loss,
+            "delta_loss": delta_loss,
+            "deriv_loss": deriv_loss,
+            "cat_loss": cat_loss,
+            "kl": kl,
+        }

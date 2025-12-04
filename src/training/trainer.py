@@ -621,13 +621,13 @@ class Trainer:
                     f"train_delta={train_metrics['delta_loss']:.4f}  "
                     f"train_deriv={train_metrics['deriv_loss']:.4f}  "
                     f"train_cat={train_metrics['cat_loss']:.4f}  "
-                    f"train_kl={train_metrics['kl']:.4f}  |  "
-                    f"val_loss={val_metrics['loss']:.4f}  "
-                    f"val_cont={val_metrics['cont_recon']:.4f}  "
-                    f"val_delta={val_metrics['delta_loss']:.4f}  "
-                    f"val_deriv={val_metrics['deriv_loss']:.4f}  "
-                    f"val_cat={val_metrics['cat_loss']:.4f}  "
-                    f"val_kl={val_metrics['kl']:.4f}"
+                    f"train_kl={train_metrics['kl']:.4f}  \n            "
+                    f"  val_loss={val_metrics['loss']:.4f}  "
+                    f"  val_cont={val_metrics['cont_recon']:.4f}  "
+                    f"  val_delta={val_metrics['delta_loss']:.4f}  "
+                    f"  val_deriv={val_metrics['deriv_loss']:.4f}  "
+                    f"  val_cat={val_metrics['cat_loss']:.4f}  "
+                    f"  val_kl={val_metrics['kl']:.4f}"
                 )
 
                 # ------------------------------
