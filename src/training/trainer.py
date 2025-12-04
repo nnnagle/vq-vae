@@ -572,7 +572,7 @@ class Trainer:
         with open(metrics_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
-                ["epoch", "split", "loss", "cont_recon", "cat_loss", "kl", "beta", "lr"]
+                ["epoch", "split", "loss", "cont_recon", "delta_loss", "cat_loss", "kl", "beta", "lr"]
             )
 
             for epoch in range(self.cfg.num_epochs):
@@ -618,10 +618,14 @@ class Trainer:
                     f"[epoch {epoch:03d}] "
                     f"train_loss={train_metrics['loss']:.4f}  "
                     f"train_cont={train_metrics['cont_recon']:.4f}  "
+                    f"train_delta={train_metrics['delta_loss']:.4f}  "
+                    f"train_deriv={train_metrics['deriv_loss']:.4f}  "
                     f"train_cat={train_metrics['cat_loss']:.4f}  "
                     f"train_kl={train_metrics['kl']:.4f}  |  "
                     f"val_loss={val_metrics['loss']:.4f}  "
                     f"val_cont={val_metrics['cont_recon']:.4f}  "
+                    f"val_delta={val_metrics['delta_loss']:.4f}  "
+                    f"val_deriv={val_metrics['deriv_loss']:.4f}  "
                     f"val_cat={val_metrics['cat_loss']:.4f}  "
                     f"val_kl={val_metrics['kl']:.4f}"
                 )

@@ -146,8 +146,8 @@ def save_spacetime_recon_grid(
     # If we are plotting deltas, precompute them now.
     if show_deltas:
         # x(t) - x(0) and recon(t) - recon(0)
-        x0 = x_sel[:, 0:1, :, :]          # [b_sel, 1, H, W]
-        r0 = r_sel[:, 0:1, :, :]
+        x0 = x_sel[:, -1:, :, :]          # [b_sel, 1, H, W] End is reference
+        r0 = r_sel[:, -1:, :, :]
 
         dx = x_sel - x0                   # [b_sel, T, H, W]
         dr = r_sel - r0

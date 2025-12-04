@@ -163,3 +163,209 @@ def categorical_recon_loss_from_embeddings(
         return torch.tensor(0.0, device=device)
 
     return loss_sum / feat_count
+
+def final_frame_weighted_mse(
+    recon_full: torch.Tensor,
+    x_full: torch.Tensor,
+    w_final: float = 2.0,
+    aoi_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Mean-squared error over [B,T,C,H,W], but with the final timestep
+    weighted more heavily.
+
+    Args
+    ----
+    recon_full, x_full : [B, T, C, H, W]
+        Reconstructed and target tensors in (typically) normalized space.
+
+    w_final : float
+        Relative weight on the final timestep (T-1). For example, w_final=2.0
+        makes the final frame contribute twice as much as any one earlier frame.
+
+    aoi_mask : [B, H, W] or [B, 1, H, W], optional
+        Boolean mask where True indicates valid area. If provided, the loss
+        is averaged only over valid pixels.
+
+    Returns
+    -------
+    loss : torch.Tensor (scalar)
+    """
+    assert recon_full.shape == x_full.shape, "Shape mismatch recon_full/x_full"
+    B, T, C, H, W = x_full.shape
+
+    diff2 = (recon_full - x_full) ** 2  # [B, T, C, H, W]
+
+    if aoi_mask is not None:
+        if aoi_mask.dim() == 3:
+            aoi_mask = aoi_mask.unsqueeze(1)  # [B, 1, H, W]
+        elif aoi_mask.dim() == 4:
+            pass  # [B, 1, H, W]
+        else:
+            raise ValueError(f"Unexpected aoi_mask shape: {aoi_mask.shape}")
+        # Broadcast to [B, T, C, H, W]
+        mask = aoi_mask.bool().unsqueeze(1).expand(-1, T, C, -1, -1)
+        diff2 = diff2 * mask
+
+        valid_early = mask[:, :-1].sum()
+        valid_final = mask[:, -1:].sum()
+    else:
+        valid_early = diff2[:, :-1].numel()
+        valid_final = diff2[:, -1:].numel()
+
+    # Avoid zero-division if mask wipes everything
+    if valid_early > 0:
+        err_early = diff2[:, :-1].sum() / valid_early
+    else:
+        err_early = torch.tensor(0.0, device=x_full.device)
+
+    if valid_final > 0:
+        err_final = diff2[:, -1:].sum() / valid_final
+    else:
+        err_final = torch.tensor(0.0, device=x_full.device)
+
+    loss = (err_early + w_final * err_final) / (1.0 + w_final)
+    return loss
+
+
+def delta_from_final_mse_all(
+    recon_full: torch.Tensor,
+    x_full: torch.Tensor,
+    aoi_mask: torch.Tensor | None = None,
+    channel_indices: list[int] | None = None,
+    change_thresh: float = 0.05,
+) -> torch.Tensor:
+    """
+    MSE between deltas relative to the final timestep for a set of channels:
+
+        (x(t) - x(T-1)) vs (recon(t) - recon(T-1))
+
+    BUT we only average over pixels where the *input* delta magnitude
+    exceeds `change_thresh` (in normalized units). This focuses the loss
+    on genuinely changing pixels instead of drowning them in stable forest.
+
+    recon_full, x_full : [B, T, C, H, W]
+    aoi_mask : [B,H,W] or [B,1,H,W]
+    channel_indices : list[int] or None (None -> all channels)
+    change_thresh : float
+        Threshold on |dx_in| (L2 over channels) to consider a pixel "changing".
+    """
+    assert recon_full.shape == x_full.shape, "Shape mismatch recon_full/x_full"
+    B, T, C, H, W = x_full.shape
+    device = x_full.device
+
+    if channel_indices is None:
+        x_sel = x_full             # [B,T,C,H,W]
+        r_sel = recon_full
+    else:
+        x_sel = x_full[:, :, channel_indices]      # [B,T,C_sel,H,W]
+        r_sel = recon_full[:, :, channel_indices]
+
+    # Anchor at final timestep
+    xT = x_sel[:, -1:]   # [B,1,C_sel,H,W]
+    rT = r_sel[:, -1:]
+
+    dx = x_sel - xT      # [B,T,C_sel,H,W]
+    dr = r_sel - rT
+
+    diff2 = (dx - dr) ** 2
+
+    # Magnitude of input delta across channels, max over time
+    # -> where does *anything* change?
+    dx_mag = dx.pow(2).sum(dim=2).sqrt()     # [B,T,H,W]
+    dx_mag_max = dx_mag.max(dim=1).values    # [B,H,W]
+
+    change_mask = dx_mag_max > change_thresh   # [B,H,W]
+
+    if aoi_mask is not None:
+        if aoi_mask.dim() == 3:
+            aoi_mask = aoi_mask.unsqueeze(1)  # [B,1,H,W]
+        elif aoi_mask.dim() == 4:
+            pass
+        else:
+            raise ValueError(f"Unexpected aoi_mask shape: {aoi_mask.shape}")
+        aoi_mask = aoi_mask.bool().squeeze(1)   # [B,H,W]
+        change_mask = change_mask & aoi_mask
+
+    # Broadcast change mask to [B,T,C_sel,H,W]
+    if change_mask.any():
+        mask = change_mask.unsqueeze(1).unsqueeze(1)  # [B,1,1,H,W]
+        mask = mask.expand_as(diff2)                  # [B,T,C_sel,H,W]
+        diff2 = diff2 * mask
+        valid = mask.sum()
+    else:
+        return torch.tensor(0.0, device=device)
+
+    if valid == 0:
+        return torch.tensor(0.0, device=device)
+
+    return diff2.sum() / valid
+  
+  
+def temporal_derivative_mse(
+    recon_full: torch.Tensor,
+    x_full: torch.Tensor,
+    aoi_mask: torch.Tensor | None = None,
+    channel_indices: list[int] | None = None,
+    change_thresh: float = 0.05,
+) -> torch.Tensor:
+    """
+    MSE between temporal derivatives:
+
+        (x(t) - x(t-1)) vs (recon(t) - recon(t-1))
+
+    Focuses on timesteps/pixels where the *input* derivative magnitude
+    exceeds `change_thresh`, so we emphasize actual change events.
+
+    Args
+    ----
+    recon_full, x_full : [B, T, C, H, W]  (normalized space)
+    aoi_mask           : [B,H,W] or [B,1,H,W], optional
+    channel_indices    : list[int] or None (None -> all continuous channels)
+    change_thresh      : float threshold in normalized units.
+    """
+    assert recon_full.shape == x_full.shape, "Shape mismatch recon_full/x_full"
+    B, T, C, H, W = x_full.shape
+    device = x_full.device
+
+    if channel_indices is None:
+        x_sel = x_full              # [B,T,C,H,W]
+        r_sel = recon_full
+    else:
+        x_sel = x_full[:, :, channel_indices]      # [B,T,C_sel,H,W]
+        r_sel = recon_full[:, :, channel_indices]
+
+    # Temporal derivatives along t
+    dx = x_sel[:, 1:] - x_sel[:, :-1]   # [B,T-1,C_sel,H,W]
+    dr = r_sel[:, 1:] - r_sel[:, :-1]   # [B,T-1,C_sel,H,W]
+
+    diff2 = (dx - dr) ** 2
+
+    # Magnitude of input derivative across channels
+    dx_mag = dx.pow(2).sum(dim=2).sqrt()    # [B,T-1,H,W]
+    change_mask = dx_mag > change_thresh    # [B,T-1,H,W]
+
+    if aoi_mask is not None:
+        if aoi_mask.dim() == 3:
+            aoi_mask = aoi_mask.unsqueeze(1)    # [B,1,H,W]
+        elif aoi_mask.dim() == 4:
+            pass
+        else:
+            raise ValueError(f"Unexpected aoi_mask shape: {aoi_mask.shape}")
+        aoi_mask = aoi_mask.bool().squeeze(1)   # [B,H,W]
+        change_mask = change_mask & aoi_mask.unsqueeze(1)  # [B,T-1,H,W]
+
+    if not change_mask.any():
+        return torch.tensor(0.0, device=device)
+
+    # Broadcast change mask to derivative tensor
+    mask = change_mask.unsqueeze(2)            # [B,T-1,1,H,W]
+    mask = mask.expand_as(diff2)               # [B,T-1,C_sel,H,W]
+    diff2 = diff2 * mask
+    valid = mask.sum()
+
+    if valid == 0:
+        return torch.tensor(0.0, device=device)
+
+    return diff2.sum() / valid
+  
