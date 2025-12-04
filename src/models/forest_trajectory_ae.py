@@ -183,18 +183,23 @@ class ForestTrajectoryAE(nn.Module):
         #   temporal_dec:   [B, 64, H, W] -> [B, T*feature_channels, H, W]
         #   feature_dec:    per-timestep 1x1 conv to C_per_t
         # ------------------------------------------------------------------
-        self.code_to_traj = nn.Conv2d(
-            in_channels=self.feature_channels,
-            out_channels=64,
-            kernel_size=1,
+        self.code_to_traj = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self.feature_channels,
+                out_channels=64,
+                kernel_size=1,
+            ),
+            nn.SiLU(),
         )
 
-        # This is a cheap "resmlp_to_sequence" approximation:
-        # we learn a per-pixel linear map 64 -> T*feature_channels.
-        self.temporal_decoder = nn.Conv2d(
-            in_channels=64,
-            out_channels=self.time_steps * self.feature_channels,
-            kernel_size=1,
+        # per-pixel linear map 64 -> T*feature_channels with nonlinearity
+        self.temporal_decoder = nn.Sequential(
+            nn.Conv2d(
+                in_channels=64,
+                out_channels=self.time_steps * self.feature_channels,
+                kernel_size=1,
+            ),
+            nn.SiLU(),
         )
 
         self.feature_decoder = nn.Conv2d(
@@ -202,7 +207,6 @@ class ForestTrajectoryAE(nn.Module):
             out_channels=self.c_per_t,
             kernel_size=1,
         )
-
     # ----------------------------------------------------------------------
     # Forward
     # ----------------------------------------------------------------------
@@ -266,16 +270,16 @@ class ForestTrajectoryAE(nn.Module):
         # --------------------------------------------------------------
         # Decoder
         # --------------------------------------------------------------
-        d = self.code_to_traj(latent)              # [B, 64, H, W]
-        d = self.temporal_decoder(d)               # [B, T*feature_channels, H, W]
+        d = self.code_to_traj(latent)                # [B, 64, H, W]
+        d = self.temporal_decoder(d)                 # [B, T*feature_channels, H, W]
         d = d.view(B, T, self.feature_channels, H, W)
 
         # Per-timestep 1x1 conv to original per-time channels
         d_flat = d.view(B * T, self.feature_channels, H, W)
-        out_per_t = self.feature_decoder(d_flat)   # [B*T, C_per_t, H, W]
+        out_per_t = self.feature_decoder(d_flat)     # [B*T, C_per_t, H, W]
 
         recon = out_per_t.view(B, T * self.c_per_t, H, W)
-
+        
         # Dummy mu/logvar so Trainer's VAE code doesn't break
         mu = x.new_zeros(B, 1)
         logvar = x.new_zeros(B, 1)
