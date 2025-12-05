@@ -368,7 +368,246 @@ def temporal_derivative_mse(
         return torch.tensor(0.0, device=device)
 
     return diff2.sum() / valid
-  
+
+
+def temporal_derivative_mae(
+    recon_full: torch.Tensor,
+    x_full: torch.Tensor,
+    aoi_mask: torch.Tensor | None = None,
+    channel_indices: list[int] | None = None,
+    change_thresh: float = 0.05,
+) -> torch.Tensor:
+    """
+    MSE between temporal derivatives:
+
+        (x(t) - x(t-1)) vs (recon(t) - recon(t-1))
+
+    Focuses on timesteps/pixels where the *input* derivative magnitude
+    exceeds `change_thresh`, so we emphasize actual change events.
+
+    Args
+    ----
+    recon_full, x_full : [B, T, C, H, W]  (normalized space)
+    aoi_mask           : [B,H,W] or [B,1,H,W], optional
+    channel_indices    : list[int] or None (None -> all continuous channels)
+    change_thresh      : float threshold in normalized units.
+    """
+    assert recon_full.shape == x_full.shape, "Shape mismatch recon_full/x_full"
+    B, T, C, H, W = x_full.shape
+    device = x_full.device
+
+    if channel_indices is None:
+        x_sel = x_full              # [B,T,C,H,W]
+        r_sel = recon_full
+    else:
+        x_sel = x_full[:, :, channel_indices]      # [B,T,C_sel,H,W]
+        r_sel = recon_full[:, :, channel_indices]
+
+    # Temporal derivatives along t
+    dx = x_sel[:, 1:] - x_sel[:, :-1]   # [B,T-1,C_sel,H,W]
+    dr = r_sel[:, 1:] - r_sel[:, :-1]   # [B,T-1,C_sel,H,W]
+
+    #diff2 = (dx - dr) ** 2
+    diff = dx - dr 
+
+    # Magnitude of input derivative across channels
+    dx_mag = dx.pow(2).sum(dim=2).sqrt()    # [B,T-1,H,W]
+    change_mask = dx_mag > change_thresh    # [B,T-1,H,W]
+
+    if aoi_mask is not None:
+        if aoi_mask.dim() == 3:
+            aoi_mask = aoi_mask.unsqueeze(1)    # [B,1,H,W]
+        elif aoi_mask.dim() == 4:
+            pass
+        else:
+            raise ValueError(f"Unexpected aoi_mask shape: {aoi_mask.shape}")
+        aoi_mask = aoi_mask.bool().squeeze(1)   # [B,H,W]
+        change_mask = change_mask & aoi_mask.unsqueeze(1)  # [B,T-1,H,W]
+        change_mask = aoi_mask.unsqueeze(1)
+
+    if not change_mask.any():
+        return torch.tensor(0.0, device=device)
+
+    # Broadcast change mask to derivative tensor
+    mask = change_mask.unsqueeze(2)            # [B,T-1,1,H,W]
+    mask = mask.expand_as(diff)               # [B,T-1,C_sel,H,W]
+    #diff2 = diff2 * mask
+    #diff = diff * mask
+    valid = mask.sum()
+
+    if valid == 0:
+        return torch.tensor(0.0, device=device)
+    loss = F.smooth_l1_loss(diff[mask], torch.zeros_like(diff[mask]), beta=0.05)
+#    return diff.abs().sum() / valid
+    return loss
+
+def spatial_gradient_loss(
+    recon_full: torch.Tensor,        # [B, T, C, H, W]
+    x_full: torch.Tensor,            # [B, T, C, H, W]
+    aoi_mask: torch.Tensor | None = None,
+    channel_indices: list[int] | None = None,
+    mode: str = "huber",             # "l2" or "l1" or "huber"
+    beta: float = 0.05,              # Huber transition
+) -> torch.Tensor:
+    """
+    Spatial gradient matching loss:
+
+        (∇_h recon - ∇_h x, ∇_w recon - ∇_w x)
+
+    Encourages preservation of spatial texture / contrast.
+    mode:
+      - "l2":    pure L2 on gradient differences
+      - "l1":    pure L1 on gradient differences
+      - "huber": SmoothL1 / Huber on gradient differences
+    """
+    assert recon_full.shape == x_full.shape, "Shape mismatch recon_full/x_full"
+    B, T, C, H, W = x_full.shape
+    device = x_full.device
+
+    if channel_indices is None:
+        x_sel = x_full
+        r_sel = recon_full
+    else:
+        x_sel = x_full[:, :, channel_indices]   # [B,T,C_sel,H,W]
+        r_sel = recon_full[:, :, channel_indices]
+
+    # finite differences along H (vertical) and W (horizontal)
+    dx_h = x_sel[:, :, :, 1:, :] - x_sel[:, :, :, :-1, :]   # [B,T,C_sel,H-1,W]
+    dr_h = r_sel[:, :, :, 1:, :] - r_sel[:, :, :, :-1, :]
+
+    dx_w = x_sel[:, :, :, :, 1:] - x_sel[:, :, :, :, :-1]   # [B,T,C_sel,H,W-1]
+    dr_w = r_sel[:, :, :, :, 1:] - r_sel[:, :, :, :, :-1]
+
+    diff_h = dr_h - dx_h
+    diff_w = dr_w - dx_w
+
+    if aoi_mask is not None:
+        # build masks that exclude gradients crossing invalid pixels
+        if aoi_mask.dim() == 3:
+            aoi_mask = aoi_mask.unsqueeze(1)  # [B,1,H,W]
+        elif aoi_mask.dim() == 4:
+            pass
+        else:
+            raise ValueError(f"Unexpected aoi_mask shape: {aoi_mask.shape}")
+        aoi_mask = aoi_mask.bool()
+
+        mask_h = aoi_mask[:, :, 1:, :] & aoi_mask[:, :, :-1, :]   # [B,1,H-1,W]
+        mask_w = aoi_mask[:, :, :, 1:] & aoi_mask[:, :, :, :-1]   # [B,1,H,W-1]
+
+        # broadcast to [B,T,C_sel,...]
+        mask_h = mask_h.unsqueeze(1).expand_as(diff_h)
+        mask_w = mask_w.unsqueeze(1).expand_as(diff_w)
+
+        diff_h = diff_h[mask_h]
+        diff_w = diff_w[mask_w]
+    else:
+        diff_h = diff_h.reshape(-1)
+        diff_w = diff_w.reshape(-1)
+
+    if diff_h.numel() == 0 or diff_w.numel() == 0:
+        return torch.tensor(0.0, device=device)
+
+    if mode == "l2":
+        loss_h = (diff_h ** 2).mean()
+        loss_w = (diff_w ** 2).mean()
+    elif mode == "l1":
+        loss_h = diff_h.abs().mean()
+        loss_w = diff_w.abs().mean()
+    elif mode == "huber":
+        # SmoothL1 / Huber around 0
+        loss_h = F.smooth_l1_loss(diff_h, torch.zeros_like(diff_h), beta=beta)
+        loss_w = F.smooth_l1_loss(diff_w, torch.zeros_like(diff_w), beta=beta)
+    else:
+        raise ValueError(f"Unknown mode={mode!r} for spatial_gradient_loss.")
+
+    return 0.5 * (loss_h + loss_w)
+
+def structure_tensor_loss(
+    recon_full: torch.Tensor,        # [B, T, C, H, W]
+    x_full: torch.Tensor,            # [B, T, C, H, W]
+    aoi_mask: torch.Tensor | None = None,
+    channel_indices: list[int] | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Very simple structure-tensor-style loss.
+
+    For each pixel, we approximate the 2x2 structure tensor of the (multi-channel)
+    field and match recon vs target.
+
+    This is more expensive than simple gradient loss; only use if you
+    really need directional texture fidelity.
+    """
+    assert recon_full.shape == x_full.shape, "Shape mismatch recon_full/x_full"
+    B, T, C, H, W = x_full.shape
+    device = x_full.device
+
+    if channel_indices is None:
+        x_sel = x_full        # [B,T,C,H,W]
+        r_sel = recon_full
+    else:
+        x_sel = x_full[:, :, channel_indices]
+        r_sel = recon_full[:, :, channel_indices]
+
+    # gradients
+    dx_h = x_sel[:, :, :, 1:, :] - x_sel[:, :, :, :-1, :]   # [B,T,C,H-1,W]
+    dx_w = x_sel[:, :, :, :, 1:] - x_sel[:, :, :, :, :-1]   # [B,T,C,H,W-1]
+
+    dr_h = r_sel[:, :, :, 1:, :] - r_sel[:, :, :, :-1, :]
+    dr_w = r_sel[:, :, :, :, 1:] - r_sel[:, :, :, :, :-1]
+
+    # pad to original size for convenience
+    dx_h = F.pad(dx_h, (0, 0, 1, 0))   # [B,T,C,H,W]
+    dx_w = F.pad(dx_w, (1, 0, 0, 0))
+
+    dr_h = F.pad(dr_h, (0, 0, 1, 0))
+    dr_w = F.pad(dr_w, (1, 0, 0, 0))
+
+    # sum over channels to get scalar gradients per pixel
+    gx = dx_w.sum(dim=2)  # [B,T,H,W]
+    gy = dx_h.sum(dim=2)
+    gxh = dr_w.sum(dim=2)
+    gyh = dr_h.sum(dim=2)
+
+    # approximate local averaging via 3x3 mean pooling over H,W
+    def pool2d(x):
+        x = x.view(B * T, 1, H, W)
+        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        return x.view(B, T, H, W)
+
+    # J = [[gx^2, gx*gy], [gx*gy, gy^2]]
+    J_x_11 = pool2d(gx * gx)
+    J_x_22 = pool2d(gy * gy)
+    J_x_12 = pool2d(gx * gy)
+
+    J_r_11 = pool2d(gxh * gxh)
+    J_r_22 = pool2d(gyh * gyh)
+    J_r_12 = pool2d(gxh * gyh)
+
+    diff_11 = J_r_11 - J_x_11
+    diff_22 = J_r_22 - J_x_22
+    diff_12 = J_r_12 - J_x_12
+
+    if aoi_mask is not None:
+        if aoi_mask.dim() == 3:
+            aoi_mask = aoi_mask.unsqueeze(1)  # [B,1,H,W]
+        aoi_mask = aoi_mask.bool()
+        mask = aoi_mask.unsqueeze(1)          # [B,1,H,W] -> [B,1,H,W]
+        diff_11 = diff_11[mask]
+        diff_22 = diff_22[mask]
+        diff_12 = diff_12[mask]
+    else:
+        diff_11 = diff_11.reshape(-1)
+        diff_22 = diff_22.reshape(-1)
+        diff_12 = diff_12.reshape(-1)
+
+    if diff_11.numel() == 0:
+        return torch.tensor(0.0, device=device)
+
+    loss = (diff_11 ** 2 + diff_22 ** 2 + 2.0 * diff_12 ** 2).mean()
+    return loss
+
+
 class ForestTrajectoryVAELoss:
     """
     Bundle all the per-batch loss logic for the forest trajectory VAE.
@@ -392,7 +631,10 @@ class ForestTrajectoryVAELoss:
             w_final: float = 2.0,  # Extra weight on last year
             channel_indices: list[int] | None = None, # Continuous Channels with time loss
             change_thresh: float = 0.05, # time deltas less than this incur no loss
-    ):
+            lambda_spatial_grad: float = 0.0,   # NEW
+            spatial_grad_mode: str = "huber",   # NEW: "l2" / "l1" / "huber"
+            spatial_grad_beta: float = 0.05,    # NEW: Huber beta
+        ):
         self.beta = beta
         self.lambda_cat = lambda_cat
         self.lambda_delta = lambda_delta
@@ -400,6 +642,9 @@ class ForestTrajectoryVAELoss:
         self.w_final = w_final
         self.channel_indices = channel_indices if channel_indices is not None else [0]
         self.change_thresh = change_thresh
+        self.lambda_spatial_grad = lambda_spatial_grad
+        self.spatial_grad_mode = spatial_grad_mode
+        self.spatial_grad_beta = spatial_grad_beta
 
     def __call__(
         self,
@@ -457,6 +702,18 @@ class ForestTrajectoryVAELoss:
         )
 
         # ---------------------------------------
+        # Spatial gradient loss (texture / contrast)
+        # ---------------------------------------
+        spatial_grad_loss = spatial_gradient_loss(
+            recon_full=recon_cont,
+            x_full=x_cont_norm,
+            aoi_mask=aoi_mask,
+            channel_indices=self.channel_indices,
+            mode=self.spatial_grad_mode,
+            beta=self.spatial_grad_beta,
+        )
+        
+        # ---------------------------------------
         # KL
         # ---------------------------------------
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
@@ -488,6 +745,7 @@ class ForestTrajectoryVAELoss:
             recon_loss
             + self.lambda_delta * delta_loss
             + self.lambda_deriv * deriv_loss
+            + self.lambda_spatial_grad * spatial_grad_loss
             + kl_weighted
             + self.lambda_cat * cat_loss
         )
@@ -497,6 +755,7 @@ class ForestTrajectoryVAELoss:
             "cont_recon": recon_loss,
             "delta_loss": delta_loss,
             "deriv_loss": deriv_loss,
+            "spatial_grad_loss": spatial_grad_loss,
             "cat_loss": cat_loss,
             "kl": kl,
         }

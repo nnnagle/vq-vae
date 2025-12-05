@@ -27,7 +27,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")  # renders directly to files, never touches a display
 import matplotlib.pyplot as plt
-
+from matplotlib.colors import Normalize, TwoSlopeNorm
 
 def save_spacetime_recon_grid(
     x_phys: torch.Tensor,
@@ -103,6 +103,13 @@ def save_spacetime_recon_grid(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Move tensors to numpy for plotting.
+    if x_phys.is_cuda:
+        x_phys = x_phys.cpu()
+    if recon_phys.is_cuda:
+        recon_phys = recon_phys.cpu()
+    if aoi is not None and aoi.is_cuda:
+        aoi = aoi.cpu()
+    
     x_np = x_phys.numpy()
     r_np = recon_phys.numpy()
     B, T, C, H, W = x_np.shape
@@ -142,6 +149,7 @@ def save_spacetime_recon_grid(
     # Using min/max of inputs makes differences more visible.
     vmin = np.nanmin(x_sel)
     vmax = np.nanmax(x_sel)
+    raw_norm = Normalize(vmin=vmin, vmax=vmax)
 
     # If we are plotting deltas, precompute them now.
     if show_deltas:
@@ -160,6 +168,11 @@ def save_spacetime_recon_grid(
             dvmin, dvmax = -1.0, 1.0
         else:
             dvmin, dvmax = -max_abs, max_abs
+        if show_deltas:
+            # Center deltas around zero
+            delta_norm = TwoSlopeNorm(vcenter=0.0, vmin=dvmin, vmax=dvmax)
+        else:
+            delta_norm = None
 
         rows_per_patch = 4
     else:
@@ -206,12 +219,14 @@ def save_spacetime_recon_grid(
                 img_re[mask] = np.nan
 
             # Plot input
-            ax_in.imshow(img_in, vmin=vmin, vmax=vmax)
+            #ax_in.imshow(img_in, vmin=vmin, vmax=vmax)
+            ax_in.imshow(img_in, norm=raw_norm)
             ax_in.set_xticks([])
             ax_in.set_yticks([])
 
             # Plot reconstruction
-            ax_re.imshow(img_re, vmin=vmin, vmax=vmax)
+            #ax_re.imshow(img_re, vmin=vmin, vmax=vmax)
+            ax_re.imshow(img_re, norm=raw_norm)
             ax_re.set_xticks([])
             ax_re.set_yticks([])
 
@@ -239,11 +254,13 @@ def save_spacetime_recon_grid(
                     img_din[mask] = np.nan
                     img_dre[mask] = np.nan
 
-                ax_din.imshow(img_din, vmin=dvmin, vmax=dvmax)
+                #ax_din.imshow(img_din, vmin=dvmin, vmax=dvmax)
+                ax_din.imshow(img_din, norm=delta_norm)
                 ax_din.set_xticks([])
                 ax_din.set_yticks([])
 
-                ax_dre.imshow(img_dre, vmin=dvmin, vmax=dvmax)
+                #ax_dre.imshow(img_dre, vmin=dvmin, vmax=dvmax)
+                ax_dre.imshow(img_dre, norm=delta_norm)
                 ax_dre.set_xticks([])
                 ax_dre.set_yticks([])
 

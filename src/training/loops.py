@@ -33,44 +33,25 @@ def train_one_epoch(
     lambda_cat: float,
     lambda_delta: float = 10.0,
     lambda_deriv: float = 10.0,
+    lambda_spatial_grad: float = 0.5,     # NEW: weight on spatial gradient loss
+    spatial_grad_mode: str = "huber",     # NEW: "l2" / "l1" / "huber"
+    spatial_grad_beta: float = 0.05,      # NEW: Huber beta
     w_final: float = 2.0,
-    change_thresh: float = 0.05 ,
+    change_thresh: float = 0.05,
     time_channel_indices: list[int] | None = None,
 ) -> Dict[str, float]:
     """
     Single training epoch over the TRAIN split.
 
-    Args:
-        model:
-            ConvVAE / ForestTrajectoryAE model on the correct device.
-        train_loader:
-            DataLoader over the training PatchDataset split. Each batch is a
-            dict with keys "x_cont", "x_cat" (optional), "x_mask" (optional),
-            "aoi".
-        optimizer:
-            Optimizer instance (e.g., Adam) configured for `model.parameters()`.
-        device:
-            Torch device (cpu or cuda) on which computations will run.
-        normalizer:
-            Normalizer with __call__(x) -> normalized, and .unnormalize(x)
-            methods. Used for continuous features.
-        cat_encoder:
-            CategoricalEmbeddingEncoder instance, or None if no categorical
-            features are present.
-        beta:
-            Weight on the KL term in the VAE loss.
-        lambda_cat:
-            Weight on the categorical reconstruction loss.
-
     Returns:
-        dict:
-            Dictionary with averaged metrics over the epoch:
-              - "loss"
-              - "cont_recon"
-              - "delta_loss"
-              - "deriv_loss"
-              - "cat_loss"
-              - "kl"
+        dict with averaged metrics over the epoch:
+          - "loss"
+          - "cont_recon"
+          - "delta_loss"
+          - "deriv_loss"
+          - "spatial_grad_loss"
+          - "cat_loss"
+          - "kl"
     """
     model.train()
     
@@ -82,12 +63,16 @@ def train_one_epoch(
         w_final=w_final,
         channel_indices=time_channel_indices,
         change_thresh=change_thresh,
+        lambda_spatial_grad=lambda_spatial_grad,   # pass through
+        spatial_grad_mode=spatial_grad_mode,
+        spatial_grad_beta=spatial_grad_beta,
     )
 
     total_loss = 0.0
     total_cont = 0.0
     total_delta = 0.0
     total_deriv = 0.0
+    total_spatial = 0.0
     total_cat = 0.0
     total_kl = 0.0
     n_batches = 0
@@ -133,7 +118,6 @@ def train_one_epoch(
         recon, mu, logvar = model(x_flat_all)     # recon is in normalized space
 
         recon_full = recon.view(B, T, C_all, H, W)
-        recon_cont = recon_full[:, :, :C_cont, ...]           # [B,T,C_cont,H,W]
 
         loss_dict = loss_fn(
             recon_full=recon_full,
@@ -150,20 +134,23 @@ def train_one_epoch(
         recon_loss = loss_dict["cont_recon"]
         delta_loss = loss_dict["delta_loss"]
         deriv_loss = loss_dict["deriv_loss"]
+        spatial_loss = loss_dict.get("spatial_grad_loss", torch.tensor(0.0, device=device))
         cat_loss = loss_dict["cat_loss"]
         kl = loss_dict["kl"]
+
         # Backprop + update
         loss.backward()
         optimizer.step()
 
         # Accumulate metrics
-        total_loss += float(loss.item())
-        total_cont += float(recon_loss.item())
-        total_delta += float(delta_loss.item())
-        total_deriv += float(deriv_loss.item())
-        total_cat  += float(cat_loss.item())
-        total_kl   += float(kl.item())
-        n_batches  += 1
+        total_loss   += float(loss.item())
+        total_cont   += float(recon_loss.item())
+        total_delta  += float(delta_loss.item())
+        total_deriv  += float(deriv_loss.item())
+        total_spatial += float(spatial_loss.item())
+        total_cat    += float(cat_loss.item())
+        total_kl     += float(kl.item())
+        n_batches    += 1
 
     if n_batches == 0:
         return {
@@ -171,6 +158,7 @@ def train_one_epoch(
             "cont_recon": float("nan"),
             "delta_loss": float("nan"),
             "deriv_loss": float("nan"),
+            "spatial_grad_loss": float("nan"),
             "cat_loss": float("nan"),
             "kl": float("nan"),
         }
@@ -180,6 +168,7 @@ def train_one_epoch(
         "cont_recon": total_cont / n_batches,
         "delta_loss": total_delta / n_batches,
         "deriv_loss": total_deriv / n_batches,
+        "spatial_grad_loss": total_spatial / n_batches,
         "cat_loss": total_cat / n_batches,
         "kl": total_kl / n_batches,
     }
@@ -194,10 +183,13 @@ def eval_one_epoch(
     cat_encoder,
     beta: float,
     lambda_cat: float,
-    lambda_delta: float =10,
-    lambda_deriv: float = 20,
+    lambda_delta: float = 10.0,
+    lambda_deriv: float = 10.0,
+    lambda_spatial_grad: float = 0.5,
+    spatial_grad_mode: str = "huber",
+    spatial_grad_beta: float = 0.05,
     w_final: float = 2.0,
-    change_thresh: float = 0.05 ,
+    change_thresh: float = 0.05,
     time_channel_indices: list[int] | None = None,
 ) -> Dict[str, float]:
     """
@@ -206,16 +198,6 @@ def eval_one_epoch(
     Mirrors train_one_epoch, but:
       - uses model.eval()
       - no optimizer or gradients
-
-    Returns:
-        dict:
-            Same keys as train_one_epoch:
-              - "loss"
-              - "cont_recon"
-              - "delta_loss"
-              - "deriv_loss"
-              - "cat_loss"
-              - "kl"
     """
     model.eval()
 
@@ -227,6 +209,9 @@ def eval_one_epoch(
         w_final=w_final,
         channel_indices=time_channel_indices,
         change_thresh=change_thresh,
+        lambda_spatial_grad=lambda_spatial_grad,
+        spatial_grad_mode=spatial_grad_mode,
+        spatial_grad_beta=spatial_grad_beta,
     )
     
     total_loss = 0.0
@@ -234,6 +219,7 @@ def eval_one_epoch(
     total_cat = 0.0
     total_delta = 0.0
     total_deriv = 0.0
+    total_spatial = 0.0
     total_kl = 0.0
     n_batches = 0
 
@@ -275,7 +261,6 @@ def eval_one_epoch(
         recon, mu, logvar = model(x_flat_all)     # recon in normalized space
 
         recon_full = recon.view(B, T, C_all, H, W)
-        recon_cont = recon_full[:, :, :C_cont, ...]   # [B,T,C_cont,H,W]
 
         loss_dict = loss_fn(
             recon_full=recon_full,
@@ -292,16 +277,18 @@ def eval_one_epoch(
         recon_loss = loss_dict["cont_recon"]
         delta_loss = loss_dict["delta_loss"]
         deriv_loss = loss_dict["deriv_loss"]
+        spatial_loss = loss_dict.get("spatial_grad_loss", torch.tensor(0.0, device=device))
         cat_loss = loss_dict["cat_loss"]
         kl = loss_dict["kl"]
         
-        total_loss  += float(loss.item())
-        total_cont  += float(recon_loss.item())
-        total_delta += float(delta_loss.item())
-        total_deriv += float(deriv_loss.item())
-        total_cat   += float(cat_loss.item())
-        total_kl    += float(kl.item())
-        n_batches   += 1
+        total_loss   += float(loss.item())
+        total_cont   += float(recon_loss.item())
+        total_delta  += float(delta_loss.item())
+        total_deriv  += float(deriv_loss.item())
+        total_spatial += float(spatial_loss.item())
+        total_cat    += float(cat_loss.item())
+        total_kl     += float(kl.item())
+        n_batches    += 1
 
     if n_batches == 0:
         return {
@@ -309,6 +296,7 @@ def eval_one_epoch(
             "cont_recon": float("nan"),
             "delta_loss": float("nan"),
             "deriv_loss": float("nan"),
+            "spatial_grad_loss": float("nan"),
             "cat_loss": float("nan"),
             "kl": float("nan"),
         }
@@ -318,6 +306,7 @@ def eval_one_epoch(
         "cont_recon": total_cont / n_batches,
         "delta_loss": total_delta / n_batches,
         "deriv_loss": total_deriv / n_batches,
+        "spatial_grad_loss": total_spatial / n_batches,
         "cat_loss": total_cat / n_batches,
         "kl": total_kl / n_batches,
     }

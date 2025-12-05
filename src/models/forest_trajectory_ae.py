@@ -115,7 +115,7 @@ class ForestTrajectoryAE(nn.Module):
         self,
         in_channels: int,
         time_steps: int,
-        feature_channels: int = 32,
+        feature_channels: int = 48,
         temporal_hidden: int = 64,
     ):
         super().__init__()
@@ -129,6 +129,7 @@ class ForestTrajectoryAE(nn.Module):
         self.time_steps = time_steps
         self.c_per_t = in_channels // time_steps
         self.feature_channels = feature_channels
+        self.context_channels = feature_channels
         self.temporal_hidden = temporal_hidden
 
         # ------------------------------------------------------------------
@@ -183,10 +184,10 @@ class ForestTrajectoryAE(nn.Module):
             ResDilatedBlock2d(64, 64, kernel_size=3, dilation=2),
             ResDilatedBlock2d(64, 64, kernel_size=3, dilation=4),
             ResDilatedBlock2d(64, 64, kernel_size=3, dilation=8),
-            ResDilatedBlock2d(64, 64, kernel_size=3, dilation=16),
+            #ResDilatedBlock2d(64, 64, kernel_size=3, dilation=16),
         )
-        self.channel_proj = nn.Conv2d(64, self.feature_channels, kernel_size=1)
-
+        self.channel_proj = nn.Conv2d(64, self.context_channels, kernel_size=1)
+        
         # ------------------------------------------------------------------
         # Decoder:
         #   latent: [B, feature_channels, H, W]
@@ -198,7 +199,7 @@ class ForestTrajectoryAE(nn.Module):
         # ------------------------------------------------------------------
         self.code_to_traj = nn.Sequential(
             nn.Conv2d(
-                in_channels=self.feature_channels + 1,  # +1 for age channel
+                in_channels=self.feature_channels + self.context_channels + 1,  # +1 for age channel
                 out_channels=64,
                 kernel_size=1,
             ),
@@ -212,6 +213,15 @@ class ForestTrajectoryAE(nn.Module):
                 kernel_size=1,
             ),
             nn.SiLU(),
+        )
+        # Temporal refinement in the decoder:
+        # operate over [B*H*W, feature_channels, T] to allow
+        # sharper / more structured temporal trajectories.
+        self.dec_temporal_blocks = nn.ModuleList(
+            [
+                ResBlock1d(self.feature_channels, kernel_size=3, dilation=1),
+                #ResBlock1d(self.feature_channels, kernel_size=3, dilation=2),
+            ]
         )
 
         self.feature_decoder = nn.Conv2d(
@@ -291,7 +301,7 @@ class ForestTrajectoryAE(nn.Module):
         h_ctx = self.spatial_blocks(z_traj_map)
         h_ctx = self.channel_proj(h_ctx)  # [B, feature_channels, H, W]
         
-        latent = z_traj_map + h_ctx # [B, feature_channels, H, W]
+        latent = torch.cat([z_traj_map, h_ctx], dim=1)   # [B, C_feat + C_ctx, H, W]
 
         # --------------------------------------------------------------
         # Decoder (conditioned on age)
@@ -301,6 +311,27 @@ class ForestTrajectoryAE(nn.Module):
         d = self.code_to_traj(latent_with_age)          # [B, 64, H, W]
         d = self.temporal_decoder(d)                    # [B, T*feature_channels, H, W]
         d = d.view(B, T, self.feature_channels, H, W)
+
+        # --------------------------------------------------------------
+        # temporal refinement in decoder
+        #   - reshape to [B*H*W, C_feat, T]
+        #   - apply a couple of ResBlock1d along time
+        # --------------------------------------------------------------
+        d_seq = (
+            d.permute(0, 3, 4, 2, 1)    # [B, H, W, C_feat, T]
+            .contiguous()
+            .view(B * H * W, self.feature_channels, T)
+        )
+
+        for block in self.dec_temporal_blocks:
+            d_seq = block(d_seq)        # [B*H*W, C_feat, T]
+
+        # reshape back to [B, T, C_feat, H, W]
+        d = (
+            d_seq.view(B, H, W, self.feature_channels, T)
+            .permute(0, 4, 3, 1, 2)     # [B, T, C_feat, H, W]
+            .contiguous()
+        )
 
         # Per-timestep 1x1 conv to original per-time channels
         d_flat = d.view(B * T, self.feature_channels, H, W)

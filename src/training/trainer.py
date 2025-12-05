@@ -101,6 +101,16 @@ class TrainConfig:
             KL weight for the VAE loss.
         lambda_cat:
             Weight on the categorical reconstruction loss.
+        lambda_delta:
+            Weight on the delta-from-final temporal loss.
+        lambda_deriv:
+            Weight on the temporal derivative loss.
+        lambda_spatial_grad:
+            Weight on the spatial gradient (texture/contrast) loss.
+        spatial_grad_mode:
+            Which norm to use for spatial gradients ["l2", "l1", "huber"].
+        spatial_grad_beta:
+            Huber beta parameter for spatial_grad_mode == "huber".
         debug_window:
             If True, restrict training to a small spatial window.
         debug_window_origin:
@@ -124,18 +134,25 @@ class TrainConfig:
     patch_size: int = 256
     batch_size: int = 2
     num_epochs: int = 5
-    
+
     # --- Loss weighting ----------------------------------------------------
     beta: float = 0.1
     lambda_cat: float = 1.0
     beta_schedule: BetaScheduleConfig = field(default_factory=BetaScheduleConfig)
+
     lambda_delta: float = 10.0           # weight on delta-from-final loss
     lambda_deriv: float = 10.0           # weight on temporal derivative loss
     w_final: float = 2.0                 # extra weight on final timestep in recon
     change_thresh: float = 0.05          # threshold for |dx| / |d/dt x|
-    time_channels: List[int] = field(    # which continuous channels get temporal loss
-        default_factory=lambda: [0]
-    )
+
+    # which continuous channels get temporal + spatial losses
+    time_channels: List[int] = field(default_factory=lambda: [0])
+
+    # NEW: spatial gradient loss config
+    lambda_spatial_grad: float = 0.0     # weight on spatial gradient loss
+    spatial_grad_mode: str = "huber"     # "l2", "l1", or "huber"
+    spatial_grad_beta: float = 0.05      # Huber beta if using "huber"
+
     # --- Optimization ------------------------------------------------------
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
@@ -197,20 +214,26 @@ class TrainConfig:
             start_value=float(bs_raw.get("start_value", raw.get("beta", 0.1))),
             end_value=float(bs_raw.get("end_value", raw.get("beta", 0.1))),
         )
-        
+
+        # Loss weights / temporal config
         lambda_delta = float(raw.get("lambda_delta", 10.0))
         lambda_deriv = float(raw.get("lambda_deriv", 10.0))
         w_final = float(raw.get("w_final", 2.0))
         change_thresh = float(raw.get("change_thresh", 0.05))
         time_channels = raw.get("time_channels", [0])
 
+        # NEW: spatial gradient config (with sane defaults if absent)
+        lambda_spatial_grad = float(raw.get("lambda_spatial_grad", 0.0))
+        spatial_grad_mode = raw.get("spatial_grad_mode", "huber")
+        spatial_grad_beta = float(raw.get("spatial_grad_beta", 0.05))
+
         # Top-level scalars
         cfg = TrainConfig(
             zarr_path=raw["zarr_path"],
             time_steps=int(raw.get("time_steps")),
             patch_size=int(raw.get("patch_size", 256)),
-            batch_size=int(raw.get("batch_size", 2)),   # or 4 if you prefer
-            num_epochs=int(raw.get("num_epochs", 5)),   # match your defaults
+            batch_size=int(raw.get("batch_size", 2)),
+            num_epochs=int(raw.get("num_epochs", 5)),
             beta=float(raw.get("beta", 0.1)),
             lambda_cat=float(raw.get("lambda_cat", 1.0)),
             beta_schedule=beta_schedule,
@@ -219,6 +242,9 @@ class TrainConfig:
             w_final=w_final,
             change_thresh=change_thresh,
             time_channels=time_channels,
+            lambda_spatial_grad=lambda_spatial_grad,   # NEW
+            spatial_grad_mode=spatial_grad_mode,       # NEW
+            spatial_grad_beta=spatial_grad_beta,       # NEW
             optimizer=optimizer,
             debug_window=bool(raw.get("debug_window", True)),
             debug_window_origin=raw.get("debug_window_origin", (256 * 10, 256 * 20)),
@@ -588,8 +614,21 @@ class Trainer:
         # Open once for the whole run and write a simple header
         with open(metrics_path, "w", newline="") as f:
             writer = csv.writer(f)
+            # CSV header
             writer.writerow(
-                ["epoch", "split", "loss", "cont_recon", "delta_loss", "cat_loss", "kl", "beta", "lr"]
+                [
+                    "epoch",
+                    "split",
+                    "loss",
+                    "cont_recon",
+                    "delta_loss",
+                    "deriv_loss",
+                    "spatial_grad_loss",
+                    "cat_loss",
+                    "kl",
+                    "beta",
+                    "lr",
+                ]
             )
 
             for epoch in range(self.cfg.num_epochs):
@@ -599,19 +638,26 @@ class Trainer:
                 else:
                     beta = self.cfg.beta
 
-            
                 # ------------------------------
                 # Training epoch
                 # ------------------------------
                 train_metrics = train_one_epoch(
-                    model=self.model,
-                    train_loader=self.train_loader,
-                    optimizer=self.optimizer,
-                    device=self.device,
-                    normalizer=self.normalizer,
-                    cat_encoder=self.cat_encoder,
-                    beta=beta,
-                    lambda_cat=self.cfg.lambda_cat,
+                      model=self.model,
+                      train_loader=self.train_loader,
+                      optimizer=self.optimizer,
+                      device=self.device,
+                      normalizer=self.normalizer,
+                      cat_encoder=self.cat_encoder,
+                      beta=beta,
+                      lambda_cat=self.cfg.lambda_cat,
+                      lambda_delta=self.cfg.lambda_delta,
+                      lambda_deriv=self.cfg.lambda_deriv,
+                      lambda_spatial_grad=self.cfg.lambda_spatial_grad,
+                      spatial_grad_mode=self.cfg.spatial_grad_mode,
+                      spatial_grad_beta=self.cfg.spatial_grad_beta,
+                      w_final=self.cfg.w_final,
+                      change_thresh=self.cfg.change_thresh,
+                      time_channel_indices=self.cfg.time_channels,
                 )
 
                 # ------------------------------
@@ -625,27 +671,36 @@ class Trainer:
                     cat_encoder=self.cat_encoder,
                     beta=beta,
                     lambda_cat=self.cfg.lambda_cat,
+                    lambda_delta=self.cfg.lambda_delta,
+                    lambda_deriv=self.cfg.lambda_deriv,
+                    lambda_spatial_grad=self.cfg.lambda_spatial_grad,
+                    spatial_grad_mode=self.cfg.spatial_grad_mode,
+                    spatial_grad_beta=self.cfg.spatial_grad_beta,
+                    w_final=self.cfg.w_final,
+                    change_thresh=self.cfg.change_thresh,
+                    time_channel_indices=self.cfg.time_channels,
                 )
-                
+
                 # ---- Current LR ----
                 current_lr = self.optimizer.param_groups[0]["lr"]
 
-                # Console summary (same as before)
                 print(
-                    f"[epoch {epoch:03d}] "
-                    f"train_loss={train_metrics['loss']:.4f}  "
-                    f"train_cont={train_metrics['cont_recon']:.4f}  "
-                    f"train_delta={train_metrics['delta_loss']:.4f}  "
-                    f"train_deriv={train_metrics['deriv_loss']:.4f}  "
-                    f"train_cat={train_metrics['cat_loss']:.4f}  "
-                    f"train_kl={train_metrics['kl']:.4f}  \n            "
-                    f"  val_loss={val_metrics['loss']:.4f}  "
-                    f"  val_cont={val_metrics['cont_recon']:.4f}  "
-                    f"  val_delta={val_metrics['delta_loss']:.4f}  "
-                    f"  val_deriv={val_metrics['deriv_loss']:.4f}  "
-                    f"  val_cat={val_metrics['cat_loss']:.4f}  "
-                    f"  val_kl={val_metrics['kl']:.4f}"
-                )
+                   f"[epoch {epoch:03d}] "
+                   f"train_loss={train_metrics['loss']:.4f}  "
+                   f"train_cont={train_metrics['cont_recon']:.4f}  "
+                   f"train_delta={train_metrics['delta_loss']:.4f}  "
+                   f"train_deriv={train_metrics['deriv_loss']:.4f}  "
+                   f"train_spat={train_metrics['spatial_grad_loss']:.4f}  "
+                   f"train_cat={train_metrics['cat_loss']:.4f}  "
+                   f"train_kl={train_metrics['kl']:.4f}  \n            "
+                   f"  val_loss={val_metrics['loss']:.4f}  "
+                   f"  val_cont={val_metrics['cont_recon']:.4f}  "
+                   f"  val_delta={val_metrics['delta_loss']:.4f}  "
+                   f"  val_deriv={val_metrics['deriv_loss']:.4f}  "
+                   f"  val_spat={val_metrics['spatial_grad_loss']:.4f}  "
+                   f"  val_cat={val_metrics['cat_loss']:.4f}  "
+                   f"  val_kl={val_metrics['kl']:.4f}"
+               )
 
                 # ------------------------------
                 # CSV logging
@@ -654,26 +709,30 @@ class Trainer:
                     [
                         epoch,
                         "train",
-                        train_metrics["loss"],
-                        train_metrics["cont_recon"],
-                        train_metrics["delta_loss"],
-                        train_metrics["cat_loss"],
-                        train_metrics["kl"],
-                        beta, 
-                        current_lr,
+                        float(train_metrics["loss"]),
+                        float(train_metrics["cont_recon"]),
+                        float(train_metrics["delta_loss"]),
+                        float(train_metrics["deriv_loss"]),   # NEW
+                        float(train_metrics["spatial_grad_loss"]),
+                        float(train_metrics["cat_loss"]),
+                        float(train_metrics["kl"]),
+                        float(beta),
+                        float(current_lr),
                     ]
                 )
                 writer.writerow(
                     [
                         epoch,
                         "val",
-                        val_metrics["loss"],
-                        val_metrics["cont_recon"],
-                        val_metrics["delta_loss"],
-                        val_metrics["cat_loss"],
-                        val_metrics["kl"],
-                        beta, 
-                        current_lr,
+                        float(val_metrics["loss"]),
+                        float(val_metrics["cont_recon"]),
+                        float(val_metrics["delta_loss"]),
+                        float(val_metrics["deriv_loss"]),     # NEW
+                        float(val_metrics["spatial_grad_loss"]),
+                        float(val_metrics["cat_loss"]),
+                        float(val_metrics["kl"]),
+                        float(beta),
+                        float(current_lr),
                     ]
                 )
                 
