@@ -15,15 +15,13 @@
 # @dataclass class BetaScheduleConfig
 # class Trainer
 
-
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Tuple, List
 import yaml
-import csv 
+import csv
 
 import torch
 from torch.utils.data import DataLoader
@@ -35,10 +33,11 @@ from src.data.patch_dataset import PatchDataset
 from src.data.categorical_meta import infer_categorical_meta_from_zarr
 
 from src.models.categorical_embedding import CategoricalEmbeddingEncoder
-#from src.models.vae_v0 import ConvVAE
 from src.models.forest_trajectory_ae import ForestTrajectoryAE
 from src.training.categorical_eval import print_categorical_histograms
 from src.training.loops import train_one_epoch, eval_one_epoch
+from src.training.loss_config import ForestTrajectoryLossConfig
+
 
 @dataclass
 class SchedulerConfig:
@@ -57,6 +56,7 @@ class SchedulerConfig:
     milestones: List[int] = field(default_factory=list)
     gamma: float = 0.1
 
+
 @dataclass
 class OptimizerConfig:
     """
@@ -66,6 +66,7 @@ class OptimizerConfig:
     lr: float = 1e-4
     weight_decay: float = 0.0
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
 
 @dataclass
 class BetaScheduleConfig:
@@ -78,7 +79,8 @@ class BetaScheduleConfig:
     end_epoch: int = 0
     start_value: float = 0.1
     end_value: float = 0.1
-    
+
+
 @dataclass
 class TrainConfig:
     """
@@ -172,7 +174,6 @@ class TrainConfig:
     experiment_name: str = "vae_v0"
     ckpt_dir: str = "checkpoints"
 
-
     @staticmethod
     def from_yaml(path: str | Path) -> "TrainConfig":
         """
@@ -260,6 +261,7 @@ class TrainConfig:
 
         return cfg
 
+
 class BetaScheduler:
     """
     Simple epoch-based beta scheduler.
@@ -331,8 +333,7 @@ class Trainer:
         with open(cfg_out, "w") as f:
             yaml.safe_dump(asdict(self.cfg), f)
         print(f"[Trainer] Saved resolved config to {cfg_out}")
-        
-        
+
         # Decide on spatial split parameters and debug window
         if cfg.debug_window:
             self.window_origin = cfg.debug_window_origin
@@ -491,7 +492,6 @@ class Trainer:
         self.C_all = C_all
         self.in_channels = in_channels
 
-
     def _build_model_and_optimizer(self):
         # ------------------------------------------------------------------
         # Build model
@@ -499,7 +499,7 @@ class Trainer:
         # The trainer already computed self.in_channels = T * C_all
         # So we also need time_steps. You already have it in config.
         time_steps = self.cfg.time_steps   # or wherever T lives in your YAML
-        
+
         self.model = ForestTrajectoryAE(
             in_channels=self.in_channels,
             time_steps=time_steps,
@@ -523,7 +523,6 @@ class Trainer:
             lr=opt_cfg.lr,
             weight_decay=opt_cfg.weight_decay,
         )
-
 
         # -------------------------------------------------------------
         # LR Scheduler
@@ -590,7 +589,6 @@ class Trainer:
             self.beta_scheduler = None
             print(f"[Trainer] BetaScheduler disabled (constant beta={self.cfg.beta}).")
 
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -638,26 +636,33 @@ class Trainer:
                 else:
                     beta = self.cfg.beta
 
+                # Build loss config for this epoch (beta may be annealed)
+                loss_cfg = ForestTrajectoryLossConfig(
+                    beta=beta,
+                    lambda_cat=self.cfg.lambda_cat,
+                    lambda_delta=self.cfg.lambda_delta,
+                    lambda_deriv=self.cfg.lambda_deriv,
+                    lambda_spatial_grad=self.cfg.lambda_spatial_grad,
+                    w_final=self.cfg.w_final,
+                    channel_indices=tuple(self.cfg.time_channels)
+                    if self.cfg.time_channels is not None
+                    else None,
+                    change_thresh=self.cfg.change_thresh,
+                    spatial_grad_mode=self.cfg.spatial_grad_mode,
+                    spatial_grad_beta=self.cfg.spatial_grad_beta,
+                )
+
                 # ------------------------------
                 # Training epoch
                 # ------------------------------
                 train_metrics = train_one_epoch(
-                      model=self.model,
-                      train_loader=self.train_loader,
-                      optimizer=self.optimizer,
-                      device=self.device,
-                      normalizer=self.normalizer,
-                      cat_encoder=self.cat_encoder,
-                      beta=beta,
-                      lambda_cat=self.cfg.lambda_cat,
-                      lambda_delta=self.cfg.lambda_delta,
-                      lambda_deriv=self.cfg.lambda_deriv,
-                      lambda_spatial_grad=self.cfg.lambda_spatial_grad,
-                      spatial_grad_mode=self.cfg.spatial_grad_mode,
-                      spatial_grad_beta=self.cfg.spatial_grad_beta,
-                      w_final=self.cfg.w_final,
-                      change_thresh=self.cfg.change_thresh,
-                      time_channel_indices=self.cfg.time_channels,
+                    model=self.model,
+                    train_loader=self.train_loader,
+                    optimizer=self.optimizer,
+                    device=self.device,
+                    normalizer=self.normalizer,
+                    cat_encoder=self.cat_encoder,
+                    loss_cfg=loss_cfg,
                 )
 
                 # ------------------------------
@@ -669,38 +674,29 @@ class Trainer:
                     device=self.device,
                     normalizer=self.normalizer,
                     cat_encoder=self.cat_encoder,
-                    beta=beta,
-                    lambda_cat=self.cfg.lambda_cat,
-                    lambda_delta=self.cfg.lambda_delta,
-                    lambda_deriv=self.cfg.lambda_deriv,
-                    lambda_spatial_grad=self.cfg.lambda_spatial_grad,
-                    spatial_grad_mode=self.cfg.spatial_grad_mode,
-                    spatial_grad_beta=self.cfg.spatial_grad_beta,
-                    w_final=self.cfg.w_final,
-                    change_thresh=self.cfg.change_thresh,
-                    time_channel_indices=self.cfg.time_channels,
+                    loss_cfg=loss_cfg,
                 )
 
                 # ---- Current LR ----
                 current_lr = self.optimizer.param_groups[0]["lr"]
 
                 print(
-                   f"[epoch {epoch:03d}] "
-                   f"train_loss={train_metrics['loss']:.4f}  "
-                   f"train_cont={train_metrics['cont_recon']:.4f}  "
-                   f"train_delta={train_metrics['delta_loss']:.4f}  "
-                   f"train_deriv={train_metrics['deriv_loss']:.4f}  "
-                   f"train_spat={train_metrics['spatial_grad_loss']:.4f}  "
-                   f"train_cat={train_metrics['cat_loss']:.4f}  "
-                   f"train_kl={train_metrics['kl']:.4f}  \n            "
-                   f"  val_loss={val_metrics['loss']:.4f}  "
-                   f"  val_cont={val_metrics['cont_recon']:.4f}  "
-                   f"  val_delta={val_metrics['delta_loss']:.4f}  "
-                   f"  val_deriv={val_metrics['deriv_loss']:.4f}  "
-                   f"  val_spat={val_metrics['spatial_grad_loss']:.4f}  "
-                   f"  val_cat={val_metrics['cat_loss']:.4f}  "
-                   f"  val_kl={val_metrics['kl']:.4f}"
-               )
+                    f"[epoch {epoch:03d}] "
+                    f"train_loss={train_metrics['loss']:.4f}  "
+                    f"train_cont={train_metrics['cont_recon']:.4f}  "
+                    f"train_delta={train_metrics['delta_loss']:.4f}  "
+                    f"train_deriv={train_metrics['deriv_loss']:.4f}  "
+                    f"train_spat={train_metrics['spatial_grad_loss']:.4f}  "
+                    f"train_cat={train_metrics['cat_loss']:.4f}  "
+                    f"train_kl={train_metrics['kl']:.4f}  \n            "
+                    f"  val_loss={val_metrics['loss']:.4f}  "
+                    f"  val_cont={val_metrics['cont_recon']:.4f}  "
+                    f"  val_delta={val_metrics['delta_loss']:.4f}  "
+                    f"  val_deriv={val_metrics['deriv_loss']:.4f}  "
+                    f"  val_spat={val_metrics['spatial_grad_loss']:.4f}  "
+                    f"  val_cat={val_metrics['cat_loss']:.4f}  "
+                    f"  val_kl={val_metrics['kl']:.4f}"
+                )
 
                 # ------------------------------
                 # CSV logging
@@ -712,7 +708,7 @@ class Trainer:
                         float(train_metrics["loss"]),
                         float(train_metrics["cont_recon"]),
                         float(train_metrics["delta_loss"]),
-                        float(train_metrics["deriv_loss"]),   # NEW
+                        float(train_metrics["deriv_loss"]),
                         float(train_metrics["spatial_grad_loss"]),
                         float(train_metrics["cat_loss"]),
                         float(train_metrics["kl"]),
@@ -727,7 +723,7 @@ class Trainer:
                         float(val_metrics["loss"]),
                         float(val_metrics["cont_recon"]),
                         float(val_metrics["delta_loss"]),
-                        float(val_metrics["deriv_loss"]),     # NEW
+                        float(val_metrics["deriv_loss"]),
                         float(val_metrics["spatial_grad_loss"]),
                         float(val_metrics["cat_loss"]),
                         float(val_metrics["kl"]),
@@ -735,7 +731,7 @@ class Trainer:
                         float(current_lr),
                     ]
                 )
-                
+
                 # ---- LR scheduler step (epoch-wise schedulers) ----
                 if self.scheduler is not None:
                     self.scheduler.step()
@@ -966,5 +962,3 @@ class Trainer:
             )
         except Exception as e:
             print(f"[Trainer] Warning: failed to write spacetime recon grid: {e}")
-
- 

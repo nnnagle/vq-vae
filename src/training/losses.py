@@ -608,43 +608,23 @@ def structure_tensor_loss(
     return loss
 
 
+from src.training.loss_config import ForestTrajectoryLossConfig
+
 class ForestTrajectoryVAELoss:
     """
     Bundle all the per-batch loss logic for the forest trajectory VAE.
 
-    Computes:
-      - continuous recon loss with final-frame weighting
-      - delta-from-final loss
-      - temporal derivative loss
-      - KL
-      - categorical recon loss (via embeddings)
-
-    and returns both the total and individual components.
+    Uses a ForestTrajectoryLossConfig to control weights and options.
     """
 
-    def __init__(
-        self,
-            beta: float,
-            lambda_cat: float,
-            lambda_delta: float = 10.0,
-            lambda_deriv: float = 10.0,
-            w_final: float = 2.0,  # Extra weight on last year
-            channel_indices: list[int] | None = None, # Continuous Channels with time loss
-            change_thresh: float = 0.05, # time deltas less than this incur no loss
-            lambda_spatial_grad: float = 0.0,   # NEW
-            spatial_grad_mode: str = "huber",   # NEW: "l2" / "l1" / "huber"
-            spatial_grad_beta: float = 0.05,    # NEW: Huber beta
-        ):
-        self.beta = beta
-        self.lambda_cat = lambda_cat
-        self.lambda_delta = lambda_delta
-        self.lambda_deriv = lambda_deriv
-        self.w_final = w_final
-        self.channel_indices = channel_indices if channel_indices is not None else [0]
-        self.change_thresh = change_thresh
-        self.lambda_spatial_grad = lambda_spatial_grad
-        self.spatial_grad_mode = spatial_grad_mode
-        self.spatial_grad_beta = spatial_grad_beta
+    def __init__(self, cfg: ForestTrajectoryLossConfig):
+        self.cfg = cfg
+
+    def _channel_indices(self) -> list[int]:
+        # Preserve your current default: if nothing specified, use [0]
+        if self.cfg.channel_indices is None:
+            return [0]
+        return list(self.cfg.channel_indices)
 
     def __call__(
         self,
@@ -657,17 +637,8 @@ class ForestTrajectoryVAELoss:
         C_cont: int,
         cat_encoder: CategoricalEmbeddingEncoder | None,
     ) -> dict[str, torch.Tensor]:
-        """
-        Compute all loss terms for a single batch.
+        channel_indices = self._channel_indices()
 
-        Returns a dict of scalar tensors:
-          - "loss"
-          - "cont_recon"
-          - "delta_loss"
-          - "deriv_loss"
-          - "cat_loss"
-          - "kl"
-        """
         # ---------------------------------------
         # Continuous reconstruction loss
         # ---------------------------------------
@@ -675,7 +646,7 @@ class ForestTrajectoryVAELoss:
         recon_loss = final_frame_weighted_mse(
             recon_full=recon_cont,
             x_full=x_cont_norm,
-            w_final=self.w_final,
+            w_final=self.cfg.w_final,
             aoi_mask=aoi_mask,
         )
 
@@ -686,8 +657,8 @@ class ForestTrajectoryVAELoss:
             recon_full=recon_cont,
             x_full=x_cont_norm,
             aoi_mask=aoi_mask,
-            channel_indices=self.channel_indices,
-            change_thresh=self.change_thresh,
+            channel_indices=channel_indices,
+            change_thresh=self.cfg.change_thresh,
         )
 
         # ---------------------------------------
@@ -697,8 +668,8 @@ class ForestTrajectoryVAELoss:
             recon_full=recon_cont,
             x_full=x_cont_norm,
             aoi_mask=aoi_mask,
-            channel_indices=self.channel_indices,
-            change_thresh=self.change_thresh,
+            channel_indices=channel_indices,
+            change_thresh=self.cfg.change_thresh,
         )
 
         # ---------------------------------------
@@ -708,16 +679,16 @@ class ForestTrajectoryVAELoss:
             recon_full=recon_cont,
             x_full=x_cont_norm,
             aoi_mask=aoi_mask,
-            channel_indices=self.channel_indices,
-            mode=self.spatial_grad_mode,
-            beta=self.spatial_grad_beta,
+            channel_indices=channel_indices,
+            mode=self.cfg.spatial_grad_mode,
+            beta=self.cfg.spatial_grad_beta,
         )
-        
+
         # ---------------------------------------
         # KL
         # ---------------------------------------
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_weighted = self.beta * kl
+        kl_weighted = self.cfg.beta * kl
 
         # ---------------------------------------
         # Categorical reconstruction loss
@@ -729,7 +700,6 @@ class ForestTrajectoryVAELoss:
             C_cont=C_cont,
         )
 
-        # Handle non-finite cat_loss here so callers don't duplicate logic
         if not torch.isfinite(cat_loss):
             if DEBUG_CAT_LOSS:
                 print(
@@ -743,11 +713,11 @@ class ForestTrajectoryVAELoss:
         # ---------------------------------------
         loss = (
             recon_loss
-            + self.lambda_delta * delta_loss
-            + self.lambda_deriv * deriv_loss
-            + self.lambda_spatial_grad * spatial_grad_loss
+            + self.cfg.lambda_delta * delta_loss
+            + self.cfg.lambda_deriv * deriv_loss
+            + self.cfg.lambda_spatial_grad * spatial_grad_loss
             + kl_weighted
-            + self.lambda_cat * cat_loss
+            + self.cfg.lambda_cat * cat_loss
         )
 
         return {

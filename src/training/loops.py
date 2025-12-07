@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict
 
 import torch
 from torch import Tensor
-from src.training.losses import ForestTrajectoryVAELoss
 
-CHANNEL_INDICES = [0]
+from src.training.losses import ForestTrajectoryVAELoss
+from src.training.loss_config import ForestTrajectoryLossConfig
+
 
 def train_one_epoch(
     model: torch.nn.Module,
@@ -29,44 +30,37 @@ def train_one_epoch(
     device: torch.device,
     normalizer,
     cat_encoder,
-    beta: float,
-    lambda_cat: float,
-    lambda_delta: float = 10.0,
-    lambda_deriv: float = 10.0,
-    lambda_spatial_grad: float = 0.5,     # NEW: weight on spatial gradient loss
-    spatial_grad_mode: str = "huber",     # NEW: "l2" / "l1" / "huber"
-    spatial_grad_beta: float = 0.05,      # NEW: Huber beta
-    w_final: float = 2.0,
-    change_thresh: float = 0.05,
-    time_channel_indices: list[int] | None = None,
+    loss_cfg: ForestTrajectoryLossConfig,
 ) -> Dict[str, float]:
     """
     Single training epoch over the TRAIN split.
 
-    Returns:
-        dict with averaged metrics over the epoch:
-          - "loss"
-          - "cont_recon"
-          - "delta_loss"
-          - "deriv_loss"
-          - "spatial_grad_loss"
-          - "cat_loss"
-          - "kl"
+    Args
+    ----
+    model : torch.nn.Module
+    train_loader : DataLoader
+    optimizer : torch.optim.Optimizer
+    device : torch.device
+    normalizer : callable
+        Normalization module/function applied to continuous inputs.
+    cat_encoder : CategoricalEmbeddingEncoder or None
+    loss_cfg : ForestTrajectoryLossConfig
+        Configuration for all loss weights and options.
+
+    Returns
+    -------
+    dict with averaged metrics over the epoch:
+      - "loss"
+      - "cont_recon"
+      - "delta_loss"
+      - "deriv_loss"
+      - "spatial_grad_loss"
+      - "cat_loss"
+      - "kl"
     """
     model.train()
-    
-    loss_fn = ForestTrajectoryVAELoss(
-        beta=beta,
-        lambda_cat=lambda_cat,
-        lambda_delta=lambda_delta,
-        lambda_deriv=lambda_deriv,
-        w_final=w_final,
-        channel_indices=time_channel_indices,
-        change_thresh=change_thresh,
-        lambda_spatial_grad=lambda_spatial_grad,   # pass through
-        spatial_grad_mode=spatial_grad_mode,
-        spatial_grad_beta=spatial_grad_beta,
-    )
+
+    loss_fn = ForestTrajectoryVAELoss(loss_cfg)
 
     total_loss = 0.0
     total_cont = 0.0
@@ -134,7 +128,10 @@ def train_one_epoch(
         recon_loss = loss_dict["cont_recon"]
         delta_loss = loss_dict["delta_loss"]
         deriv_loss = loss_dict["deriv_loss"]
-        spatial_loss = loss_dict.get("spatial_grad_loss", torch.tensor(0.0, device=device))
+        spatial_loss = loss_dict.get(
+            "spatial_grad_loss",
+            torch.tensor(0.0, device=device),
+        )
         cat_loss = loss_dict["cat_loss"]
         kl = loss_dict["kl"]
 
@@ -143,14 +140,14 @@ def train_one_epoch(
         optimizer.step()
 
         # Accumulate metrics
-        total_loss   += float(loss.item())
-        total_cont   += float(recon_loss.item())
-        total_delta  += float(delta_loss.item())
-        total_deriv  += float(deriv_loss.item())
+        total_loss    += float(loss.item())
+        total_cont    += float(recon_loss.item())
+        total_delta   += float(delta_loss.item())
+        total_deriv   += float(deriv_loss.item())
         total_spatial += float(spatial_loss.item())
-        total_cat    += float(cat_loss.item())
-        total_kl     += float(kl.item())
-        n_batches    += 1
+        total_cat     += float(cat_loss.item())
+        total_kl      += float(kl.item())
+        n_batches     += 1
 
     if n_batches == 0:
         return {
@@ -181,16 +178,7 @@ def eval_one_epoch(
     device: torch.device,
     normalizer,
     cat_encoder,
-    beta: float,
-    lambda_cat: float,
-    lambda_delta: float = 10.0,
-    lambda_deriv: float = 10.0,
-    lambda_spatial_grad: float = 0.5,
-    spatial_grad_mode: str = "huber",
-    spatial_grad_beta: float = 0.05,
-    w_final: float = 2.0,
-    change_thresh: float = 0.05,
-    time_channel_indices: list[int] | None = None,
+    loss_cfg: ForestTrajectoryLossConfig,
 ) -> Dict[str, float]:
     """
     Single evaluation epoch over the VAL split.
@@ -201,19 +189,8 @@ def eval_one_epoch(
     """
     model.eval()
 
-    loss_fn = ForestTrajectoryVAELoss(
-        beta=beta,
-        lambda_cat=lambda_cat,
-        lambda_delta=lambda_delta,
-        lambda_deriv=lambda_deriv,
-        w_final=w_final,
-        channel_indices=time_channel_indices,
-        change_thresh=change_thresh,
-        lambda_spatial_grad=lambda_spatial_grad,
-        spatial_grad_mode=spatial_grad_mode,
-        spatial_grad_beta=spatial_grad_beta,
-    )
-    
+    loss_fn = ForestTrajectoryVAELoss(loss_cfg)
+
     total_loss = 0.0
     total_cont = 0.0
     total_cat = 0.0
@@ -243,7 +220,7 @@ def eval_one_epoch(
 
         # Optional categorical embeddings
         if cat_encoder is not None and x_cat is not None:
-            x_cat_emb = cat_encoder(x_cat)         # [B,T,C_emb,H,W]
+            x_cat_emb = cat_encoder(x_cat)         # [B, T, C_emb, H, W]
             x_all = torch.cat([x_cont_norm, x_cat_emb], dim=2)
         else:
             x_all = x_cont_norm
@@ -277,18 +254,21 @@ def eval_one_epoch(
         recon_loss = loss_dict["cont_recon"]
         delta_loss = loss_dict["delta_loss"]
         deriv_loss = loss_dict["deriv_loss"]
-        spatial_loss = loss_dict.get("spatial_grad_loss", torch.tensor(0.0, device=device))
+        spatial_loss = loss_dict.get(
+            "spatial_grad_loss",
+            torch.tensor(0.0, device=device),
+        )
         cat_loss = loss_dict["cat_loss"]
         kl = loss_dict["kl"]
-        
-        total_loss   += float(loss.item())
-        total_cont   += float(recon_loss.item())
-        total_delta  += float(delta_loss.item())
-        total_deriv  += float(deriv_loss.item())
+
+        total_loss    += float(loss.item())
+        total_cont    += float(recon_loss.item())
+        total_delta   += float(delta_loss.item())
+        total_deriv   += float(deriv_loss.item())
         total_spatial += float(spatial_loss.item())
-        total_cat    += float(cat_loss.item())
-        total_kl     += float(kl.item())
-        n_batches    += 1
+        total_cat     += float(cat_loss.item())
+        total_kl      += float(kl.item())
+        n_batches     += 1
 
     if n_batches == 0:
         return {

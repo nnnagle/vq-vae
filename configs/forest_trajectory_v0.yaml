@@ -7,17 +7,18 @@ patch_size: 256
 batch_size: 2
 num_epochs: 100
 
-beta: 0.1
-lambda_cat: 1.0
-lambda_delta: 1.0
-lambda_deriv: 1.0
-lambda_spatial_grad: 0.5     # or 1.0
-spatial_grad_mode: "huber"   # or "l2"
-spatial_grad_beta: 0.05
-w_final: 2.0
-change_thresh: 0.05
-time_channels: [0]
-
+loss:
+  beta: 0.1
+  lambda_cat: 1.0
+  time_channels: [0]
+  lambda_delta: 1.0
+  lambda_deriv: 1.0
+  change_thresh: 0.05
+  lambda_spatial_grad: 1.0     # or 1.0
+  spatial_grad_mode: "huber"   # or "l2"
+  spatial_grad_beta: 0.05
+  w_final: 2.0
+  
 
 optimizer:
   name: adam
