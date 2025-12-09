@@ -1,9 +1,10 @@
 # configs/forest_trajectory.yaml
 
-zarr_path: "/data/VA/zarr/va_cube.zarr"
+#zarr_path: "/data/VA/zarr/va_cube.zarr"
+zarr_path: "/data/VA/processed2/va_vae_dataset.zarr"
 
 time_steps: 10
-patch_size: 256
+patch_size: 128
 batch_size: 2
 num_epochs: 100
 

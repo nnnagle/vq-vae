@@ -154,6 +154,8 @@ class TrainConfig:
     lambda_spatial_grad: float = 0.0     # weight on spatial gradient loss
     spatial_grad_mode: str = "huber"     # "l2", "l1", or "huber"
     spatial_grad_beta: float = 0.05      # Huber beta if using "huber"
+    
+    lambda_vq: float = 0.0               # weight on VQ loss (0.0 = off)
 
     # --- Optimization ------------------------------------------------------
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -227,6 +229,8 @@ class TrainConfig:
         lambda_spatial_grad = float(raw.get("lambda_spatial_grad", 0.0))
         spatial_grad_mode = raw.get("spatial_grad_mode", "huber")
         spatial_grad_beta = float(raw.get("spatial_grad_beta", 0.05))
+        
+        lambda_vq = float(raw.get("lambda_vq", 0.0))
 
         # Top-level scalars
         cfg = TrainConfig(
@@ -246,6 +250,7 @@ class TrainConfig:
             lambda_spatial_grad=lambda_spatial_grad,   # NEW
             spatial_grad_mode=spatial_grad_mode,       # NEW
             spatial_grad_beta=spatial_grad_beta,       # NEW
+            lambda_vq=lambda_vq,   
             optimizer=optimizer,
             debug_window=bool(raw.get("debug_window", True)),
             debug_window_origin=raw.get("debug_window_origin", (256 * 10, 256 * 20)),
@@ -505,6 +510,7 @@ class Trainer:
             time_steps=time_steps,
             feature_channels=32,     # or make configurable later
             temporal_hidden=64,      # or make configurable later
+            num_codes=64,  
         ).to(self.device)
 
         # Keep categorical encoder behavior unchanged
@@ -623,6 +629,7 @@ class Trainer:
                     "deriv_loss",
                     "spatial_grad_loss",
                     "cat_loss",
+                    "vq_loss",
                     "kl",
                     "beta",
                     "lr",
@@ -650,6 +657,7 @@ class Trainer:
                     change_thresh=self.cfg.change_thresh,
                     spatial_grad_mode=self.cfg.spatial_grad_mode,
                     spatial_grad_beta=self.cfg.spatial_grad_beta,
+                    lambda_vq=self.cfg.lambda_vq,
                 )
 
                 # ------------------------------
@@ -695,6 +703,7 @@ class Trainer:
                     f"  val_deriv={val_metrics['deriv_loss']:.4f}  "
                     f"  val_spat={val_metrics['spatial_grad_loss']:.4f}  "
                     f"  val_cat={val_metrics['cat_loss']:.4f}  "
+                    f"  val_vq={val_metrics.get('vq_loss', 0.0):.4f}"
                     f"  val_kl={val_metrics['kl']:.4f}"
                 )
 
@@ -711,6 +720,7 @@ class Trainer:
                         float(train_metrics["deriv_loss"]),
                         float(train_metrics["spatial_grad_loss"]),
                         float(train_metrics["cat_loss"]),
+                        float(train_metrics["vq_loss"]),
                         float(train_metrics["kl"]),
                         float(beta),
                         float(current_lr),
@@ -726,6 +736,7 @@ class Trainer:
                         float(val_metrics["deriv_loss"]),
                         float(val_metrics["spatial_grad_loss"]),
                         float(val_metrics["cat_loss"]),
+                        float(val_metrics["vq_loss"]),
                         float(val_metrics["kl"]),
                         float(beta),
                         float(current_lr),

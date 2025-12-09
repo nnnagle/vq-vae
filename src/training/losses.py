@@ -636,6 +636,7 @@ class ForestTrajectoryVAELoss:
         aoi_mask: torch.Tensor,     # [B, 1, H, W] or [B, H, W]
         C_cont: int,
         cat_encoder: CategoricalEmbeddingEncoder | None,
+        vq_loss: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         channel_indices = self._channel_indices()
 
@@ -709,6 +710,18 @@ class ForestTrajectoryVAELoss:
             cat_loss = torch.tensor(0.0, device=recon_full.device)
 
         # ---------------------------------------
+        # VQ loss (optional)
+        # ---------------------------------------
+        if vq_loss is None:
+            vq_loss_term = torch.tensor(0.0, device=recon_full.device)
+        else:
+            # Safety: detach NaNs/Infs instead of poisoning the batch
+            if not torch.isfinite(vq_loss):
+                vq_loss_term = torch.tensor(0.0, device=recon_full.device)
+            else:
+                vq_loss_term = vq_loss
+
+        # ---------------------------------------
         # Total loss
         # ---------------------------------------
         loss = (
@@ -718,6 +731,7 @@ class ForestTrajectoryVAELoss:
             + self.cfg.lambda_spatial_grad * spatial_grad_loss
             + kl_weighted
             + self.cfg.lambda_cat * cat_loss
+            + self.cfg.lambda_vq * vq_loss_term           # <-- NEW
         )
 
         return {
@@ -728,4 +742,5 @@ class ForestTrajectoryVAELoss:
             "spatial_grad_loss": spatial_grad_loss,
             "cat_loss": cat_loss,
             "kl": kl,
+            "vq_loss": vq_loss_term,                      # <-- NEW
         }

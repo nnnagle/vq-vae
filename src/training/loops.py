@@ -68,6 +68,7 @@ def train_one_epoch(
     total_deriv = 0.0
     total_spatial = 0.0
     total_cat = 0.0
+    total_vq = 0.0
     total_kl = 0.0
     n_batches = 0
 
@@ -112,6 +113,8 @@ def train_one_epoch(
         recon, mu, logvar = model(x_flat_all)     # recon is in normalized space
 
         recon_full = recon.view(B, T, C_all, H, W)
+        
+        vq_loss_model = getattr(model, "_vq_loss", None)
 
         loss_dict = loss_fn(
             recon_full=recon_full,
@@ -122,6 +125,7 @@ def train_one_epoch(
             aoi_mask=aoi_mask,
             C_cont=C_cont,
             cat_encoder=cat_encoder,
+            vq_loss=vq_loss_model, 
         )
 
         loss = loss_dict["loss"]
@@ -133,6 +137,7 @@ def train_one_epoch(
             torch.tensor(0.0, device=device),
         )
         cat_loss = loss_dict["cat_loss"]
+        vq_loss = loss_dict["vq_loss"]
         kl = loss_dict["kl"]
 
         # Backprop + update
@@ -146,6 +151,7 @@ def train_one_epoch(
         total_deriv   += float(deriv_loss.item())
         total_spatial += float(spatial_loss.item())
         total_cat     += float(cat_loss.item())
+        total_vq      += float(vq_loss.item())
         total_kl      += float(kl.item())
         n_batches     += 1
 
@@ -157,6 +163,7 @@ def train_one_epoch(
             "deriv_loss": float("nan"),
             "spatial_grad_loss": float("nan"),
             "cat_loss": float("nan"),
+            "vq_loss": float("nan"),
             "kl": float("nan"),
         }
 
@@ -167,6 +174,7 @@ def train_one_epoch(
         "deriv_loss": total_deriv / n_batches,
         "spatial_grad_loss": total_spatial / n_batches,
         "cat_loss": total_cat / n_batches,
+        "vq_loss": total_vq / n_batches,
         "kl": total_kl / n_batches,
     }
 
@@ -197,6 +205,7 @@ def eval_one_epoch(
     total_delta = 0.0
     total_deriv = 0.0
     total_spatial = 0.0
+    total_vq = 0.0
     total_kl = 0.0
     n_batches = 0
 
@@ -238,6 +247,8 @@ def eval_one_epoch(
         recon, mu, logvar = model(x_flat_all)     # recon in normalized space
 
         recon_full = recon.view(B, T, C_all, H, W)
+        
+        vq_loss_model = getattr(model, "_vq_loss", None)
 
         loss_dict = loss_fn(
             recon_full=recon_full,
@@ -248,6 +259,7 @@ def eval_one_epoch(
             aoi_mask=aoi_mask,
             C_cont=C_cont,
             cat_encoder=cat_encoder,
+            vq_loss=vq_loss_model,
         )
 
         loss = loss_dict["loss"]
@@ -259,6 +271,10 @@ def eval_one_epoch(
             torch.tensor(0.0, device=device),
         )
         cat_loss = loss_dict["cat_loss"]
+        vq_loss_effective = loss_dict.get(
+            "vq_loss",
+            torch.tensor(0.0, device=device),
+        )
         kl = loss_dict["kl"]
 
         total_loss    += float(loss.item())
@@ -267,6 +283,7 @@ def eval_one_epoch(
         total_deriv   += float(deriv_loss.item())
         total_spatial += float(spatial_loss.item())
         total_cat     += float(cat_loss.item())
+        total_vq      += float(vq_loss_effective.item()) 
         total_kl      += float(kl.item())
         n_batches     += 1
 
@@ -278,6 +295,7 @@ def eval_one_epoch(
             "deriv_loss": float("nan"),
             "spatial_grad_loss": float("nan"),
             "cat_loss": float("nan"),
+            "vq_loss": float("nan"),
             "kl": float("nan"),
         }
 
@@ -288,5 +306,6 @@ def eval_one_epoch(
         "deriv_loss": total_deriv / n_batches,
         "spatial_grad_loss": total_spatial / n_batches,
         "cat_loss": total_cat / n_batches,
+        "vq_loss": total_vq / n_batches,
         "kl": total_kl / n_batches,
     }
