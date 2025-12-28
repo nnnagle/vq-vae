@@ -251,6 +251,8 @@ def export_img_to_gcs(
     or, if gcs_dir is None:
       gs://<bucket>/<base_name>.tif
     """
+    img = ee.Image(img)
+    aoi = ee.Geometry(aoi)
     # Build the GCS object prefix (without extension)
     if gcs_dir:
         gcs_dir = gcs_dir.rstrip("/")  # avoid double slashes
