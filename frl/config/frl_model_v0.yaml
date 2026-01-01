@@ -1,0 +1,277 @@
+version: "1.0"
+name: forest_state_repr_v1
+
+# ================================================================
+# Global conventions (model-side only)
+# ================================================================
+conventions:
+  tensor_order:
+    temporal: [B, K, C, T, H, W]   # K = window bundle members (e.g., t0,t2,t4) OR 1
+    static:   [B, K, C, H, W]
+  bundle_dimension:
+    enabled: true
+    K: 3
+    keys: [t0, t2, t4]
+  activation: relu
+  norm_layer: groupnorm            # stable for small batch sizes
+  dropout: 0.0                     # default; overridden per-module below
+
+# ================================================================
+# Latent spaces
+# ================================================================
+latents:
+  z_type:
+    dim: 64
+    quantized: true
+  z_phase:
+    dim: 16
+
+quantization:
+  kind: vq
+  target: z_type
+  num_embeddings: 256
+  embedding_dim: 64
+  commitment_cost: 0.25
+  straight_through: true
+
+# ================================================================
+# Modules
+# ================================================================
+modules:
+
+  # ----------------------------
+  # Temporal encoders
+  # ----------------------------
+  tcn_type_ls8_delta:
+    kind: tcn
+    in_channels: 4                  # dNDVI_summer_p95, dNDVI_winter_max, dNDVI_amplitude, dNBR_annual_min
+    channels: [128, 128, 128]
+    kernel_size: 3
+    dilations: [1, 2, 4]
+    dropout: 0.10
+    pooling:
+      kind: stats
+      stats: [mean, max]            # -> 256 dims
+
+  tcn_phase_ls8_level:
+    kind: tcn
+    in_channels: 9                  # ls8day_level bands + 2 position bands
+    channels: [128, 128, 128]
+    kernel_size: 3
+    dilations: [1, 2, 4]
+    dropout: 0.10
+    pooling:
+      kind: stats
+      stats: [mean, recent_mean_3, last]   # mean (128), recent_mean(128), last(128) -> 384
+
+  tcn_phase_lcms:
+    kind: tcn
+    in_channels: 17                 # (if you keep original 17) OR adjust to your lcms_stack size
+    channels: [64, 64, 64]
+    kernel_size: 3
+    dilations: [1, 2, 4]
+    dropout: 0.10
+    pooling:
+      kind: stats
+      stats: [mean, recent_mean_3, last]   # 64*3=192 (or 256 if you use different stats)
+
+  # ----------------------------
+  # Sparse NAIP encoder
+  # ----------------------------
+  naip_sparse_encoder:
+    kind: sparse_temporal_encoder
+    in_channels: 6
+    embed_dim: 32
+    time_embedding: learned
+    aggregation: attention_pool       # or mean_pool (simpler)
+    dropout: 0.10
+
+  # ----------------------------
+  # Static encoders
+  # ----------------------------
+  mlp_ccdc_history:
+    kind: mlp
+    in_dim: 47
+    layers: [128, 64]
+    dropout: 0.10
+    output_dim: 64
+
+  mlp_topo:
+    kind: mlp
+    in_dim: 8
+    layers: [16, 6]
+    dropout_schedule:
+      kind: linear
+      start_p: 0.75
+      end_p: 0.20
+      duration_epochs: 80
+    output_dim: 6
+
+  mlp_ccdc_snapshot:
+    kind: mlp
+    in_dim: 21                     # new per-window snapshot vector (2024/2022/2020)
+    layers: [32, 16]
+    dropout: 0.10
+    output_dim: 16
+
+  # ----------------------------
+  # Fusion trunks (per-pixel before spatial smoothing)
+  # ----------------------------
+  type_trunk:
+    kind: mlp
+    # 256 (ls8 delta stats pool) + 64 (ccdc_hist) + 6 (topo) + 32 (naip) = 358
+    # If you omit naip for type early, set naip_dim=0 in your bindings and this still works.
+    in_dim: 358
+    layers: [256, 128]
+    dropout: 0.10
+    output_dim: 128
+
+  phase_trunk:
+    kind: mlp
+    # 384 (ls8 level stats pool) + 192 (lcms stats pool) + 32 (naip) + 16 (ccdc_snap_mlp) + 6 (topo)
+    in_dim: 630
+    layers: [256, 128]
+    dropout: 0.10
+    output_dim: 128
+
+  # ----------------------------
+  # Late spatial smoothing (gated residual conv)
+  # ----------------------------
+  adaptive_spatial_conv:
+    kind: gated_residual_conv2d
+    channels: 128
+    conv:
+      layers: 2
+      kernel_size: 3
+      padding: 1
+    gate:
+      hidden: 64
+      kernel_size: 1
+
+  # ----------------------------
+  # Latent heads
+  # ----------------------------
+  head_z_type:
+    kind: mlp
+    in_dim: 128
+    layers: [256, 64]
+    dropout: 0.0
+    output_dim: 64                  # z_type continuous
+
+  head_z_phase:
+    kind: mlp
+    # phase conditioned on stopgrad(z_type_cont)
+    in_dim: 128 + 64
+    layers: [256, 16]
+    dropout: 0.0
+    output_dim: 4
+
+  # ----------------------------
+  # Heads for training supervision / products
+  # ----------------------------
+  head_phase_age:
+    kind: linear
+    in_dim: 4
+    out_dim: 1
+    activation: sigmoid             # s_phase in [0,1]
+
+  head_evt_continuous:
+    kind: linear
+    in_dim: 64
+    out_dim: 50
+
+  head_evt_quantized:
+    kind: linear
+    in_dim: 64
+    out_dim: 50
+
+  head_lcms_lc:
+    kind: linear
+    in_dim: 64
+    out_dim: 7
+
+  head_lcms_lu:
+    kind: linear
+    in_dim: 64
+    out_dim: 4
+
+  head_lcms_change:
+    kind: linear
+    in_dim: 64
+    out_dim: 4
+
+  head_phase_state_decoder:
+    kind: mlp
+    in_dim: 64 + 4                  # stopgrad(z_type_cont) + z_phase
+    layers: [80, 32]
+    dropout: 0.10
+    output_dim: 32
+
+  head_ccdc_current_pred:
+    kind: linear
+    in_dim: 32
+    out_dim: 21                     # predict snapshot vector for the matching window key
+
+# ================================================================
+# Model graph (wiring among modules)
+# ================================================================
+graph:
+
+  # Type pathway
+  type_path:
+    inputs:
+      ls8_delta: derived.inputs.temporal.ls8day_delta
+      ccdc_hist: inputs.static.ccdc_history
+      topo: inputs.static.topo
+      # naip: inputs.irregular.naip_sparse
+    flow:
+      - ls8_delta -> modules.tcn_type_ls8_delta -> feat_type_ls8
+      - ccdc_hist -> modules.mlp_ccdc_history -> feat_ccdc_hist
+      - topo -> modules.mlp_topo -> feat_topo
+      # - naip -> modules.naip_sparse_encoder -> feat_naip
+      - concat([feat_type_ls8, feat_ccdc_hist, feat_topo, feat_naip]) -> modules.type_trunk -> h_type
+      - h_type -> modules.adaptive_spatial_conv -> h_type_smooth
+      - h_type_smooth -> modules.head_z_type -> z_type_cont
+      - z_type_cont -> quantization -> z_type_quant
+
+  # Phase pathway
+  phase_path:
+    inputs:
+      ls8:       inputs.temporal.ls8day
+      lcms_chg:  inputs.temporal.lcms_chg    # 3 bands
+      lcms_lc_p: inputs.temporal.lcms_lc_p   # 7 bands
+      lcms_lu_p: inputs.temporal.lcms_lu_p   # 4 bands
+      lcms_ysfc: inputs.temporal.lcms_ysfc   # 1 band
+      # naip: inputs.irregular.naip_sparse
+      ccdc_current: inputs.static.ccdc_current     # per-window: t0/t2/t4
+    flow:
+      - concat([lcms_chg, lcms_lc_p, lcms_lu_p, lcms_ysfc]) -> lcms_stack
+      - ls8 -> modules.tcn_phase_ls8 -> feat_phase_ls8
+      - lcms_stack -> modules.tcn_phase_lcms -> feat_lcms
+      - naip -> modules.naip_sparse_encoder -> feat_naip_p
+      - ccdc_current -> modules.mlp_ccdc_current -> feat_ccdc_current
+      - concat([feat_phase_ls8, feat_lcms, feat_naip_p, feat_ccdc_current]) -> modules.phase_trunk -> h_phase
+      - h_phase -> modules.adaptive_spatial_conv -> h_phase_smooth
+      - concat([h_phase_smooth, stopgrad(z_type_cont)]) -> modules.head_z_phase -> z_phase
+      - z_phase -> modules.head_phase_age -> s_phase
+
+  # Heads / products
+  heads:
+    evt_cont:  z_type_cont -> modules.head_evt_continuous
+    evt_quant: z_type_quant -> modules.head_evt_quantized
+    lcms_lc:   z_type_quant -> modules.head_lcms_lc
+    lcms_lu:   z_type_quant -> modules.head_lcms_lu
+    lcms_chg:  z_type_quant -> modules.head_lcms_change
+
+    # type-conditioned phase state prediction (per-window)
+    phase_state:
+      - concat([stopgrad(z_type_cont), z_phase]) -> modules.head_phase_state_decoder -> h_state
+      - h_state -> modules.head_ccdc_current_pred -> ccdc_current_pred
+
+# ================================================================
+# Notes / invariants
+# ================================================================
+invariants:
+  - z_phase is conditioned on stop-gradient z_type_cont to prevent type leakage.
+  - adaptive_spatial_conv is residual+gated to preserve sharp edges while smoothing interiors.
+  - ccdc_current_pred predicts the 21-dim snapshot corresponding to the window key (t0/t2/t4).

@@ -1,0 +1,1045 @@
+📁 annual/
+  📁 lcms_chg/
+    📁 data/
+      📄 lcms_chg_p_fastloss
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_chg_p_gain
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_chg_p_slowloss
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+  📁 lcms_lc_p/
+    📁 data/
+      📄 lcms_lc_p_barren_impervious
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lc_p_barren_treesmix
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lc_p_grassforb_treesmix
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lc_p_shrubs
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lc_p_shrubs_treesmix
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lc_p_trees
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lc_p_water
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+  📁 lcms_lu_p/
+    📁 data/
+      📄 lcms_lu_p_ag
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lu_p_dev
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lu_p_forest
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 lcms_lu_p_rangeland_pasture
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+  📁 lcms_q_interp/
+    📁 mask/
+      📄 lcms_qa_interp
+         Shape: (15, 1024, 1024)
+         Dtype: uint8
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+  📁 lcms_ysfc/
+    📁 data/
+      📄 lcms_ysfc_value_1985_2024
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+  📁 lcms_ysfc_censored/
+    📁 data/
+      📄 lcms_ysfc_censored_1985_2024
+         Shape: (15, 1024, 1024)
+         Dtype: uint8
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+  📁 ls8day/
+    📁 data/
+      📄 EVI2_summer_p95
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NBR_annual_min
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NBR_summer_p95
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NDMI_summer_mean
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NDVI_amplitude
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NDVI_summer_p95
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NDVI_winter_max
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+    📁 quality/
+      📄 summer_obs_count
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 winter_obs_count
+         Shape: (15, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'time_coords', 'y_coords', 'x_coords', 'statistics']
+
+📄 aoi
+   Shape: (1024, 1024)
+   Dtype: uint8
+   Chunks: (256, 256)
+   Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', '_FillValue']
+
+📁 irregular/
+  📁 naip/
+    📁 data/
+      📄 NDVI
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NDVI_var_15m
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NIR_ent_21m
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NIR_lac_21m
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NIR_var_15m
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+      📄 NIR_var_7m
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+    📁 quality/
+      📄 DOY
+         Shape: (7, 1024, 1024)
+         Dtype: float16
+         Chunks: (1, 256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'snapshot_coords', 'y_coords', 'x_coords', 'statistics']
+
+📁 static/
+  📁 ccdc_metrics_current/
+    📁 data/
+      📄 rapid_loss_year_1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_3
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_4
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_dnbr_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_dndmi_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_dndvi_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_green
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_nbr
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_ndmi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_ndvi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_rmse_mean
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_seasonal_amp_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_seasonal_amp_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_spectral_velocity
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_tcb
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_tcg
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2020_0831_tcw
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_dnbr_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_dndmi_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_dndvi_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_green
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_nbr
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_ndmi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_ndvi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_rmse_mean
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_seasonal_amp_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_seasonal_amp_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_spectral_velocity
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_tcb
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_tcg
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2022_0831_tcw
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_dnbr_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_dndmi_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_dndvi_dt
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_green
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_nbr
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_ndmi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_ndvi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_rmse_mean
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_seasonal_amp_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_seasonal_amp_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_spectral_velocity
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_tcb
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_tcg
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 snap_2024_0831_tcw
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+  📁 ccdc_metrics_history/
+    📁 data/
+      📄 break_count
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 break_rate_per_decade
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 cv_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 max_break_magnitude
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 max_rmse_joint
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 max_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 max_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 max_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_break_magnitude
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_decline_rate
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_green
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_loss_recovery_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_nbr
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_ndmi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_ndvi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_recovery_rate
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_rmse_joint
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_amp_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_amp_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_snr_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_snr_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_snr_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_seasonal_snr_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_spectral_velocity
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 mean_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 min_segment_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 net_change_ndvi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 net_change_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 net_change_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 net_change_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 num_segments
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_mean_magnitude
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_rate_per_decade
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_3
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 rapid_loss_year_4
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 spectral_distance_per_decade
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 std_loss_recovery_duration
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 total_spectral_distance
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 variance_ndvi
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 variance_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 variance_seasonal_amp_nir
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 variance_seasonal_amp_red
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 variance_seasonal_amp_swir1
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 variance_seasonal_amp_swir2
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 years_since_last_break
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+  📁 evt/
+    📁 data/
+      📄 evt
+         Shape: (1024, 1024)
+         Dtype: int16
+         Chunks: (256, 256)
+         Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', 'long_name', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+  📁 soils_masks/
+    📁 mask/
+      📄 dem_mask
+         Shape: (1024, 1024)
+         Dtype: uint8
+         Chunks: (256, 256)
+         Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', 'long_name', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 hand_mask
+         Shape: (1024, 1024)
+         Dtype: uint8
+         Chunks: (256, 256)
+         Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', 'long_name', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 ksat_mask
+         Shape: (1024, 1024)
+         Dtype: uint8
+         Chunks: (256, 256)
+         Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', 'long_name', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 tpi_mask
+         Shape: (1024, 1024)
+         Dtype: uint8
+         Chunks: (256, 256)
+         Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', 'long_name', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 twi_mask
+         Shape: (1024, 1024)
+         Dtype: uint8
+         Chunks: (256, 256)
+         Attrs: ['AREA_OR_POINT', 'scale_factor', 'add_offset', 'long_name', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+  📁 topo/
+    📁 data/
+      📄 eastness
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 elevation
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 HAND
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 ksat_log10_0_5
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 northness
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 slope_deg
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 TPI_500m
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+      📄 TWI
+         Shape: (1024, 1024)
+         Dtype: float16
+         Chunks: (256, 256)
+         Attrs: ['scale_factor', 'add_offset', 'semantic_type', 'category', 'group', 'subsection', 'y_coords', 'x_coords', 'statistics']
+
+📄 strata
+   Shape: (1024, 1024)
+   Dtype: int16
+   Chunks: (256, 256)
+   Attrs: ['AREA_OR_POINT', 'STATISTICS_APPROXIMATE', 'STATISTICS_MAXIMUM', 'STATISTICS_MEAN', 'STATISTICS_MINIMUM', 'STATISTICS_STDDEV', 'STATISTICS_VALID_PERCENT', 'scale_factor', 'add_offset', '_FillValue']
+

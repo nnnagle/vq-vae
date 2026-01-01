@@ -1,0 +1,985 @@
+# forest_repr_model_bindings.yaml
+version: "1.0"
+name: "forest_state_repr_v1"
+zarr:
+  path: /data/VA/zarr/va_vae_dataset_test.zarr
+  structure: hierarchical
+
+
+
+
+# -------------------------------------------------------------------
+# Normalization policies
+# -------------------------------------------------------------------
+normalization:
+  # Use stats embedded in Zarr (you already compute/export them)
+  presets:
+    # Standard z-score using mean/sd from zarr stats
+    zscore:
+      type: zscore
+      stats_source: zarr
+      fields: {mean: mean, std: sd}
+      clamp: {enabled: true, min: -6.0, max: 6.0}
+      missing: {fill: 0.0}
+
+    zscore_computed:
+      type: zscore
+      stats_source: computed  # Compute during training
+      warmup_epochs: 5
+      method: running_stats  # or 'batch_stats'
+      clamp: {enabled: true, min: -6.0, max: 6.0}
+      missing: {fill: 0.0}
+      cache_file: "derived_normalization_stats.json"
+
+    # Robust scaling using median/IQR from zarr stats
+    robust_iqr:
+      type: robust_iqr
+      stats_source: zarr
+      fields: {q25: q25, q50: q50, q75: q75}
+      clamp: {enabled: true, min: -8.0, max: 8.0}
+      missing: {fill: 0.0}
+
+    # Probabilities already [0,1]
+    prob01:
+      type: clamp
+      clamp: {enabled: true, min: 0.0, max: 1.0}
+      missing: {fill: 0.0}
+
+    # Masks/booleans as-is
+    identity:
+      type: none
+      missing: {fill: 0}
+
+    # Bounded trig. Just clamps to -1,1 and fills missing. For Northness and Eastness which are already -1,1
+    trig:
+      type: clamp
+      clamp: {enabled: true, min: -1.0, max: 1.0}
+      missing: {fill: 0.0}
+
+    # Fixed min-max scaling (for ages, durations, etc.)
+    minmax_0_20:
+      type: minmax
+      stats_source: fixed
+      min: 0.0
+      max: 40.0
+      clamp: {enabled: true, min: 0.0, max: 1.0}
+      missing: {fill: 0.0}
+
+    # Fixed scaling for year-to-year deltas in NDVI-like indices
+    # Keeps loader simple (no derived-stats pass).
+    delta_ls8_fixed:
+      type: linear_rescale
+      stats_source: fixed
+      in_min: -0.4
+      in_max: 0.4
+      out_min: -1.0
+      out_max: 1.0
+      clamp: true
+      missing: {fill: 0}
+
+# -------------------------------------------------------------------
+# Shared masks / weights / derived quantities
+# (These can be referenced by name from any band/group)
+# -------------------------------------------------------------------
+shared:
+
+  masks:
+    # AOI mask used during stats; also can be used at training
+    aoi:
+      zarr:
+        group: aoi
+        array: aoi
+      type: boolean
+      dimension: spatial
+      behavior:
+        false_means_invalid: true
+        missing: false
+
+    # Soils/topo data coverage masks
+    dem_mask:
+      zarr: {group: static/soils_masks/mask, array: dem_mask}
+      type: boolean
+      dimension: spatial
+      behavior: {false_means_invalid: true, missing: true}
+
+    tpi_mask:
+      zarr: {group: static/soils_masks/mask, array: tpi_mask}
+      type: boolean
+      dimension: spatial
+      behavior: {false_means_invalid: true, missing: true}
+
+    hand_mask:
+      zarr: {group: static/soils_masks/mask, array: hand_mask}
+      type: boolean
+      dimension: spatial
+      behavior: {false_means_invalid: true, missing: true}
+
+    twi_mask:
+      zarr: {group: static/soils_masks/mask, array: twi_mask}
+      type: boolean
+      dimension: spatial
+      behavior: {false_means_invalid: true, missing: true}
+
+    ksat_mask:
+      zarr: {group: static/soils_masks/mask, array: ksat_mask}
+      type: boolean
+      dimension: spatial
+      behavior: {false_means_invalid: true, missing: true}
+
+    # LCMS interpolation QA (you called it lcms_qa_interp)
+    lcms_interp_ok:
+      zarr: {group: annual/lcms_q_interp/mask, array: lcms_qa_interp}
+      type: boolean_or_uint8
+      dimension: spatio-temporal
+      # define what "ok" means in your QA (adjust thresholds here)
+      ok_if:
+        op: ">="
+        value: 1
+      behavior: {false_means_invalid: false, missing: true}
+
+    # Forest Mask: prob(forest) >= .25
+    forest:
+      type: threshold
+      source:
+        zarr: {group: annual/lcms_lu_p/data, array: lcms_lu_p_forest}
+      dimension: spatial
+      time:
+        use: last_in_window
+      ok_if:
+        op: ">="
+        value: 0.25
+      behavior:
+        false_means_invalid: false   # false => not forest (you may still keep pixel, but weight=low)
+        missing: false
+
+  quality:
+    # Landsat seasonal obs counts as a soft weight in [0,1]
+    ls_winter_obs_weight:
+      zarr: {group: annual/ls8day/quality, array: winter_obs_count}
+      type: float
+      dimension: spatio-temporal
+      transform:
+        type: linear_rescale
+        in_min: 1.0
+        in_max: 3.0
+        out_min: 0.0
+        out_max: 1.0
+        clamp: true
+      missing: {fill: 0.0}
+
+    ls_summer_obs_weight:
+      zarr: {group: annual/ls8day/quality, array: summer_obs_count}
+      type: float
+      dimension: spatio-temporal
+      transform:
+        type: linear_rescale
+        in_min: 3.0
+        in_max: 10.0
+        out_min: 0.0
+        out_max: 1.0
+        clamp: true
+      missing: {fill: 0.0}
+
+    # NAIP DOY exists but it’s not “quality”; treat as metadata unless you want to weight by seasonality
+    naip_doy:
+      zarr: {group: irregular/naip/quality, array: DOY}
+      dimension: spatio-temporal
+      type: float
+      missing: {fill: 0.0}
+
+    # Forest probability from LCMS land use prob
+    p_forest:
+      zarr: {group: annual/lcms_lu_p/data, array: lcms_lu_p_forest}
+      type: float
+      norm: prob01
+      dimension: spatial
+      time:
+        use: last_in_window   # for a 10y window, use the most recent year inside it
+
+    # Your preferred forest_weight = p_forest^2, normalized to mean=1 per batch
+    forest_weight:
+      type: expression
+      expression: "pow(p_forest, 2)"
+      dimension: spatial
+      normalize:
+        mode: mean1
+        
+# -------------------------------------------------------------------
+# Input groups (what the model consumes)
+# -------------------------------------------------------------------
+inputs:
+
+  temporal:
+    # ---------------------------------------------------------------
+    # Landsat annual metrics (ls8day)
+    # ---------------------------------------------------------------
+    ls8day:
+      zarr: {group: annual/ls8day/data}
+      kind: dense_time_series
+      time_window_years: 10
+      bands:
+        - name: NDVI_summer_p95
+          array: NDVI_summer_p95
+          norm: zscore
+          quality_weight: [shared.quality.ls_summer_obs_weight]
+          loss_weight: shared.quality.forest_weight
+        - name: NDVI_winter_max
+          array: NDVI_winter_max
+          norm: zscore
+          quality_weight: [shared.quality.ls_winter_obs_weight]
+          loss_weight: shared.quality.forest_weight
+        - name: NDVI_amplitude
+          array: NDVI_amplitude
+          norm: zscore
+          quality_weight: [shared.quality.ls_summer_obs_weight, shared.quality.ls_winter_obs_weight]
+          loss_weight: shared.quality.forest_weight
+        - name: NBR_annual_min
+          array: NBR_annual_min
+          norm: zscore
+          quality_weight: [shared.quality.ls_summer_obs_weight, shared.quality.ls_winter_obs_weight]
+          loss_weight: shared.quality.forest_weight
+        - name: NBR_summer_p95
+          array: NBR_summer_p95
+          norm: zscore
+          quality_weight: [shared.quality.ls_summer_obs_weight]
+          loss_weight: shared.quality.forest_weight
+        - name: NDMI_summer_mean
+          array: NDMI_summer_mean
+          norm: zscore
+          quality_weight: [shared.quality.ls_summer_obs_weight]
+          loss_weight: shared.quality.forest_weight
+        - name: EVI2_summer_p95
+          array: EVI2_summer_p95
+          norm: zscore
+          quality_weight: [shared.quality.ls_summer_obs_weight]
+          loss_weight: shared.quality.forest_weight
+
+    # ---------------------------------------------------------------
+    # LCMS change probs (3)
+    # ---------------------------------------------------------------
+    lcms_chg:
+      zarr: {group: annual/lcms_chg/data}
+      kind: dense_time_series
+      time_window_years: 10
+      bands:
+        - {name: p_fastloss, array: lcms_chg_p_fastloss, norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: p_gain,     array: lcms_chg_p_gain,     norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: p_slowloss, array: lcms_chg_p_slowloss, norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+
+    # ---------------------------------------------------------------
+    # LCMS land cover probs (7)
+    # ---------------------------------------------------------------
+    lcms_lc_p:
+      zarr: {group: annual/lcms_lc_p/data}
+      kind: dense_time_series
+      time_window_years: 10
+      bands:
+        - {name: lc_barren_impervious,    array: lcms_lc_p_barren_impervious,    norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: lc_barren_treesmix,      array: lcms_lc_p_barren_treesmix,      norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: lc_grassforb_treesmix,   array: lcms_lc_p_grassforb_treesmix,   norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: lc_shrubs,              array: lcms_lc_p_shrubs,               norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: lc_shrubs_treesmix,      array: lcms_lc_p_shrubs_treesmix,      norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: lc_trees,               array: lcms_lc_p_trees,                norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+        - {name: lc_water,               array: lcms_lc_p_water,                norm: prob01, mask: [shared.masks.lcms_interp_ok], loss_weight: shared.quality.forest_weight}
+
+    # ---------------------------------------------------------------
+    # LCMS land use probs (4)
+    # ---------------------------------------------------------------
+    lcms_lu_p:
+      zarr: {group: annual/lcms_lu_p/data}
+      kind: dense_time_series
+      time_window_years: 10
+      bands:
+        - {name: lu_ag,                  array: lcms_lu_p_ag,                  norm: prob01, mask: [shared.masks.lcms_interp_ok]}
+        - {name: lu_dev,                 array: lcms_lu_p_dev,                 norm: prob01, mask: [shared.masks.lcms_interp_ok]}
+        - {name: lu_forest,              array: lcms_lu_p_forest,              norm: prob01, mask: [shared.masks.lcms_interp_ok]}
+        - {name: lu_rangeland_pasture,   array: lcms_lu_p_rangeland_pasture,   norm: prob01, mask: [shared.masks.lcms_interp_ok]}
+
+    # ---------------------------------------------------------------
+    # LCMS years since fast change (ysfc)
+    # ---------------------------------------------------------------
+    lcms_ysfc:
+      zarr: {group: annual/lcms_ysfc/data}
+      kind: dense_time_series
+      time_window_years: 10
+      bands:
+        - name: ysfc
+          array: lcms_ysfc_value_1985_2024
+          norm: minmax_0_20
+          mask: [shared.masks.lcms_interp_ok]
+          loss_weight: shared.quality.forest_weight
+
+  irregular:
+
+    # ---------------------------------------------------------------
+    # NAIP irregular (sparse time series)
+    # ---------------------------------------------------------------
+    naip:
+      zarr: {group: irregular/naip/data}
+      kind: sparse_time_series
+      years: [2011, 2012, 2014, 2016, 2018, 2021, 2023]
+      bands:
+        - {name: NDVI,         array: NDVI,          norm: zscore, mask: [shared.masks.aoi], loss_weight: shared.quality.forest_weight}
+        - {name: NIR_var_7m,   array: NIR_var_7m,    norm: zscore, mask: [shared.masks.aoi], loss_weight: shared.quality.forest_weight}
+        - {name: NIR_var_15m,  array: NIR_var_15m,   norm: zscore, mask: [shared.masks.aoi], loss_weight: shared.quality.forest_weight}
+        - {name: NIR_ent_21m,  array: NIR_ent_21m,   norm: zscore, mask: [shared.masks.aoi], loss_weight: shared.quality.forest_weight}
+        - {name: NIR_lac_21m,  array: NIR_lac_21m,   norm: zscore, mask: [shared.masks.aoi], loss_weight: shared.quality.forest_weight}
+        - {name: NDVI_var_15m, array: NDVI_var_15m,  norm: zscore, mask: [shared.masks.aoi], loss_weight: shared.quality.forest_weight}
+      quality:
+        - {name: DOY, source: shared.quality.naip_doy}
+
+  # -------------------------------------------------------------------
+  # Snapshot inputs (time-specific but not time-series)
+  # These are point-in-time snapshots that vary by window end year
+  # -------------------------------------------------------------------
+  
+  snapshot:
+    ccdc_snapshot:
+      zarr: {group: static/ccdc_metrics_current/data}
+      kind: continuous
+      missing_policy:
+        nan_from_fill: [-9999]
+      years: [2020, 2022, 2024]
+      zarr_pattern: snap_{year}_0831
+
+      # The model sees a vector per bundle member:
+      bands_template:
+        # reflectance / indices
+        - {name: green,              array: "{zarr_pattern}_green",              norm: robust_iqr}
+        - {name: red,                array: "{zarr_pattern}_red",                norm: robust_iqr}
+        - {name: nir,                array: "{zarr_pattern}_nir",                norm: robust_iqr}
+        - {name: swir1,              array: "{zarr_pattern}_swir1",              norm: robust_iqr}
+        - {name: swir2,              array: "{zarr_pattern}_swir2",              norm: robust_iqr}
+        - {name: ndvi,               array: "{zarr_pattern}_ndvi",               norm: robust_iqr}
+        - {name: nbr,                array: "{zarr_pattern}_nbr",                norm: robust_iqr}
+        - {name: ndmi,               array: "{zarr_pattern}_ndmi",               norm: robust_iqr}
+
+        # tasseled cap
+        - {name: tcb,                array: "{zarr_pattern}_tcb",                norm: robust_iqr}
+        - {name: tcg,                array: "{zarr_pattern}_tcg",                norm: robust_iqr}
+        - {name: tcw,                array: "{zarr_pattern}_tcw",                norm: robust_iqr}
+
+        # seasonality
+        - {name: seasonal_amp_red,   array: "{zarr_pattern}_seasonal_amp_red",   norm: robust_iqr}
+        - {name: seasonal_amp_nir,   array: "{zarr_pattern}_seasonal_amp_nir",   norm: robust_iqr}
+        - {name: seasonal_amp_swir1, array: "{zarr_pattern}_seasonal_amp_swir1", norm: robust_iqr}
+        - {name: seasonal_amp_swir2, array: "{zarr_pattern}_seasonal_amp_swir2", norm: robust_iqr}
+
+        # dynamics / fit quality
+        - {name: spectral_velocity,  array: "{zarr_pattern}_spectral_velocity",  norm: robust_iqr}
+        - {name: rmse_mean,          array: "{zarr_pattern}_rmse_mean",          norm: robust_iqr}
+
+        # trend-only derivatives at snapshot date
+        - {name: dndvi_dt,           array: "{zarr_pattern}_dndvi_dt",           norm: robust_iqr}
+        - {name: dndmi_dt,           array: "{zarr_pattern}_dndmi_dt",           norm: robust_iqr}
+        - {name: dnbr_dt,            array: "{zarr_pattern}_dnbr_dt",            norm: robust_iqr}
+  
+ 
+  static:
+
+    evt:
+      zarr: {group: static/evt/data}
+      kind: categorical
+      bands:
+        - name: evt
+          array: evt
+          num_classes: 50
+          mask: [shared.masks.aoi]
+          loss_weight: shared.quality.forest_weight
+
+    topo:
+      zarr: {group: static/topo/data}
+      kind: continuous
+      bands:
+        - {name: elevation,       array: elevation,       norm: robust_iqr, mask: [shared.masks.dem_mask]}
+        - {name: slope_deg,       array: slope_deg,       norm: robust_iqr, mask: [shared.masks.dem_mask]}
+        - {name: northness,       array: northness,       norm: trig,       mask: [shared.masks.dem_mask]}
+        - {name: eastness,        array: eastness,        norm: trig,       mask: [shared.masks.dem_mask]}
+        - {name: HAND,            array: HAND,            norm: robust_iqr, mask: [shared.masks.hand_mask]}
+        - {name: TWI,             array: TWI,             norm: robust_iqr, mask: [shared.masks.twi_mask]}
+        - {name: TPI_500m,        array: TPI_500m,        norm: robust_iqr, mask: [shared.masks.tpi_mask]}
+        - {name: ksat_log10_0_5,  array: ksat_log10_0_5,  norm: robust_iqr, mask: [shared.masks.ksat_mask]}
+
+
+    ccdc_history:
+      zarr: {group: static/ccdc_metrics_history/data}
+      kind: continuous
+      missing_policy:
+        nan_from_fill: [-9999]
+      bands:
+        - {name: mean_green,                   array: mean_green,                   norm: robust_iqr}
+        - {name: mean_red,                     array: mean_red,                     norm: robust_iqr}
+        - {name: mean_nir,                     array: mean_nir,                     norm: robust_iqr}
+        - {name: mean_swir1,                   array: mean_swir1,                   norm: robust_iqr}
+        - {name: mean_swir2,                   array: mean_swir2,                   norm: robust_iqr}
+        - {name: mean_ndvi,                    array: mean_ndvi,                    norm: robust_iqr}
+        - {name: mean_nbr,                     array: mean_nbr,                     norm: robust_iqr}
+        - {name: mean_ndmi,                    array: mean_ndmi,                    norm: robust_iqr}
+        - {name: mean_seasonal_amp_red,        array: mean_seasonal_amp_red,        norm: robust_iqr}
+        - {name: mean_seasonal_amp_nir,        array: mean_seasonal_amp_nir,        norm: robust_iqr}
+        - {name: mean_seasonal_amp_swir1,      array: mean_seasonal_amp_swir1,      norm: robust_iqr}
+        - {name: mean_seasonal_amp_swir2,      array: mean_seasonal_amp_swir2,      norm: robust_iqr}
+
+        - {name: mean_seasonal_snr_red,        array: mean_seasonal_snr_red,        norm: robust_iqr}
+        - {name: mean_seasonal_snr_nir,        array: mean_seasonal_snr_nir,        norm: robust_iqr}
+        - {name: mean_seasonal_snr_swir1,      array: mean_seasonal_snr_swir1,      norm: robust_iqr}
+        - {name: mean_seasonal_snr_swir2,      array: mean_seasonal_snr_swir2,      norm: robust_iqr}
+
+        - {name: variance_seasonal_amp_red,    array: variance_seasonal_amp_red,    norm: robust_iqr}
+        - {name: variance_seasonal_amp_nir,    array: variance_seasonal_amp_nir,    norm: robust_iqr}
+        - {name: variance_seasonal_amp_swir1,  array: variance_seasonal_amp_swir1,  norm: robust_iqr}
+        - {name: variance_seasonal_amp_swir2,  array: variance_seasonal_amp_swir2,  norm: robust_iqr}
+
+        - {name: max_seasonal_amp_nir,         array: max_seasonal_amp_nir,         norm: robust_iqr}
+        - {name: net_change_seasonal_amp_nir,  array: net_change_seasonal_amp_nir,  norm: robust_iqr}
+        - {name: max_seasonal_amp_swir1,       array: max_seasonal_amp_swir1,       norm: robust_iqr}
+        - {name: net_change_seasonal_amp_swir1,array: net_change_seasonal_amp_swir1,norm: robust_iqr}
+
+        - {name: spectral_distance_per_decade, array: spectral_distance_per_decade, norm: robust_iqr}
+        - {name: mean_spectral_velocity,       array: mean_spectral_velocity,       norm: robust_iqr}
+        - {name: net_change_ndvi,              array: net_change_ndvi,              norm: robust_iqr}
+        - {name: net_change_nir,               array: net_change_nir,               norm: robust_iqr}
+        - {name: mean_recovery_rate,           array: mean_recovery_rate,           norm: robust_iqr}
+        - {name: mean_decline_rate,            array: mean_decline_rate,            norm: robust_iqr}
+
+        - {name: num_segments,                 array: num_segments,                 norm: robust_iqr}
+        - {name: break_rate_per_decade,        array: break_rate_per_decade,        norm: robust_iqr}
+        - {name: years_since_last_break,       array: years_since_last_break,       norm: minmax_0_20}
+        - {name: mean_segment_duration,        array: mean_segment_duration,        norm: minmax_0_20}
+        - {name: max_segment_duration,         array: max_segment_duration,         norm: minmax_0_20}
+        - {name: min_segment_duration,         array: min_segment_duration,         norm: minmax_0_20}
+        - {name: mean_break_magnitude,         array: mean_break_magnitude,         norm: robust_iqr}
+        - {name: max_break_magnitude,          array: max_break_magnitude,          norm: robust_iqr}
+
+        - {name: variance_ndvi,                array: variance_ndvi,                norm: robust_iqr}
+        - {name: variance_nir,                 array: variance_nir,                 norm: robust_iqr}
+        - {name: cv_segment_duration,          array: cv_segment_duration,          norm: robust_iqr}
+        - {name: mean_rmse_joint,              array: mean_rmse_joint,              norm: robust_iqr}
+        - {name: max_rmse_joint,               array: max_rmse_joint,               norm: robust_iqr}
+
+        - {name: rapid_loss_rate_per_decade,   array: rapid_loss_rate_per_decade,   norm: robust_iqr}
+        - {name: rapid_loss_mean_magnitude,    array: rapid_loss_mean_magnitude,    norm: robust_iqr}
+
+        - {name: mean_loss_recovery_duration,  array: mean_loss_recovery_duration,  norm: minmax_0_20}
+        - {name: std_loss_recovery_duration,   array: std_loss_recovery_duration,   norm: robust_iqr}
+
+        # Years with rapid_loss
+        - {name: rapid_loss_year_1,            array: rapid_loss_year_1,            norm: minmax_0_20}
+        - {name: rapid_loss_year_2,            array: rapid_loss_year_2,            norm: minmax_0_20}
+        - {name: rapid_loss_year_3,            array: rapid_loss_year_3,            norm: minmax_0_20}
+        - {name: rapid_loss_year_4,            array: rapid_loss_year_4,            norm: minmax_0_20}
+
+# -------------------------------------------------------------------
+# Derived features created by the loader (not stored in Zarr)
+# -------------------------------------------------------------------
+derived:
+
+  # Temporal position channels appended to dense time series inputs.
+  # These are deterministic functions of timestep index within the 10y window.
+  temporal_position:
+    enabled: true
+    window_length: 10           # T
+    channels:
+      - name: p_t               # in [0,1]
+        formula: "t / (T - 1)"
+        dtype: float32
+      - name: c_t               # in [-1,1]
+        formula: "(t - (T - 1)/2) / ((T - 1)/2)"
+        dtype: float32
+
+    injection:
+      mode: concat_channels     # append as extra channels per timestep
+      apply_to:
+        # I'd add to phase-relevant sequences at minimum
+        - inputs.temporal.ls8day
+        - inputs.temporal.lcms_chg
+        - inputs.temporal.lcms_lc_p
+        - inputs.temporal.lcms_lu_p
+        - inputs.temporal.lcms_ysfc
+      norm: identity            # these are already bounded nicely
+
+  ls8_delta:
+    enabled: true
+    source: inputs.temporal.ls8day
+    kind: dense_time_series_derive
+    time_window_years: 10
+
+    # Compute first differences along time: x[t] - x[t-1]
+    operation: diff
+    axis: time
+    prepend:
+      mode: zero        # produces length 10 (t0 delta = 0)
+      # alternatives: "nan" (then missing filled later), or "repeat_first"
+    bands:
+      - name:           dNDVI_summer_p95
+        from:           NDVI_summer_p95
+        norm:           zscore_computed
+      - name:           dNDVI_winter_max
+        from:           NDVI_winter_max
+        norm:           zscore_computed
+      - name:           dNDVI_amplitude
+        from:           NDVI_amplitude
+        norm:           score_computed
+      - name:           dNBR_annual_min
+        from:           NBR_annual_min
+        norm:           zscore_computed
+
+    export_as:
+      path: derived.inputs.temporal.ls8_delta
+
+
+  # =================================================================
+  # GRADIENTS: shared defaults (YAML anchor)
+  # =================================================================
+  _grad_defaults: &grad_defaults
+    operation: sobel
+    directions: [0, 45, 90, 135]
+    scales:
+      - size: 3
+        method: sobel_3x3
+        description: "Sharp edge detection (single-pixel boundaries)"
+      - size: 5
+        method: gaussian_smooth_sobel
+        gaussian_sigma: 1.0
+        sobel_size: 3
+        description: "Regional structure (smoothed Sobel)"
+    normalize_per_band:
+      enabled: true
+      method: derivative_aware
+      norm: zscore_computed
+      stats:
+        warmup_epochs: 5
+        use_mad: true
+        default_scale: 0.5
+
+  # =================================================================
+  # SPECTRAL GRADIENTS - Long-term (10-year mean of selected indices)
+  # =================================================================
+  spectral_grads_window:
+    enabled: false
+    description: "Directional gradients from 10-year mean of selected LS8 indices"
+
+    # Step 1: temporal mean of z-scored bands
+    mean10:
+      source: inputs.temporal.ls8day
+      operation: mean
+      axis: time
+      bands: [NDVI_summer_p95, NDVI_winter_max, NDVI_amplitude, NBR_annual_min]
+      # Output: [B, 4, H, W]
+
+    # Step 2: gradients per band
+    grads_per_band:
+      source: derived.spectral_grads_window.mean10
+      <<: *grad_defaults
+      # Output: [B, band=4, dir=4, scale=2, H, W]
+
+    # Step 3: composite across bands (max)
+    composite:
+      source: derived.spectral_grads_window.grads_per_band
+      operation: max
+      axis: band
+      description: "Max gradient magnitude across spectral bands"
+      # Output: [B, dir=4, scale=2, H, W]
+
+    # Step 4: exports
+    export:
+      grad_3x3:
+        source: derived.spectral_grads_window.composite
+        select_scale: 3
+        description: "Directional gradients (3x3)"
+        # Output: [B, 4, H, W]
+      grad_5x5:
+        source: derived.spectral_grads_window.composite
+        select_scale: 5
+        description: "Directional gradients (5x5)"
+        # Output: [B, 4, H, W]
+
+  # =================================================================
+  # SPECTRAL GRADIENTS - Current/Last year in window (t = -1)
+  # =================================================================
+  spectral_grads_last:
+    enabled: false
+    description: "Directional gradients from last year (t=-1) LS8 indices"
+
+    # Step 1: select last timestep
+    current:
+      source: inputs.temporal.ls8day
+      operation: select_timestep
+      timestep: -1
+      bands: [NDVI_summer_p95, NDVI_winter_max, NDVI_amplitude, NBR_annual_min]
+      # Output: [B, 4, H, W]
+
+    # Step 2: gradients per band
+    grads_per_band:
+      source: derived.spectral_grads_last.current
+      <<: *grad_defaults
+      # Output: [B, band=4, dir=4, scale=2, H, W]
+
+    # Step 3: composite across bands
+    composite:
+      source: derived.spectral_grads_last.grads_per_band
+      operation: max
+      axis: band
+      description: "Max gradient magnitude across spectral bands (last year)"
+      # Output: [B, dir=4, scale=2, H, W]
+
+    # Step 4: exports
+    export:
+      grad_3x3:
+        source: derived.spectral_grads_last.composite
+        select_scale: 3
+        description: "Directional gradients (3x3) from last year"
+        # Output: [B, 4, H, W]
+      grad_5x5:
+        source: derived.spectral_grads_last.composite
+        select_scale: 5
+        description: "Directional gradients (5x5) from last year"
+        # Output: [B, 4, H, W]
+
+  # =================================================================
+  # TOPOGRAPHIC GRADIENTS (static)
+  # =================================================================
+  topo_grads:
+    enabled: false
+    description: "Directional gradients from static topographic fields"
+
+    # Step 1: select topo bands (already normalized upstream)
+    topo_stack:
+      source: inputs.static.topo
+      operation: select_bands
+      bands: [elevation, TWI, TPI_500m]
+      # Output: [B, 3, H, W]
+
+    # Step 2: gradients per band
+    grads_per_band:
+      source: derived.topo_grads.topo_stack
+      <<: *grad_defaults
+      # Output: [B, band=3, dir=4, scale=2, H, W]
+
+    # Step 3: composite across topo bands
+    composite:
+      source: derived.topo_grads.grads_per_band
+      operation: max
+      axis: band
+      description: "Max gradient magnitude across topo bands"
+      # Output: [B, dir=4, scale=2, H, W]
+
+    # Step 4: exports
+    export:
+      grad_3x3:
+        source: derived.topo_grads.composite
+        select_scale: 3
+        description: "Topographic gradients (3x3)"
+        # Output: [B, 4, H, W]
+      grad_5x5:
+        source: derived.topo_grads.composite
+        select_scale: 5
+        description: "Topographic gradients (5x5)"
+        # Output: [B, 4, H, W]
+        
+        
+# -------------------------------------------------------------------
+# A “model view” that matches your spec: which groups feed which encoder
+# -------------------------------------------------------------------
+model_inputs:
+
+  type_encoder:
+    temporal:
+      - derived.ls8_delta
+      # (optional) you may add NAIP later, but keep it out initially
+    static:
+      - inputs.static.ccdc_history
+      - inputs.static.topo
+    labels:
+      - inputs.static.evt
+
+  phase_encoder:
+    temporal:
+      - inputs.temporal.ls8day
+      - derived.temporal_position
+      - inputs.temporal.lcms_chg
+      - inputs.temporal.lcms_lc_p
+      - inputs.temporal.lcms_lu_p
+      - inputs.temporal.lcms_ysfc
+    static:
+      - inputs.snapshot.ccdc_snapshot
+      - inputs.static.topo
+
+# -------------------------------------------------------------------
+# Loss weighting hooks (so your trainer can use the same forest_weight everywhere)
+# -------------------------------------------------------------------
+loss_masking:
+  default_mask: shared.masks.aoi
+  
+loss_weighting:
+  default_weight: shared.quality.forest_weight
+  exclude_if:
+    any_mask_false: true
+
+training:
+
+  windowing:
+    # A "window" is defined by its end year Y_end and length L:
+    # years = [Y_end-L+1, ..., Y_end]
+    length_years: 10
+
+    # Allowed end-years for sampling (bounded by data availability)
+    end_year_range: {min: 2020, max: 2024}
+
+    # The overlapping scheme you described: three windows per sample
+    # Example for anchor_end=2024:
+    #   [2015-2024] (end=2024),
+    #   [2013-2022] (end=2022),
+    #   [2011-2020] (end=2020)
+    multi_window_bundle:
+      enabled: true
+      bundle_size: 3
+      end_year_offsets: [0, -2, -4]     # relative to anchor_end
+      name: "t0_t2_t4"
+
+    # How to choose anchor_end during training
+    anchor_sampling:
+      mode: categorical
+      end_years: [2024, 2022, 2020]     # if you want *only* those
+      # OR if you want all possible anchors within a range:
+      # mode: uniform
+      # end_year_range: {min: 2020, max: 2024}
+
+    # Optional: how often to include larger gaps beyond the bundle
+    extra_pairs:
+      enabled: false
+      probability: 0.30
+      offsets: [-1, -3]                 # adds t-1 or t-3 comparisons sometimes
+      
+sampling:
+  patch:
+    size: [256, 256]
+    batch_patches: 4
+
+  subsample_grid:
+    per_patch: [16, 16]         # 256 -> 16 stride grid
+    jitter: {enabled: true, px: 4}
+
+  supplemental_forest_samples:
+    enabled: true
+    per_patch: 64
+    from: shared.masks.forest
+    strategy: weighted_by_forest_prob
+
+  cross_batch_pool:
+    enabled: false
+    max_points: 2048            # memory bank size (in-batch + prev batches)
+    refresh: fifo
+
+losses:
+
+  z_type_triplet:
+    enabled: true
+    weight_schedule:
+      - {epoch: [0, 14], value: 0.0}
+      - {epoch: [15, null], value: 1.0}
+
+    embed: model.z_type_continuous
+    points:
+      source: sampling.subsample_grid
+      extras: sampling.supplemental_forest_samples
+
+    eco_distance:
+      type: euclidean
+      features:
+        - {source: static/topo/data:elevation, norm: robust_iqr}
+        - {source: static/topo/data:slope_deg, norm: robust_iqr}
+        - {source: static/topo/data:HAND, norm: robust_iqr}
+        - {source: static/topo/data:TWI, norm: robust_iqr}
+        - {source: static/topo/data:TPI_500m, norm: robust_iqr}
+        - {source: static/topo/data:ksat_log10_0_5, norm: robust_iqr}
+
+    triplet_sampling:
+      positives: {quantile: [0.0, 0.2]}
+      negatives: {quantile: [0.4, 0.8]}
+      strategy: per_anchor_quantiles
+      cross_batch: {use: false, pool: cross_batch_pool}
+
+    loss:
+      type: triplet_margin
+      margin: 0.2
+      distance: euclidean
+
+    weight:
+      per_triplet: shared.quality.forest_weight
+
+  vq_loss:
+    enabled: true
+    weight: 1.0
+    terms: [commitment, codebook]
+    commitment_cost: 0.25
+
+  phase_monotonicity:
+    enabled: true
+    input: derived_model_signals.s_phase
+    windows: [t0, t2, t4]
+
+    gating:
+      ysfc:
+        source: annual/lcms_ysfc/data:lcms_ysfc_value_1985_2024
+        year: window_end@t0
+
+    constraints:
+      - when: {ysfc_in: [0, 1]}
+        order: [t0, t4, t2]
+      - when: {ysfc_in: [2, 3]}
+        order: [t2, t0, t4]
+      - when: {ysfc_ge: 4}
+        order: [t4, t2, t0]
+
+    loss:
+      type: ordered_hinge
+      delta: 0.01
+
+    mask: [shared.masks.aoi, shared.masks.forest]
+    weight: shared.quality.forest_weight
+
+  # ==================================================================
+  # GRADIENT RECONSTRUCTION LOSS - Type Pathway
+  # ==================================================================
+  gradient_reconstruction_type:
+    enabled: false
+    description: "Predict spectral-long and topo gradient stacks from h_type_smooth"
+
+    weight_schedule:
+      - {epoch: [0, 19], value: 0.0}
+      - {epoch: [20, 49], value: linear}
+      - {epoch: [50, null], value: 0.02}  
+
+    # ------------------------------------------------------------
+    # PREDICTION: two heads, each outputs 8 channels
+    #   channel order: [3x3_dir0,3x3_dir45,3x3_dir90,3x3_dir135,
+    #                   5x5_dir0,5x5_dir45,5x5_dir90,5x5_dir135]
+    # ------------------------------------------------------------
+    predict:
+      source: model.h_type_smooth 
+
+      heads:
+        spectral:
+          architecture: conv2d
+          in_channels: 128
+          out_channels: 8
+          kernel_size: 1
+          channel_layout: &grad8_layout
+            concat: scale_then_direction
+            scales: [3, 5]
+            directions: [0, 45, 90, 135]
+
+        topo:
+          architecture: conv2d
+          in_channels: 128
+          out_channels: 8
+          kernel_size: 1
+          channel_layout: *grad8_layout 
+
+    # ------------------------------------------------------------
+    # TARGETS: build matching 8-channel stacks
+    # Each source_* is expected to be [4,H,W] in direction order:
+    #   [0,45,90,135] (whatever your derived block guarantees)
+    # ------------------------------------------------------------
+    targets:
+      spectral:
+        source_3x3: derived.spectral_gradients_window.export.spectral_grad_window_3x3
+        source_5x5: derived.spectral_gradients_window.export.spectral_grad_window_5x5
+        stack:
+          operation: concat
+          axis: channel
+          order: [source_3x3, source_5x5]
+        weight: 0.7 
+
+      topo:
+        source_3x3: derived.topographic_gradients.export.topo_grad_3x3
+        source_5x5: derived.topographic_gradients.export.topo_grad_5x5
+        stack:
+          operation: concat
+          axis: channel
+          order: [source_3x3, source_5x5]
+        weight: 0.5 
+
+    # ------------------------------------------------------------
+    # LOSS: apply per-head, optionally normalized per sample
+    # ------------------------------------------------------------
+    loss_fn:
+      type: mse
+      reduction: mean
+      normalize_inputs:
+        enabled: true
+        method: per_sample_zscore 
+
+    # Optional: additional weighting inside each 8-channel block
+    channel_weights:
+      apply_within_each_head: true
+      by_scale: {3: 0.3, 5: 0.7}
+      by_direction: {0: 1.0, 45: 0.8, 90: 1.0, 135: 0.8}
+      layout: scale_then_direction  
+
+    # Masking and weighting
+    mask: [shared.masks.aoi, shared.masks.forest]
+    weight: shared.quality.forest_weight  
+
+  # ==================================================================
+  # GRADIENT RECONSTRUCTION LOSS - Phase Pathway
+  # ==================================================================
+  gradient_reconstruction_phase:
+    enabled: false
+    description: "Predict current-year spectral gradient stacks from h_phase"
+
+    weight_schedule:
+      - {epoch: [0, 19], value: 0.0}
+      - {epoch: [20, 49], value: linear}
+      - {epoch: [50, null], value: 0.01}
+
+    # ------------------------------------------------------------
+    # PREDICTION: one head outputs 8 channels
+    #   channel order: [3x3_dir0,3x3_dir45,3x3_dir90,3x3_dir135,
+    #                   5x5_dir0,5x5_dir45,5x5_dir90,5x5_dir135]
+    # ------------------------------------------------------------
+    predict:
+      source: model.h_phase 
+
+      heads:
+        spectral:
+          architecture: conv2d
+          in_channels: 128
+          out_channels: 8
+          kernel_size: 1
+          channel_layout: *grad8_layout
+
+    # ------------------------------------------------------------
+    # TARGETS: build matching 8-channel stack from current-year grads
+    # ------------------------------------------------------------
+    targets:
+      spectral:
+        source_3x3: derived.spectral_gradients_snapshot.export.spectral_grad_snap_3x3
+        source_5x5: derived.spectral_gradients_snapshot.export.spectral_grad_snap_5x5
+        stack:
+          operation: concat
+          axis: channel
+          order: [source_3x3, source_5x5]
+        weight: 1.0
+        description: "Recent disturbance boundaries from current-year spectral data"  
+
+    # ------------------------------------------------------------
+    # LOSS
+    # ------------------------------------------------------------
+    loss_fn:
+      type: mse
+      reduction: mean
+      normalize_inputs:
+        enabled: true
+        method: per_sample_zscore 
+
+    channel_weights:
+      apply_within_each_head: true
+      by_scale: {3: 0.3, 5: 0.7}
+      by_direction: {0: 1.0, 45: 0.8, 90: 1.0, 135: 0.8}
+      layout: scale_then_direction  
+
+    mask: [shared.masks.aoi, shared.masks.forest]
+    weight: shared.quality.forest_weight  
+

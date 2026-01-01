@@ -1,0 +1,568 @@
+# VA VAE Dataset Configuration - TEST SUBSET
+# Schema version: 1.0.0
+# Last updated: 2025-12-26
+# Test configuration: 1024x1024 pixel subset centered in Virginia
+# This is for testing/validation before running the full dataset
+
+dataset:
+  name: va_vae_raster_dataset_test
+  version: "1.0.0-test"
+
+  out_zarr:
+    path: /data/VA/zarr/va_vae_dataset_test.zarr
+    structure: hierarchical
+
+  # Spatial reference system and extent
+  spatial:
+    # Target CRS - same as full dataset
+    crs:
+      wkt: |
+        PROJCS["AEA_WGS84",
+          GEOGCS["GCS_WGS_1984",
+            DATUM["WGS_1984",
+              SPHEROID["WGS_84",6378137,298.257223563]],
+            PRIMEM["Greenwich",0],
+            UNIT["Degree",0.0174532925199433]],
+          PROJECTION["Albers_Conic_Equal_Area"],
+          PARAMETER["False_Easting",0],
+          PARAMETER["False_Northing",0],
+          PARAMETER["Central_Meridian",-96],
+          PARAMETER["Standard_Parallel_1",29.5],
+          PARAMETER["Standard_Parallel_2",45.5],
+          PARAMETER["Latitude_Of_Origin",23],
+          UNIT["Meter",1]]
+
+    # Spatial extent and resolution - TEST SUBSET
+    resolution: 30  # meters
+
+    # Geotransform: [pixel_width, rotation, x_origin, rotation, pixel_height, y_origin]
+    # Updated for centered 1024x1024 subset
+    transform: [30, 0, 1427235, 0, -30, 1786005]
+
+    # Bounding box - centered 1024x1024 subset
+    bounds:
+      xmin: 1427235
+      ymin: 1755285
+      xmax: 1457955
+      ymax: 1786005
+      # Dimensions: 1024 x 1024 pixels (30720m x 30720m)
+      # Grid is multiple of 256: 4 x 4 tiles
+
+  # dtype to use for data. Coerce if necessary
+  dtype:
+    default: float16
+    continuous: float16
+    categorical: int16
+    mask: uint8
+
+  default_chunk:
+    annual: {time: 1, y: 256, x: 256, bands: all}
+    irregular: {time: 1, y: 256, x: 256, bands: all}
+    static: {y: 256, x: 256, bands: all}
+
+  compressor:
+    name: blosc
+    cname: lz4
+    clevel: 3
+    shuffle: 2
+
+  time:
+    continuous: {start: 2010, end: 2024}
+
+  # Statistics to calculate for each band:
+  statistics:
+    spatial_mask: aoi  # Use AOI to mask out pixels when computing stats
+    continuous: [mean, sd, min, q02, q25, q50, q75, q98, max]
+    categorical: histogram
+    boolean: [true_count, false_count, true_fraction]
+    embed_in_zarr: true
+    export_json: true
+    export_csv: true
+
+  reprojection:
+    enabled: true
+    crs_match_mode: projection  # Ignore WGS84 vs NAD83 difference
+    resolution_tolerance_m: 1.0
+    interpolation: nearest
+
+aoi:
+  type: static
+  path: /data/VA/main/va_mask.tif
+
+strata:
+  type: static
+  path: /data/VA/main/va_strata.tif
+
+annual:
+  - group: ls8day
+    path: /data/VA/ls8day/ls8day_metrics_{yyyy}.vrt
+    years:
+      start: 2010
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: NDVI_summer_p95
+          source_band: 1
+        - id: NDVI_winter_max
+          source_band: 2
+        - id: NDVI_amplitude
+          source_band: 3
+        - id: NBR_annual_min
+          source_band: 4
+        - id: NBR_summer_p95
+          source_band: 5
+        - id: NDMI_summer_mean
+          source_band: 6
+        - id: EVI2_summer_p95
+          source_band: 7
+    quality:
+      semantic_type: continuous
+      bands:
+        - id: winter_obs_count
+          source_band: 8
+        - id: summer_obs_count
+          source_band: 9
+
+  - group: lcms_chg
+    years:
+      start: 1985
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: lcms_chg_p_fastloss
+          path: /data/VA/lcms/lcms_chg_p_fastloss_1985_2024.vrt
+        - id: lcms_chg_p_gain
+          path: /data/VA/lcms/lcms_chg_p_gain_1985_2024.vrt
+        - id: lcms_chg_p_slowloss
+          path: /data/VA/lcms/lcms_chg_p_slowloss_1985_2024.vrt
+
+  - group: lcms_lc_p
+    years:
+      start: 1985
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: lcms_lc_p_barren_impervious
+          path: /data/VA/lcms/lcms_lc_p_barren_impervious_1985_2024.vrt
+        - id: lcms_lc_p_barren_treesmix
+          path: /data/VA/lcms/lcms_lc_p_barren_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_grassforb_treesmix
+          path: /data/VA/lcms/lcms_lc_p_grassforb_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_shrubs
+          path: /data/VA/lcms/lcms_lc_p_shrubs_1985_2024.vrt
+        - id: lcms_lc_p_shrubs_treesmix
+          path: /data/VA/lcms/lcms_lc_p_shrubs_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_trees
+          path: /data/VA/lcms/lcms_lc_p_trees_1985_2024.vrt
+        - id: lcms_lc_p_water
+          path: /data/VA/lcms/lcms_lc_p_water_1985_2024.vrt
+
+  - group: lcms_lu_p
+    years:
+      start: 1985
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: lcms_lu_p_ag
+          path: /data/VA/lcms/lcms_lu_p_ag_1985_2024.vrt
+        - id: lcms_lu_p_dev
+          path: /data/VA/lcms/lcms_lu_p_dev_1985_2024.vrt
+        - id: lcms_lu_p_forest
+          path: /data/VA/lcms/lcms_lu_p_forest_1985_2024.vrt
+        - id: lcms_lu_p_rangeland_pasture
+          path: /data/VA/lcms/lcms_lu_p_rangeland_pasture_1985_2024.vrt
+
+  - group: lcms_q_interp
+    years:
+      start: 1985
+      end: 2024
+    mask:
+      semantic_type: mask
+      bands:
+        - id: lcms_qa_interp
+          path: /data/VA/lcms/lcms_qa_interp_1985_2024.vrt
+  - group: lcms_ysfc
+    years: {start: 1985, end: 2024}
+    data:
+      bands:
+        - id: lcms_ysfc_value_1985_2024
+          path: /data/VA/lcms_ysfc/lcms_ysfc_value_1985_2024.vrt
+  - group: lcms_ysfc_censored
+    years: {start: 1985, end: 2024}
+    data:
+      semantic_type: mask
+      bands:
+        - id: lcms_ysfc_censored_1985_2024
+          path: /data/VA/lcms_ysfc/lcms_ysfc_value_1985_2024.vrt
+  
+irregular:
+  - group: naip
+    path: /data/VA/naip/naip_{yyyy}.vrt
+    years: [2011,2012,2014,2016,2018,2021,2023]
+    data:
+      semantic_type: continuous
+      bands:
+        - id: NDVI
+          source_band: 1
+        - id: NIR_var_7m
+          source_band: 2
+        - id: NIR_var_15m
+          source_band: 3
+        - id: NIR_ent_21m
+          source_band: 4
+        - id: NIR_lac_21m
+          source_band: 5
+        - id: NDVI_var_15m
+          source_band: 6
+    quality:
+      semantic_type: continuous
+      bands:
+        - id: DOY
+          source_band: 7
+
+static:
+  - group: evt
+    path: /data/VA/evt/evt.tif
+    data:
+      semantic_type: categorical
+      bands:
+        - id: evt
+          source_band: 1
+
+  - group: topo
+    path: /data/VA/topo/topo_soils_features.vrt
+    data:
+      semantic_type: continuous
+      bands:
+        - id: elevation
+          source_band: 1
+        - id: slope_deg
+          source_band: 2
+        - id: northness
+          source_band: 3
+        - id: eastness
+          source_band: 4
+        - id: HAND
+          source_band: 5
+        - id: TWI
+          source_band: 6
+        - id: TPI_500m
+          source_band: 7
+        - id: ksat_log10_0_5
+          source_band: 8
+
+  - group: soils_masks
+    path: /data/VA/topo/topo_soils_masks_30m_aea.tif
+    mask:
+      semantic_type: mask
+      bands:
+        - id: dem_mask
+          source_band: 1
+        - id: tpi_mask
+          source_band: 2
+        - id: hand_mask
+          source_band: 3
+        - id: twi_mask
+          source_band: 4
+        - id: ksat_mask
+          source_band: 5
+
+  # ccdc_metrics_current 67  bands
+  - group: ccdc_metrics_current
+    path: /data/VA/ccdc/ccdc_metrics_1986_2024.vrt
+    data:
+      semantic_type: continuous
+      bands:
+        # =========================
+        # SNAPSHOT 2024_0831 (21)
+        # =========================
+        - id: snap_2024_0831_green                # 1
+          source_band: 1
+        - id: snap_2024_0831_red                  # 2
+          source_band: 2
+        - id: snap_2024_0831_nir                  # 3
+          source_band: 3
+        - id: snap_2024_0831_swir1                # 4
+          source_band: 4
+        - id: snap_2024_0831_swir2                # 5
+          source_band: 5
+        - id: snap_2024_0831_ndvi                 # 6
+          source_band: 6
+        - id: snap_2024_0831_nbr                  # 7
+          source_band: 7
+        - id: snap_2024_0831_ndmi                 # 8
+          source_band: 8
+        - id: snap_2024_0831_tcb                  # 9
+          source_band: 9
+        - id: snap_2024_0831_tcg                  # 10
+          source_band: 10
+        - id: snap_2024_0831_tcw                  # 11
+          source_band: 11
+        - id: snap_2024_0831_seasonal_amp_red     # 12
+          source_band: 12
+        - id: snap_2024_0831_seasonal_amp_nir     # 13
+          source_band: 13
+        - id: snap_2024_0831_seasonal_amp_swir1   # 14
+          source_band: 14
+        - id: snap_2024_0831_seasonal_amp_swir2   # 15
+          source_band: 15
+        - id: snap_2024_0831_spectral_velocity    # 16
+          source_band: 16
+        - id: snap_2024_0831_segment_duration     # 17
+          source_band: 17
+        - id: snap_2024_0831_rmse_mean            # 18
+          source_band: 18
+        - id: snap_2024_0831_dndvi_dt             # 19
+          source_band: 19
+        - id: snap_2024_0831_dndmi_dt             # 20
+          source_band: 20
+        - id: snap_2024_0831_dnbr_dt              # 21
+          source_band: 21
+
+        # =========================
+        # SNAPSHOT 2022_0831 (21)
+        # =========================
+        - id: snap_2022_0831_green                # 22
+          source_band: 22
+        - id: snap_2022_0831_red                  # 23
+          source_band: 23
+        - id: snap_2022_0831_nir                  # 24
+          source_band: 24
+        - id: snap_2022_0831_swir1                # 25
+          source_band: 25
+        - id: snap_2022_0831_swir2                # 26
+          source_band: 26
+        - id: snap_2022_0831_ndvi                 # 27
+          source_band: 27
+        - id: snap_2022_0831_nbr                  # 28
+          source_band: 28
+        - id: snap_2022_0831_ndmi                 # 29
+          source_band: 29
+        - id: snap_2022_0831_tcb                  # 30
+          source_band: 30
+        - id: snap_2022_0831_tcg                  # 31
+          source_band: 31
+        - id: snap_2022_0831_tcw                  # 32
+          source_band: 32
+        - id: snap_2022_0831_seasonal_amp_red     # 33
+          source_band: 33
+        - id: snap_2022_0831_seasonal_amp_nir     # 34
+          source_band: 34
+        - id: snap_2022_0831_seasonal_amp_swir1   # 35
+          source_band: 35
+        - id: snap_2022_0831_seasonal_amp_swir2   # 36
+          source_band: 36
+        - id: snap_2022_0831_spectral_velocity    # 37
+          source_band: 37
+        - id: snap_2022_0831_segment_duration     # 38
+          source_band: 38
+        - id: snap_2022_0831_rmse_mean            # 39
+          source_band: 39
+        - id: snap_2022_0831_dndvi_dt             # 40
+          source_band: 40
+        - id: snap_2022_0831_dndmi_dt             # 41
+          source_band: 41
+        - id: snap_2022_0831_dnbr_dt              # 42
+          source_band: 42
+
+        # =========================
+        # SNAPSHOT 2020_0831 (21)
+        # =========================
+        - id: snap_2020_0831_green                # 43
+          source_band: 43
+        - id: snap_2020_0831_red                  # 44
+          source_band: 44
+        - id: snap_2020_0831_nir                  # 45
+          source_band: 45
+        - id: snap_2020_0831_swir1                # 46
+          source_band: 46
+        - id: snap_2020_0831_swir2                # 47
+          source_band: 47
+        - id: snap_2020_0831_ndvi                 # 48
+          source_band: 48
+        - id: snap_2020_0831_nbr                  # 49
+          source_band: 49
+        - id: snap_2020_0831_ndmi                 # 50
+          source_band: 50
+        - id: snap_2020_0831_tcb                  # 51
+          source_band: 51
+        - id: snap_2020_0831_tcg                  # 52
+          source_band: 52
+        - id: snap_2020_0831_tcw                  # 53
+          source_band: 53
+        - id: snap_2020_0831_seasonal_amp_red     # 54
+          source_band: 54
+        - id: snap_2020_0831_seasonal_amp_nir     # 55
+          source_band: 55
+        - id: snap_2020_0831_seasonal_amp_swir1   # 56
+          source_band: 56
+        - id: snap_2020_0831_seasonal_amp_swir2   # 57
+          source_band: 57
+        - id: snap_2020_0831_spectral_velocity    # 58
+          source_band: 58
+        - id: snap_2020_0831_segment_duration     # 59
+          source_band: 59
+        - id: snap_2020_0831_rmse_mean            # 60
+          source_band: 60
+        - id: snap_2020_0831_dndvi_dt             # 61
+          source_band: 61
+        - id: snap_2020_0831_dndmi_dt             # 62
+          source_band: 62
+        - id: snap_2020_0831_dnbr_dt              # 63
+          source_band: 63
+
+        - id: rapid_loss_year_1
+          source_band: 64
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_2
+          source_band: 65
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_3
+          source_band: 66
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_4
+          source_band: 67
+          fill_value: {source: -9999, target: na}
+
+  # ccdc_metrics_history 49 bands
+  - group: ccdc_metrics_history
+    path: /data/VA/ccdc/ccdc_metrics_1986_2024.vrt
+    data:
+      semantic_type: continuous
+      bands:
+        # Section 3: duration-weighted mean state (8)
+        - id: mean_green
+          source_band: 64
+        - id: mean_red
+          source_band: 65
+        - id: mean_nir
+          source_band: 66
+        - id: mean_swir1
+          source_band: 67
+        - id: mean_swir2
+          source_band: 68
+        - id: mean_ndvi
+          source_band: 69
+        - id: mean_nbr
+          source_band: 70
+        - id: mean_ndmi
+          source_band: 71
+
+        # Section 3b: harmonics mean amps (4)
+        - id: mean_seasonal_amp_red
+          source_band: 72
+        - id: mean_seasonal_amp_nir
+          source_band: 73
+        - id: mean_seasonal_amp_swir1
+          source_band: 74
+        - id: mean_seasonal_amp_swir2
+          source_band: 75
+
+        # Section 3b: mean SNR (4)
+        - id: mean_seasonal_snr_red
+          source_band: 76
+        - id: mean_seasonal_snr_nir
+          source_band: 77
+        - id: mean_seasonal_snr_swir1
+          source_band: 78
+        - id: mean_seasonal_snr_swir2
+          source_band: 79
+
+        # Section 3b: variance of amp (4)
+        - id: variance_seasonal_amp_red
+          source_band: 80
+        - id: variance_seasonal_amp_nir
+          source_band: 81
+        - id: variance_seasonal_amp_swir1
+          source_band: 82
+        - id: variance_seasonal_amp_swir2
+          source_band: 83
+
+        # Section 3b: summary (4)
+        - id: max_seasonal_amp_nir
+          source_band: 84
+        - id: net_change_seasonal_amp_nir
+          source_band: 85
+        - id: max_seasonal_amp_swir1
+          source_band: 86
+        - id: net_change_seasonal_amp_swir1
+          source_band: 87
+
+        # Section 4: trajectory (7)
+        - id: total_spectral_distance
+          source_band: 88
+        - id: spectral_distance_per_decade
+          source_band: 89
+        - id: mean_spectral_velocity
+          source_band: 90
+        - id: net_change_ndvi
+          source_band: 91
+        - id: net_change_nir
+          source_band: 92
+        - id: mean_recovery_rate
+          source_band: 93
+        - id: mean_decline_rate
+          source_band: 94
+
+        # Section 5: disturbance history (9, assuming magnitudes exist)
+        - id: num_segments
+          source_band: 95
+        - id: break_count
+          source_band: 96
+        - id: break_rate_per_decade
+          source_band: 97
+        - id: years_since_last_break
+          source_band: 98
+        - id: mean_segment_duration
+          source_band: 99
+        - id: max_segment_duration
+          source_band: 100
+        - id: min_segment_duration
+          source_band: 101
+        - id: mean_break_magnitude
+          source_band: 102
+        - id: max_break_magnitude
+          source_band: 103
+
+        # Section 6: variability (5)
+        - id: variance_ndvi
+          source_band: 104
+        - id: variance_nir
+          source_band: 105
+        - id: cv_segment_duration
+          source_band: 106
+        - id: mean_rmse_joint
+          source_band: 107
+        - id: max_rmse_joint
+          source_band: 108
+
+        # Section 7: rapid loss (6)
+        - id: rapid_loss_rate_per_decade
+          source_band: 109
+        - id: rapid_loss_mean_magnitude
+          source_band: 110
+        - id: rapid_loss_year_1
+          source_band: 111
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_2
+          source_band: 112
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_3
+          source_band: 113
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_4
+          source_band: 114
+          fill_value: {source: -9999, target: na}
+
+        # Section 8: loss recovery (2)
+        - id: mean_loss_recovery_duration
+          source_band: 115
+          fill_value: {source: -9999, target: na}
+        - id: std_loss_recovery_duration
+          source_band: 116
+          fill_value: {source: -9999, target: na}    
+    
