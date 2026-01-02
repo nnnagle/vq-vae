@@ -549,6 +549,8 @@ class DataReader:
         
         Returns full temporal dimension [T, H, W].
         
+        Uses array's 'time_coords' attribute to map requested years to array indices.
+        
         Args:
             zarray: Zarr array to read from
             spatial_window: Spatial window
@@ -573,6 +575,78 @@ class DataReader:
         elif len(array_shape) == 3:
             # Array is [T, H, W]
             T_available, H_available, W_available = array_shape
+            
+            # Get time coordinates from array attributes
+            time_coords = zarray.attrs.get('time_coords', None)
+            
+            # Calculate requested year range
+            window_start_year = temporal_window.end_year - temporal_window.window_length + 1
+            window_end_year = temporal_window.end_year
+            
+            # Determine which timesteps to read
+            if time_coords is not None:
+                # Use time_coords to find exact indices for requested years
+                try:
+                    # Convert time_coords to years (handle various formats)
+                    if isinstance(time_coords[0], str):
+                        # Parse dates if stored as strings (e.g., "2020-01-01")
+                        import pandas as pd
+                        years = pd.to_datetime(time_coords).year.values
+                    else:
+                        # Assume numeric years
+                        years = np.array(time_coords, dtype=int)
+                    
+                    # Find indices for requested years
+                    year_mask = (years >= window_start_year) & (years <= window_end_year)
+                    matching_indices = np.where(year_mask)[0]
+                    
+                    if len(matching_indices) == 0:
+                        # No data in requested window - return all NaN
+                        logger.warning(
+                            f"No timesteps found for years {window_start_year}-{window_end_year}. "
+                            f"Available years: {years[0]}-{years[-1]}"
+                        )
+                        return np.full(
+                            (temporal_window.window_length, spatial_window.height, spatial_window.width),
+                            np.nan,
+                            dtype=np.float32
+                        )
+                    
+                    # Determine temporal reading parameters
+                    t_start_actual = matching_indices[0]
+                    t_end_actual = matching_indices[-1] + 1
+                    num_years_available = len(matching_indices)
+                    
+                    # Calculate padding
+                    if num_years_available < temporal_window.window_length:
+                        # Pad at beginning if we don't have all requested years
+                        pad_temporal_start = temporal_window.window_length - num_years_available
+                    else:
+                        pad_temporal_start = 0
+                    
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to parse time_coords: {e}. "
+                        f"Falling back to last-N-timesteps approach."
+                    )
+                    # Fall back to old behavior
+                    time_coords = None
+            
+            if time_coords is None:
+                # No time_coords available - use last N timesteps (old behavior)
+                logger.warning(
+                    f"Array missing 'time_coords' attribute. Using last {temporal_window.window_length} timesteps. "
+                    f"This may not match requested years {window_start_year}-{window_end_year}."
+                )
+                T_requested = temporal_window.window_length
+                if T_requested > T_available:
+                    t_start_actual = 0
+                    t_end_actual = T_available
+                    pad_temporal_start = T_requested - T_available
+                else:
+                    t_start_actual = T_available - T_requested
+                    t_end_actual = T_available
+                    pad_temporal_start = 0
             
             # Check spatial bounds
             request_row_end = spatial_window.row_start + spatial_window.height
@@ -604,21 +678,6 @@ class DataReader:
             pad_bottom = max(0, request_row_end - H_available)
             pad_left = max(0, -spatial_window.col_start)
             pad_right = max(0, request_col_end - W_available)
-            
-            # Handle temporal dimension - read last N timesteps
-            T_requested = temporal_window.window_length
-            if T_requested > T_available:
-                # Pad with zeros at beginning
-                t_start_actual = 0
-                t_end_actual = T_available
-                pad_temporal_start = T_requested - T_available
-                pad_temporal_end = 0
-            else:
-                # Read last T_requested timesteps
-                t_start_actual = T_available - T_requested
-                t_end_actual = T_available
-                pad_temporal_start = 0
-                pad_temporal_end = 0
             
             # Read actual data
             read_data = zarray[
@@ -671,6 +730,8 @@ class DataReader:
         
         Returns [H, W].
         
+        Uses array's 'time_coords' attribute to find the exact timestep for end_year.
+        
         Args:
             zarray: Zarr array to read from
             spatial_window: Spatial window
@@ -687,8 +748,53 @@ class DataReader:
             return self._read_static_array_with_padding(zarray, spatial_window, missing_policy)
         
         elif len(array_shape) == 3:
-            # Temporal array [T, H, W], read last timestep
+            # Temporal array [T, H, W], read timestep for end_year
             T_available, H_available, W_available = array_shape
+            
+            # Get time coordinates from array attributes
+            time_coords = zarray.attrs.get('time_coords', None)
+            
+            # Determine which timestep to read
+            if time_coords is not None:
+                try:
+                    # Convert time_coords to years
+                    if isinstance(time_coords[0], str):
+                        import pandas as pd
+                        years = pd.to_datetime(time_coords).year.values
+                    else:
+                        years = np.array(time_coords, dtype=int)
+                    
+                    # Find index for end_year
+                    matching_indices = np.where(years == temporal_window.end_year)[0]
+                    
+                    if len(matching_indices) == 0:
+                        logger.warning(
+                            f"No timestep found for year {temporal_window.end_year}. "
+                            f"Available years: {years[0]}-{years[-1]}. Using NaN."
+                        )
+                        return np.full(
+                            (spatial_window.height, spatial_window.width),
+                            np.nan,
+                            dtype=np.float32
+                        )
+                    
+                    # Use first matching index (should only be one)
+                    t_idx = matching_indices[0]
+                    
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to parse time_coords: {e}. "
+                        f"Falling back to last timestep."
+                    )
+                    time_coords = None
+            
+            if time_coords is None:
+                # No time_coords - use last timestep (old behavior)
+                logger.warning(
+                    f"Array missing 'time_coords' attribute. Using last timestep. "
+                    f"This may not match requested year {temporal_window.end_year}."
+                )
+                t_idx = T_available - 1
             
             # Read spatial region from last available timestep
             request_row_end = spatial_window.row_start + spatial_window.height
@@ -716,8 +822,7 @@ class DataReader:
             pad_left = max(0, -spatial_window.col_start)
             pad_right = max(0, request_col_end - W_available)
             
-            # Read last timestep
-            t_idx = min(T_available - 1, temporal_window.window_length - 1)
+            # Read the timestep for end_year
             read_data = zarray[t_idx, row_start_actual:row_end_actual, col_start_actual:col_end_actual]
             
             # Convert to float32 first (required for NaN)
