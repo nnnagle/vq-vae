@@ -1,5 +1,12 @@
 """
 YAML Bindings Parser for Forest Representation Model
+Provides:
+
+@dataclass class BandConfig
+
+@dataclass class InputGroup
+
+class BindingsParser
 
 Parses and validates the comprehensive YAML bindings configuration file that defines:
 - Normalization presets

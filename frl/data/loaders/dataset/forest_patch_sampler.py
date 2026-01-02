@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 
-from data.loaders.windows import SpatialWindow
+from data.loaders import SpatialWindow
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

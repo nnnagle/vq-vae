@@ -30,12 +30,10 @@ import numpy as np
 from typing import Dict, List, Any, Optional
 import logging
 
-from data.loaders.bindings.parser import BindingsParser
-from data.loaders.bindings.utils import BindingsRegistry
-from data.loaders.data_reader import DataReader
-from data.loaders.mask_reader import MaskBuilder
-from data.loaders.data_bundle import BundleBuilder, TrainingBundle
-from data.loaders.forest_patch_sampler import ForestPatchSampler
+from data.loaders.config import BindingsParser, BindingsRegistry
+from data.loaders import DataReader, MaskBuilder
+from data.loaders.builders import BundleBuilder, TrainingBundle
+from .forest_patch_sampler import ForestPatchSampler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

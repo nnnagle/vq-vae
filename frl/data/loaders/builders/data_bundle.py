@@ -20,9 +20,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import logging
 
-from data.loaders.data_reader import DataReader, GroupReadResult
-from data.loaders.mask_reader import MaskBuilder, MaskResult, QualityResult
-from data.loaders.windows import SpatialWindow, TemporalWindow
+from data.loaders import (
+  DataReader, 
+  GroupReadResult,
+  MaskBuilder, 
+  MaskResult, 
+  QualityResult, 
+  SpatialWindow, 
+  TemporalWindow,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

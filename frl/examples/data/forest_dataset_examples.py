@@ -14,8 +14,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from data.loaders.bindings.parser import BindingsParser
-from data.loaders.forest_dataset import ForestDataset, forest_collate_fn
+from data.loaders.config import BindingsParser
+from data.loaders.dataset import ForestDataset, forest_collate_fn
 
 
 def example_basic_usage():

@@ -20,9 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 
-from data.loaders.bindings.parser import BandConfig
-from data.loaders.bindings.utils import BindingsRegistry
-from data.loaders.windows import SpatialWindow, TemporalWindow
+from data.loaders.config import BandConfig
+from data.loaders.config import BindingsRegistry
+from .windows import SpatialWindow, TemporalWindow
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
