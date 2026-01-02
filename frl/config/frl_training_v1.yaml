@@ -1,0 +1,152 @@
+# ================================================================
+# Forest Representation Learning - Training Configuration v0
+# ================================================================
+version: "1.0"
+name: forest_trajectory_v0
+
+config:
+  bindings_path: config/frl_bindings_v0.yaml
+  model_path: config/frl_model_v0.yaml
+  
+run:
+  experiment_name: frl_v0_exp001
+  run_root: runs
+  ckpt_dir: checkpoints
+  log_dir: logs
+  
+  checkpoint:
+    save_every_n_epochs: 5
+    save_top_k: 3
+    monitor: val/loss_total
+    mode: min
+    save_last: true
+    
+hardware:
+  device: cuda
+  gpu_ids: [0]
+  num_workers: 4
+  pin_memory: true
+  
+  mixed_precision:
+    enabled: true
+    dtype: bfloat16
+    
+training:
+  epoch:
+    num_epochs: 100
+    mode: full # full/frac/number - use every batch or take a sample
+    sample_frac: .1
+    sample_number: 1000
+    batch_size: 4
+  
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+    
+  early_stopping:
+    enabled: true
+    patience: 15
+    
+  validation:
+    enabled: true
+    val_every_n_epochs: 1
+    val_fraction: 0.15
+    
+optimizer:
+  name: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01
+        
+scheduler:
+  name: cosine_warmup
+  warmup:
+    enabled: true
+    epochs: 5
+  T_max: 95
+  eta_min: 1.0e-6
+    
+spatial_domain:
+  debug_mode: true
+  debug_window:
+    origin: [0, 0] #[row, col]
+    size: [1024, 1024] # [H,W]
+    block_grid: [1,1]
+  full_domain:
+    origin: [0, 0] # row, col
+    size: [13056, 23552] # Height, Width
+    block_grid: [7, 7] # The val/train/test split using a block size of [y,x] patches
+    
+temporal_domain:
+  end_years: [2020, 2022, 2024]
+  window_length: 10
+  bundle:
+    enabled: true
+    size: 3
+    offsets: [0, -2, -4]
+  sampling:
+    mode: weighted
+    weights:
+      2024: 0.4
+      2022: 0.3
+      2020: 0.3
+      
+sampling:
+  patch_size: 256
+  grid_subsample:
+    enabled: false
+    grid_size: [16, 16]
+  forest_samples:
+    enabled: false
+    per_patch: 64
+  augmentation:
+    enabled: false
+    random_flip: {prob: 0.5}
+    random_rotation: {angles: [0, 90, 180, 270]}
+    
+losses:
+  z_type_triplet:
+    enabled: true
+    weight_schedule:
+      - {epoch: [0, 14], value: 0.0}
+      - {epoch: [15, null], value: 1.0}
+    triplet_mining:
+      strategy: hardest_in_batch
+      margin: 0.2
+      
+  vq_loss:
+    enabled: false
+    weight: 1.0
+    commitment_cost: 0.25
+      
+  phase_monotonicity:
+    enabled: true
+    weight_schedule:
+      - {epoch: [0, 9], value: 0.0}
+      - {epoch: [10, 29], value: 0.5}
+      - {epoch: [30, null], value: 1.0}
+    constraints:
+      - {when: {ysfc_in: [0, 1]}, order: [t0, t4, t2]}
+      - {when: {ysfc_in: [2, 3]}, order: [t2, t0, t4]}
+      - {when: {ysfc_ge: 4}, order: [t4, t2, t0]}
+        
+masking:
+  global_mask: [shared.masks.aoi, shared.masks.forest]
+  per_loss_masks:
+    z_type_triplet: [shared.masks.aoi, shared.masks.forest]
+  global_weight: shared.quality.forest_weight
+    
+metrics:
+  train: [loss_total, loss_vq, loss_triplet, learning_rate]
+  validation: [loss_total, loss_vq]
+  latent_analysis:
+    enabled: true
+    compute_every_n_epochs: 10
+      
+visualization:
+  enabled: false
+  tensorboard:
+    log_images_every_n_epochs: 5
+    
+reproducibility:
+  seed: 42
+  benchmark: true
