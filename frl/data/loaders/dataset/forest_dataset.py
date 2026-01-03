@@ -34,6 +34,7 @@ from data.loaders.config import BindingsParser, BindingsRegistry
 from data.loaders import DataReader, MaskBuilder
 from data.loaders.builders import BundleBuilder, TrainingBundle
 from data.stats import DerivedStatsLoader
+from data.normalization import ZScoreNormalizer, NormalizationConfig
 from .forest_patch_sampler import ForestPatchSampler
 
 logging.basicConfig(level=logging.INFO)
@@ -206,8 +207,8 @@ class ForestDataset(Dataset):
         """
         Normalize derived features in a TrainingBundle using pre-computed statistics.
 
-        Applies z-score normalization (x - mean) / sd to each derived feature
-        that has statistics available in the stats_loader.
+        Uses the existing normalization framework (ZScoreNormalizer) with statistics
+        loaded from the derived_stats group in Zarr via DerivedStatsLoader.
 
         Args:
             bundle: TrainingBundle with raw derived features
@@ -218,18 +219,23 @@ class ForestDataset(Dataset):
         Note:
             - Modifies the bundle in-place for efficiency
             - Features without available statistics are left unchanged
-            - Applies optional clamping based on normalization config
+            - Uses existing ZScoreNormalizer for consistent behavior
         """
         if not self.normalize_derived or self.stats_loader is None:
             return bundle
 
-        # Get normalization config
-        norm_config = self.bindings_config.get('normalization', {}).get('presets', {})
-        zscore_config = norm_config.get('zscore', {})
-        clamp_config = zscore_config.get('clamp', {})
-        clamp_enabled = clamp_config.get('enabled', True)
-        clamp_min = clamp_config.get('min', -6.0)
-        clamp_max = clamp_config.get('max', 6.0)
+        # Get normalization config from YAML
+        norm_presets = self.bindings_config.get('normalization', {}).get('presets', {})
+        zscore_preset = norm_presets.get('zscore', {})
+
+        # Create normalization config using existing framework
+        norm_config = NormalizationConfig(
+            type='zscore',
+            stats_source='zarr',  # Stats come from Zarr (via DerivedStatsLoader)
+            fields=zscore_preset.get('fields', {'mean': 'mean', 'std': 'sd'}),
+            clamp=zscore_preset.get('clamp', {'enabled': True, 'min': -6.0, 'max': 6.0}),
+            missing=zscore_preset.get('missing', {'fill': 0.0})
+        )
 
         # Normalize derived features in each window
         for window_label, window_data in bundle.windows.items():
@@ -238,52 +244,40 @@ class ForestDataset(Dataset):
 
             for feature_name, feature_data in window_data.derived.items():
                 try:
-                    # Get statistics for this feature
+                    # Get statistics for this feature from DerivedStatsLoader
                     stats = self.stats_loader.get_feature_stats(feature_name)
-                    mean = stats['mean']  # [C]
-                    sd = stats['sd']      # [C]
 
-                    # Apply z-score normalization
-                    # feature_data is typically [C, ...] where ... can be T, H, W or H, W
-                    # We need to broadcast mean and sd correctly
-
-                    # Reshape mean and sd to match feature dimensions
-                    # Assume first dimension is channels
-                    shape = feature_data.shape
-                    n_channels = shape[0]
-
-                    if len(mean) != n_channels:
+                    # Validate channel dimensions
+                    if len(stats['mean']) != feature_data.shape[0]:
                         logger.warning(
-                            f"Feature '{feature_name}' has {n_channels} channels "
-                            f"but stats have {len(mean)} channels. Skipping normalization."
+                            f"Feature '{feature_name}' has {feature_data.shape[0]} channels "
+                            f"but stats have {len(stats['mean'])} channels. Skipping normalization."
                         )
                         continue
 
-                    # Reshape for broadcasting
-                    # For [C, T, H, W]: mean/sd should be [C, 1, 1, 1]
-                    # For [C, H, W]: mean/sd should be [C, 1, 1]
+                    # Prepare stats for broadcasting
+                    # ZScoreNormalizer expects stats to broadcast to data shape
+                    shape = feature_data.shape
+                    n_channels = shape[0]
                     broadcast_shape = [n_channels] + [1] * (len(shape) - 1)
-                    mean_bc = mean.reshape(broadcast_shape)
-                    sd_bc = sd.reshape(broadcast_shape)
 
-                    # Avoid division by zero
-                    sd_bc = np.where(sd_bc > 1e-8, sd_bc, 1.0)
+                    broadcast_stats = {
+                        'mean': stats['mean'].reshape(broadcast_shape),
+                        'sd': stats['sd'].reshape(broadcast_shape)
+                    }
 
-                    # Normalize
-                    normalized = (feature_data - mean_bc) / sd_bc
+                    # Create normalizer using existing framework
+                    normalizer = ZScoreNormalizer(norm_config, broadcast_stats)
 
-                    # Clamp if enabled
-                    if clamp_enabled:
-                        normalized = np.clip(normalized, clamp_min, clamp_max)
+                    # Apply normalization
+                    normalized = normalizer.normalize(feature_data, mask=None)
 
                     # Update in place
-                    window_data.derived[feature_name] = normalized.astype(feature_data.dtype)
+                    window_data.derived[feature_name] = normalized
 
                     logger.debug(
-                        f"Normalized {window_label}.{feature_name}: "
-                        f"shape={feature_data.shape}, "
-                        f"mean={mean[:3] if len(mean) > 3 else mean}, "
-                        f"sd={sd[:3] if len(sd) > 3 else sd}"
+                        f"Normalized {window_label}.{feature_name} using ZScoreNormalizer: "
+                        f"shape={feature_data.shape}"
                     )
 
                 except KeyError as e:
