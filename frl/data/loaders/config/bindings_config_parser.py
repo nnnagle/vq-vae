@@ -235,6 +235,7 @@ class BindingsParser:
         self._parse_shared_section()
         self._parse_inputs()
         self._parse_derived_features()
+        self._parse_derived_statistics()
         self._parse_model_inputs()
         self._parse_training_config()
         
@@ -708,6 +709,77 @@ class BindingsParser:
                     self.reference_locations[target].append(f"derived.{feature_name}")
         
         logger.info(f"Parsed {len(self.parsed['derived'])} derived features")
+    
+    def _parse_derived_statistics(self):
+        """Parse derived statistics configuration"""
+        ds_config = self.raw_config.get('derived_statistics', {})
+        
+        if not ds_config:
+            self.parsed['derived_statistics'] = {}
+            return
+        
+        # Parse sampling config
+        sampling = ds_config.get('sampling', {})
+        mask_ref = sampling.get('mask')
+        if mask_ref:
+            # Track mask reference
+            self.used_references.add(mask_ref)
+            self.reference_locations[mask_ref].append('derived_statistics.sampling')
+        
+        # Parse feature configs
+        features = ds_config.get('features', {})
+        for feature_name, feature_config in features.items():
+            # Track reference to derived feature
+            derived_ref = f"derived.{feature_name}"
+            self.used_references.add(derived_ref)
+            self.reference_locations[derived_ref].append(
+                f'derived_statistics.features.{feature_name}'
+            )
+            
+            # Track normalization preset reference if specified
+            update_norm = feature_config.get('update_norm_preset')
+            if update_norm:
+                norm_ref = f"normalization.presets.{update_norm}"
+                self.used_references.add(norm_ref)
+                self.reference_locations[norm_ref].append(
+                    f'derived_statistics.features.{feature_name}'
+                )
+        
+        # Parse covariance matrix configs
+        cov_matrices = ds_config.get('covariance_matrices', {})
+        for cov_name, cov_config in cov_matrices.items():
+            arrays = cov_config.get('arrays', [])
+            
+            # Validate array references
+            for array_path in arrays:
+                # Support both formats:
+                # 1. Direct Zarr path: static/topo/data/elevation
+                # 2. Reference path: inputs.static.topo.elevation
+                
+                if array_path.startswith('inputs.'):
+                    # Reference path - validate it exists
+                    self.used_references.add(array_path)
+                    self.reference_locations[array_path].append(
+                        f'derived_statistics.covariance_matrices.{cov_name}'
+                    )
+                # else: Direct Zarr path - can't validate here, will be checked at runtime
+            # FIX: Convert regularization to float if present
+            inverse_config = cov_config.get('inverse', {})
+            if 'regularization' in inverse_config:
+                try:
+                    inverse_config['regularization'] = float(inverse_config['regularization'])
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        f"Could not convert regularization to float for '{cov_name}': {e}. "
+                        f"Using default 1e-6"
+                    )
+                    inverse_config['regularization'] = 1e-6
+        self.parsed['derived_statistics'] = ds_config
+        
+        logger.info(
+            f"Parsed derived statistics config: "
+            f"{len(features)} features, {len(cov_matrices)} covariance matrices"
+        )
     
     def _parse_model_inputs(self):
         """Parse model input mapping"""

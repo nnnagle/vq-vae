@@ -771,6 +771,58 @@ sampling:
     max_points: 2048            # memory bank size (in-batch + prev batches)
     refresh: fifo
 
+derived_statistics:
+  zarr_location: derived_stats
+  
+  sampling:
+    patch_size: [256, 256]
+    n_patches: 100
+    mask: shared.masks.aoi  # CHANGED: Need full reference path
+    splits: all
+    seed: 42
+    
+  features:
+    ls8_delta:  # CHANGED: No dash, no "derived." prefix, dict not list
+      enabled: true
+      stats: [mean, sd, q02, q25, q50, q75, q98, min, max, mad]
+    spectral_grads_window:  # CHANGED: No dash, no "derived." prefix
+      enabled: false
+      stats: [mean, sd, q02, q25, q50, q75, q98, min, max, mad]
+  
+  covariance_matrices:
+    topo_cov:
+      description: "Covariance for topographic distance in triplet loss"
+      domain: per-patch
+      arrays:
+        - static/topo/data/elevation
+        - static/topo/data/slope_deg
+        - static/topo/data/HAND
+        - static/topo/data/TWI
+        - static/topo/data/TPI_500m
+        - static/topo/data/ksat_log10_0_5
+      inverse:
+        compute: true
+        id: topo_cov_inv
+        regularization: 1e-6
+        
+    static_eco_cov:
+      description: "Covariance for ecological distances"
+      domain: per-patch
+      arrays:
+        - static/ccdc_metrics_history/data/mean_nir
+        - static/ccdc_metrics_history/data/mean_swir1
+        - static/ccdc_metrics_history/data/mean_ndvi
+        - static/ccdc_metrics_history/data/mean_ndmi
+        - static/ccdc_metrics_history/data/mean_seasonal_amp_nir
+        - static/ccdc_metrics_history/data/mean_seasonal_amp_swir1
+        - static/ccdc_metrics_history/data/spectral_distance_per_decade
+        - static/ccdc_metrics_history/data/variance_ndvi
+      inverse:
+        compute: true
+        id: static_eco_cov_inv  # CHANGED: Different ID from topo_cov
+        regularization: 1e-6
+        
+        
 losses:
 
   z_type_triplet:
@@ -804,6 +856,9 @@ losses:
       type: triplet_margin
       margin: 0.2
       distance: euclidean
+      mahalanobis:
+        enable: true
+        matrix: eco_cov_inv
 
     weight:
       per_triplet: shared.quality.forest_weight
