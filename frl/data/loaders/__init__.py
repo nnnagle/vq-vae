@@ -15,8 +15,6 @@ from .config import (
   BindingsRegistry,
 )
 
-from .readers.mask_builder import MaskBuilder
-
 __all__ = [
     'DataReader',
     'GroupReadResult',    
