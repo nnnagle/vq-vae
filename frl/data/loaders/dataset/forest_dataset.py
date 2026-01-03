@@ -33,6 +33,7 @@ import logging
 from data.loaders.config import BindingsParser, BindingsRegistry
 from data.loaders import DataReader, MaskBuilder
 from data.loaders.builders import BundleBuilder, TrainingBundle
+from data.stats import DerivedStatsLoader
 from .forest_patch_sampler import ForestPatchSampler
 
 logging.basicConfig(level=logging.INFO)
@@ -42,47 +43,56 @@ logger = logging.getLogger(__name__)
 class ForestDataset(Dataset):
     """
     PyTorch Dataset for forest representation learning.
-    
+
     Generates training samples as (spatial_window, anchor_year) pairs using
     ForestPatchSampler, then builds complete TrainingBundle objects containing
     data for all 3 temporal windows plus static data.
-    
-    Returns raw (unnormalized) data. Normalization should happen in training loop
-    after computing statistics over first few epochs.
-    
+
+    Optionally normalizes derived features using pre-computed statistics from Zarr.
+
     Attributes:
         sampler: ForestPatchSampler for generating sample specifications
         reader: DataReader for loading raw Zarr data
         masker: MaskBuilder for loading masks and quality weights
         builder: BundleBuilder for constructing TrainingBundle objects
+        stats_loader: Optional DerivedStatsLoader for normalizing derived features
+        normalize_derived: Whether to normalize derived features
     """
-    
+
     def __init__(
         self,
         bindings_config: Dict[str, Any],
         training_config: Dict[str, Any],
-        split: Optional[str] = None
+        split: Optional[str] = None,
+        normalize_derived: bool = False
     ):
         """
         Initialize ForestDataset.
-        
+
         Args:
             bindings_config: Parsed bindings configuration
             training_config: Parsed training configuration
             split: Optional split ('train', 'val', 'test', or None for all)
-        
+            normalize_derived: If True, normalize derived features using
+                pre-computed statistics from Zarr (default: False)
+
         Example:
             >>> # Parse configs
             >>> bindings_parser = BindingsParser('config/frl_bindings_v0.yaml')
             >>> bindings_config = bindings_parser.parse()
-            >>> 
+            >>>
             >>> import yaml
             >>> with open('config/frl_training_v1.yaml') as f:
             ...     training_config = yaml.safe_load(f)
-            >>> 
-            >>> # Create dataset
-            >>> dataset = ForestDataset(bindings_config, training_config, split='train')
-            >>> 
+            >>>
+            >>> # Create dataset with normalization
+            >>> dataset = ForestDataset(
+            ...     bindings_config,
+            ...     training_config,
+            ...     split='train',
+            ...     normalize_derived=True
+            ... )
+            >>>
             >>> # Use with DataLoader
             >>> from torch.utils.data import DataLoader
             >>> dataloader = DataLoader(
@@ -95,8 +105,9 @@ class ForestDataset(Dataset):
         self.bindings_config = bindings_config
         self.training_config = training_config
         self.split = split
-        
-        logger.info(f"Initializing ForestDataset with split='{split}'")
+        self.normalize_derived = normalize_derived
+
+        logger.info(f"Initializing ForestDataset with split='{split}', normalize_derived={normalize_derived}")
         
         # Initialize sampler
         logger.info("Creating ForestPatchSampler...")
@@ -114,7 +125,22 @@ class ForestDataset(Dataset):
         # Initialize bundle builder
         logger.info("Creating BundleBuilder...")
         self.builder = BundleBuilder(bindings_config, self.reader, self.masker)
-        
+
+        # Initialize stats loader if normalization is enabled
+        self.stats_loader = None
+        if self.normalize_derived:
+            logger.info("Creating DerivedStatsLoader for normalization...")
+            try:
+                self.stats_loader = DerivedStatsLoader(bindings_config)
+                logger.info("✓ DerivedStatsLoader initialized successfully")
+            except (ValueError, KeyError) as e:
+                logger.warning(
+                    f"Could not initialize DerivedStatsLoader: {e}\n"
+                    f"Derived features will NOT be normalized. "
+                    f"Run DerivedStatsComputer.compute_and_save() first."
+                )
+                self.normalize_derived = False
+
         logger.info(
             f"ForestDataset initialized: {len(self)} samples for split='{split}'"
         )
@@ -159,7 +185,7 @@ class ForestDataset(Dataset):
         """
         # Get sample specification from sampler
         spatial_window, anchor_year = self.sampler[idx]
-        
+
         # Build complete bundle
         try:
             bundle = self.builder.build_bundle(spatial_window, anchor_year)
@@ -169,9 +195,114 @@ class ForestDataset(Dataset):
                 f"spatial_window={spatial_window}, anchor_year={anchor_year}: {e}"
             )
             raise
-        
+
+        # Normalize derived features if enabled
+        if self.normalize_derived:
+            bundle = self._normalize_derived_features(bundle)
+
         return bundle
-    
+
+    def _normalize_derived_features(self, bundle: TrainingBundle) -> TrainingBundle:
+        """
+        Normalize derived features in a TrainingBundle using pre-computed statistics.
+
+        Applies z-score normalization (x - mean) / sd to each derived feature
+        that has statistics available in the stats_loader.
+
+        Args:
+            bundle: TrainingBundle with raw derived features
+
+        Returns:
+            TrainingBundle with normalized derived features
+
+        Note:
+            - Modifies the bundle in-place for efficiency
+            - Features without available statistics are left unchanged
+            - Applies optional clamping based on normalization config
+        """
+        if not self.normalize_derived or self.stats_loader is None:
+            return bundle
+
+        # Get normalization config
+        norm_config = self.bindings_config.get('normalization', {}).get('presets', {})
+        zscore_config = norm_config.get('zscore', {})
+        clamp_config = zscore_config.get('clamp', {})
+        clamp_enabled = clamp_config.get('enabled', True)
+        clamp_min = clamp_config.get('min', -6.0)
+        clamp_max = clamp_config.get('max', 6.0)
+
+        # Normalize derived features in each window
+        for window_label, window_data in bundle.windows.items():
+            if not window_data.derived:
+                continue
+
+            for feature_name, feature_data in window_data.derived.items():
+                try:
+                    # Get statistics for this feature
+                    stats = self.stats_loader.get_feature_stats(feature_name)
+                    mean = stats['mean']  # [C]
+                    sd = stats['sd']      # [C]
+
+                    # Apply z-score normalization
+                    # feature_data is typically [C, ...] where ... can be T, H, W or H, W
+                    # We need to broadcast mean and sd correctly
+
+                    # Reshape mean and sd to match feature dimensions
+                    # Assume first dimension is channels
+                    shape = feature_data.shape
+                    n_channels = shape[0]
+
+                    if len(mean) != n_channels:
+                        logger.warning(
+                            f"Feature '{feature_name}' has {n_channels} channels "
+                            f"but stats have {len(mean)} channels. Skipping normalization."
+                        )
+                        continue
+
+                    # Reshape for broadcasting
+                    # For [C, T, H, W]: mean/sd should be [C, 1, 1, 1]
+                    # For [C, H, W]: mean/sd should be [C, 1, 1]
+                    broadcast_shape = [n_channels] + [1] * (len(shape) - 1)
+                    mean_bc = mean.reshape(broadcast_shape)
+                    sd_bc = sd.reshape(broadcast_shape)
+
+                    # Avoid division by zero
+                    sd_bc = np.where(sd_bc > 1e-8, sd_bc, 1.0)
+
+                    # Normalize
+                    normalized = (feature_data - mean_bc) / sd_bc
+
+                    # Clamp if enabled
+                    if clamp_enabled:
+                        normalized = np.clip(normalized, clamp_min, clamp_max)
+
+                    # Update in place
+                    window_data.derived[feature_name] = normalized.astype(feature_data.dtype)
+
+                    logger.debug(
+                        f"Normalized {window_label}.{feature_name}: "
+                        f"shape={feature_data.shape}, "
+                        f"mean={mean[:3] if len(mean) > 3 else mean}, "
+                        f"sd={sd[:3] if len(sd) > 3 else sd}"
+                    )
+
+                except KeyError as e:
+                    # Stats not available for this feature - skip normalization
+                    logger.debug(
+                        f"No statistics available for '{feature_name}', "
+                        f"leaving unnormalized: {e}"
+                    )
+                    continue
+                except Exception as e:
+                    logger.error(
+                        f"Error normalizing feature '{feature_name}' "
+                        f"in window '{window_label}': {e}"
+                    )
+                    # Leave feature unnormalized on error
+                    continue
+
+        return bundle
+
     def on_epoch_start(self):
         """
         Call at the start of each epoch.
