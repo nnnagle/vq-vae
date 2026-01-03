@@ -140,6 +140,14 @@ class DerivedStatsComputer:
         logger.info("Starting derived statistics computation")
         logger.info("=" * 70)
         
+        # Create or replace derived_stats group ONCE
+        zarr_location = self.stats_config.zarr_location
+        try:
+            del self.zarr_root[zarr_location]
+        except KeyError:
+            pass
+        stats_group = self.zarr_root.create_group(zarr_location)
+        
         # Sample patch locations
         patch_specs = self._sample_patches(verbose=verbose)
         
@@ -147,17 +155,19 @@ class DerivedStatsComputer:
         if self.stats_config.features:
             logger.info("\nComputing feature statistics...")
             feature_stats = self._compute_feature_stats(patch_specs, verbose=verbose)
-            self._save_feature_stats(feature_stats, verbose=verbose)
+            self._save_feature_stats(feature_stats,  stats_group, verbose=verbose)
         
         # Compute covariance matrices
         if self.stats_config.covariance_matrices:
             logger.info("\nComputing covariance matrices...")
             cov_results = self._compute_covariances(patch_specs, verbose=verbose)
-            self._save_covariances(cov_results, verbose=verbose)
+            self._save_covariances(cov_results,  stats_group, verbose=verbose)
         
         logger.info("\n" + "=" * 70)
         logger.info("✓ Derived statistics computation complete!")
         logger.info("=" * 70)
+        
+        zarr.consolidate_metadata(self.zarr_path)
     
     def _sample_patches(self, verbose: bool = True) -> List[Tuple[SpatialWindow, TemporalWindow]]:
         """
@@ -419,7 +429,8 @@ class DerivedStatsComputer:
                         else:
                             data_subsampled = data_masked
                         
-                        stats_computer.update(data_subsampled.T)  # [N, C]
+                        #stats_computer.update(data_subsampled.T)  # [N, C]
+                        stats_computer.update_nan_safe(data_subsampled.T)  # [N, C]
                     
                     total_time = time.time() - patch_start
                     
@@ -542,20 +553,26 @@ class DerivedStatsComputer:
                     else:
                         # Per-patch: compute covariance for this patch
                         if valid_data.shape[1] > 1:
-                            patch_cov = np.cov(valid_data, ddof=1)
+                            patch_cov = np.cov(valid_data.astype(np.float64, copy=False), ddof=1)
                             patch_covs.append(patch_cov)
-                            patch_weights.append(valid_data.shape[1])
                             
-                            # Track mean
+                            n_new = int(valid_data.shape[1])
+                            patch_weights.append(n_new)
+                            
+                            patch_mean = valid_data.mean(axis=1, dtype=np.float64)
+                            
+                            # Track global mean with numerically-stable incremental update
                             if global_mean is None:
-                                global_mean = valid_data.mean(axis=1)
+                                logger.info("    [mean] initializing global mean to patch mean")
+                                global_mean = patch_mean
+                                total_samples = n_new
                             else:
-                                n_old = total_samples
-                                n_new = valid_data.shape[1]
-                                global_mean = (
-                                    n_old * global_mean + n_new * valid_data.mean(axis=1)
-                                ) / (n_old + n_new)
-                            
+                                n_old = int(total_samples)
+                                n_tot = n_old + n_new
+                                w = n_new / n_tot
+                                global_mean = global_mean + w * (patch_mean - global_mean)
+                                total_samples = n_tot
+                                
                             total_samples += valid_data.shape[1]
                     
                     if verbose and (i + 1) % 20 == 0:
@@ -692,6 +709,7 @@ class DerivedStatsComputer:
     def _save_feature_stats(
         self,
         feature_stats: Dict[str, Dict[str, np.ndarray]],
+        stats_group, 
         verbose: bool = True
     ):
         """Save feature statistics to Zarr"""
@@ -700,25 +718,23 @@ class DerivedStatsComputer:
         # Create zarr group for derived stats
         zarr_location = self.stats_config.zarr_location
         
-        # Delete existing group if present
-        if zarr_location in self.zarr_root:
-            logger.info(f"  Deleting existing '{zarr_location}' group...")
-            del self.zarr_root[zarr_location]
-        
-        stats_group = self.zarr_root.create_group(zarr_location)
-        features_group = stats_group.create_group('features')
+        try:
+            del stats_group["features"]
+        except KeyError:
+            pass
+        # stats_group = self.zarr_root.create_group(zarr_location)
+        features_group = stats_group.create_group('features', overwrite=True)
         
         for feature_name, stats in feature_stats.items():
             # Create group for this feature
-            feature_group = features_group.create_group(feature_name)
+            feature_group = features_group.create_group(feature_name, overwrite=True)
             
             # Save each statistic as an array
             for stat_name, stat_values in stats.items():
-                feature_group.create_dataset(
+                feature_group.create_array(
                     stat_name,
-                    data=stat_values,
-                    dtype=np.float32,
-                    chunks=None
+                    data=np.asarray(stat_values, dtype=np.float32),
+                    overwrite=True
                 )
             
             # Save metadata
@@ -733,44 +749,46 @@ class DerivedStatsComputer:
     def _save_covariances(
         self,
         cov_results: Dict[str, Dict[str, Any]],
+        stats_group,
         verbose: bool = True
     ):
         """Save covariance matrices to Zarr"""
         logger.info("\nSaving covariance matrices to Zarr...")
         
         zarr_location = self.stats_config.zarr_location
-        stats_group = self.zarr_root[zarr_location]
-        
-        cov_group = stats_group.create_group('covariance_matrices')
+        #stats_group = self.zarr_root[zarr_location]
+        try:
+            del stats_group["covariance_matrices"]
+        except KeyError:
+            pass
+  
+        cov_group = stats_group.create_group('covariance_matrices', overwrite=True)
         
         for cov_name, cov_data in cov_results.items():
             # Create group for this covariance matrix
-            cov_matrix_group = cov_group.create_group(cov_name)
+            cov_matrix_group = cov_group.create_group(cov_name, overwrite=True)
             
             # Save covariance matrix
-            cov_matrix_group.create_dataset(
+            cov_matrix_group.create_array(
                 'covariance',
-                data=cov_data['covariance'],
-                dtype=np.float32,
-                chunks=None
+                data=np.asarray(cov_data['covariance'], dtype=np.float32),
+                overwrite=True
             )
             
             # Save mean
-            cov_matrix_group.create_dataset(
+            cov_matrix_group.create_array(
                 'mean',
-                data=cov_data['mean'],
-                dtype=np.float32,
-                chunks=None
+                data=np.asarray(cov_data['mean'], dtype=np.float32),
+                overwrite=True
             )
             
             # Save inverse if computed
             if cov_data['inverse'] is not None:
                 inverse_id = self.stats_config.covariance_matrices[cov_name]['inverse']['id']
-                cov_matrix_group.create_dataset(
+                cov_matrix_group.create_array(
                     inverse_id,
-                    data=cov_data['inverse'],
-                    dtype=np.float32,
-                    chunks=None
+                    data=np.asarray(cov_data['inverse'], dtype=np.float32),
+                    overwrite=True
                 )
             
             # Save metadata
