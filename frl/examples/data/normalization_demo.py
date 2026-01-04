@@ -264,7 +264,8 @@ def main():
 
         n_channels = ls8_delta_raw.shape[0]
         channel_names = [
-            'dNDVI_summer_p95', 'dNDVI_winter_max', 'dNDVI_amplitude', 'dNBR_annual_min'
+            'dNDVI_summer_p95', 'dNDVI_winter_max', 'dNDVI_amplitude', 'dNBR_annual_min',
+            'dNBR_summer_p95', 'dNDMI_summer_mean','dEVI2_summer_p95',
         ]
 
         for i in range(min(n_channels, len(channel_names))):

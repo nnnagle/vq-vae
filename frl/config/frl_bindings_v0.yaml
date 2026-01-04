@@ -523,6 +523,15 @@ derived:
       - name:           dNBR_annual_min
         from:           NBR_annual_min
         norm:           zscore_computed
+      - name:           dNBR_summer_p95
+        from:           NBR_summer_p95
+        norm:           zscore_computed
+      - name:           dNDMI_summer_mean
+        from:           NDMI_summer_mean
+        norm:           zscore_computed
+      - name:           dEVI2_summer_p95
+        from:           EVI2_summer_p95
+        norm:           zscore_computed
 
     export_as:
       path: derived.inputs.temporal.ls8_delta
