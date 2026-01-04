@@ -303,8 +303,7 @@ class ForestDataset(Dataset):
                         norm_preset = band_config.norm
                         array_name = band_config.array
 
-                        # Get stats for logging
-                        from ..normalization.zarr_stats_loader import ZarrStatsLoader
+                        # Get stats for logging (ZarrStatsLoader already imported at top)
                         if hasattr(self.norm_manager, 'stats_loader') and isinstance(self.norm_manager.stats_loader, ZarrStatsLoader):
                             stats = self.norm_manager.stats_loader.get_stats(group_path, array_name)
                             logger.info(f"Normalizing {group_name}.{band_name} (array={array_name}, preset={norm_preset})")
