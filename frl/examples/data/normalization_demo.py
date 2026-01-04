@@ -121,7 +121,7 @@ def main():
             bindings_config,
             training_config,
             split='train',
-            normalize_derived=False
+            normalize=False
         )
         print(f"   ✓ Raw dataset created: {len(dataset_raw)} samples")
     except Exception as e:
@@ -130,18 +130,20 @@ def main():
         traceback.print_exc()
         return
 
-    print("\n   Creating dataset WITH normalization...")
+    print("\n   Creating dataset WITH normalization (ALL bands)...")
     try:
         dataset_norm = ForestDataset(
             bindings_config,
             training_config,
             split='train',
-            normalize_derived=True
+            normalize=True
         )
         print(f"   ✓ Normalized dataset created: {len(dataset_norm)} samples")
     except Exception as e:
         print(f"   ✗ Failed to create normalized dataset: {e}")
-        print(f"   Note: You may need to run DerivedStatsComputer first.")
+        print(f"   Note: This requires:")
+        print(f"      - Variable statistics embedded in Zarr (.attrs['statistics'])")
+        print(f"      - DerivedStatsComputer run for derived features")
         import traceback
         traceback.print_exc()
         # Continue with raw dataset only
@@ -180,14 +182,23 @@ def main():
         print_stats(stats_raw)
 
         if bundle_norm is not None and 'topo' in bundle_norm.static:
-            # Note: Static layers are not normalized by this implementation
-            # This just shows they remain the same
             elevation_norm = bundle_norm.static['topo'].data[0]
 
-            print("\nAFTER normalization attempt:")
-            print("  (Note: Static layers are NOT normalized by normalize_derived flag)")
+            print("\nAFTER normalization:")
             stats_norm = compute_nan_safe_stats(elevation_norm, 'elevation')
             print_stats(stats_norm)
+
+            # Show normalization effect if different
+            if stats_raw['n_valid'] > 0 and stats_norm['n_valid'] > 0:
+                if abs(stats_raw['mean'] - stats_norm['mean']) > 0.01:
+                    print("\n" + "-" * 80)
+                    print("NORMALIZATION EFFECT:")
+                    print("-" * 80)
+                    print(f"  Mean:  {stats_raw['mean']:8.4f} → {stats_norm['mean']:8.4f}")
+                    print(f"  Std:   {stats_raw['std']:8.4f} → {stats_norm['std']:8.4f}")
+                    print(f"  ✓ Static layer normalized using NormalizationManager")
+                else:
+                    print("\n  (No normalization applied - may not have 'norm' preset in config)")
     else:
         print("  ✗ 'topo' group not found in bundle")
 
