@@ -34,7 +34,8 @@ from data.loaders.config import BindingsParser, BindingsRegistry
 from data.loaders import DataReader, MaskBuilder
 from data.loaders.builders import BundleBuilder, TrainingBundle
 from data.stats import DerivedStatsLoader
-from data.normalization import ZScoreNormalizer, NormalizationConfig
+from data.normalization import NormalizationManager, ZScoreNormalizer, NormalizationConfig
+from data.normalization.zarr_stats_loader import ZarrStatsLoader
 from .forest_patch_sampler import ForestPatchSampler
 
 logging.basicConfig(level=logging.INFO)
@@ -49,15 +50,16 @@ class ForestDataset(Dataset):
     ForestPatchSampler, then builds complete TrainingBundle objects containing
     data for all 3 temporal windows plus static data.
 
-    Optionally normalizes derived features using pre-computed statistics from Zarr.
+    Optionally normalizes all bands using pre-computed statistics from Zarr.
 
     Attributes:
         sampler: ForestPatchSampler for generating sample specifications
         reader: DataReader for loading raw Zarr data
         masker: MaskBuilder for loading masks and quality weights
         builder: BundleBuilder for constructing TrainingBundle objects
-        stats_loader: Optional DerivedStatsLoader for normalizing derived features
-        normalize_derived: Whether to normalize derived features
+        norm_manager: Optional NormalizationManager for normalizing regular bands
+        derived_stats_loader: Optional DerivedStatsLoader for normalizing derived features
+        normalize: Whether to normalize all data
     """
 
     def __init__(
@@ -65,7 +67,7 @@ class ForestDataset(Dataset):
         bindings_config: Dict[str, Any],
         training_config: Dict[str, Any],
         split: Optional[str] = None,
-        normalize_derived: bool = False
+        normalize: bool = False
     ):
         """
         Initialize ForestDataset.
@@ -74,7 +76,7 @@ class ForestDataset(Dataset):
             bindings_config: Parsed bindings configuration
             training_config: Parsed training configuration
             split: Optional split ('train', 'val', 'test', or None for all)
-            normalize_derived: If True, normalize derived features using
+            normalize: If True, normalize all bands (regular + derived) using
                 pre-computed statistics from Zarr (default: False)
 
         Example:
@@ -91,7 +93,7 @@ class ForestDataset(Dataset):
             ...     bindings_config,
             ...     training_config,
             ...     split='train',
-            ...     normalize_derived=True
+            ...     normalize=True
             ... )
             >>>
             >>> # Use with DataLoader
@@ -106,9 +108,9 @@ class ForestDataset(Dataset):
         self.bindings_config = bindings_config
         self.training_config = training_config
         self.split = split
-        self.normalize_derived = normalize_derived
+        self.normalize = normalize
 
-        logger.info(f"Initializing ForestDataset with split='{split}', normalize_derived={normalize_derived}")
+        logger.info(f"Initializing ForestDataset with split='{split}', normalize={normalize}")
         
         # Initialize sampler
         logger.info("Creating ForestPatchSampler...")
@@ -127,20 +129,42 @@ class ForestDataset(Dataset):
         logger.info("Creating BundleBuilder...")
         self.builder = BundleBuilder(bindings_config, self.reader, self.masker)
 
-        # Initialize stats loader if normalization is enabled
-        self.stats_loader = None
-        if self.normalize_derived:
-            logger.info("Creating DerivedStatsLoader for normalization...")
+        # Initialize normalization infrastructure if enabled
+        self.norm_manager = None
+        self.derived_stats_loader = None
+
+        if self.normalize:
+            logger.info("Initializing normalization infrastructure...")
+
+            # Initialize ZarrStatsLoader and NormalizationManager for regular bands
             try:
-                self.stats_loader = DerivedStatsLoader(bindings_config)
-                logger.info("✓ DerivedStatsLoader initialized successfully")
+                zarr_path = bindings_config['zarr']['path']
+                zarr_stats_loader = ZarrStatsLoader(zarr_path, cache_stats=True)
+                logger.info("✓ ZarrStatsLoader initialized")
+
+                self.norm_manager = NormalizationManager(bindings_config, zarr_stats_loader)
+                logger.info("✓ NormalizationManager initialized for regular bands")
+            except Exception as e:
+                logger.warning(
+                    f"Could not initialize NormalizationManager: {e}\n"
+                    f"Regular bands will NOT be normalized."
+                )
+
+            # Initialize DerivedStatsLoader for derived features
+            try:
+                self.derived_stats_loader = DerivedStatsLoader(bindings_config)
+                logger.info("✓ DerivedStatsLoader initialized for derived features")
             except (ValueError, KeyError) as e:
                 logger.warning(
                     f"Could not initialize DerivedStatsLoader: {e}\n"
                     f"Derived features will NOT be normalized. "
                     f"Run DerivedStatsComputer.compute_and_save() first."
                 )
-                self.normalize_derived = False
+
+            # Disable normalization if both failed
+            if self.norm_manager is None and self.derived_stats_loader is None:
+                logger.warning("No normalization will be applied (all loaders failed)")
+                self.normalize = False
 
         logger.info(
             f"ForestDataset initialized: {len(self)} samples for split='{split}'"
@@ -197,11 +221,197 @@ class ForestDataset(Dataset):
             )
             raise
 
-        # Normalize derived features if enabled
-        if self.normalize_derived:
+        # Normalize all bands if enabled
+        if self.normalize:
+            bundle = self._normalize_all_bands(bundle)
+
+        return bundle
+
+    def _normalize_all_bands(self, bundle: TrainingBundle) -> TrainingBundle:
+        """
+        Normalize all bands in a TrainingBundle using pre-computed statistics.
+
+        Normalizes:
+        - Regular bands (static, temporal, snapshot, irregular) using NormalizationManager
+        - Derived features using DerivedStatsLoader + ZScoreNormalizer
+
+        Args:
+            bundle: TrainingBundle with raw data
+
+        Returns:
+            TrainingBundle with normalized data
+
+        Note:
+            - Modifies the bundle in-place for efficiency
+            - Bands/features without available statistics are left unchanged
+        """
+        if not self.normalize:
+            return bundle
+
+        # Normalize regular bands (static, temporal, snapshot, irregular)
+        if self.norm_manager is not None:
+            bundle = self._normalize_regular_bands(bundle)
+
+        # Normalize derived features
+        if self.derived_stats_loader is not None:
             bundle = self._normalize_derived_features(bundle)
 
         return bundle
+
+    def _normalize_regular_bands(self, bundle: TrainingBundle) -> TrainingBundle:
+        """
+        Normalize regular bands using NormalizationManager.
+
+        Handles static, temporal, snapshot, and irregular groups.
+
+        Args:
+            bundle: TrainingBundle with raw data
+
+        Returns:
+            TrainingBundle with normalized regular bands
+        """
+        if self.norm_manager is None:
+            return bundle
+
+        # Normalize static groups
+        for group_name, group_result in bundle.static.items():
+            try:
+                # Get group configuration (InputGroup object)
+                input_group = self.bindings_config['inputs']['static'].get(group_name)
+                if not input_group:
+                    logger.debug(f"Skipping {group_name}: not found in config")
+                    continue
+
+                group_path = input_group.zarr.group
+                bands_config = input_group.bands  # List[BandConfig]
+
+                if not group_path or not bands_config:
+                    logger.debug(f"Skipping {group_name}: no normalization config")
+                    continue
+
+                # Normalize each band/channel
+                for i, band_config in enumerate(bands_config):
+                    if i >= group_result.data.shape[0]:
+                        break
+
+                    if not band_config.norm:
+                        continue  # Skip bands without normalization preset
+
+                    try:
+                        # DEBUG: Log normalization details
+                        band_name = band_config.name
+                        norm_preset = band_config.norm
+                        array_name = band_config.array
+
+                        # Get stats for logging (ZarrStatsLoader already imported at top)
+                        if hasattr(self.norm_manager, 'stats_loader') and isinstance(self.norm_manager.stats_loader, ZarrStatsLoader):
+                            stats = self.norm_manager.stats_loader.get_stats(group_path, array_name)
+                            logger.info(f"Normalizing {group_name}.{band_name} (array={array_name}, preset={norm_preset})")
+                            logger.info(f"  Data shape: {group_result.data[i].shape}, dtype: {group_result.data[i].dtype}")
+                            logger.info(f"  Stats from Zarr:")
+                            for k, v in stats.items():
+                                if hasattr(v, 'shape'):
+                                    logger.info(f"    {k}: shape={v.shape}, dtype={v.dtype}, value={v}")
+                                else:
+                                    logger.info(f"    {k}: {v}")
+                            logger.info(f"  Before: mean={np.nanmean(group_result.data[i]):.4f}, std={np.nanstd(group_result.data[i]):.4f}")
+
+                        # Create band_dict for compatibility with NormalizationManager
+                        band_dict = {
+                            'name': band_config.name,
+                            'array': band_config.array,
+                            'norm': band_config.norm
+                        }
+
+                        # Get normalizer for logging
+                        normalizer = self.norm_manager.get_normalizer_for_band(group_path, band_dict)
+                        logger.info(f"  Normalizer: {type(normalizer).__name__}")
+                        logger.info(f"  Normalizer config: type={normalizer.config.type}, stats_source={normalizer.config.stats_source}")
+
+                        # Normalize this channel
+                        normalized = normalizer.normalize(
+                            data=group_result.data[i],
+                            mask=None
+                        )
+                        group_result.data[i] = normalized
+
+                        # DEBUG: Log results
+                        logger.info(f"  After:  mean={np.nanmean(normalized):.4f}, std={np.nanstd(normalized):.4f}")
+
+                        logger.debug(f"Normalized {group_name}[{i}] ({band_config.array})")
+                    except Exception as e:
+                        logger.warning(f"Failed to normalize {group_name}[{i}]: {e}")
+                        continue
+
+            except Exception as e:
+                logger.warning(f"Error normalizing static group '{group_name}': {e}")
+                continue
+
+        # Normalize temporal/snapshot/irregular groups in windows
+        for window_label, window_data in bundle.windows.items():
+            # Normalize temporal groups
+            for group_name, group_result in window_data.temporal.items():
+                try:
+                    self._normalize_group(group_result, group_name, 'temporal', window_label)
+                except Exception as e:
+                    logger.warning(f"Error normalizing {window_label}.temporal.{group_name}: {e}")
+
+            # Normalize snapshot groups
+            for group_name, group_result in window_data.snapshot.items():
+                try:
+                    self._normalize_group(group_result, group_name, 'snapshot', window_label)
+                except Exception as e:
+                    logger.warning(f"Error normalizing {window_label}.snapshot.{group_name}: {e}")
+
+            # Normalize irregular groups
+            for group_name, group_result in window_data.irregular.items():
+                try:
+                    self._normalize_group(group_result, group_name, 'irregular', window_label)
+                except Exception as e:
+                    logger.warning(f"Error normalizing {window_label}.irregular.{group_name}: {e}")
+
+        return bundle
+
+    def _normalize_group(self, group_result, group_name: str, category: str, window_label: str = None):
+        """Helper to normalize a single group."""
+        # Get group configuration (InputGroup object)
+        input_group = self.bindings_config['inputs'][category].get(group_name)
+        if not input_group:
+            return
+
+        group_path = input_group.zarr.group
+        bands_config = input_group.bands  # List[BandConfig]
+
+        if not group_path or not bands_config:
+            return
+
+        # Normalize each band
+        for i, band_config in enumerate(bands_config):
+            if i >= group_result.data.shape[0]:
+                break
+
+            if not band_config.norm:
+                continue
+
+            try:
+                # Create band_dict for compatibility with NormalizationManager
+                band_dict = {
+                    'name': band_config.name,
+                    'array': band_config.array,
+                    'norm': band_config.norm
+                }
+
+                normalized = self.norm_manager.normalize_band(
+                    data=group_result.data[i],
+                    group_path=group_path,
+                    band_config=band_dict,
+                    mask=None
+                )
+                group_result.data[i] = normalized
+
+                logger.debug(f"Normalized {window_label}.{category}.{group_name}[{i}]")
+            except Exception as e:
+                logger.warning(f"Failed to normalize {category}.{group_name}[{i}]: {e}")
 
     def _normalize_derived_features(self, bundle: TrainingBundle) -> TrainingBundle:
         """
@@ -221,7 +431,7 @@ class ForestDataset(Dataset):
             - Features without available statistics are left unchanged
             - Uses existing ZScoreNormalizer for consistent behavior
         """
-        if not self.normalize_derived or self.stats_loader is None:
+        if self.derived_stats_loader is None:
             return bundle
 
         # Get normalization config from YAML
@@ -245,7 +455,7 @@ class ForestDataset(Dataset):
             for feature_name, feature_data in window_data.derived.items():
                 try:
                     # Get statistics for this feature from DerivedStatsLoader
-                    stats = self.stats_loader.get_feature_stats(feature_name)
+                    stats = self.derived_stats_loader.get_feature_stats(feature_name)
 
                     # Validate channel dimensions
                     if len(stats['mean']) != feature_data.shape[0]:
