@@ -276,11 +276,14 @@ class ForestDataset(Dataset):
         # Normalize static groups
         for group_name, group_result in bundle.static.items():
             try:
-                # Get group configuration
-                group_config = self.bindings_config.get('inputs', {}).get('static', {}).get(group_name, {})
-                zarr_config = group_config.get('zarr', {})
-                group_path = zarr_config.get('group')
-                bands_config = group_config.get('bands', [])
+                # Get group configuration (InputGroup object)
+                input_group = self.bindings_config['inputs']['static'].get(group_name)
+                if not input_group:
+                    logger.debug(f"Skipping {group_name}: not found in config")
+                    continue
+
+                group_path = input_group.zarr.group
+                bands_config = input_group.bands  # List[BandConfig]
 
                 if not group_path or not bands_config:
                     logger.debug(f"Skipping {group_name}: no normalization config")
@@ -291,14 +294,14 @@ class ForestDataset(Dataset):
                     if i >= group_result.data.shape[0]:
                         break
 
-                    if 'norm' not in band_config:
+                    if not band_config.norm:
                         continue  # Skip bands without normalization preset
 
                     try:
                         # DEBUG: Log normalization details
-                        band_name = band_config.get('name', f'channel_{i}')
-                        norm_preset = band_config.get('norm')
-                        array_name = band_config.get('array')
+                        band_name = band_config.name
+                        norm_preset = band_config.norm
+                        array_name = band_config.array
 
                         # Get stats for logging
                         from ..normalization.zarr_stats_loader import ZarrStatsLoader
@@ -314,8 +317,15 @@ class ForestDataset(Dataset):
                                     logger.info(f"    {k}: {v}")
                             logger.info(f"  Before: mean={np.nanmean(group_result.data[i]):.4f}, std={np.nanstd(group_result.data[i]):.4f}")
 
+                        # Create band_dict for compatibility with NormalizationManager
+                        band_dict = {
+                            'name': band_config.name,
+                            'array': band_config.array,
+                            'norm': band_config.norm
+                        }
+
                         # Get normalizer for logging
-                        normalizer = self.norm_manager.get_normalizer_for_band(group_path, band_config)
+                        normalizer = self.norm_manager.get_normalizer_for_band(group_path, band_dict)
                         logger.info(f"  Normalizer: {type(normalizer).__name__}")
                         logger.info(f"  Normalizer config: type={normalizer.config.type}, stats_source={normalizer.config.stats_source}")
 
@@ -329,7 +339,7 @@ class ForestDataset(Dataset):
                         # DEBUG: Log results
                         logger.info(f"  After:  mean={np.nanmean(normalized):.4f}, std={np.nanstd(normalized):.4f}")
 
-                        logger.debug(f"Normalized {group_name}[{i}] ({band_config.get('array', 'unknown')})")
+                        logger.debug(f"Normalized {group_name}[{i}] ({band_config.array})")
                     except Exception as e:
                         logger.warning(f"Failed to normalize {group_name}[{i}]: {e}")
                         continue
@@ -365,11 +375,13 @@ class ForestDataset(Dataset):
 
     def _normalize_group(self, group_result, group_name: str, category: str, window_label: str = None):
         """Helper to normalize a single group."""
-        # Get group configuration
-        group_config = self.bindings_config.get('inputs', {}).get(category, {}).get(group_name, {})
-        zarr_config = group_config.get('zarr', {})
-        group_path = zarr_config.get('group')
-        bands_config = group_config.get('bands', [])
+        # Get group configuration (InputGroup object)
+        input_group = self.bindings_config['inputs'][category].get(group_name)
+        if not input_group:
+            return
+
+        group_path = input_group.zarr.group
+        bands_config = input_group.bands  # List[BandConfig]
 
         if not group_path or not bands_config:
             return
@@ -379,14 +391,21 @@ class ForestDataset(Dataset):
             if i >= group_result.data.shape[0]:
                 break
 
-            if 'norm' not in band_config:
+            if not band_config.norm:
                 continue
 
             try:
+                # Create band_dict for compatibility with NormalizationManager
+                band_dict = {
+                    'name': band_config.name,
+                    'array': band_config.array,
+                    'norm': band_config.norm
+                }
+
                 normalized = self.norm_manager.normalize_band(
                     data=group_result.data[i],
                     group_path=group_path,
-                    band_config=band_config,
+                    band_config=band_dict,
                     mask=None
                 )
                 group_result.data[i] = normalized
