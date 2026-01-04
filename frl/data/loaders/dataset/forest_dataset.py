@@ -295,14 +295,39 @@ class ForestDataset(Dataset):
                         continue  # Skip bands without normalization preset
 
                     try:
+                        # DEBUG: Log normalization details
+                        band_name = band_config.get('name', f'channel_{i}')
+                        norm_preset = band_config.get('norm')
+                        array_name = band_config.get('array')
+
+                        # Get stats for logging
+                        from ..normalization.zarr_stats_loader import ZarrStatsLoader
+                        if hasattr(self.norm_manager, 'stats_loader') and isinstance(self.norm_manager.stats_loader, ZarrStatsLoader):
+                            stats = self.norm_manager.stats_loader.get_stats(group_path, array_name)
+                            logger.info(f"Normalizing {group_name}.{band_name} (array={array_name}, preset={norm_preset})")
+                            logger.info(f"  Data shape: {group_result.data[i].shape}, dtype: {group_result.data[i].dtype}")
+                            logger.info(f"  Stats from Zarr:")
+                            for k, v in stats.items():
+                                if hasattr(v, 'shape'):
+                                    logger.info(f"    {k}: shape={v.shape}, dtype={v.dtype}, value={v}")
+                                else:
+                                    logger.info(f"    {k}: {v}")
+                            logger.info(f"  Before: mean={np.nanmean(group_result.data[i]):.4f}, std={np.nanstd(group_result.data[i]):.4f}")
+
+                        # Get normalizer for logging
+                        normalizer = self.norm_manager.get_normalizer_for_band(group_path, band_config)
+                        logger.info(f"  Normalizer: {type(normalizer).__name__}")
+                        logger.info(f"  Normalizer config: type={normalizer.config.type}, stats_source={normalizer.config.stats_source}")
+
                         # Normalize this channel
-                        normalized = self.norm_manager.normalize_band(
+                        normalized = normalizer.normalize(
                             data=group_result.data[i],
-                            group_path=group_path,
-                            band_config=band_config,
                             mask=None
                         )
                         group_result.data[i] = normalized
+
+                        # DEBUG: Log results
+                        logger.info(f"  After:  mean={np.nanmean(normalized):.4f}, std={np.nanstd(normalized):.4f}")
 
                         logger.debug(f"Normalized {group_name}[{i}] ({band_config.get('array', 'unknown')})")
                     except Exception as e:
