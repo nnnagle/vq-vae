@@ -13,6 +13,6 @@ from .normalization import(
 
 __all__ = [
   'NormalizationConfig',
-  'ZscoreNormalizer',
+  'ZScoreNormalizer',
   'NormalizationManager',
 ]
