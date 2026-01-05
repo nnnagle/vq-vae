@@ -527,222 +527,107 @@ class ForestDataset(Dataset):
 
 def forest_collate_fn(batch: List[TrainingBundle]) -> Dict[str, Any]:
     """
-    Collate function for batching TrainingBundle objects.
-    
-    Converts a list of TrainingBundle objects into a single batched dictionary
-    with all arrays stacked along batch dimension.
-    
+    Collate function for batching TrainingBundle objects with window-stacked arrays.
+
+    Each TrainingBundle already has window-stacked arrays. This function simply
+    stacks them along the batch dimension.
+
     Args:
         batch: List of TrainingBundle objects from Dataset.__getitem__
-    
+
     Returns:
         Dictionary with batched structure:
         {
-            'windows': {
-                't0': {
-                    'temporal': {'ls8day': Tensor[B,C,T,H,W], ...},
-                    'snapshot': {'ccdc_snapshot': Tensor[B,C,H,W], ...},
-                    'irregular': {'naip': Tensor[B,C,T_obs,H,W], ...},
-                    'derived': {'temporal_position': Tensor[B,C,T,H,W], ...},
-                    'temporal_masks': {'ls8day': Tensor[B,C,T,H,W], ...},
-                    'snapshot_masks': {...},
-                    'irregular_masks': {...},
-                    'temporal_quality': {...},
-                    'snapshot_quality': {...},
-                    'irregular_quality': {...},
-                },
-                't2': {...},
-                't4': {...}
-            },
+            'temporal': {'ls8day': Tensor[B,Win,C,T,H,W], ...},
+            'snapshot': {'ccdc_snapshot': Tensor[B,Win,C,H,W], ...},
+            'derived': {'temporal_position': Tensor[B,Win,C,T,H,W], ...},
             'static': {'topo': Tensor[B,C,H,W], ...},
+
+            'temporal_masks': {'ls8day': Tensor[B,Win,C,T,H,W], ...},
+            'snapshot_masks': {'ccdc_snapshot': Tensor[B,Win,C,H,W], ...},
             'static_masks': {'topo': Tensor[B,C,H,W], ...},
-            'static_quality': {'topo': Tensor[B,C,H,W], ...},
+
+            'temporal_quality': {...},
+            'snapshot_quality': {...},
+            'static_quality': {...},
+
+            'anchor_mask': Tensor[B,Win],  # Binary mask
             'anchor_ids': ['t0', 't2', 't0', ...],  # List[str], length B
+            'window_labels': ['t0', 't2', 't4'],  # Window labels
             'spatial_windows': [...],  # List[SpatialWindow], length B
             'metadata': [...]  # List[Dict], length B
         }
-    
+
     Example:
         >>> dataloader = DataLoader(dataset, batch_size=4, collate_fn=forest_collate_fn)
         >>> batch = next(iter(dataloader))
-        >>> 
+        >>>
         >>> # Access batched data
-        >>> ls8_batch = batch['windows']['t0']['temporal']['ls8day']
-        >>> print(ls8_batch.shape)  # [4, 7, 10, 256, 256]
-        >>> 
-        >>> # Get anchor for first sample in batch
-        >>> print(batch['anchor_ids'][0])  # 't0'
+        >>> ls8 = batch['temporal']['ls8day']  # (4, 3, 7, 10, 256, 256)
+        >>> anchor_mask = batch['anchor_mask']  # (4, 3)
+        >>>
+        >>> # For gradient masking
+        >>> mask = anchor_mask.view(B, Win, 1, 1, 1, 1)
+        >>> ls8_masked = mask * ls8 + (1 - mask) * ls8.detach()
     """
     if len(batch) == 0:
         raise ValueError("Cannot collate empty batch")
-    
-    batch_size = len(batch)
-    
-    # Collect window labels from first bundle (should be same for all)
-    window_labels = list(batch[0].windows.keys())  # ['t0', 't2', 't4']
-    
-    # Initialize batched structure
+
+    B = len(batch)
+
+    # Collate window-stacked data
     batched = {
-        'windows': {label: {} for label in window_labels},
-        'static': {},
-        'static_masks': {},
-        'static_quality': {},
-        'anchor_ids': [],
-        'spatial_windows': [],
-        'metadata': []
+        'temporal': _collate_array_dicts([bundle.temporal for bundle in batch]),
+        'snapshot': _collate_array_dicts([bundle.snapshot for bundle in batch]),
+        'derived': _collate_array_dicts([bundle.derived for bundle in batch]),
+        'static': _collate_array_dicts([bundle.static for bundle in batch]),
+
+        'temporal_masks': _collate_array_dicts([bundle.temporal_masks for bundle in batch]),
+        'snapshot_masks': _collate_array_dicts([bundle.snapshot_masks for bundle in batch]),
+        'static_masks': _collate_array_dicts([bundle.static_masks for bundle in batch]),
+
+        'temporal_quality': _collate_array_dicts([bundle.temporal_quality for bundle in batch]),
+        'snapshot_quality': _collate_array_dicts([bundle.snapshot_quality for bundle in batch]),
+        'static_quality': _collate_array_dicts([bundle.static_quality for bundle in batch]),
     }
-    
-    # Collate each window
-    for window_label in window_labels:
-        window_batch = batched['windows'][window_label]
-        
-        # Get all WindowData objects for this window
-        window_data_list = [bundle.windows[window_label] for bundle in batch]
-        
-        # Collate temporal groups
-        window_batch['temporal'] = _collate_group_dicts(
-            [wd.temporal for wd in window_data_list]
-        )
-        
-        # Collate snapshot groups
-        window_batch['snapshot'] = _collate_group_dicts(
-            [wd.snapshot for wd in window_data_list]
-        )
-        
-        # Collate irregular groups
-        window_batch['irregular'] = _collate_group_dicts(
-            [wd.irregular for wd in window_data_list]
-        )
-        
-        # Collate derived features
-        window_batch['derived'] = _collate_derived_dicts(
-            [wd.derived for wd in window_data_list]
-        )
-        
-        # Collate masks
-        window_batch['temporal_masks'] = _collate_mask_dicts(
-            [wd.temporal_masks for wd in window_data_list]
-        )
-        window_batch['snapshot_masks'] = _collate_mask_dicts(
-            [wd.snapshot_masks for wd in window_data_list]
-        )
-        window_batch['irregular_masks'] = _collate_mask_dicts(
-            [wd.irregular_masks for wd in window_data_list]
-        )
-        
-        # Collate quality
-        window_batch['temporal_quality'] = _collate_quality_dicts(
-            [wd.temporal_quality for wd in window_data_list]
-        )
-        window_batch['snapshot_quality'] = _collate_quality_dicts(
-            [wd.snapshot_quality for wd in window_data_list]
-        )
-        window_batch['irregular_quality'] = _collate_quality_dicts(
-            [wd.irregular_quality for wd in window_data_list]
-        )
-    
-    # Collate static groups
-    batched['static'] = _collate_group_dicts([bundle.static for bundle in batch])
-    batched['static_masks'] = _collate_mask_dicts([bundle.static_masks for bundle in batch])
-    batched['static_quality'] = _collate_quality_dicts([bundle.static_quality for bundle in batch])
-    
-    # Collect metadata (not stacked, just lists)
+
+    # Stack anchor masks: (B, Win)
+    anchor_masks = [bundle.anchor_mask for bundle in batch]
+    batched['anchor_mask'] = torch.from_numpy(np.stack(anchor_masks, axis=0))
+
+    # Metadata (not stacked, just lists)
     batched['anchor_ids'] = [bundle.anchor_id for bundle in batch]
+    batched['window_labels'] = batch[0].window_labels  # Same for all bundles
     batched['spatial_windows'] = [bundle.spatial_window for bundle in batch]
     batched['metadata'] = [bundle.metadata for bundle in batch]
-    
+
     return batched
 
 
-def _collate_group_dicts(group_dicts: List[Dict]) -> Dict[str, torch.Tensor]:
+def _collate_array_dicts(array_dicts: List[Dict[str, np.ndarray]]) -> Dict[str, torch.Tensor]:
     """
-    Collate list of group result dicts into batched tensors.
-    
+    Collate list of array dicts into batched tensors.
+
     Args:
-        group_dicts: List of Dict[group_name, GroupReadResult]
-    
+        array_dicts: List of Dict[name, np.ndarray] where each dict is from one sample
+
     Returns:
-        Dict[group_name, Tensor] with batch dimension added
+        Dict[name, Tensor] with batch dimension added as first dimension
+
+    Example:
+        Input: [{'ls8': (Win,C,T,H,W)}, {'ls8': (Win,C,T,H,W)}, ...]  # B samples
+        Output: {'ls8': Tensor(B,Win,C,T,H,W)}
     """
-    if not group_dicts or not group_dicts[0]:
+    if not array_dicts or not array_dicts[0]:
         return {}
-    
-    # Get group names from first dict
-    group_names = list(group_dicts[0].keys())
-    
+
+    # Get group/feature names from first dict
+    names = list(array_dicts[0].keys())
+
     batched = {}
-    for group_name in group_names:
-        # Stack data arrays for this group across batch
-        arrays = [gd[group_name].data for gd in group_dicts]
-        batched[group_name] = torch.from_numpy(np.stack(arrays, axis=0))
-    
-    return batched
+    for name in names:
+        # Stack arrays across batch dimension
+        arrays = [d[name] for d in array_dicts]
+        batched[name] = torch.from_numpy(np.stack(arrays, axis=0))
 
-
-def _collate_mask_dicts(mask_dicts: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Collate list of mask result dicts into batched tensors.
-    
-    Args:
-        mask_dicts: List of Dict[group_name, MaskResult]
-    
-    Returns:
-        Dict[group_name, Tensor] with batch dimension added
-    """
-    if not mask_dicts or not mask_dicts[0]:
-        return {}
-    
-    group_names = list(mask_dicts[0].keys())
-    
-    batched = {}
-    for group_name in group_names:
-        arrays = [md[group_name].data for md in mask_dicts]
-        batched[group_name] = torch.from_numpy(np.stack(arrays, axis=0))
-    
-    return batched
-
-
-def _collate_quality_dicts(quality_dicts: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Collate list of quality result dicts into batched tensors.
-    
-    Args:
-        quality_dicts: List of Dict[group_name, QualityResult]
-    
-    Returns:
-        Dict[group_name, Tensor] with batch dimension added
-    """
-    if not quality_dicts or not quality_dicts[0]:
-        return {}
-    
-    group_names = list(quality_dicts[0].keys())
-    
-    batched = {}
-    for group_name in group_names:
-        arrays = [qd[group_name].data for qd in quality_dicts]
-        batched[group_name] = torch.from_numpy(np.stack(arrays, axis=0))
-    
-    return batched
-
-
-def _collate_derived_dicts(derived_dicts: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Collate list of derived feature dicts into batched tensors.
-    
-    Args:
-        derived_dicts: List of Dict[feature_name, np.ndarray]
-    
-    Returns:
-        Dict[feature_name, Tensor] with batch dimension added
-    """
-    if not derived_dicts or not derived_dicts[0]:
-        return {}
-    
-    feature_names = list(derived_dicts[0].keys())
-    
-    batched = {}
-    for feature_name in feature_names:
-        arrays = [dd[feature_name] for dd in derived_dicts]
-        batched[feature_name] = torch.from_numpy(np.stack(arrays, axis=0))
-    
     return batched
