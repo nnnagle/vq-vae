@@ -10,7 +10,7 @@ For each year in 2010-2024, this script:
   - Extracts snapshot trajectory metrics (velocity, duration, RMSE, derivatives)
   - Exports an annual GeoTIFF to GCS for every tile
 
-Snapshot date: September 31 (falls back to the last valid day of September).
+Snapshot date: September 30 (end of summer growing season).
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ SCALE_M = 30.0
 
 # GCS export configuration
 GCS_BUCKET = "va_rasters"
-GCS_DIR = "ccdc_snapshots_annual_tiled"
+GCS_DIR = "ccdc_annual_tiled"
 BASE_NAME_PREFIX = "ccdc_snapshot_metrics"
 
 # Target projection (matches fitting script)
@@ -72,7 +72,7 @@ HARMONIC_BANDS = ["RED", "NIR", "SWIR1", "SWIR2"]
 
 # Snapshot date configuration
 EXTRACT_MONTH = 9
-EXTRACT_DAY = 31
+EXTRACT_DAY = 30
 SNAPSHOT_YEARS = list(range(2010, 2025))
 
 MAX_PIXELS = 1e13
@@ -438,7 +438,7 @@ def build_snapshot_metrics(ccdc: ee.Image, t_snap: float, key: str, has_harmonic
 # -----------------------------------------------------------------------------
 # Main processing function
 # -----------------------------------------------------------------------------
-def process_tile(row: int, col: int, x_ul: float, y_ul: float, geom: ee.Geometry, dry_run: bool = False) -> None:
+def process_tile(row: int, col: int, x_ul: float, y_ul: float, geom: ee.Geometry, years_to_process: list[int], dry_run: bool = False) -> None:
     """Process a single tile: load CCDC asset, extract metrics, export to GCS."""
     asset_id = f"{ASSET_ROOT}_r{row:03d}_c{col:03d}"
 
@@ -469,7 +469,7 @@ def process_tile(row: int, col: int, x_ul: float, y_ul: float, geom: ee.Geometry
     has_harmonics = all(f"{band}_coefs" in bands for band in HARMONIC_BANDS)
     tile_tr = tile_transform(x_ul, y_ul, SCALE_M)
 
-    for year in SNAPSHOT_YEARS:
+    for year in years_to_process:
         snapshot = SNAPSHOTS[year]
         base_name = f"{BASE_NAME_PREFIX}_{snapshot.key}_r{row:03d}_c{col:03d}"
         print(f"  Building snapshot metrics for {snapshot.actual_date.isoformat()} ({snapshot.key})...")
@@ -505,14 +505,31 @@ def process_tile(row: int, col: int, x_ul: float, y_ul: float, geom: ee.Geometry
             print(f"    ERROR: Export failed for {snapshot.key}: {e}")
 
 
-def main(dry_run: bool = False, max_tiles: int | None = None) -> None:
+def main(dry_run: bool = False, max_tiles: int | None = None, start_year: int | None = None, end_year: int | None = None, batch_size: int | None = None, batch_number: int | None = None) -> None:
     """
     Process all CCDC tiles and export annual snapshot metrics to GCS.
 
     Args:
         dry_run: If True, don't actually start export tasks
         max_tiles: If set, only process first N tiles (for testing)
+        start_year: If set, only process years >= start_year
+        end_year: If set, only process years <= end_year
+        batch_size: If set, process tiles in batches of this size
+        batch_number: If set, process only this batch (0-indexed, requires batch_size)
     """
+    # Filter years based on provided range
+    years_to_process = SNAPSHOT_YEARS
+    if start_year is not None:
+        years_to_process = [y for y in years_to_process if y >= start_year]
+    if end_year is not None:
+        years_to_process = [y for y in years_to_process if y <= end_year]
+
+    if not years_to_process:
+        print("ERROR: No years to process after applying filters")
+        return
+
+    print(f"Years to process: {min(years_to_process)}-{max(years_to_process)} ({len(years_to_process)} years)")
+
     print("Generating tile grid...")
     tiles = make_aligned_tiles(
         region=PADDED_REGION,
@@ -524,14 +541,44 @@ def main(dry_run: bool = False, max_tiles: int | None = None) -> None:
     )
 
     total_tiles = len(tiles)
-    print(f"Found {total_tiles} tiles to process")
+    print(f"Found {total_tiles} tiles in total")
+
+    # Apply tile batching if requested
+    if batch_size is not None:
+        if batch_number is not None:
+            # Process specific batch
+            start_idx = batch_number * batch_size
+            end_idx = start_idx + batch_size
+
+            if start_idx >= total_tiles:
+                print(f"ERROR: Batch {batch_number} is out of range (only {total_tiles} tiles available)")
+                return
+
+            tiles = tiles[start_idx:end_idx]
+            total_batches = (total_tiles + batch_size - 1) // batch_size
+            print(f"Processing batch {batch_number}/{total_batches - 1} (tiles {start_idx}-{min(end_idx, total_tiles) - 1})")
+            print(f"  Tiles in this batch: {len(tiles)}")
+        else:
+            # Show batch info but process all
+            total_batches = (total_tiles + batch_size - 1) // batch_size
+            print(f"Batch size: {batch_size} tiles")
+            print(f"Total batches available: {total_batches}")
+            print(f"Processing ALL tiles (use --batch-number to process specific batch)")
 
     if max_tiles:
         tiles = tiles[:max_tiles]
         print(f"Limiting to first {max_tiles} tiles for testing")
 
+    # Calculate estimated task count
+    estimated_tasks = len(tiles) * len(years_to_process)
+    print(f"\nEstimated export tasks: {estimated_tasks} ({len(tiles)} tiles × {len(years_to_process)} years)")
+
     if dry_run:
         print("\n*** DRY RUN MODE - No exports will be started ***\n")
+    else:
+        if estimated_tasks > 100:
+            print("⚠️  WARNING: This will create a large number of export tasks.")
+            print("   Consider using --batch-size to process tiles in smaller groups.")
 
     success_count = 0
     error_count = 0
@@ -540,7 +587,7 @@ def main(dry_run: bool = False, max_tiles: int | None = None) -> None:
         print(f"\nProgress: {i + 1}/{len(tiles)}")
 
         try:
-            process_tile(row, col, x_ul, y_ul, geom, dry_run=dry_run)
+            process_tile(row, col, x_ul, y_ul, geom, years_to_process, dry_run=dry_run)
             success_count += 1
         except Exception as e:
             print(f"  FATAL ERROR processing tile r{row:03d}_c{col:03d}: {e}")
@@ -584,5 +631,48 @@ if __name__ == "__main__":
         help="Process only first N tiles (for testing)",
     )
 
+    parser.add_argument(
+        "--start-year",
+        "--start_year",
+        type=int,
+        default=None,
+        metavar="YEAR",
+        help="Process only years >= YEAR (default: 2010)",
+    )
+
+    parser.add_argument(
+        "--end-year",
+        "--end_year",
+        type=int,
+        default=None,
+        metavar="YEAR",
+        help="Process only years <= YEAR (default: 2024)",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        "--batch_size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Process tiles in batches of N tiles to avoid task overload",
+    )
+
+    parser.add_argument(
+        "--batch-number",
+        "--batch_number",
+        type=int,
+        default=None,
+        metavar="B",
+        help="Process only batch B (0-indexed, requires --batch-size)",
+    )
+
     args = parser.parse_args()
-    main(dry_run=args.dry_run, max_tiles=args.max_tiles)
+    main(
+        dry_run=args.dry_run,
+        max_tiles=args.max_tiles,
+        start_year=args.start_year,
+        end_year=args.end_year,
+        batch_size=args.batch_size,
+        batch_number=args.batch_number,
+    )
