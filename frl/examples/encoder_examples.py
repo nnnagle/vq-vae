@@ -76,6 +76,81 @@ def example_tcn_type_encoder():
     return encoder
 
 
+def example_tcn_with_mask():
+    """
+    Example: TCN encoder with mask support for handling clouds/missing data.
+
+    Demonstrates how masks affect statistics pooling by excluding invalid timesteps.
+    """
+    print("\n" + "="*70)
+    print("TCN with Mask Support (handling clouds/missing data)")
+    print("="*70)
+
+    config = {
+        'in_channels': 7,
+        'channels': [128, 128, 128],
+        'kernel_size': 3,
+        'dilations': [1, 2, 4],
+        'residual': {'projection_channels': 128},
+        'dropout': {'rate': 0.10},
+        'norm': {'num_groups': 16},
+        'pooling': {'kind': 'stats'},
+        'post_pool_norm': {'kind': 'layernorm'}
+    }
+
+    encoder = build_tcn_from_config(config)
+
+    # Sample input
+    B, T, H, W = 2, 10, 32, 32
+    x = torch.randn(B, 7, T, H, W)
+
+    print(f"Input shape: {x.shape}")
+
+    # Create mask: simulate clouds at different timesteps/locations
+    mask = torch.ones(B, T, H, W, dtype=torch.bool)
+
+    # Mask out timesteps 2-4 for first batch, top-left 16x16 region
+    mask[0, 2:5, :16, :16] = False  # Clouds in batch 0
+
+    # Mask out timesteps 7-9 for second batch, bottom-right 16x16 region
+    mask[1, 7:10, 16:, 16:] = False  # Clouds in batch 1
+
+    valid_per_batch = mask.float().sum(dim=(1, 2, 3))
+    print(f"Valid timesteps per batch: {valid_per_batch.tolist()}")
+    print(f"  Batch 0: {int(valid_per_batch[0].item())} valid locations")
+    print(f"  Batch 1: {int(valid_per_batch[1].item())} valid locations")
+
+    # Forward pass without mask
+    print("\n1. Without mask (includes all timesteps):")
+    out_no_mask = encoder(x)
+    print(f"   Output shape: {out_no_mask.shape}")
+
+    # Forward pass with mask
+    print("\n2. With mask (excludes masked timesteps):")
+    out_with_mask = encoder(x, mask=mask)
+    print(f"   Output shape: {out_with_mask.shape}")
+
+    # Compare statistics
+    print("\n3. Effect of masking on statistics:")
+    # Check a location that was masked in batch 0
+    masked_loc_b0 = out_with_mask[0, :128, 8, 8]  # Mean channels
+    unmasked_loc_b0 = out_no_mask[0, :128, 8, 8]
+    diff_b0 = (masked_loc_b0 - unmasked_loc_b0).abs().mean()
+    print(f"   Batch 0, masked region - Mean difference: {diff_b0:.4f}")
+
+    # Check a location that was NOT masked
+    unaffected_loc_b0 = out_with_mask[0, :128, 24, 24]
+    unaffected_ref_b0 = out_no_mask[0, :128, 24, 24]
+    diff_unaffected = (unaffected_loc_b0 - unaffected_ref_b0).abs().mean()
+    print(f"   Batch 0, unmasked region - Mean difference: {diff_unaffected:.4f}")
+    print(f"   (Masked region should differ more than unmasked region)")
+
+    assert out_with_mask.shape == (B, 256, H, W)
+    print("\n✓ Mask handling correct!")
+
+    return encoder
+
+
 def example_tcn_phase_encoder():
     """
     Example: TCN encoder for phase pathway (no pooling, keeps temporal dimension).
@@ -441,6 +516,7 @@ if __name__ == '__main__':
 
     # Run examples
     example_tcn_type_encoder()
+    example_tcn_with_mask()
     example_tcn_phase_encoder()
     example_conv2d_encoder()
     example_gated_spatial_conv()

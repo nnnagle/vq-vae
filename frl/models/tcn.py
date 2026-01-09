@@ -7,6 +7,7 @@ Features:
 - Configurable dropout (preconv placement)
 - GroupNorm with preact placement (conv -> norm -> activation)
 - Optional temporal pooling (mean/std statistics or none)
+- Mask-aware temporal pooling for handling invalid timesteps
 - Spatial-aware processing (applies same TCN to each spatial location)
 """
 
@@ -136,7 +137,8 @@ class TCNEncoder(nn.Module):
         ...     pooling='stats'
         ... )
         >>> x = torch.randn(2, 7, 10, 32, 32)  # [B, C, T, H, W]
-        >>> out = tcn(x)  # [B, 256, 32, 32] if pooling='stats' (mean+std)
+        >>> mask = torch.ones(2, 10, 32, 32, dtype=torch.bool)  # All valid
+        >>> out = tcn(x, mask=mask)  # [B, 256, 32, 32] if pooling='stats' (mean+std)
     """
 
     def __init__(
@@ -205,10 +207,12 @@ class TCNEncoder(nn.Module):
         else:
             self.post_norm = nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x: Input tensor [B, C, T, H, W]
+            mask: Optional validity mask [B, T, H, W] where True/1.0 = valid, False/0.0 = masked.
+                  Used during pooling to exclude invalid timesteps (e.g., clouds, missing data).
 
         Returns:
             If pooling='stats': [B, 2*C_out, H, W] (mean and std concatenated)
@@ -220,6 +224,13 @@ class TCNEncoder(nn.Module):
         x = x.permute(0, 3, 4, 1, 2)  # [B, H, W, C, T]
         x = x.reshape(B * H * W, C, T)  # [B*H*W, C, T]
 
+        # Reshape mask if provided: [B, T, H, W] -> [B*H*W, T]
+        if mask is not None:
+            mask = mask.permute(0, 2, 3, 1)  # [B, H, W, T]
+            mask = mask.reshape(B * H * W, T)  # [B*H*W, T]
+            # Ensure mask is float for computation
+            mask = mask.float()
+
         # Apply TCN layers
         for layer in self.layers:
             x = layer(x)  # [B*H*W, C_out, T]
@@ -228,9 +239,29 @@ class TCNEncoder(nn.Module):
 
         # Apply pooling
         if self.pooling == 'stats':
-            # Compute mean and std across time dimension
-            mean = x.mean(dim=2)  # [B*H*W, C_out]
-            std = x.std(dim=2)    # [B*H*W, C_out]
+            if mask is not None:
+                # Masked mean and std computation
+                # Expand mask to match feature channels: [B*H*W, T] -> [B*H*W, 1, T]
+                mask_expanded = mask.unsqueeze(1)  # [B*H*W, 1, T]
+
+                # Count valid timesteps per location
+                valid_count = mask_expanded.sum(dim=2, keepdim=False)  # [B*H*W, 1]
+                valid_count = torch.clamp(valid_count, min=1.0)  # Avoid division by zero
+
+                # Masked mean: sum(x * mask) / count_valid
+                masked_x = x * mask_expanded  # [B*H*W, C_out, T]
+                mean = masked_x.sum(dim=2) / valid_count  # [B*H*W, C_out]
+
+                # Masked std: sqrt(sum((x - mean)^2 * mask) / count_valid)
+                mean_expanded = mean.unsqueeze(2)  # [B*H*W, C_out, 1]
+                squared_diff = ((x - mean_expanded) ** 2) * mask_expanded  # [B*H*W, C_out, T]
+                variance = squared_diff.sum(dim=2) / valid_count  # [B*H*W, C_out]
+                std = torch.sqrt(variance + 1e-8)  # Add small epsilon for numerical stability
+            else:
+                # Standard mean and std across time dimension (no masking)
+                mean = x.mean(dim=2)  # [B*H*W, C_out]
+                std = x.std(dim=2)    # [B*H*W, C_out]
+
             x = torch.cat([mean, std], dim=1)  # [B*H*W, 2*C_out]
 
             # Reshape back to [B, 2*C_out, H, W]

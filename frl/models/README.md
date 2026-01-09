@@ -14,6 +14,7 @@ Temporal Convolutional Network for processing `[B, C, T, H, W]` tensors.
 - Pre-convolution dropout
 - Pre-activation GroupNorm
 - Optional temporal pooling (statistics or none)
+- **Mask-aware temporal pooling** for handling clouds, missing data, etc.
 - Post-pooling LayerNorm
 
 **Example:**
@@ -33,10 +34,22 @@ config = {
 }
 
 encoder = build_tcn_from_config(config)
-# Input: [B, 7, T, H, W]
-# Output: [B, 256, H, W] if pooling='stats' (mean+std)
-#         [B, 128, T, H, W] if pooling='none'
+
+# Without mask
+x = torch.randn(2, 7, 10, 32, 32)  # [B, C, T, H, W]
+out = encoder(x)  # [B, 256, 32, 32] if pooling='stats' (mean+std)
+
+# With mask (exclude clouds/invalid timesteps)
+mask = torch.ones(2, 10, 32, 32, dtype=torch.bool)  # [B, T, H, W]
+mask[:, 2:5, :, :] = False  # Mask out timesteps 2-4
+out = encoder(x, mask=mask)  # Statistics computed only from valid timesteps
 ```
+
+**Mask API:**
+- Mask shape: `[B, T, H, W]`
+- Values: `True`/`1.0` = valid, `False`/`0.0` = masked (excluded)
+- When provided, masked timesteps are excluded from statistics computation
+- Handles edge cases: all-masked locations default to count=1 to avoid NaN
 
 ### 2. Conv2D Encoder (`conv2d_encoder.py`)
 
