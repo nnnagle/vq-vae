@@ -97,6 +97,7 @@ class GroupSpec:
     bands: List[BandSpec] = None
     years: Optional[List[int]] = None  # For annual/irregular
     year_range: Optional[Tuple[int, int]] = None  # Alternative to explicit years
+    fill_value: Optional[Dict[str, Any]] = None  # Group-level default fill value
 
 
 # =============================================================================
@@ -228,6 +229,7 @@ def parse_group_specs(cfg: dict) -> List[GroupSpec]:
     for group in cfg.get('annual', []):
         group_name = group['group']
         group_path = group.get('path')
+        group_fill_value = group.get('fill_value')  # Get group-level fill_value
         
         # Parse years
         years = None
@@ -256,7 +258,8 @@ def parse_group_specs(cfg: dict) -> List[GroupSpec]:
                 path=group_path,
                 bands=bands,
                 years=years,
-                year_range=year_range
+                year_range=year_range,
+                fill_value=group_fill_value  # Pass group-level fill_value
             ))
     
     # Parse irregular groups
@@ -264,6 +267,7 @@ def parse_group_specs(cfg: dict) -> List[GroupSpec]:
         group_name = group['group']
         group_path = group.get('path')
         years = group.get('years', [])
+        group_fill_value = group.get('fill_value')  # Get group-level fill_value
         
         for subsection in ['data', 'quality', 'mask']:
             if subsection not in group:
@@ -280,13 +284,15 @@ def parse_group_specs(cfg: dict) -> List[GroupSpec]:
                 semantic_type=semantic_type,
                 path=group_path,
                 bands=bands,
-                years=years
+                years=years,
+                fill_value=group_fill_value  # Pass group-level fill_value
             ))
     
     # Parse static groups
     for group in cfg.get('static', []):
         group_name = group['group']
         group_path = group.get('path')
+        group_fill_value = group.get('fill_value')  # Get group-level fill_value
         
         for subsection in ['data', 'quality', 'mask']:
             if subsection not in group:
@@ -302,7 +308,8 @@ def parse_group_specs(cfg: dict) -> List[GroupSpec]:
                 subsection=subsection,
                 semantic_type=semantic_type,
                 path=group_path,
-                bands=bands
+                bands=bands,
+                fill_value=group_fill_value  # Pass group-level fill_value
             ))
     
     log.info(f"Parsed {len(specs)} group specifications")
@@ -561,7 +568,7 @@ def load_static_band(
     da = align_to_template(da, template)
     
     # Handle nodata/fill values
-    da = handle_fill_values(da, band_spec, group_spec.semantic_type)
+    da = handle_fill_values(da, band_spec, group_spec)
     
     # Convert dtype
     da = da.astype(target_dtype)
@@ -620,7 +627,7 @@ def load_annual_band(
     log.debug(f"      After temporal align: min={da.min().values:.3f}, max={da.max().values:.3f}")
     
     # Handle nodata/fill values
-    da = handle_fill_values(da, band_spec, group_spec.semantic_type)
+    da = handle_fill_values(da, band_spec, group_spec)
     log.debug(f"      After fill handling: min={da.min().values:.3f}, max={da.max().values:.3f}")
     
     # Convert dtype
@@ -808,7 +815,7 @@ def load_irregular_band(
     da = da.assign_coords(snapshot_year=('snapshot', years))
     
     # Handle nodata/fill values  
-    da = handle_fill_values(da, band_spec, group_spec.semantic_type)
+    da = handle_fill_values(da, band_spec, group_spec)
     
     # Convert dtype
     da = da.astype(target_dtype)
@@ -822,11 +829,22 @@ def load_irregular_band(
 def handle_fill_values(
     da: xr.DataArray,
     band_spec: BandSpec,
-    semantic_type: str
+    group_spec: GroupSpec
 ) -> xr.DataArray:
-    """Handle fill/nodata values according to band spec and semantic type."""
+    """
+    Handle fill/nodata values according to band spec and semantic type.
     
-    # Check for explicit fill_value in band spec
+    Priority order:
+    1. Band-specific fill_value (if specified)
+    2. Group-level fill_value (if specified)
+    3. Raster metadata nodata (if present)
+    4. No replacement
+    
+    Stores the target fill value in da.attrs['_FillValue'] for use when
+    writing to Zarr.
+    """
+    
+    # Check for explicit fill_value in band spec (highest priority)
     if band_spec.fill_value:
         source_val = band_spec.fill_value.get('source')
         target_val = band_spec.fill_value.get('target')
@@ -834,22 +852,47 @@ def handle_fill_values(
         if target_val == 'na' or target_val is None:
             # Replace with NaN
             da = da.where(da != source_val, np.nan)
+            # Store NaN as the fill value for Zarr
+            da.attrs['_FillValue'] = np.nan
         else:
             da = da.where(da != source_val, target_val)
+            # Store the target value as fill value for Zarr
+            da.attrs['_FillValue'] = target_val
         
         return da
     
-    # Check for nodata in raster metadata
+    # Check for group-level fill_value (second priority)
+    if group_spec.fill_value:
+        source_val = group_spec.fill_value.get('source')
+        target_val = group_spec.fill_value.get('target')
+        
+        if target_val == 'na' or target_val is None:
+            # Replace with NaN
+            da = da.where(da != source_val, np.nan)
+            # Store NaN as the fill value for Zarr
+            da.attrs['_FillValue'] = np.nan
+        else:
+            da = da.where(da != source_val, target_val)
+            # Store the target value as fill value for Zarr
+            da.attrs['_FillValue'] = target_val
+        
+        return da
+    
+    # Check for nodata in raster metadata (third priority)
     nodata = da.attrs.get('_FillValue') or da.attrs.get('nodata')
     
     if nodata is not None:
-        if semantic_type == 'continuous':
+        if group_spec.semantic_type == 'continuous':
             # Replace with NaN
             da = da.where(da != nodata, np.nan)
-        elif semantic_type in ('categorical', 'mask'):
+            # Store NaN as the fill value
+            da.attrs['_FillValue'] = np.nan
+        elif group_spec.semantic_type in ('categorical', 'mask'):
             # Replace with 0 or False
-            fill = 0 if semantic_type == 'categorical' else False
+            fill = 0 if group_spec.semantic_type == 'categorical' else False
             da = da.where(da != nodata, fill)
+            # Store the fill value
+            da.attrs['_FillValue'] = fill
     
     return da
 
@@ -1421,13 +1464,17 @@ def write_zarr_hierarchy(
             chunks.get(d, s) for d, s in zip(da.dims, da.shape)
         )
         
-        # Create array
+        # Get fill_value from attrs if present
+        fill_value = da.attrs.get('_FillValue', None)
+        
+        # Create array with fill_value
         ds = sub_group.create_array(
             var_name,
             shape=da.shape,
             chunks=var_chunks,
             dtype=da.dtype,
             compressor=compressor,
+            fill_value=fill_value,  # Pass fill_value to Zarr
             overwrite=True
         )
         

@@ -94,6 +94,50 @@ strata:
   path: /data/VA/main/va_strata.tif
 
 annual:
+  - group: ccdc_annual
+    path: /data/VA/ccdc_annual/ccdc_snapshot_metrics_{yyyy}.vrt
+    years:
+      start: 2010
+      end: 2024
+    fill_value: {source: -9999, target: na}
+    data:
+      semantic_type: continuous
+      bands:
+        - id: green
+          source_band: 1
+        - id: red
+          source_band: 2
+        - id: nir
+          source_band: 3
+        - id: swir1
+          source_band: 4
+        - id: swir2
+          source_band: 5
+        - id: ndvi
+          source_band: 6
+        - id: nbr
+          source_band: 7
+        - id: ndmi
+          source_band: 8
+        - id: tassel_cap_blue
+          source_band: 9
+        - id: tassel_cap_green
+          source_band: 10
+        - id: tassel_cap_wet
+          source_band: 11
+        - id: seas_amp_red
+          source_band: 12
+        - id: seas_amp_nir
+          source_band: 13
+        - id: seas_amp_swir1
+          source_band: 14
+        - id: seas_amp_swir2
+          source_band: 15
+        - id: spectral_velocity
+          source_band: 16
+        - id: rmse_mean
+          source_band: 18
+
   - group: ls8day
     path: /data/VA/ls8day/ls8day_metrics_{yyyy}.vrt
     years:
@@ -271,162 +315,6 @@ static:
         - id: ksat_mask
           source_band: 5
 
-  # ccdc_metrics_current 67  bands
-  - group: ccdc_metrics_current
-    path: /data/VA/ccdc/ccdc_metrics_1986_2024.vrt
-    data:
-      semantic_type: continuous
-      bands:
-        # =========================
-        # SNAPSHOT 2024_0831 (21)
-        # =========================
-        - id: snap_2024_0831_green                # 1
-          source_band: 1
-        - id: snap_2024_0831_red                  # 2
-          source_band: 2
-        - id: snap_2024_0831_nir                  # 3
-          source_band: 3
-        - id: snap_2024_0831_swir1                # 4
-          source_band: 4
-        - id: snap_2024_0831_swir2                # 5
-          source_band: 5
-        - id: snap_2024_0831_ndvi                 # 6
-          source_band: 6
-        - id: snap_2024_0831_nbr                  # 7
-          source_band: 7
-        - id: snap_2024_0831_ndmi                 # 8
-          source_band: 8
-        - id: snap_2024_0831_tcb                  # 9
-          source_band: 9
-        - id: snap_2024_0831_tcg                  # 10
-          source_band: 10
-        - id: snap_2024_0831_tcw                  # 11
-          source_band: 11
-        - id: snap_2024_0831_seasonal_amp_red     # 12
-          source_band: 12
-        - id: snap_2024_0831_seasonal_amp_nir     # 13
-          source_band: 13
-        - id: snap_2024_0831_seasonal_amp_swir1   # 14
-          source_band: 14
-        - id: snap_2024_0831_seasonal_amp_swir2   # 15
-          source_band: 15
-        - id: snap_2024_0831_spectral_velocity    # 16
-          source_band: 16
-        - id: snap_2024_0831_segment_duration     # 17
-          source_band: 17
-        - id: snap_2024_0831_rmse_mean            # 18
-          source_band: 18
-        - id: snap_2024_0831_dndvi_dt             # 19
-          source_band: 19
-        - id: snap_2024_0831_dndmi_dt             # 20
-          source_band: 20
-        - id: snap_2024_0831_dnbr_dt              # 21
-          source_band: 21
-
-        # =========================
-        # SNAPSHOT 2022_0831 (21)
-        # =========================
-        - id: snap_2022_0831_green                # 22
-          source_band: 22
-        - id: snap_2022_0831_red                  # 23
-          source_band: 23
-        - id: snap_2022_0831_nir                  # 24
-          source_band: 24
-        - id: snap_2022_0831_swir1                # 25
-          source_band: 25
-        - id: snap_2022_0831_swir2                # 26
-          source_band: 26
-        - id: snap_2022_0831_ndvi                 # 27
-          source_band: 27
-        - id: snap_2022_0831_nbr                  # 28
-          source_band: 28
-        - id: snap_2022_0831_ndmi                 # 29
-          source_band: 29
-        - id: snap_2022_0831_tcb                  # 30
-          source_band: 30
-        - id: snap_2022_0831_tcg                  # 31
-          source_band: 31
-        - id: snap_2022_0831_tcw                  # 32
-          source_band: 32
-        - id: snap_2022_0831_seasonal_amp_red     # 33
-          source_band: 33
-        - id: snap_2022_0831_seasonal_amp_nir     # 34
-          source_band: 34
-        - id: snap_2022_0831_seasonal_amp_swir1   # 35
-          source_band: 35
-        - id: snap_2022_0831_seasonal_amp_swir2   # 36
-          source_band: 36
-        - id: snap_2022_0831_spectral_velocity    # 37
-          source_band: 37
-        - id: snap_2022_0831_segment_duration     # 38
-          source_band: 38
-        - id: snap_2022_0831_rmse_mean            # 39
-          source_band: 39
-        - id: snap_2022_0831_dndvi_dt             # 40
-          source_band: 40
-        - id: snap_2022_0831_dndmi_dt             # 41
-          source_band: 41
-        - id: snap_2022_0831_dnbr_dt              # 42
-          source_band: 42
-
-        # =========================
-        # SNAPSHOT 2020_0831 (21)
-        # =========================
-        - id: snap_2020_0831_green                # 43
-          source_band: 43
-        - id: snap_2020_0831_red                  # 44
-          source_band: 44
-        - id: snap_2020_0831_nir                  # 45
-          source_band: 45
-        - id: snap_2020_0831_swir1                # 46
-          source_band: 46
-        - id: snap_2020_0831_swir2                # 47
-          source_band: 47
-        - id: snap_2020_0831_ndvi                 # 48
-          source_band: 48
-        - id: snap_2020_0831_nbr                  # 49
-          source_band: 49
-        - id: snap_2020_0831_ndmi                 # 50
-          source_band: 50
-        - id: snap_2020_0831_tcb                  # 51
-          source_band: 51
-        - id: snap_2020_0831_tcg                  # 52
-          source_band: 52
-        - id: snap_2020_0831_tcw                  # 53
-          source_band: 53
-        - id: snap_2020_0831_seasonal_amp_red     # 54
-          source_band: 54
-        - id: snap_2020_0831_seasonal_amp_nir     # 55
-          source_band: 55
-        - id: snap_2020_0831_seasonal_amp_swir1   # 56
-          source_band: 56
-        - id: snap_2020_0831_seasonal_amp_swir2   # 57
-          source_band: 57
-        - id: snap_2020_0831_spectral_velocity    # 58
-          source_band: 58
-        - id: snap_2020_0831_segment_duration     # 59
-          source_band: 59
-        - id: snap_2020_0831_rmse_mean            # 60
-          source_band: 60
-        - id: snap_2020_0831_dndvi_dt             # 61
-          source_band: 61
-        - id: snap_2020_0831_dndmi_dt             # 62
-          source_band: 62
-        - id: snap_2020_0831_dnbr_dt              # 63
-          source_band: 63
-
-        - id: rapid_loss_year_1
-          source_band: 64
-          fill_value: {source: -9999, target: na}
-        - id: rapid_loss_year_2
-          source_band: 65
-          fill_value: {source: -9999, target: na}
-        - id: rapid_loss_year_3
-          source_band: 66
-          fill_value: {source: -9999, target: na}
-        - id: rapid_loss_year_4
-          source_band: 67
-          fill_value: {source: -9999, target: na}
 
   # ccdc_metrics_history 49 bands
   - group: ccdc_metrics_history
