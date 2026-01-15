@@ -211,6 +211,63 @@ inputs:
 
   temporal:
     # ---------------------------------------------------------------
+    # CCDC annual metrics 
+    # ---------------------------------------------------------------
+    ccdc_annual:
+      zarr: {group: annual/ccdc.......}
+      kind: dense_time_series
+      time_window_years: 10
+      bands:
+        - name: green
+          array: green
+          norm: zscore
+        - name: red
+          array: red
+          norm: zscore
+        - name: nir
+          array: nir
+          norm: zscore
+        - name: swir1
+          array: swir1
+          norm: zscore
+        - name: swir2
+          array: swir2
+          norm: zscore
+        - name: ndvi
+          array: ndvi
+          norm: zscore
+        - name: nbr
+          array: nbr
+          norm: zscore
+        - name: ndmi
+          array: ndmi
+          norm: zscore
+        - name: tassel_cap_green
+          array: tassel_cap_green
+          norm: zscore
+        - name: tassel_cap_wet
+          array: tassel_cap_wet
+          norm: zscore
+        - name: seas_amp_red
+          array: seas_amp_red
+          norm: zscore
+        - name: seas_amp_nir
+          array: seas_amp_nir
+          norm: zscore
+        - name: seas_amp_swir1
+          array: seas_amp_swir1
+          norm: zscore
+        - name: seas_amp_swir2
+          array: seas_amp_swir2
+          norm: zscore
+        - name: spectral_velocity
+          array: spectral_velocity
+          norm: zscore
+        - name: rmse_mean
+          array: rmse_mean
+          norm: zscore
+
+    # ---------------------------------------------------------------
     # Landsat annual metrics (ls8day)
     # ---------------------------------------------------------------
     ls8day:
@@ -333,48 +390,6 @@ inputs:
   # These are point-in-time snapshots that vary by window end year
   # -------------------------------------------------------------------
   
-  snapshot:
-    ccdc_snapshot:
-      zarr: {group: static/ccdc_metrics_current/data}
-      kind: continuous
-      missing_policy:
-        nan_from_fill: [-9999]
-      years: [2020, 2022, 2024]
-      zarr_pattern: snap_{year}_0831
-
-      # The model sees a vector per bundle member:
-      bands_template:
-        # reflectance / indices
-        - {name: green,              array: "{zarr_pattern}_green",              norm: robust_iqr}
-        - {name: red,                array: "{zarr_pattern}_red",                norm: robust_iqr}
-        - {name: nir,                array: "{zarr_pattern}_nir",                norm: robust_iqr}
-        - {name: swir1,              array: "{zarr_pattern}_swir1",              norm: robust_iqr}
-        - {name: swir2,              array: "{zarr_pattern}_swir2",              norm: robust_iqr}
-        - {name: ndvi,               array: "{zarr_pattern}_ndvi",               norm: robust_iqr}
-        - {name: nbr,                array: "{zarr_pattern}_nbr",                norm: robust_iqr}
-        - {name: ndmi,               array: "{zarr_pattern}_ndmi",               norm: robust_iqr}
-
-        # tasseled cap
-        - {name: tcb,                array: "{zarr_pattern}_tcb",                norm: robust_iqr}
-        - {name: tcg,                array: "{zarr_pattern}_tcg",                norm: robust_iqr}
-        - {name: tcw,                array: "{zarr_pattern}_tcw",                norm: robust_iqr}
-
-        # seasonality
-        - {name: seasonal_amp_red,   array: "{zarr_pattern}_seasonal_amp_red",   norm: robust_iqr}
-        - {name: seasonal_amp_nir,   array: "{zarr_pattern}_seasonal_amp_nir",   norm: robust_iqr}
-        - {name: seasonal_amp_swir1, array: "{zarr_pattern}_seasonal_amp_swir1", norm: robust_iqr}
-        - {name: seasonal_amp_swir2, array: "{zarr_pattern}_seasonal_amp_swir2", norm: robust_iqr}
-
-        # dynamics / fit quality
-        - {name: spectral_velocity,  array: "{zarr_pattern}_spectral_velocity",  norm: robust_iqr}
-        - {name: rmse_mean,          array: "{zarr_pattern}_rmse_mean",          norm: robust_iqr}
-
-        # trend-only derivatives at snapshot date
-        - {name: dndvi_dt,           array: "{zarr_pattern}_dndvi_dt",           norm: robust_iqr}
-        - {name: dndmi_dt,           array: "{zarr_pattern}_dndmi_dt",           norm: robust_iqr}
-        - {name: dnbr_dt,            array: "{zarr_pattern}_dnbr_dt",            norm: robust_iqr}
-  
- 
   static:
 
     evt:
@@ -482,9 +497,6 @@ derived:
     channels:
       - name: p_t               # in [0,1]
         formula: "t / (T - 1)"
-        dtype: float32
-      - name: c_t               # in [-1,1]
-        formula: "(t - (T - 1)/2) / ((T - 1)/2)"
         dtype: float32
 
     injection:
