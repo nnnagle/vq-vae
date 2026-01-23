@@ -1,0 +1,119 @@
+# forest_repr_model_bindings.yaml
+version: "1.0"
+name: "forest_state_repr_v1"
+zarr:
+  path: /data/VA/zarr/va_vae_dataset_test.zarr
+  structure: hierarchical
+time_window:
+  start: 2010
+  end: 2024
+# annual layers should be clipped and/or extended to the time_window by the dataloader.
+# irregular time series layer should be subset to the time_window.
+
+# There will be a function that will:
+#   For each feature:
+#   iterate through datasets, computing univariate stats and covariance if requested.
+#   Covariances can either: 1. use the global mean (use a compute efficient one-pass algorithm)
+#     or 2. center using the patch mean. Either way, average across all sample patches.
+stats:
+  compute: if-not-exists
+  type: json
+  file: /data/VA/zarr/va_vae_dataset_test_stats.json
+  stats:
+    [mean, sd, q02, q05, q25, q50, q75, q95, q98]
+  covariance: true
+  samples:
+    n: 16 # number of patches to sample
+  mask:
+    - static_mask.aoi
+    - static_mask.forest
+
+# -------------------------------------------------------------------
+# Notes: The general strategy is to a ForestDataset class that loads the raw zarr into
+# one tensor per dimension size: example, all dense time stacks in one place
+# There is then a function that pre-compute stats and stores those as a json in the zarr
+# There is then a FeatureProcessor that takes the raw tensors, their stats, and creates
+# model tensor objects as requested.
+#
+# Objects created by dataloader in dataset:
+# static_mask
+# annual_mask
+# annual
+# static
+# The dataloader DOES NOT apply masks. That is done by the FeatureProcessor.
+# -------------------------------------------------------------------
+
+dataset: # These exist in the zarr
+  static_mask:
+    type: uint8
+    dim: [C,H,W] # in most cases this is inferable from source, but broadcast if needed
+    channels: # Order = index in tensor
+      - {name: aoi, source: aoi}
+      - {name: dem_mask, source: static/soils_masks/mask/dem_mask}
+      - {name: tpi_mask, source: static/soils_masks/mask/tpi_mask}
+      - {name: hand_mask, source: static/soils_masks/mask/hand_mask}
+      - {name: twi_mask, source: static/soils_masks/mask/twi_mask}
+      - {name: ksat_mask, source: static/soils_masks/mask/ksat_mask}
+      - name: lcms_lu_p
+        source: annual/lcms_q_interp/mask/lcms_qa_interp
+        year: 2024
+      - name: forest
+        source: annual/lcms_lu_p/data/lcms_lu_p_forest
+        time:
+          use: 2024
+        ok_if:
+          op: ">="
+          value: 0.25
+
+  annual_mask:
+    type: uint8
+    dim: [C,T,H,W]
+    channels:
+      - name: lcms_interp_ok
+        source: annual/lcms_q_interp/mask/lcms_qa_interp
+        ok_if:
+          op: ">="
+          value: 1 # anything >=1 is 1, else 0
+
+  annual:
+    type: float16
+    dim: [C,T,H,W]
+    channels:
+      - {name: evi2_summer_p95, source: annual/ls8day/data/EVI2_summer_p95}
+      - {name: nbr_annual_min, source: annual/ls8day/data/NBR_annual_min}
+      - {name: nbr_summer_p95, source: annual/ls8day/data/NBR_summer_p95}
+      - {name: ndmi_summer_mean, source: annual/ls8day/data/NDMI_summer_mean}
+      - {name: ndvi_amplitude, source: annual/ls8day/data/NDVI_amplitude}
+      - {name: ndvi_summer_p95, source: annual/ls8day/data/NDVI_summer_p95}
+      - {name: ndvi_winter_max, source: annual/ls8day/data/NDVI_winter_max}
+      - name: temporal_position               # in [0,1]
+        formula: "t / (T - 1)" #T is inferred from time_window
+
+
+  static:
+    type: float16
+    dim: [C,H,W]
+    channels:
+      - {name: elevation, source: static/topo/data/elevation}
+      - {name: slope, source: static/topo/data/slope_deg}
+      - {name: northness, source: static/topo/data/northness}
+      - {name: eastness, source: static/topo/data/eastness}
+      - {name: hand, source: static/topo/data/HAND}
+      - {name: twi, source: static/topo/data/TWI}
+      - {name: tpi, source: static/topo/data/TPI_500m}
+      - {name: ksat, source: static/topo/data/ksat_lot10_0_5}
+      - {name: mean_green, source: static/ccdc-metric_history/data/mean_green, fill_value: -9999}
+      - {name: mean_red,   source: static/ccdc-metric_history/data/mean_red, fill_value: -9999}
+      - {name: mean_nir, source: static/ccdc-metric_history/data/mean_nir, fill_value: -9999}
+      - {name: mean_swir1, source: static/ccdc-metric_history/data/mean_swir1, fill_value: -9999}
+      - {name: mean_swir2, source: static/ccdc-metric_history/data/mean_swir2, fill_value: -9999}
+      - {name: mean_ndvi, source: static/ccdc-metric_history/data/mean_ndvi, fill_value: -9999}
+      - {name: mean_nbr,  source: static/ccdc-metric_history/data/mean_nbr,  fill_value: -9999}
+      - {name: mean_ndmi, source: static/ccdc-metric_history/data/mean_ndmi, fill_value: -9999}
+      - {name: mean_seasonal_amp_red, source: static/ccdc-metric_history/data/mean_seasonal_amp_red, fill_value: -9999}
+      - {name: mean_seasonal_amp_nir,  source: static/ccdc-metric_history/data/mean_seasonal_amp_nir,  fill_value: -9999}
+      - {name: mean_seasonal_amp_swir1, source: static/ccdc-metric_history/data/mean_seasonal_amp_swir1, fill_value: -9999}
+      - {name: mean_seasonal_amp_swir2, source: static/ccdc-metric_history/data/mean_seasonal_amp_swir2, fill_value: -9999}
+      - {name: spectral_distance_per_decade,  source: static/ccdc-metric_history/data/spectral_distance_per_decade,  fill_value: -9999}
+      - {name: mean_decline_rate, source: static/ccdc-metric_history/data/mean_decline_rate, fill_value: -9999}
+      - {name: num_segments, source: static/ccdc-metric_history/data/num_segments, fill_value: -9999}

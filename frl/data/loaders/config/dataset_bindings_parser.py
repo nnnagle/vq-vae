@@ -1,0 +1,237 @@
+"""
+Parser for dataset bindings YAML configuration.
+
+This module provides a simple parser that loads YAML configuration
+and creates typed configuration objects.
+"""
+
+import yaml
+from pathlib import Path
+from typing import Dict, Any, Union
+
+from .dataset_config import (
+    BindingsConfig,
+    ZarrConfig,
+    TimeWindowConfig,
+    DatasetGroupConfig,
+    ChannelConfig,
+)
+
+
+class BindingsParseError(Exception):
+    """Raised when bindings YAML parsing fails."""
+    pass
+
+
+class DatasetBindingsParser:
+    """Parser for dataset bindings YAML files.
+
+    This parser focuses on the dataset section of the bindings YAML,
+    creating a strongly-typed configuration object.
+
+    Example usage:
+        parser = DatasetBindingsParser('config/bindings.yaml')
+        config = parser.parse()
+        static_group = config.get_group('static')
+    """
+
+    def __init__(self, yaml_path: Union[str, Path]):
+        """Initialize parser with path to YAML file.
+
+        Args:
+            yaml_path: Path to bindings YAML file
+        """
+        self.yaml_path = Path(yaml_path)
+        if not self.yaml_path.exists():
+            raise FileNotFoundError(f"Bindings YAML not found: {self.yaml_path}")
+
+        # Load raw YAML
+        with open(self.yaml_path, 'r') as f:
+            self.raw_config = yaml.safe_load(f)
+
+    def parse(self) -> BindingsConfig:
+        """Parse the YAML file and return structured configuration.
+
+        Returns:
+            BindingsConfig object with all parsed configuration
+
+        Raises:
+            BindingsParseError: If configuration is invalid
+        """
+        try:
+            # Parse top-level metadata
+            version = self._parse_version()
+            name = self._parse_name()
+
+            # Parse zarr configuration
+            zarr_config = self._parse_zarr()
+
+            # Parse time window
+            time_window = self._parse_time_window()
+
+            # Parse dataset groups
+            dataset_groups = self._parse_dataset_groups()
+
+            # Parse optional stats configuration
+            stats = self.raw_config.get('stats', None)
+
+            return BindingsConfig(
+                version=version,
+                name=name,
+                zarr=zarr_config,
+                time_window=time_window,
+                dataset_groups=dataset_groups,
+                stats=stats,
+            )
+
+        except Exception as e:
+            raise BindingsParseError(f"Failed to parse bindings: {e}") from e
+
+    def _parse_version(self) -> str:
+        """Parse version string."""
+        version = self.raw_config.get('version')
+        if not version:
+            raise BindingsParseError("Missing required field: 'version'")
+        return str(version)
+
+    def _parse_name(self) -> str:
+        """Parse dataset name."""
+        name = self.raw_config.get('name')
+        if not name:
+            raise BindingsParseError("Missing required field: 'name'")
+        return str(name)
+
+    def _parse_zarr(self) -> ZarrConfig:
+        """Parse zarr configuration."""
+        zarr_dict = self.raw_config.get('zarr')
+        if not zarr_dict:
+            raise BindingsParseError("Missing required section: 'zarr'")
+
+        path = zarr_dict.get('path')
+        if not path:
+            raise BindingsParseError("Missing required field: 'zarr.path'")
+
+        structure = zarr_dict.get('structure', 'hierarchical')
+
+        return ZarrConfig(path=path, structure=structure)
+
+    def _parse_time_window(self) -> TimeWindowConfig:
+        """Parse time window configuration."""
+        tw_dict = self.raw_config.get('time_window')
+        if not tw_dict:
+            raise BindingsParseError("Missing required section: 'time_window'")
+
+        start = tw_dict.get('start')
+        end = tw_dict.get('end')
+
+        if start is None or end is None:
+            raise BindingsParseError(
+                "time_window must have 'start' and 'end' fields"
+            )
+
+        return TimeWindowConfig(start=int(start), end=int(end))
+
+    def _parse_dataset_groups(self) -> Dict[str, DatasetGroupConfig]:
+        """Parse all dataset groups."""
+        dataset_dict = self.raw_config.get('dataset')
+        if not dataset_dict:
+            raise BindingsParseError("Missing required section: 'dataset'")
+
+        groups = {}
+        for group_name, group_spec in dataset_dict.items():
+            groups[group_name] = self._parse_dataset_group(group_name, group_spec)
+
+        return groups
+
+    def _parse_dataset_group(
+        self,
+        group_name: str,
+        group_spec: Dict[str, Any]
+    ) -> DatasetGroupConfig:
+        """Parse a single dataset group.
+
+        Args:
+            group_name: Name of the group (e.g., 'static_mask')
+            group_spec: Dictionary with group specification
+
+        Returns:
+            DatasetGroupConfig object
+        """
+        # Parse dtype
+        dtype = group_spec.get('type')
+        if not dtype:
+            raise BindingsParseError(
+                f"Group '{group_name}' missing required field: 'type'"
+            )
+
+        # Parse dimensions
+        dim = group_spec.get('dim')
+        if not dim:
+            raise BindingsParseError(
+                f"Group '{group_name}' missing required field: 'dim'"
+            )
+        if not isinstance(dim, list):
+            raise BindingsParseError(
+                f"Group '{group_name}' field 'dim' must be a list, got {type(dim)}"
+            )
+
+        # Parse channels
+        channels_list = group_spec.get('channels')
+        if not channels_list:
+            raise BindingsParseError(
+                f"Group '{group_name}' missing required field: 'channels'"
+            )
+        if not isinstance(channels_list, list):
+            raise BindingsParseError(
+                f"Group '{group_name}' field 'channels' must be a list, got {type(channels_list)}"
+            )
+
+        channels = []
+        for i, channel_spec in enumerate(channels_list):
+            try:
+                channels.append(self._parse_channel(channel_spec))
+            except Exception as e:
+                raise BindingsParseError(
+                    f"Error parsing channel {i} in group '{group_name}': {e}"
+                ) from e
+
+        return DatasetGroupConfig(
+            name=group_name,
+            dtype=dtype,
+            dim=dim,
+            channels=channels,
+        )
+
+    def _parse_channel(self, channel_spec: Dict[str, Any]) -> ChannelConfig:
+        """Parse a single channel specification.
+
+        Args:
+            channel_spec: Dictionary with channel specification
+
+        Returns:
+            ChannelConfig object
+        """
+        # Channel name is required
+        name = channel_spec.get('name')
+        if not name:
+            raise BindingsParseError(
+                f"Channel specification missing required field: 'name'"
+            )
+
+        # Extract optional fields
+        source = channel_spec.get('source')
+        formula = channel_spec.get('formula')
+        year = channel_spec.get('year')
+        time = channel_spec.get('time')
+        ok_if = channel_spec.get('ok_if')
+        fill_value = channel_spec.get('fill_value')
+
+        return ChannelConfig(
+            name=name,
+            source=source,
+            formula=formula,
+            year=year,
+            time=time,
+            ok_if=ok_if,
+            fill_value=fill_value,
+        )
