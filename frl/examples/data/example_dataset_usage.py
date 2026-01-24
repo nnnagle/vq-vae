@@ -12,8 +12,8 @@ This script shows:
 import numpy as np
 from pathlib import Path
 
-from frl.data.loaders.config import DatasetBindingsParser
-from frl.data.loaders.dataset import ForestDatasetV2, collate_fn
+from data.loaders.config import DatasetBindingsParser
+from data.loaders.dataset import ForestDatasetV2, collate_fn
 
 
 def print_section(title):
@@ -27,7 +27,7 @@ def example_1_load_config():
     """Example 1: Load and inspect the bindings configuration."""
     print_section("Example 1: Loading Configuration")
 
-    yaml_path = "frl/config/forest_repr_model_bindings.yaml"
+    yaml_path = 'config/frl_binding_v1.yaml'
 
     print(f"\n📄 Loading config from: {yaml_path}")
     parser = DatasetBindingsParser(yaml_path)
@@ -73,7 +73,7 @@ def example_2_create_dataset(config):
     try:
         dataset = ForestDatasetV2(
             config,
-            split='train',           # Use training split
+            split=None,           # Use training split
             patch_size=256,          # 256x256 patches
             min_aoi_fraction=0.3,    # Require 30% valid AOI
             epoch_mode='number',     # Fixed number per epoch
@@ -236,7 +236,7 @@ def example_6_multiple_splits():
     """Example 6: Create datasets for train/val/test splits."""
     print_section("Example 6: Train/Val/Test Splits")
 
-    yaml_path = "frl/config/forest_repr_model_bindings.yaml"
+    yaml_path = "config/frl_binding_v1.yaml"
     config = DatasetBindingsParser(yaml_path).parse()
 
     if not Path(config.zarr.path).exists():
