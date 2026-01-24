@@ -4,11 +4,11 @@ Simple minimal example of using ForestDatasetV2.
 Quick start script for testing the new dataset loader.
 """
 
-from frl.data.loaders.config import DatasetBindingsParser
-from frl.data.loaders.dataset import ForestDatasetV2
+from data.loaders.config import DatasetBindingsParser
+from data.loaders.dataset import ForestDatasetV2
 
 # Load configuration
-config = DatasetBindingsParser('frl/config/forest_repr_model_bindings.yaml').parse()
+config = DatasetBindingsParser('config/frl_binding_v1.yaml').parse()
 
 # Create dataset
 dataset = ForestDatasetV2(

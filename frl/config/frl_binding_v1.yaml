@@ -1,0 +1,346 @@
+# forest_repr_model_bindings.yaml
+version: "1.0"
+name: "forest_state_repr_v1"
+zarr:
+  path: /data/VA/zarr/va_vae_dataset_test.zarr
+  structure: hierarchical
+time_window: 
+  start: 2010
+  end: 2024
+# annual layers should be clipped and/or extended to the time_window by the dataloader.
+# irregular time series layer should be subset to the time_window.
+
+# There will be a function that will:
+#   For each feature:
+#   iterate through datasets, computing univariate stats and covariance if requested.
+#   Covariances can either: 1. use the global mean (use a compute efficient one-pass algorithm)
+#     or 2. center using the patch mean. Either way, average across all sample patches.
+stats:
+  compute: if-not-exists
+  type: json
+  file: /data/VA/zarr/va_vae_dataset_test_stats.json
+  stats:
+    [mean, sd, q02, q05, q25, q50, q75, q95, q98]
+  covariance: true
+  samples:
+    n: 16 # number of patches to sample
+  mask:
+    - static_mask.aoi
+    - static_mask.forest
+
+# -------------------------------------------------------------------
+# Notes: The general strategy is to a ForestDataset class that loads the raw zarr into
+# one tensor per dimension size: example, all dense time stacks in one place
+# There is then a function that pre-compute stats and stores those as a json in the zarr
+# There is then a FeatureProcessor that takes the raw tensors, their stats, and creates 
+# model tensor objects as requested.
+#
+# Objects created by dataloader in dataset:
+# static_mask
+# annual_mask
+# annual
+# static
+# The dataloader DOES NOT apply masks. That is done by the FeatureProcessor.
+# -------------------------------------------------------------------
+
+dataset: # These exist in the zarr
+  static_mask:
+    type: uint8
+    dim: [C,H,W] # in most cases this is inferable from source, but broadcast if needed
+    channels: # Order = index in tensor
+      - {name: aoi, source: aoi}
+      - {name: dem_mask, source: static/soils_masks/mask/dem_mask}
+      - {name: tpi_mask, source: static/soils_masks/mask/tpi_mask}
+      - {name: hand_mask, source: static/soils_masks/mask/hand_mask}
+      - {name: twi_mask, source: static/soils_masks/mask/twi_mask}
+      - {name: ksat_mask, source: static/soils_masks/mask/ksat_mask}
+      - name: lcms_lu_p
+        source: annual/lcms_q_interp/mask/lcms_qa_interp
+        year: 2024
+      - name: forest
+        source: annual/lcms_lu_p/data/lcms_lu_p_forest
+        time:
+          use: 2024
+        ok_if:
+          op: ">="
+          value: 0.25
+
+  annual_mask:
+    type: uint8
+    dim: [C,T,H,W]
+    channels:
+      - name: lcms_interp_ok 
+        source: annual/lcms_q_interp/mask/lcms_qa_interp
+        ok_if:
+          op: ">="
+          value: 1 # anything >=1 is 1, else 0
+
+  annual:
+    type: float16
+    dim: [C,T,H,W]
+    channels:
+      - {name: evi2_summer_p95, source: annual/ls8day/data/EVI2_summer_p95}
+      - {name: nbr_annual_min, source: annual/ls8day/data/NBR_annual_min}
+      - {name: nbr_summer_p95, source: annual/ls8day/data/NBR_summer_p95}
+      - {name: ndmi_summer_mean, source: annual/ls8day/data/NDMI_summer_mean}
+      - {name: ndvi_amplitude, source: annual/ls8day/data/NDVI_amplitude}
+      - {name: ndvi_summer_p95, source: annual/ls8day/data/NDVI_summer_p95}
+      - {name: ndvi_winter_max, source: annual/ls8day/data/NDVI_winter_max}
+      - name: temporal_position               # in [0,1]
+        formula: "t / (T - 1)" #T is inferred from time_window
+
+  
+  static:
+    type: float16
+    dim: [C,H,W]
+    channels:
+      - {name: elevation, source: static/topo/data/elevation}
+      - {name: slope, source: static/topo/data/slope_deg}
+      - {name: northness, source: static/topo/data/northness}
+      - {name: eastness, source: static/topo/data/eastness}
+      - {name: hand, source: static/topo/data/HAND}
+      - {name: twi, source: static/topo/data/TWI}
+      - {name: tpi, source: static/topo/data/TPI_500m}
+      - {name: ksat, source: static/topo/data/ksat_log10_0_5}
+      - {name: mean_green, source: static/ccdc_metrics_history/data/mean_green, fill_value: -9999}
+      - {name: mean_red,   source: static/ccdc_metrics_history/data/mean_red, fill_value: -9999}
+      - {name: mean_nir, source: static/ccdc_metrics_history/data/mean_nir, fill_value: -9999}
+      - {name: mean_swir1, source: static/ccdc_metrics_history/data/mean_swir1, fill_value: -9999}
+      - {name: mean_swir2, source: static/ccdc_metrics_history/data/mean_swir2, fill_value: -9999}
+      - {name: mean_ndvi, source: static/ccdc_metrics_history/data/mean_ndvi, fill_value: -9999}
+      - {name: mean_nbr,  source: static/ccdc_metrics_history/data/mean_nbr,  fill_value: -9999}
+      - {name: mean_ndmi, source: static/ccdc_metrics_history/data/mean_ndmi, fill_value: -9999}
+      - {name: mean_seasonal_amp_red, source: static/ccdc_metrics_history/data/mean_seasonal_amp_red, fill_value: -9999}
+      - {name: mean_seasonal_amp_nir,  source: static/ccdc_metrics_history/data/mean_seasonal_amp_nir,  fill_value: -9999}
+      - {name: mean_seasonal_amp_swir1, source: static/ccdc_metrics_history/data/mean_seasonal_amp_swir1, fill_value: -9999}
+      - {name: mean_seasonal_amp_swir2, source: static/ccdc_metrics_history/data/mean_seasonal_amp_swir2, fill_value: -9999}
+      - {name: spectral_distance_per_decade,  source: static/ccdc_metrics_history/data/spectral_distance_per_decade,  fill_value: -9999}
+      - {name: mean_decline_rate, source: static/ccdc_metrics_history/data/mean_decline_rate, fill_value: -9999}
+      - {name: num_segments, source: static/ccdc_metrics_history/data/num_segments, fill_value: -9999}
+      
+      
+
+# -------------------------------------------------------------------
+# Normalization policies
+# -------------------------------------------------------------------
+normalization:
+  # Use stats embedded in Zarr (you already compute/export them)
+  presets:
+    # Standard z-score using mean/sd from zarr stats
+    zscore:
+      type: zscore
+      stats_source: zarr
+      fields: {mean: mean, std: sd}
+      clamp: {enabled: true, min: -6.0, max: 6.0}
+
+    # Robust scaling using median/IQR from zarr stats
+    robust_iqr:
+      type: robust_iqr
+      stats_source: zarr
+      fields: {q25: q25, q50: q50, q75: q75}
+      clamp: {enabled: true, min: -8.0, max: 8.0}
+
+    # Probabilities already [0,1]
+    prob01:
+      type: clamp
+      clamp: {enabled: true, min: 0.0, max: 1.0}
+
+    # Masks/booleans as-is
+    identity:
+      type: none
+
+    # Bounded trig. Just clamps to -1,1 For Northness and Eastness which are already -1,1
+    trig:
+      type: clamp
+      clamp: {enabled: true, min: -1.0, max: 1.0}
+
+    # Fixed min-max scaling (for ages, durations, etc.)
+    minmax_0_40:
+      type: linear_rescale
+      stats_source: fixed
+      in_min: 0.0
+      in_max: 40.0
+      out_min: 0.0
+      out_max: 1.0
+      clamp: {enabled: true, min: 0.0, max: 1.0}
+
+    # Fixed scaling for year-to-year deltas in NDVI-like indices
+    # Keeps loader simple (no derived-stats pass).
+    delta_ls8_fixed:
+      type: linear_rescale
+      stats_source: fixed
+      in_min: -0.4
+      in_max: 0.4
+      out_min: -1.0
+      out_max: 1.0
+      clamp: {enabled: true}
+
+
+
+features:
+  topo:
+    dim: [C,H,W]
+    channels: 
+      static.elevation: {mask: static_mask.dem_mask, quality: none, norm: zscore}
+      static.slope: {mask: static_mask.dem_mask, quality: none, norm: zscore}
+      static.northness: {mask: static_mask.dem_mask, quality: none, norm: zscore}
+      static.eastness: {mask: static_mask.dem_mask, quality: none, norm: zscore}
+  ccdc_history:
+    dim: [C,H,W]
+    channels:
+      static.mean_green: {norm: robust_iqr}
+      static.mean_red: {norm: robust_iqr}
+      static.mean_nir: {norm: robust_iqr}
+      static.mean_swir1: {norm: robust_iqr}
+      static.mean_swir2: {norm: robust_iqr}
+      static.mean_ndvi: {norm: robust_iqr}
+      static.mean_nbr: {norm: robust_iqr}
+      static.mean_ndmi: {norm: robust_iqr}
+      static.mean_seasonal_amp_red: {norm: robust_iqr}
+      static.mean_seasonal_amp_nir: {norm: robust_iqr}
+      static.mean_seasonal_amp_swir1: {norm: robust_iqr}
+      static.mean_seasonal_amp_swir2: {norm: robust_iqr}
+      static.spectral_distance_per_decade: {norm: robust_iqr}
+      static.mean_decline_rate: {norm: robust_iqr}
+      static.num_segments: {norm: robust_iqr}
+  infonce_type_spectral:
+    dim: [C,H,W]
+    channels:
+      static.mean_red: {norm: zscore}
+      static.mean_nir: {norm: zscore}
+      static.mean_swir1: {norm: zscore}
+      static.mean_swir2: {norm: zscore}
+      static.mean_ndvi: {norm: zscore}
+      static.mean_nbr: {norm: zscore}
+      static.mean_ndmi: {norm: zscore}
+    covariance:
+      dim: [C,C]
+      calculate: true
+      stat_domain: patch # options are patch stats vs global stats
+  infonce_type_topo:
+    dim: [C,H,W]    
+    channels:
+      - static.elevation: {norm: zscore}
+      - static.northness: {norm: zscore}
+    masks:
+      - static_mask.aoi
+      - static_mask.forest
+      - static_mask.dem_mask
+    covariance: 
+      dim: [C,C]      
+      calculate: true
+      stat_domain: patch
+  phase_ls8:
+    dim: [C,T,H,W]
+    channels:
+      derived.temporal_position: {norm: identity}
+      annual.evi2_summer_p95: {norm: zscore}
+      annual.nbr_annual_min: {norm: zscore}
+      annual.nbr_summer_p95: {norm: zscore}
+      annual.ndmi_summer_mean: {norm: zscore}
+      annual.ndvi_amplitude: {norm: zscore}
+      annual.ndvi_summer_p95: {norm: zscore}
+      annual.ndvi_winter_max: {norm: zscore}
+
+######################
+# Losses template
+# name:
+#   mask: list of masks and quality to apply. multiply
+#   type: infonce
+#   distance: coordinate or context
+#   if feature:
+#     context_feature: feature for distance calculation
+#     covariance: true/false if true: the config knows how to find it for the context feature
+#   Sampling strategy
+#      positive_strategy: str = 'radius',   # 'radius', 'quantile', 'topk', 'mknn'
+#      negative_strategy: str = 'hard',     # 'hard', 'random', 'semihard'
+    
+# Define some pixel sompling strategies within a patch
+sampling-strategy:
+  patch:
+    interior-only: true
+    border_width: 16  
+  
+  grid:
+    stride: 16              # 16×16 = 256 pixels per patch
+    exclude_border: 16      # Exclude edge pixels
+    jitter: # randomly jitter the origin of the grid. 
+      radius: 4               # jitter starting point by +/- 
+      
+    
+  grid-plus-supplement:
+    grid:
+      stride: 16              # 16×16 = 256 pixels per patch
+      exclude_border: 16      # Exclude edge pixels
+      jitter: 
+        radius: 4               # jitter starting point by +/- 
+    supplement:
+      n: 104
+      sampling:
+        type: weighted
+        weight_by: # Multiply multiple weights/qualities.
+          - static_mask.aoi
+          - static_mask.forest
+
+losses:
+  # Ecological similarity (context-driven)
+  infonce_type_spectral:
+    weight: 1.0
+    type: infonce
+    mask: 
+      - static_mask.aoi
+      - static_mask.forest
+    
+    # Distance metric for selecting positives/negatives
+    auxiliary_distance: 
+      feature: features.infonce_type_spectral
+      metric: l2
+      covariance: true  # Mahalanobis (L2 in whitened space)
+    
+    anchor:
+      population: grid-plus-supplement
+    
+    positive_strategy:
+      candidates: anchors
+      distance: auxiliary
+      selection:
+        type: mutual-knn
+        k: 16
+        min_distance: 4  # Prevent trivial spatial neighbors
+    
+    negative_strategy:
+      candidates: anchors
+      distance: auxiliary
+      selection:
+        type: quantile
+        range: [0.5, 0.75]
+        min_distance: 8
+  
+  # Spatial smoothness (coordinate-driven)
+  infonce_type_spatial:
+    weight: 1.0
+    type: infonce
+    mask: 
+      - static_mask.aoi
+      - static_mask.forest
+    
+    # Distance: pixel coordinates (implicit in spatial-knn)
+    
+    anchor: 
+      population: grid
+    
+    positive_strategy:
+      candidates: patch
+      selection:
+        type: spatial-knn
+        k: 4
+        min_distance: 1  # Not self
+        max_distance: 8  # Local neighborhood only
+    
+    negative_strategy:
+      candidates: patch
+      selection:
+        type: spatial-quantile
+        range: [0.65, 0.90]  # Far away (not middle)
+        min_distance: 16        
+        
