@@ -1,0 +1,420 @@
+# VA VAE Dataset Configuration
+# Schema version: 1.0.0
+# Last updated: 2025-12-26
+# Build a zarr for downstream learning model
+# Data are in three types: continuous time, snapshot time, and static (do not broadcast)
+# The time dimension of the zarr has a start and end. Some time continuous layers may be longer than that
+# so they will have to be clipped to the start:end of the zarr. Some time continous layers may be shorter
+# that that, and will need to be temporally padded
+
+dataset:
+  name: va_vae_raster_dataset
+  version: "1.0.0"
+  
+  out_zarr:
+    path: /data/VA/processed2/va_vae_dataset.zarr
+    structure: hierarchical
+  
+  # Spatial reference system and extent
+  spatial:
+    # Target CRS (all inputs reprojected to this)
+    crs:
+      # Option 1: EPSG code (if available)
+      # epsg: 5070  # NAD83 / Conus Albers (close to your custom)
+      
+      # Option 2: Well-Known Text (WKT) - most explicit
+      wkt: |
+        PROJCS["AEA_WGS84",
+          GEOGCS["GCS_WGS_1984",
+            DATUM["WGS_1984",
+              SPHEROID["WGS_84",6378137,298.257223563]],
+            PRIMEM["Greenwich",0],
+            UNIT["Degree",0.0174532925199433]],
+          PROJECTION["Albers_Conic_Equal_Area"],
+          PARAMETER["False_Easting",0],
+          PARAMETER["False_Northing",0],
+          PARAMETER["Central_Meridian",-96],
+          PARAMETER["Standard_Parallel_1",29.5],
+          PARAMETER["Standard_Parallel_2",45.5],
+          PARAMETER["Latitude_Of_Origin",23],
+          UNIT["Meter",1]]
+      
+      # Option 3: PROJ string (alternative)
+      # proj4: "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    
+    # Spatial extent and resolution
+    resolution: 30  # meters
+    
+    # Geotransform: [pixel_width, rotation, x_origin, rotation, pixel_height, y_origin]
+    transform: [30, 0, 1089315, 0, -30, 1966485]
+    
+    # Bounding box in target CRS coordinates
+    bounds:
+      xmin: 1089315
+      ymin: 1574805
+      xmax: 1795875
+      ymax: 1966485
+      # Dimensions: 23552 x 13056 pixels (706560m x 391680m)
+      # Grid is multiple of 256: 92 x 51 tiles
+  # dtype to use for data. Coerce if necessary
+  dtype:
+    default: float16
+    continuous: float16
+    categorical: int16
+    mask: uint8
+  default_chunk: 
+    annual: {time: 1, y: 256, x: 256, bands: all}  
+    irregular: {time: 1, y: 256, x: 256, bands: all}
+    static: {y: 256, x: 256, bands: all}
+  compressor:
+    name: blosc
+    cname: lz4
+    clevel: 3
+    shuffle: 2
+  time:
+    continuous: {start: 2010, end: 2024}
+  # Statistics to calculate for each band:
+  statistics:
+    spatial_mask: aoi  # Use AOI to mask out pixels when computing stats
+    continuous: [mean, sd, min, q02, q25, q50, q75, q98, max]
+    categorical: histogram
+    boolean: [true_count, false_count, true_fraction]
+    embed_in_zarr: true
+    export_json: true
+    export_csv: true
+  reprojection:
+    enabled: true
+    # CRS matching strategy:
+    # - exact: CRS must match exactly (EPSG:5070 ≠ WGS84 Albers)
+    # - projection: Same projection + params OK, ignore datum differences
+    # - disabled: Always reproject to target CRS
+    crs_match_mode: projection  # Ignore WGS84 vs NAD83 difference
+    # If CRS differs, or resolution/alignment off:
+    resolution_tolerance_m: 1.0
+    interpolation: nearest
+
+aoi:
+  type: static
+  path: /data/VA/main/va_mask.tif
+strata:
+  type: static
+  path: /data/VA/main/va_strata.tif
+annual:
+  - group: ls8day
+    path: /data/VA/ls8day/ls8day_metrics_{yyyy}.vrt
+    years:
+      start: 2010
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: NDVI_summer_p95
+          source_band: 1
+        - id: NDVI_winter_max
+          source_band: 2
+        - id: NDVI_amplitude
+          source_band: 3
+        - id: NBR_annual_min
+          source_band: 4
+        - id: NBR_summer_p95
+          source_band: 5
+        - id: NDMI_summer_mean
+          source_band: 6
+        - id: EVI2_summer_p95
+          source_band: 7
+    quality:
+      semantic_type: continuous
+      bands:
+        - id: winter_obs_count
+          source_band: 8
+        - id: summer_obs_count
+          source_band: 9
+  - group: lcms_chg
+    years:
+      start: 1985
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: lcms_chg_p_fastloss
+          path: /data/VA/lcms/lcms_chg_p_fastloss_1985_2024.vrt
+        - id: lcms_chg_p_gain
+          path: /data/VA/lcms/lcms_chg_p_gain_1985_2024.vrt 
+        - id: lcms_chg_p_slowloss
+          path: /data/VA/lcms/lcms_chg_p_slowloss_1985_2024.vrt
+  - group: lcms_lc_p
+    years: 
+      start: 1985
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: lcms_lc_p_barren_impervious
+          path: /data/VA/lcms/lcms_lc_p_barren_impervious_1985_2024.vrt
+        - id: lcms_lc_p_barren_treesmix
+          path: /data/VA/lcms/lcms_lc_p_barren_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_grassforb_treesmix
+          path: /data/VA/lcms/lcms_lc_p_grassforb_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_shrubs
+          path: /data/VA/lcms/lcms_lc_p_shrubs_1985_2024.vrt 
+        - id: lcms_lc_p_shrubs_treesmix
+          path: /data/VA/lcms/lcms_lc_p_shrubs_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_tallshrubs
+          path: /data/VA/lcms/lcms_lc_p_tallshrubs_1985_2024.vrt
+        - id: lcms_lc_p_tallshrubs_treesmix
+          path: /data/VA/lcms/lcms_lc_p_tallshrubs_treesmix_1985_2024.vrt
+        - id: lcms_lc_p_trees
+          path: /data/VA/lcms/lcms_lc_p_trees_1985_2024.vrt
+        - id: lcms_lc_p_water
+          path: /data/VA/lcms/lcms_lc_p_water_1985_2024.vrt
+  - group: lcms_lu_p
+    years: 
+      start: 1985
+      end: 2024
+    data:
+      semantic_type: continuous
+      bands:
+        - id: lcms_lu_p_ag
+          path: /data/VA/lcms/lcms_lu_p_ag_1985_2024.vrt
+        - id: lcms_lu_p_dev
+          path: /data/VA/lcms/lcms_lu_p_dev_1985_2024.vrt
+        - id: lcms_lu_p_forest
+          path: /data/VA/lcms/lcms_lu_p_forest_1985_2024.vrt
+        - id: lcms_lu_p_rangeland_pasture
+          path: /data/VA/lcms/lcms_lu_p_rangeland_pasture_1985_2024.vrt
+  - group: lcms_q_interp
+    years:
+      start: 1984
+      end: 2024
+    mask:
+      semantic_type: mask
+      bands:
+        - id: lcms_qa_interp
+          path: /data/VA/lcms/lcms_qa_interp_1985_2024.vrt
+irregular:
+  - group: naip
+    path: /data/VA/naip/naip_{yyyy}.vrt
+    years: [2011,2012,2014,2016,2018,2021,2023]
+    data:
+      semantic_type: continuous
+      bands:
+        - id: NDVI
+          source_band: 1
+        - id: NIR_var_7m
+          source_band: 2
+        - id: NIR_var_15m
+          source_band: 3
+        - id: NIR_ent_21m
+          source_band: 4
+        - id: NIR_lac_21m
+          source_band: 5
+        - id: NIR_var_15m
+          source_band: 6
+    quality:
+      semantic_type: continuous
+      bands:
+        - id: DOY
+          source_band: 7
+static:
+  - group: evt
+    path: /data/VA/evt/evt.tif
+    data:
+      semantic_type: categorical
+      bands:
+        - id: evt
+          source_band: 1
+  - group: topo
+    path: /data/VA/topo/topo_soils_features.vrt
+    data:
+      semantic_type: continuous
+      bands:
+        - id: elevation
+          source_band: 1
+        - id: slope_deg
+          source_band: 2
+        - id: northness
+          source_band: 3
+        - id: eastness
+          source_band: 4
+        - id: HAND
+          source_band: 5
+        - id: TWI
+          source_band: 6
+        - id: TPI_500m
+          source_band: 7
+        - id: ksat_log10_0_5
+          source_band: 8
+  - group: soils_masks
+    path: /data/VA/topo/topo_soils_masks.tif
+    mask:
+      semantic_type: mask
+      bands:
+        - id: dem_mask
+          source_band: 1
+        - id: tpi_mask
+          source_band: 2
+        - id: hand_mask
+          source_band: 3
+        - id: twi_mask
+          source_band: 4
+        - id: ksat_mask
+          source_band: 5
+  - group: ccdc_metrics
+    path: /data/VA/ccdc/ccdc_metrics_1986_2024.vrt
+    data:
+      semantic_type: continuous
+      bands:
+        # Section 1: Current State (8 bands)
+        - id: current_green
+          source_band: 1
+        - id: current_red
+          source_band: 2
+        - id: current_nir
+          source_band: 3
+        - id: current_swir1
+          source_band: 4
+        - id: current_swir2
+          source_band: 5
+        - id: current_ndvi
+          source_band: 6
+        - id: current_nbr
+          source_band: 7
+        - id: current_ndmi
+          source_band: 8
+        # Section 1b: Current Harmonics (4 bands)
+        - id: current_seasonal_amp_red
+          source_band: 9
+        - id: current_seasonal_amp_nir
+          source_band: 10
+        - id: current_seasonal_amp_swir1
+          source_band: 11
+        - id: current_seasonal_amp_swir2
+          source_band: 12
+        # Section 2: Current Trajectory (4 bands)
+        - id: current_slope_ndvi
+          source_band: 13
+        - id: current_spectral_velocity
+          source_band: 14
+        - id: current_segment_duration
+          source_band: 15
+        - id: current_rmse_mean
+          source_band: 16
+        # Section 3: Long-term State (13 bands)
+        - id: mean_green
+          source_band: 17
+        - id: mean_red
+          source_band: 18
+        - id: mean_nir
+          source_band: 19
+        - id: mean_swir1
+          source_band: 20
+        - id: mean_swir2
+          source_band: 21
+        - id: mean_ndvi
+          source_band: 22
+        - id: mean_nbr
+          source_band: 23
+        - id: mean_ndmi
+          source_band: 24
+        - id: mean_seasonal_amp_red
+          source_band: 25
+        - id: mean_seasonal_amp_nir
+          source_band: 26
+        - id: mean_seasonal_amp_swir1
+          source_band: 27
+        - id: mean_seasonal_amp_swir2
+          source_band: 28
+        # Section 3b: Harmonic Quality & Consistency (12 bands)
+        - id: mean_seasonal_snr_red
+          source_band: 29
+        - id: mean_seasonal_snr_nir
+          source_band: 30
+        - id: mean_seasonal_snr_swir1
+          source_band: 31
+        - id: mean_seasonal_snr_swir2
+          source_band: 32
+        - id: variance_seasonal_amp_red
+          source_band: 33
+        - id: variance_seasonal_amp_nir
+          source_band: 34
+        - id: variance_seasonal_amp_swir1
+          source_band: 35
+        - id: variance_seasonal_amp_swir2
+          source_band: 36
+        - id: max_seasonal_amp_nir
+          source_band: 37
+        - id: net_change_seasonal_amp_nir
+          source_band: 38
+        - id: max_seasonal_amp_swir1
+          source_band: 39
+        - id: net_change_seasonal_amp_swir1
+          source_band: 40
+        # Section 4: Long-term Trajectory (7 bands)
+        - id: total_spectral_distance
+          source_band: 41
+        - id: spectral_distance_per_decade
+          source_band: 42
+        - id: mean_spectral_velocity
+          source_band: 43
+        - id: net_change_ndvi
+          source_band: 44
+        - id: net_change_nir
+          source_band: 45
+        - id: mean_recovery_rate
+          source_band: 46
+        - id: mean_decline_rate
+          source_band: 47
+        # Section 5: Disturbance History (11 bands)
+        - id: num_segments
+          source_band: 48
+        - id: break_count
+          source_band: 49
+        - id: break_rate_per_decade
+          source_band: 50
+        - id: years_since_last_break
+          source_band: 51
+        - id: mean_segment_duration
+          source_band: 52
+        - id: max_segment_duration
+          source_band: 53
+        - id: min_segment_duration
+          source_band: 54
+        - id: mean_break_magnitude
+          source_band: 55
+        - id: max_break_magnitude
+          source_band: 56
+        # Section 6: Variability (5 bands)
+        - id: variance_ndvi
+          source_band: 57
+        - id: variance_nir
+          source_band: 58
+        - id: cv_segment_duration
+          source_band: 59
+        - id: mean_rmse_joint
+          source_band: 60
+        - id: max_rmse_joint
+          source_band: 61
+        # Section 7: Rapid Loss Events (6 bands)
+        - id: rapid_loss_rate_per_decade
+          source_band: 62
+        - id: rapid_loss_mean_magnitude
+          source_band: 63
+        - id: rapid_loss_year_1
+          source_band: 64
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_2
+          source_band: 65
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_3
+          source_band: 66
+          fill_value: {source: -9999, target: na}
+        - id: rapid_loss_year_4
+          source_band: 67
+          fill_value: {source: -9999, target: na}
+        # Section 8: Loss Recovery Metrics (2 bands)
+        - id: mean_loss_recovery_duration
+          source_band: 68
+          fill_value: {source: -9999, target: na}
+        - id: std_loss_recovery_duration
+          source_band: 69
+          fill_value: {source: -9999, target: na}
