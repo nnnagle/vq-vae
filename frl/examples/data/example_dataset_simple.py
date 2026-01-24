@@ -13,7 +13,7 @@ config = DatasetBindingsParser('config/frl_binding_v1.yaml').parse()
 # Create dataset
 dataset = ForestDatasetV2(
     config,
-    split='train',
+    split=None,
     patch_size=256,
     epoch_mode='number',
     sample_number=5,  # Just 5 samples for quick test
