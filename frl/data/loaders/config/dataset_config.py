@@ -173,6 +173,65 @@ class ZarrConfig:
 
 
 @dataclass
+class StatsConfig:
+    """Configuration for statistics computation."""
+    compute: str  # 'always', 'if-not-exists', 'never'
+    type: str  # 'json'
+    file: str  # Path to stats file
+    stats: List[str]  # List of stat names: ['mean', 'sd', 'q02', ...]
+    covariance: bool  # Whether to compute covariance
+    samples: Dict[str, int]  # {'n': 16}
+    mask: List[str]  # List of mask references: ['static_mask.aoi', 'static_mask.forest']
+
+
+@dataclass
+class NormalizationPresetConfig:
+    """Configuration for a normalization preset."""
+    name: str
+    type: str  # 'zscore', 'robust_iqr', 'clamp', 'none', 'linear_rescale'
+    stats_source: Optional[str] = None  # 'zarr', 'fixed', None
+    fields: Optional[Dict[str, str]] = None  # {'mean': 'mean', 'std': 'sd'}
+    clamp: Optional[Dict[str, Any]] = None  # {'enabled': true, 'min': -6.0, 'max': 6.0}
+    # For linear_rescale
+    in_min: Optional[float] = None
+    in_max: Optional[float] = None
+    out_min: Optional[float] = None
+    out_max: Optional[float] = None
+
+
+@dataclass
+class FeatureChannelConfig:
+    """Configuration for a single channel within a feature."""
+    dataset_group: str  # 'static', 'annual', etc.
+    channel_name: str  # 'elevation', 'evi2_summer_p95', etc.
+    mask: Optional[str] = None  # 'static_mask.dem_mask'
+    quality: Optional[str] = None  # Quality mask (not used yet)
+    norm: Optional[str] = None  # Normalization preset name
+
+
+@dataclass
+class CovarianceConfig:
+    """Configuration for covariance computation."""
+    dim: List[str]  # ['C', 'C']
+    calculate: bool  # Whether to compute
+    stat_domain: str  # 'patch' or 'global'
+
+
+@dataclass
+class FeatureConfig:
+    """Configuration for a feature (collection of channels with processing)."""
+    name: str
+    dim: List[str]  # ['C', 'H', 'W'] or ['C', 'T', 'H', 'W']
+    channels: Dict[str, FeatureChannelConfig]  # channel_ref -> config
+    masks: Optional[List[str]] = None  # Feature-level masks
+    covariance: Optional[CovarianceConfig] = None
+
+    def get_channel_list(self) -> List[str]:
+        """Get ordered list of channel references."""
+        return list(self.channels.keys())
+
+
+@dataclass
 class BindingsConfig:
     """Top-level bindings configuration.
 
@@ -184,12 +243,26 @@ class BindingsConfig:
     time_window: TimeWindowConfig
     dataset_groups: Dict[str, DatasetGroupConfig]
 
-    # Optional stats configuration (for future use)
-    stats: Optional[Dict[str, Any]] = None
+    # Optional sections
+    stats: Optional[StatsConfig] = None
+    normalization_presets: Optional[Dict[str, NormalizationPresetConfig]] = None
+    features: Optional[Dict[str, FeatureConfig]] = None
 
     def get_group(self, name: str) -> Optional[DatasetGroupConfig]:
         """Get a dataset group by name."""
         return self.dataset_groups.get(name)
+
+    def get_feature(self, name: str) -> Optional[FeatureConfig]:
+        """Get a feature by name."""
+        if self.features is None:
+            return None
+        return self.features.get(name)
+
+    def get_normalization_preset(self, name: str) -> Optional[NormalizationPresetConfig]:
+        """Get a normalization preset by name."""
+        if self.normalization_presets is None:
+            return None
+        return self.normalization_presets.get(name)
 
     def get_all_source_paths(self) -> List[str]:
         """Get all unique zarr source paths referenced in the config."""

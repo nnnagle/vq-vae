@@ -1,13 +1,5 @@
-from .online_covariance_computer import (
-    OnlineCovarianceComputer,
-    OnlineStatsComputer,
-    compute_masked_covariance_online
-)
-from .derived_statistics_loader import DerivedStatsLoader
+"""Statistics computation for forest dataset features."""
 
-__all__ = [
-  "OnlineCovarianceComputer",
-  "OnlineStatsComputer",
-  "compute_masked_covariance_online",
-  "DerivedStatsLoader",
-]
+from .stats_calculator import StatsCalculator, compute_stats_from_config
+
+__all__ = ['StatsCalculator', 'compute_stats_from_config']

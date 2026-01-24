@@ -15,6 +15,11 @@ from .dataset_config import (
     TimeWindowConfig,
     DatasetGroupConfig,
     ChannelConfig,
+    StatsConfig,
+    NormalizationPresetConfig,
+    FeatureConfig,
+    FeatureChannelConfig,
+    CovarianceConfig,
 )
 
 
@@ -72,8 +77,10 @@ class DatasetBindingsParser:
             # Parse dataset groups
             dataset_groups = self._parse_dataset_groups()
 
-            # Parse optional stats configuration
-            stats = self.raw_config.get('stats', None)
+            # Parse optional sections
+            stats = self._parse_stats() if 'stats' in self.raw_config else None
+            normalization_presets = self._parse_normalization() if 'normalization' in self.raw_config else None
+            features = self._parse_features() if 'features' in self.raw_config else None
 
             return BindingsConfig(
                 version=version,
@@ -82,6 +89,8 @@ class DatasetBindingsParser:
                 time_window=time_window,
                 dataset_groups=dataset_groups,
                 stats=stats,
+                normalization_presets=normalization_presets,
+                features=features,
             )
 
         except Exception as e:
@@ -234,4 +243,167 @@ class DatasetBindingsParser:
             time=time,
             ok_if=ok_if,
             fill_value=fill_value,
+        )
+
+    def _parse_stats(self) -> StatsConfig:
+        """Parse stats configuration."""
+        stats_dict = self.raw_config.get('stats')
+        if not stats_dict:
+            raise BindingsParseError("Missing 'stats' section")
+
+        compute = stats_dict.get('compute', 'if-not-exists')
+        type_ = stats_dict.get('type', 'json')
+        file = stats_dict.get('file')
+        if not file:
+            raise BindingsParseError("stats.file is required")
+
+        stats_list = stats_dict.get('stats', [])
+        if not isinstance(stats_list, list):
+            raise BindingsParseError("stats.stats must be a list")
+
+        covariance = stats_dict.get('covariance', False)
+        samples = stats_dict.get('samples', {})
+        mask = stats_dict.get('mask', [])
+
+        return StatsConfig(
+            compute=compute,
+            type=type_,
+            file=file,
+            stats=stats_list,
+            covariance=covariance,
+            samples=samples,
+            mask=mask,
+        )
+
+    def _parse_normalization(self) -> Dict[str, NormalizationPresetConfig]:
+        """Parse normalization presets."""
+        norm_dict = self.raw_config.get('normalization', {})
+        presets_dict = norm_dict.get('presets', {})
+
+        presets = {}
+        for preset_name, preset_spec in presets_dict.items():
+            presets[preset_name] = NormalizationPresetConfig(
+                name=preset_name,
+                type=preset_spec.get('type', 'none'),
+                stats_source=preset_spec.get('stats_source'),
+                fields=preset_spec.get('fields'),
+                clamp=preset_spec.get('clamp'),
+                in_min=preset_spec.get('in_min'),
+                in_max=preset_spec.get('in_max'),
+                out_min=preset_spec.get('out_min'),
+                out_max=preset_spec.get('out_max'),
+            )
+
+        return presets
+
+    def _parse_features(self) -> Dict[str, FeatureConfig]:
+        """Parse features configuration."""
+        features_dict = self.raw_config.get('features', {})
+
+        features = {}
+        for feature_name, feature_spec in features_dict.items():
+            features[feature_name] = self._parse_feature(feature_name, feature_spec)
+
+        return features
+
+    def _parse_feature(self, feature_name: str, feature_spec: Dict[str, Any]) -> FeatureConfig:
+        """Parse a single feature.
+
+        Args:
+            feature_name: Name of the feature
+            feature_spec: Dictionary with feature specification
+
+        Returns:
+            FeatureConfig object
+        """
+        # Parse dim
+        dim = feature_spec.get('dim')
+        if not dim:
+            raise BindingsParseError(f"Feature '{feature_name}' missing 'dim'")
+
+        # Parse channels
+        channels_spec = feature_spec.get('channels')
+        if not channels_spec:
+            raise BindingsParseError(f"Feature '{feature_name}' missing 'channels'")
+
+        # Channels can be either a dict or a list
+        channels = {}
+        if isinstance(channels_spec, dict):
+            # Dict format: {channel_ref: {mask: ..., norm: ...}}
+            for channel_ref, channel_config in channels_spec.items():
+                channels[channel_ref] = self._parse_feature_channel(channel_ref, channel_config)
+        elif isinstance(channels_spec, list):
+            # List format: [{dataset.channel: {mask: ..., norm: ...}}]
+            for item in channels_spec:
+                if not isinstance(item, dict):
+                    raise BindingsParseError(
+                        f"Feature '{feature_name}' channel must be a dict, got {type(item)}"
+                    )
+                # Each item should have exactly one key
+                if len(item) != 1:
+                    raise BindingsParseError(
+                        f"Feature '{feature_name}' channel dict must have exactly one key"
+                    )
+                channel_ref = list(item.keys())[0]
+                channel_config = item[channel_ref]
+                channels[channel_ref] = self._parse_feature_channel(channel_ref, channel_config)
+        else:
+            raise BindingsParseError(
+                f"Feature '{feature_name}' channels must be dict or list, got {type(channels_spec)}"
+            )
+
+        # Parse optional masks
+        masks = feature_spec.get('masks')
+
+        # Parse optional covariance
+        covariance = None
+        if 'covariance' in feature_spec:
+            cov_spec = feature_spec['covariance']
+            covariance = CovarianceConfig(
+                dim=cov_spec.get('dim', ['C', 'C']),
+                calculate=cov_spec.get('calculate', False),
+                stat_domain=cov_spec.get('stat_domain', 'patch'),
+            )
+
+        return FeatureConfig(
+            name=feature_name,
+            dim=dim,
+            channels=channels,
+            masks=masks,
+            covariance=covariance,
+        )
+
+    def _parse_feature_channel(
+        self,
+        channel_ref: str,
+        channel_config: Dict[str, Any]
+    ) -> FeatureChannelConfig:
+        """Parse a single feature channel reference.
+
+        Args:
+            channel_ref: Channel reference like 'static.elevation' or 'annual.evi2_summer_p95'
+            channel_config: Configuration dict with mask, quality, norm
+
+        Returns:
+            FeatureChannelConfig object
+        """
+        # Parse channel reference (format: dataset_group.channel_name)
+        parts = channel_ref.split('.')
+        if len(parts) != 2:
+            raise BindingsParseError(
+                f"Channel reference must be 'dataset_group.channel_name', got '{channel_ref}'"
+            )
+        dataset_group, channel_name = parts
+
+        # Parse optional fields
+        mask = channel_config.get('mask')
+        quality = channel_config.get('quality')
+        norm = channel_config.get('norm')
+
+        return FeatureChannelConfig(
+            dataset_group=dataset_group,
+            channel_name=channel_name,
+            mask=mask,
+            quality=quality,
+            norm=norm,
         )
