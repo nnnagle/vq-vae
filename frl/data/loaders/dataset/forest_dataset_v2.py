@@ -18,7 +18,6 @@ from ..config.dataset_config import (
     ChannelConfig,
 )
 from ..config.dataset_bindings_parser import DatasetBindingsParser
-from .forest_patch_sampler import ForestPatchSampler, SamplerConfig
 from ..readers.windows import SpatialWindow
 
 
@@ -80,26 +79,23 @@ class ForestDatasetV2(Dataset):
         # Determine zarr temporal metadata (if any temporal arrays exist)
         self._infer_zarr_temporal_metadata()
 
-        # Initialize spatial sampler (reuses existing logic)
-        sampler_config = SamplerConfig(
-            zarr_path=str(self.zarr_path),
-            aoi_zarr_group='',  # AOI at root level
-            aoi_zarr_array='aoi',
+        # Build simple patch sampler
+        self.patches = self._build_patch_list(
             patch_size=patch_size,
-            block_height=4,
-            block_width=4,
-            use_debug_window=debug_window is not None,
-            window_origin=debug_window[0] if debug_window else None,
-            window_size=debug_window[1] if debug_window else None,
-            endpoint_years=[config.time_window.end],  # Single endpoint
-            anchor_weights={config.time_window.end: 1.0},
-            epoch_mode=epoch_mode,
-            sample_frac=sample_frac,
-            sample_number=sample_number,
             min_aoi_fraction=min_aoi_fraction,
+            debug_window=debug_window,
         )
 
-        self.sampler = ForestPatchSampler(sampler_config, split=split)
+        # Apply train/val/test split
+        if split is not None:
+            self.patches = self._filter_by_split(self.patches, split)
+
+        # Setup epoch sampling
+        self.epoch_mode = epoch_mode
+        self.sample_frac = sample_frac
+        self.sample_number = sample_number
+        self._current_indices = list(range(len(self.patches)))
+        np.random.shuffle(self._current_indices)
 
     def _validate_sources(self):
         """Validate that all source paths exist in zarr.
@@ -184,13 +180,127 @@ class ForestDatasetV2(Dataset):
             node = node[part]
         return node
 
+    def _build_patch_list(
+        self,
+        patch_size: int,
+        min_aoi_fraction: float,
+        debug_window: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+    ) -> List[SpatialWindow]:
+        """Build list of valid spatial patches.
+
+        Args:
+            patch_size: Size of patches in pixels
+            min_aoi_fraction: Minimum fraction of valid AOI pixels
+            debug_window: Optional ((row, col), (height, width)) to restrict spatial extent
+
+        Returns:
+            List of SpatialWindow objects for valid patches
+        """
+        # Load AOI mask
+        aoi = self._get_zarr_array('aoi')[:]
+        full_height, full_width = aoi.shape
+
+        # Determine spatial extent
+        if debug_window is not None:
+            (row_start, col_start), (height, width) = debug_window
+            row_end = row_start + height
+            col_end = col_start + width
+        else:
+            row_start, col_start = 0, 0
+            row_end, col_end = full_height, full_width
+
+        # Build grid of patches
+        patches = []
+        for row in range(row_start, row_end, patch_size):
+            for col in range(col_start, col_end, patch_size):
+                # Create spatial window
+                actual_height = min(patch_size, row_end - row)
+                actual_width = min(patch_size, col_end - col)
+
+                window = SpatialWindow(
+                    row_start=row,
+                    col_start=col,
+                    height=actual_height,
+                    width=actual_width,
+                )
+
+                # Check AOI coverage
+                patch_aoi = aoi[row:row+actual_height, col:col+actual_width]
+                aoi_frac = patch_aoi.sum() / patch_aoi.size
+
+                if aoi_frac >= min_aoi_fraction:
+                    patches.append(window)
+
+        return patches
+
+    def _filter_by_split(
+        self,
+        patches: List[SpatialWindow],
+        split: str,
+    ) -> List[SpatialWindow]:
+        """Filter patches by train/val/test split using checkerboard pattern.
+
+        Args:
+            patches: List of all valid patches
+            split: 'train', 'val', or 'test'
+
+        Returns:
+            Filtered list of patches
+        """
+        # Deterministic split using checkerboard pattern
+        # Based on global patch indices (not debug window indices)
+        patch_size = self.patch_size
+        block_height, block_width = 4, 4  # 4x4 block grid
+
+        split_codes = {'train': 1, 'val': 2, 'test': 3}
+        target_code = split_codes[split]
+
+        filtered = []
+        for window in patches:
+            # Compute global patch indices
+            patch_row = window.row_start // patch_size
+            patch_col = window.col_start // patch_size
+
+            # Compute block indices
+            block_row = patch_row // block_height
+            block_col = patch_col // block_width
+
+            # Checkerboard pattern
+            A = (block_row // 2 + block_col // 2) % 2
+            B = (block_row + block_col) % 4
+
+            if A == 0 and B == 0:
+                code = 3  # test
+            elif A == 0 and B == 2:
+                code = 2  # val
+            else:
+                code = 1  # train
+
+            if code == target_code:
+                filtered.append(window)
+
+        return filtered
+
     def __len__(self) -> int:
-        """Return number of samples in dataset."""
-        return len(self.sampler)
+        """Return number of samples in current epoch."""
+        return len(self._current_indices)
 
     def on_epoch_start(self):
-        """Call this at the start of each epoch to reshuffle samples."""
-        self.sampler.on_epoch_start()
+        """Call at start of each epoch to reshuffle/resample patches."""
+        if self.epoch_mode == 'full':
+            # Use all patches, reshuffled
+            self._current_indices = list(range(len(self.patches)))
+            np.random.shuffle(self._current_indices)
+        elif self.epoch_mode == 'frac':
+            # Random sample of patches
+            n = int(self.sample_frac * len(self.patches))
+            self._current_indices = np.random.choice(len(self.patches), n, replace=False).tolist()
+        elif self.epoch_mode == 'number':
+            # Fixed number of patches
+            n = min(self.sample_number, len(self.patches))
+            self._current_indices = np.random.choice(len(self.patches), n, replace=False).tolist()
+        else:
+            raise ValueError(f"Unknown epoch_mode: {self.epoch_mode}")
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Load a single patch.
@@ -204,15 +314,16 @@ class ForestDatasetV2(Dataset):
                 - Values: numpy arrays with loaded data
                 - 'metadata': dict with spatial_window, channel_names, etc.
         """
-        # Get spatial window from sampler
-        spatial_window, _ = self.sampler[idx]  # Returns (SpatialWindow, anchor_year)
+        # Get spatial window from patch list
+        patch_idx = self._current_indices[idx]
+        spatial_window = self.patches[patch_idx]
 
         # Load all dataset groups
         result = {}
         metadata = {
             'spatial_window': spatial_window,
             'channel_names': {},
-            'patch_idx': idx,
+            'patch_idx': patch_idx,
         }
 
         for group_name, group_config in self.config.dataset_groups.items():
