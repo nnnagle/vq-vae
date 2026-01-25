@@ -323,25 +323,12 @@ class StatsCalculator:
                     valid_values = feature_data[c][valid_mask]
                     channel_values[c].extend(valid_values.flatten())
             else:
-                # Temporal data [C, T, H, W] - collapse time dimension
+                # Temporal data [C, T, H, W] - collect all valid
                 for c in range(n_channels):
-                    # Average across time for each valid pixel, then collect
-                    channel_temporal = feature_data[c]  # [T, H, W]
-                    # Only average where valid
-                    valid_temporal = channel_temporal[:, valid_mask[0]]  # Assume mask same across time
-                    # Actually, valid_mask is [T, H, W], so we need to apply it properly
-                    if valid_mask.ndim == 3:
-                        # Mask is temporal
-                        masked_data = np.where(valid_mask, channel_temporal, np.nan)
-                        # Compute mean across time, ignoring NaNs
-                        mean_across_time = np.nanmean(masked_data, axis=0)  # [H, W]
-                        valid_means = mean_across_time[~np.isnan(mean_across_time)]
-                        channel_values[c].extend(valid_means.flatten())
-                    else:
-                        # Mask is static, broadcast across time
-                        valid_values = channel_temporal[:, valid_mask]  # [T, N_valid_pixels]
-                        mean_across_time = np.mean(valid_values, axis=0)  # [N_valid_pixels]
-                        channel_values[c].extend(mean_across_time.flatten())
+                   channel_temporal = feature_data[c] 
+                   valid_values = channel_temporal[valid_mask]
+                   channel_values[c].extend(valid_values.flatten())
+
 
         # Compute stats for each channel
         stats_dict = {}
@@ -412,18 +399,12 @@ class StatsCalculator:
                         valid_vals = feature_data[c][valid_mask]
                         channel_values.append(valid_vals.flatten())
                 else:
-                    # Temporal [C, T, H, W] - average across time first
+                    # Temporal [C, T, H, W] - collect all valid (t, h, w) values
                     for c in range(n_channels):
-                        channel_temporal = feature_data[c]  # [T, H, W]
-                        if valid_mask.ndim == 3:
-                            masked_data = np.where(valid_mask, channel_temporal, np.nan)
-                            mean_across_time = np.nanmean(masked_data, axis=0)  # [H, W]
-                            valid_means = mean_across_time[~np.isnan(mean_across_time)]
-                            channel_values.append(valid_means.flatten())
-                        else:
-                            valid_values = channel_temporal[:, valid_mask]
-                            mean_across_time = np.mean(valid_values, axis=0)
-                            channel_values.append(mean_across_time.flatten())
+                      channel_temporal = feature_data[c]  # [T, H, W]
+                      valid_values = channel_temporal[valid_mask]  # Flattened valid values
+                      channel_values.append(valid_values.flatten())
+
 
                 # Stack into [C, N] matrix
                 if all(len(v) > 0 for v in channel_values):
