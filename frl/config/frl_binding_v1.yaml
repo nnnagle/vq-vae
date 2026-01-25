@@ -233,7 +233,7 @@ features:
   phase_ls8:
     dim: [C,T,H,W]
     channels:
-      derived.temporal_position: {norm: identity}
+      annual.temporal_position: {norm: identity}
       annual.evi2_summer_p95: {norm: zscore}
       annual.nbr_annual_min: {norm: zscore}
       annual.nbr_summer_p95: {norm: zscore}

@@ -228,7 +228,7 @@ class StatsCalculator:
             channel_idx = channel_names.index(channel_name)
 
             # Extract channel data
-            channel_data = group_data[channel_idx]  # [H,W] or [T,H,W]
+            channel_data = group_data[channel_idx].astype(np.float32)  # [H,W] or [T,H,W]
             channel_arrays.append(channel_data)
 
         # Stack channels: [C, H, W] or [C, T, H, W]
