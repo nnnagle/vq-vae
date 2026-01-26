@@ -20,7 +20,10 @@ Example:
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
+import torch.nn.functional as F
 
 
 def contrastive_loss(
@@ -30,6 +33,7 @@ def contrastive_loss(
     pos_weights: torch.Tensor | None = None,
     neg_weights: torch.Tensor | None = None,
     temperature: float = 0.07,
+    similarity: Literal["l2", "cosine", "dot"] = "l2",
 ) -> torch.Tensor:
     """
     Compute contrastive loss with weighted positive and negative pairs.
@@ -42,9 +46,13 @@ def contrastive_loss(
         L_a = -log(sum_p(w_p * exp(sim(a,p)/t)) /
                    (sum_p(w_p * exp(sim(a,p)/t)) + sum_n(w_n * exp(sim(a,n)/t))))
 
-    where sim(a, b) = -||a - b||^2 (negative squared Euclidean distance).
-    This means similar points (close in embedding space) have similarity near 0,
-    while dissimilar points (far apart) have large negative similarity.
+    Similarity functions:
+        - "l2": sim(a, b) = -||a - b||^2 (negative squared L2 distance)
+        - "cosine": sim(a, b) = (a · b) / (||a|| ||b||) (cosine similarity)
+        - "dot": sim(a, b) = a · b (dot product)
+
+    Note: For normalized embeddings, "cosine" and "dot" are equivalent, and "l2"
+    is a linear transformation of both: -||a-b||^2 = -2 + 2(a·b) for unit vectors.
 
     Args:
         embeddings: Embedding vectors of shape [N, D] where N is the number of
@@ -59,6 +67,8 @@ def contrastive_loss(
             uniform weights of 1.0 are used.
         temperature: Temperature scaling factor for the softmax. Lower values
             make the distribution sharper. Default: 0.07.
+        similarity: Similarity function to use. One of "l2", "cosine", or "dot".
+            Default: "l2".
 
     Returns:
         Scalar loss value averaged over all unique anchors.
@@ -91,15 +101,32 @@ def contrastive_loss(
     if neg_weights is None:
         neg_weights = torch.ones(neg_pairs.shape[0], device=embeddings.device)
 
-    # Compute negative squared L2 distance as similarity
-    # sim(a, b) = -||a - b||^2
-    # Close points -> small distance -> sim near 0 -> high exp(sim/t)
-    # Far points -> large distance -> very negative sim -> low exp(sim/t)
-    pos_diff = embeddings[pos_anchors] - embeddings[pos_targets]  # [P, D]
-    neg_diff = embeddings[neg_anchors] - embeddings[neg_targets]  # [M, D]
+    # Compute similarities based on chosen similarity function
+    pos_emb_a = embeddings[pos_anchors]  # [P, D]
+    pos_emb_b = embeddings[pos_targets]  # [P, D]
+    neg_emb_a = embeddings[neg_anchors]  # [M, D]
+    neg_emb_b = embeddings[neg_targets]  # [M, D]
 
-    pos_sims = -(pos_diff * pos_diff).sum(dim=1)  # [P]
-    neg_sims = -(neg_diff * neg_diff).sum(dim=1)  # [M]
+    if similarity == "l2":
+        # sim(a, b) = -||a - b||^2
+        pos_diff = pos_emb_a - pos_emb_b
+        neg_diff = neg_emb_a - neg_emb_b
+        pos_sims = -(pos_diff * pos_diff).sum(dim=1)  # [P]
+        neg_sims = -(neg_diff * neg_diff).sum(dim=1)  # [M]
+    elif similarity == "cosine":
+        # sim(a, b) = (a · b) / (||a|| ||b||)
+        pos_emb_a = F.normalize(pos_emb_a, p=2, dim=1)
+        pos_emb_b = F.normalize(pos_emb_b, p=2, dim=1)
+        neg_emb_a = F.normalize(neg_emb_a, p=2, dim=1)
+        neg_emb_b = F.normalize(neg_emb_b, p=2, dim=1)
+        pos_sims = (pos_emb_a * pos_emb_b).sum(dim=1)  # [P]
+        neg_sims = (neg_emb_a * neg_emb_b).sum(dim=1)  # [M]
+    elif similarity == "dot":
+        # sim(a, b) = a · b
+        pos_sims = (pos_emb_a * pos_emb_b).sum(dim=1)  # [P]
+        neg_sims = (neg_emb_a * neg_emb_b).sum(dim=1)  # [M]
+    else:
+        raise ValueError(f"Unknown similarity function: {similarity}")
 
     # Apply temperature scaling
     pos_sims = pos_sims / temperature
