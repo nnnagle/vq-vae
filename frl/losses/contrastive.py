@@ -130,16 +130,12 @@ def contrastive_loss(
     else:
         raise ValueError(f"Unknown similarity function: {similarity}")
 
-    # Apply temperature scaling
-    pos_sims = pos_sims / temperature
-    neg_sims = neg_sims / temperature
-
-    # Compute weighted exponentials
-    pos_exp = pos_weights * torch.exp(pos_sims)  # [P]
-    neg_exp = neg_weights * torch.exp(neg_sims)  # [M]
+    # Apply temperature scaling and convert to log-space for numerical stability
+    # logits = log(weight) + sim/temperature
+    pos_logits = torch.log(pos_weights) + pos_sims / temperature  # [P]
+    neg_logits = torch.log(neg_weights) + neg_sims / temperature  # [M]
 
     # Get unique anchors and create mapping for scatter
-    # We need to sum exp values for each unique anchor
     all_anchors = torch.cat([pos_anchors, neg_anchors])
     unique_anchors = torch.unique(all_anchors)
     num_anchors = unique_anchors.shape[0]
@@ -156,22 +152,37 @@ def contrastive_loss(
     pos_anchor_idx = anchor_to_idx[pos_anchors]  # [P]
     neg_anchor_idx = anchor_to_idx[neg_anchors]  # [M]
 
-    # Sum positive and negative exponentials per anchor using scatter_add
-    pos_sum = torch.zeros(num_anchors, device=embeddings.device, dtype=embeddings.dtype)
-    neg_sum = torch.zeros(num_anchors, device=embeddings.device, dtype=embeddings.dtype)
+    # Compute log-sum-exp per anchor using the identity:
+    # logsumexp(x) = max(x) + log(sum(exp(x - max(x))))
+    # This avoids overflow/underflow from direct exp()
 
-    pos_sum.scatter_add_(0, pos_anchor_idx, pos_exp)
-    neg_sum.scatter_add_(0, neg_anchor_idx, neg_exp)
+    # Concatenate all logits and anchor indices
+    all_logits = torch.cat([pos_logits, neg_logits])  # [P + M]
+    all_anchor_idx = torch.cat([pos_anchor_idx, neg_anchor_idx])  # [P + M]
 
-    # Compute loss: -log(pos_sum / (pos_sum + neg_sum))
-    # = -log(pos_sum) + log(pos_sum + neg_sum)
-    denominator = pos_sum + neg_sum
-
-    # Avoid log(0) by clamping
-    eps = 1e-8
-    loss_per_anchor = -torch.log(pos_sum.clamp(min=eps)) + torch.log(
-        denominator.clamp(min=eps)
+    # Find max logit per anchor for numerical stability
+    max_logits = torch.full(
+        (num_anchors,), float("-inf"), device=embeddings.device, dtype=embeddings.dtype
     )
+    max_logits.scatter_reduce_(0, all_anchor_idx, all_logits, reduce="amax")
+
+    # Compute stable exp: exp(logit - max_per_anchor)
+    all_exp = torch.exp(all_logits - max_logits[all_anchor_idx])
+    pos_exp = torch.exp(pos_logits - max_logits[pos_anchor_idx])
+
+    # Sum exponentials per anchor
+    all_sum = torch.zeros(num_anchors, device=embeddings.device, dtype=embeddings.dtype)
+    pos_sum = torch.zeros(num_anchors, device=embeddings.device, dtype=embeddings.dtype)
+
+    all_sum.scatter_add_(0, all_anchor_idx, all_exp)
+    pos_sum.scatter_add_(0, pos_anchor_idx, pos_exp)
+
+    # Compute log sums (add back the max)
+    log_pos_sum = torch.log(pos_sum) + max_logits  # log(sum(w_p * exp(s_p/t)))
+    log_all_sum = torch.log(all_sum) + max_logits  # log(sum(w * exp(s/t)))
+
+    # Loss = -log(pos_sum / all_sum) = -log_pos_sum + log_all_sum
+    loss_per_anchor = -log_pos_sum + log_all_sum
 
     # Average over anchors
     return loss_per_anchor.mean()
