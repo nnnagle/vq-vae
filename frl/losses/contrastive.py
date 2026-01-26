@@ -47,12 +47,13 @@ def contrastive_loss(
                    (sum_p(w_p * exp(sim(a,p)/t)) + sum_n(w_n * exp(sim(a,n)/t))))
 
     Similarity functions:
-        - "l2": sim(a, b) = -||a - b||^2 (negative squared L2 distance)
+        - "l2": sim(a, b) = -||a - b||^2 / D (negative mean squared distance)
         - "cosine": sim(a, b) = (a · b) / (||a|| ||b||) (cosine similarity)
         - "dot": sim(a, b) = a · b (dot product)
 
-    Note: For normalized embeddings, "cosine" and "dot" are equivalent, and "l2"
-    is a linear transformation of both: -||a-b||^2 = -2 + 2(a·b) for unit vectors.
+    Note: L2 is normalized by embedding dimension D so temperature has consistent
+    meaning across dimensions. For normalized embeddings, "cosine" and "dot" are
+    equivalent, and "l2" is a linear transformation: -||a-b||^2/D = -2 + 2(a·b)/D.
 
     Args:
         embeddings: Embedding vectors of shape [N, D] where N is the number of
@@ -108,11 +109,12 @@ def contrastive_loss(
     neg_emb_b = embeddings[neg_targets]  # [M, D]
 
     if similarity == "l2":
-        # sim(a, b) = -||a - b||^2
+        # sim(a, b) = -||a - b||^2 / D (normalized by dimension)
         pos_diff = pos_emb_a - pos_emb_b
         neg_diff = neg_emb_a - neg_emb_b
-        pos_sims = -(pos_diff * pos_diff).sum(dim=1)  # [P]
-        neg_sims = -(neg_diff * neg_diff).sum(dim=1)  # [M]
+        dim = embeddings.shape[1]
+        pos_sims = -(pos_diff * pos_diff).sum(dim=1) / dim  # [P]
+        neg_sims = -(neg_diff * neg_diff).sum(dim=1) / dim  # [M]
     elif similarity == "cosine":
         # sim(a, b) = (a · b) / (||a|| ||b||)
         pos_emb_a = F.normalize(pos_emb_a, p=2, dim=1)
