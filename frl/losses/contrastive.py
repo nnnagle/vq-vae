@@ -135,10 +135,16 @@ def contrastive_loss(
     pos_logits = torch.log(pos_weights) + pos_sims / temperature  # [P]
     neg_logits = torch.log(neg_weights) + neg_sims / temperature  # [M]
 
-    # Get unique anchors and create mapping for scatter
-    all_anchors = torch.cat([pos_anchors, neg_anchors])
-    unique_anchors = torch.unique(all_anchors)
+    # Get unique anchors from POSITIVE pairs only (anchors must have at least one positive)
+    # Negatives for anchors without positives are ignored
+    unique_anchors = torch.unique(pos_anchors)
     num_anchors = unique_anchors.shape[0]
+
+    # Filter negative pairs to only include anchors that have positives
+    valid_neg_mask = torch.isin(neg_anchors, unique_anchors)
+    neg_anchors = neg_anchors[valid_neg_mask]
+    neg_targets = neg_targets[valid_neg_mask]
+    neg_logits = neg_logits[valid_neg_mask]
 
     # Create index mapping: original anchor idx -> contiguous idx
     anchor_to_idx = torch.zeros(

@@ -212,8 +212,9 @@ def example_temperature_effect():
         loss = contrastive_loss(embeddings, pos_pairs, neg_pairs, temperature=temp)
         print(f"  temp={temp:4.2f}: loss={loss.item():.4f}")
 
-    print("\nLower temp -> loss depends more on the single closest negative")
-    print("Higher temp -> loss considers all negatives more equally")
+    print("\nLower temp -> loss depends more on the single closest pair")
+    print("Higher temp -> loss considers all pairs more equally")
+    print("Note: At very low temp, loss -> 0 if positive is closest (perfect separation)")
 
 
 def example_gradient_flow():
@@ -278,8 +279,9 @@ def example_training_loop_snippet():
 
         # Define pairs (in practice, from your data loader)
         # Here: consecutive samples are positive pairs, random are negative
+        # Note: neg pair anchors must have at least one positive pair
         pos_pairs = torch.tensor([[i, i + 1] for i in range(0, 14, 2)])
-        neg_pairs = torch.tensor([[i, (i + 8) % 16] for i in range(0, 16, 2)])
+        neg_pairs = torch.tensor([[i, (i + 8) % 16] for i in range(0, 14, 2)])
 
         # Compute loss
         loss = contrastive_loss(
