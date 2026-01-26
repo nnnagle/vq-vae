@@ -21,7 +21,6 @@ Example:
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 
 def contrastive_loss(
@@ -43,12 +42,13 @@ def contrastive_loss(
         L_a = -log(sum_p(w_p * exp(sim(a,p)/t)) /
                    (sum_p(w_p * exp(sim(a,p)/t)) + sum_n(w_n * exp(sim(a,n)/t))))
 
-    where sim(a, b) is the cosine similarity between embeddings a and b.
+    where sim(a, b) = -||a - b||^2 (negative squared Euclidean distance).
+    This means similar points (close in embedding space) have similarity near 0,
+    while dissimilar points (far apart) have large negative similarity.
 
     Args:
         embeddings: Embedding vectors of shape [N, D] where N is the number of
-            samples and D is the embedding dimension. Embeddings are L2-normalized
-            internally before computing similarities.
+            samples and D is the embedding dimension.
         pos_pairs: Positive pair indices of shape [P, 2] where P is the number of
             positive pairs. Each row is (anchor_idx, positive_idx).
         neg_pairs: Negative pair indices of shape [M, 2] where M is the number of
@@ -78,9 +78,6 @@ def contrastive_loss(
     if pos_pairs.numel() == 0:
         return torch.tensor(0.0, device=embeddings.device, dtype=embeddings.dtype)
 
-    # L2 normalize embeddings for cosine similarity
-    embeddings = F.normalize(embeddings, p=2, dim=1)
-
     # Extract anchor and target indices
     pos_anchors = pos_pairs[:, 0]  # [P]
     pos_targets = pos_pairs[:, 1]  # [P]
@@ -94,10 +91,15 @@ def contrastive_loss(
     if neg_weights is None:
         neg_weights = torch.ones(neg_pairs.shape[0], device=embeddings.device)
 
-    # Compute cosine similarities (embeddings are already normalized)
-    # sim = dot product of normalized vectors
-    pos_sims = (embeddings[pos_anchors] * embeddings[pos_targets]).sum(dim=1)  # [P]
-    neg_sims = (embeddings[neg_anchors] * embeddings[neg_targets]).sum(dim=1)  # [M]
+    # Compute negative squared L2 distance as similarity
+    # sim(a, b) = -||a - b||^2
+    # Close points -> small distance -> sim near 0 -> high exp(sim/t)
+    # Far points -> large distance -> very negative sim -> low exp(sim/t)
+    pos_diff = embeddings[pos_anchors] - embeddings[pos_targets]  # [P, D]
+    neg_diff = embeddings[neg_anchors] - embeddings[neg_targets]  # [M, D]
+
+    pos_sims = -(pos_diff * pos_diff).sum(dim=1)  # [P]
+    neg_sims = -(neg_diff * neg_diff).sum(dim=1)  # [M]
 
     # Apply temperature scaling
     pos_sims = pos_sims / temperature
