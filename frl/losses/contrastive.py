@@ -11,7 +11,7 @@ Features:
     - Fully vectorized implementation (no Python loops)
 
 Example:
-    >>> from frl.losses import contrastive_loss
+    >>> from losses import contrastive_loss
     >>> embeddings = torch.randn(100, 128)  # 100 samples, 128-dim embeddings
     >>> pos_pairs = torch.tensor([[0, 1], [0, 2], [1, 3]])  # anchor, positive
     >>> neg_pairs = torch.tensor([[0, 5], [0, 6], [1, 7]])  # anchor, negative

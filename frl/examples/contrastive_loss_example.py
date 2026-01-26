@@ -9,7 +9,7 @@ This script demonstrates how to:
 """
 
 import torch
-from frl.losses import contrastive_loss
+from losses import contrastive_loss
 
 
 def example_basic_usage():

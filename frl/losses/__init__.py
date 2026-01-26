@@ -10,7 +10,7 @@ Available losses:
 
 from __future__ import annotations
 
-from frl.losses.contrastive import contrastive_loss
+from losses.contrastive import contrastive_loss
 
 __all__ = [
     "contrastive_loss",
