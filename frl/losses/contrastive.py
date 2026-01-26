@@ -47,13 +47,26 @@ def contrastive_loss(
                    (sum_p(w_p * exp(sim(a,p)/t)) + sum_n(w_n * exp(sim(a,n)/t))))
 
     Similarity functions:
-        - "l2": sim(a, b) = -||a - b||^2 / D (negative mean squared distance)
-        - "cosine": sim(a, b) = (a · b) / (||a|| ||b||) (cosine similarity)
-        - "dot": sim(a, b) = a · b (dot product)
+        - "l2": sim(a, b) = -||a - b||^2 / D (negative mean squared distance).
+            Normalized by embedding dimension D for consistent temperature scaling.
+            Works well with default temperature. Recommended for general use.
+        - "cosine": sim(a, b) = (a · b) / (||a|| ||b||) (cosine similarity).
+            Bounded in [-1, 1]. Works well with default temperature.
+        - "dot": sim(a, b) = a · b (dot product).
+            Unbounded - use only with normalized embeddings or higher temperature.
+            For unnormalized embeddings, dot products scale with dimension and
+            can cause the softmax to concentrate on a single pair.
 
-    Note: L2 is normalized by embedding dimension D so temperature has consistent
-    meaning across dimensions. For normalized embeddings, "cosine" and "dot" are
-    equivalent, and "l2" is a linear transformation: -||a-b||^2/D = -2 + 2(a·b)/D.
+    For normalized embeddings:
+        - "cosine" and "dot" are equivalent
+        - "l2" is a linear transformation: -||a-b||^2/D = (-2 + 2*dot)/D
+
+    Edge cases:
+        - Anchors with positives but no negatives: loss = 0 (nothing to contrast)
+        - Anchors with negatives but no positives: ignored (filtered out)
+        - Empty pos_pairs: returns 0.0
+        - Very low temperature (e.g., 0.01): loss approaches 0 if the positive
+          pair is closer than all negatives (perfect separation)
 
     Args:
         embeddings: Embedding vectors of shape [N, D] where N is the number of
@@ -61,18 +74,21 @@ def contrastive_loss(
         pos_pairs: Positive pair indices of shape [P, 2] where P is the number of
             positive pairs. Each row is (anchor_idx, positive_idx).
         neg_pairs: Negative pair indices of shape [M, 2] where M is the number of
-            negative pairs. Each row is (anchor_idx, negative_idx).
+            negative pairs. Each row is (anchor_idx, negative_idx). Anchors that
+            don't appear in pos_pairs are ignored.
         pos_weights: Optional weights for positive pairs of shape [P]. If None,
-            uniform weights of 1.0 are used.
+            uniform weights of 1.0 are used. Can be used for importance sampling
+            or confidence weighting.
         neg_weights: Optional weights for negative pairs of shape [M]. If None,
-            uniform weights of 1.0 are used.
+            uniform weights of 1.0 are used. Can be used for hard negative mining.
         temperature: Temperature scaling factor for the softmax. Lower values
-            make the distribution sharper. Default: 0.07.
+            make the distribution sharper (harder contrastive learning). Higher
+            values make it softer (smoother gradients). Default: 0.07.
         similarity: Similarity function to use. One of "l2", "cosine", or "dot".
             Default: "l2".
 
     Returns:
-        Scalar loss value averaged over all unique anchors.
+        Scalar loss value averaged over all unique anchors that have positives.
 
     Example:
         >>> embeddings = torch.randn(100, 128)
