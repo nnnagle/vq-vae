@@ -31,6 +31,7 @@ def count_loss(
     loss_type: Literal["poisson", "negative_binomial"] = "poisson",
     reduction: Literal["mean", "sum", "none"] = "mean",
     dispersion: torch.Tensor | float = 1.0,
+    full: bool = False,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
@@ -40,7 +41,8 @@ def count_loss(
 
     Loss types:
         - "poisson": Poisson negative log-likelihood. Assumes variance = mean.
-            L = rate - target * log(rate)
+            L = rate - target * log(rate) + log(target!)  [if full=True]
+            L = rate - target * log(rate)                  [if full=False]
             Use when counts follow Poisson distribution (variance ≈ mean).
 
         - "negative_binomial": Negative Binomial NLL. Handles overdispersion.
@@ -62,6 +64,9 @@ def count_loss(
         dispersion: Dispersion parameter for negative binomial (also called 'r' or
             'n' in some parameterizations). Can be a scalar or tensor matching rate
             shape. Higher values -> closer to Poisson. Default: 1.0.
+        full: If True, include the Stirling approximation log(target!) term for
+            Poisson loss. Makes loss non-negative and comparable to NegBin.
+            Default: False (matches PyTorch's PoissonNLLLoss behavior).
         eps: Small constant for numerical stability. Default: 1e-8.
 
     Returns:
@@ -80,6 +85,9 @@ def count_loss(
         >>> target = actual_counts.float()
         >>> loss = count_loss(rate, target, loss_type="poisson")
 
+        >>> # Full Poisson NLL (non-negative, comparable to NegBin)
+        >>> loss = count_loss(rate, target, loss_type="poisson", full=True)
+
         >>> # With mask (e.g., ignore missing data)
         >>> mask = ~torch.isnan(target)
         >>> target = torch.nan_to_num(target, 0)
@@ -96,9 +104,12 @@ def count_loss(
     rate = rate.clamp(min=eps)
 
     if loss_type == "poisson":
-        # Poisson NLL: rate - target * log(rate)
-        # (Ignoring constant term log(target!) which doesn't affect gradients)
+        # Poisson NLL: rate - target * log(rate) + log(target!)
+        # The log(target!) term doesn't affect gradients but makes loss non-negative
         loss = rate - target * torch.log(rate)
+        if full:
+            # Add log(target!) = lgamma(target + 1)
+            loss = loss + torch.lgamma(target + 1)
 
     elif loss_type == "negative_binomial":
         # Negative Binomial NLL

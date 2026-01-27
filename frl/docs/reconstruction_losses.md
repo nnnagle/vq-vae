@@ -194,6 +194,7 @@ def count_loss(
     loss_type: Literal["poisson", "negative_binomial"] = "poisson",
     reduction: Literal["mean", "sum", "none"] = "mean",
     dispersion: torch.Tensor | float = 1.0,
+    full: bool = False,
     eps: float = 1e-8,
 ) -> torch.Tensor
 ```
@@ -208,6 +209,7 @@ def count_loss(
 | `loss_type` | str | `"poisson"` or `"negative_binomial"` |
 | `reduction` | str | `"mean"`, `"sum"`, `"none"` |
 | `dispersion` | float or Tensor | NegBin dispersion parameter |
+| `full` | bool | Include log(k!) term for Poisson (default: False) |
 | `eps` | float | Numerical stability (default: 1e-8) |
 
 ### Loss Types
@@ -224,6 +226,9 @@ def count_loss(
 log_rate = model(features)
 rate = torch.exp(log_rate)  # Ensure positive via exp
 loss = count_loss(rate, target_counts, loss_type="poisson")
+
+# Full Poisson NLL (non-negative, comparable to NegBin)
+loss = count_loss(rate, target_counts, loss_type="poisson", full=True)
 
 # Alternative: use softplus for positivity
 rate = F.softplus(model(features))

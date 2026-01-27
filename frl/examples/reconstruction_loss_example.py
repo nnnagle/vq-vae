@@ -295,10 +295,10 @@ def example_count_negative_binomial():
         loss = count_loss(rate, target, loss_type="negative_binomial", dispersion=dispersion)
         print(f"  dispersion={dispersion:5.1f}: {loss.item():.4f}")
 
-    # Compare with Poisson
-    poisson_loss = count_loss(rate, target, loss_type="poisson")
-    print(f"\nPoisson loss:        {poisson_loss.item():.4f}")
-    print("(NegBin with high dispersion ≈ Poisson)")
+    # Compare with Poisson (use full=True for fair comparison)
+    poisson_loss = count_loss(rate, target, loss_type="poisson", full=True)
+    print(f"\nPoisson loss (full): {poisson_loss.item():.4f}")
+    print("(NegBin with high dispersion ≈ Poisson when full=True)")
 
 
 def example_count_learned_dispersion():
