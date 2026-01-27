@@ -12,6 +12,12 @@ Available losses:
     - variance_covariance_loss: VICReg-style loss to prevent embedding collapse
     - variance_loss: Variance component only
     - covariance_loss: Covariance component only
+
+Pair generation for contrastive learning:
+    - pairs_knn: k-nearest neighbor pairs
+    - pairs_mutual_knn: mutual k-nearest neighbor pairs
+    - pairs_quantile: pairs from quantile range of distances
+    - pairs_radius: pairs from absolute distance range
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from __future__ import annotations
 from losses.categorical import categorical_loss
 from losses.contrastive import contrastive_loss
 from losses.count import count_loss
+from losses.pairs import pairs_knn, pairs_mutual_knn, pairs_quantile, pairs_radius
 from losses.reconstruction import reconstruction_loss
 from losses.variance_covariance import (
     covariance_loss,
@@ -31,6 +38,10 @@ __all__ = [
     "contrastive_loss",
     "count_loss",
     "covariance_loss",
+    "pairs_knn",
+    "pairs_mutual_knn",
+    "pairs_quantile",
+    "pairs_radius",
     "reconstruction_loss",
     "variance_covariance_loss",
     "variance_loss",
