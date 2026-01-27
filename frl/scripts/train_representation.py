@@ -305,14 +305,20 @@ def train_one_batch(
     if n_valid == 0:
         return {'loss': 0.0, 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
 
-    # Average loss over valid samples
+    # Average loss over valid samples in batch
+    # Note: contrastive_loss already averages over anchors within each sample,
+    # so this averages across samples (standard mini-batch averaging)
     mean_loss = total_loss / n_valid
 
     # Backward
     mean_loss.backward()
 
     # Gradient clipping
-    torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+    if config.get('gradient_clip_enabled', True):
+        torch.nn.utils.clip_grad_norm_(
+            encoder.parameters(),
+            max_norm=config.get('gradient_clip_max_norm', 1.0)
+        )
 
     optimizer.step()
 
@@ -341,60 +347,70 @@ def main():
     parser.add_argument(
         '--epochs',
         type=int,
-        default=10,
-        help='Number of training epochs'
+        default=None,
+        help='Number of training epochs (overrides config)'
     )
     parser.add_argument(
         '--batch-size',
         type=int,
-        default=4,
-        help='Batch size'
+        default=None,
+        help='Batch size (overrides config)'
     )
     parser.add_argument(
         '--lr',
         type=float,
-        default=1e-4,
-        help='Learning rate'
+        default=None,
+        help='Learning rate (overrides config)'
     )
     parser.add_argument(
         '--device',
         type=str,
-        default='cuda' if torch.cuda.is_available() else 'cpu',
-        help='Device to use'
+        default=None,
+        help='Device to use (overrides config)'
     )
     parser.add_argument(
         '--checkpoint-dir',
         type=str,
-        default='checkpoints',
-        help='Directory to save checkpoints'
+        default=None,
+        help='Directory to save checkpoints (overrides config)'
     )
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    logger.info(f"Using device: {device}")
-
-    # Parse configs
+    # Parse configs first to get defaults
     logger.info(f"Loading bindings config from {args.bindings}")
     bindings_config = DatasetBindingsParser(args.bindings).parse()
 
     logger.info(f"Loading training config from {args.training}")
     training_config = TrainingConfigParser(args.training).parse()
 
+    # Apply config values with command-line overrides
+    num_epochs = args.epochs or training_config.training.num_epochs
+    batch_size = args.batch_size or training_config.training.batch_size
+    lr = args.lr or training_config.optimizer.lr
+    weight_decay = training_config.optimizer.weight_decay
+    device_str = args.device or training_config.hardware.device
+    checkpoint_dir = args.checkpoint_dir or training_config.run.ckpt_dir
+
+    device = torch.device(device_str)
+    logger.info(f"Using device: {device}")
+
     # Create dataset
     logger.info("Creating dataset...")
+    patch_size = training_config.sampling.patch_size
     dataset = ForestDatasetV2(
         bindings_config,
         split='train',
-        patch_size=256,
+        patch_size=patch_size,
         min_aoi_fraction=0.3,
     )
     logger.info(f"Dataset has {len(dataset)} patches")
 
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Start with 0 for debugging
+        num_workers=training_config.hardware.num_workers,
+        pin_memory=training_config.hardware.pin_memory,
         collate_fn=collate_fn,
     )
 
@@ -417,20 +433,44 @@ def main():
     n_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {n_params:,}")
 
-    # Create optimizer and scheduler
+    # Create optimizer
+    logger.info(f"Creating optimizer: lr={lr}, weight_decay={weight_decay}")
     optimizer = torch.optim.AdamW(
         encoder.parameters(),
-        lr=args.lr,
-        weight_decay=0.01,
+        lr=lr,
+        weight_decay=weight_decay,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs * len(dataloader),
-        eta_min=1e-6,
-    )
+    # Create scheduler with optional warmup
+    scheduler_config = training_config.scheduler
+    total_steps = num_epochs * len(dataloader)
 
-    # Loss config from bindings
+    if scheduler_config.warmup.enabled:
+        warmup_steps = scheduler_config.warmup.epochs * len(dataloader)
+        logger.info(f"Using cosine scheduler with {warmup_steps} warmup steps")
+
+        # Linear warmup + cosine annealing
+        def lr_lambda(step):
+            if step < warmup_steps:
+                # Linear warmup
+                return step / warmup_steps
+            else:
+                # Cosine annealing after warmup
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return scheduler_config.eta_min / lr + (1 - scheduler_config.eta_min / lr) * (
+                    0.5 * (1 + np.cos(np.pi * progress))
+                )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        logger.info(f"Using cosine scheduler: T_max={scheduler_config.T_max}, eta_min={scheduler_config.eta_min}")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=scheduler_config.T_max * len(dataloader),
+            eta_min=scheduler_config.eta_min,
+        )
+
+    # Loss and training config
     loss_config = {
         'stride': 16,
         'border': 16,
@@ -442,15 +482,17 @@ def main():
         'negative_quantile_high': 0.75,
         'negative_min_spatial': 8.0,
         'temperature': 0.07,
+        'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
+        'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
     }
 
     # Create checkpoint directory
-    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Training loop
-    logger.info("Starting training...")
-    for epoch in range(args.epochs):
+    logger.info(f"Starting training for {num_epochs} epochs...")
+    for epoch in range(num_epochs):
         dataset.on_epoch_start()  # Reshuffle patches
 
         epoch_loss = 0.0
@@ -474,7 +516,7 @@ def main():
 
                 if batch_idx % 10 == 0:
                     logger.info(
-                        f"Epoch {epoch+1}/{args.epochs} | "
+                        f"Epoch {epoch+1}/{num_epochs} | "
                         f"Batch {batch_idx+1}/{len(dataloader)} | "
                         f"Loss: {stats['loss']:.4f} | "
                         f"Pos: {stats['pos_pairs']} | "
