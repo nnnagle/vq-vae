@@ -412,11 +412,12 @@ def example_gradient_flow():
     print(f"Categorical - grad norm: {logits.grad.norm().item():.4f}")
 
     # Count
-    rate = torch.exp(torch.randn(4, 1, 8, 8, requires_grad=True))
+    log_rate = torch.randn(4, 1, 8, 8, requires_grad=True)
+    rate = torch.exp(log_rate)
     target_count = torch.poisson(rate.detach())
     loss_count = count_loss(rate, target_count, loss_type="poisson")
     loss_count.backward()
-    print(f"Count - grad norm: {rate.grad.norm().item():.4f}")
+    print(f"Count - grad norm: {log_rate.grad.norm().item():.4f}")
 
 
 if __name__ == "__main__":
