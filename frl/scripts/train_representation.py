@@ -330,6 +330,145 @@ def train_one_batch(
     }
 
 
+@torch.no_grad()
+def validate_one_batch(
+    batch: dict,
+    feature_builder: FeatureBuilder,
+    encoder: nn.Module,
+    device: torch.device,
+    config: dict,
+) -> dict:
+    """
+    Validate on a single batch (no gradient updates).
+
+    Args:
+        batch: Batch from dataloader
+        feature_builder: FeatureBuilder instance
+        encoder: Encoder network
+        device: Device to use
+        config: Loss config dict
+
+    Returns:
+        Dict with loss values and stats
+    """
+    encoder.eval()
+
+    total_loss = 0.0
+    n_valid = 0
+    total_pos_pairs = 0
+    total_neg_pairs = 0
+
+    batch_size = len(batch['metadata'])
+
+    for i in range(batch_size):
+        # Extract single sample from batch
+        sample = {
+            key: val[i].numpy() if isinstance(val, torch.Tensor) else val[i]
+            for key, val in batch.items()
+            if key != 'metadata'
+        }
+        sample['metadata'] = batch['metadata'][i]
+
+        # Build features
+        encoder_feature = feature_builder.build_feature('ccdc_history', sample)
+        distance_feature = feature_builder.build_feature('infonce_type_spectral', sample)
+
+        # Convert to tensors
+        encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
+        distance_data = torch.from_numpy(distance_feature.data).float().to(device)
+        mask = torch.from_numpy(encoder_feature.mask).to(device)
+
+        # Also apply distance feature mask
+        dist_mask = torch.from_numpy(distance_feature.mask).to(device)
+        combined_mask = mask & dist_mask
+
+        # Sample anchor locations (no jitter for deterministic validation)
+        anchors = sample_anchors_grid_plus_supplement(
+            combined_mask,
+            stride=config.get('stride', 16),
+            border=config.get('border', 16),
+            jitter_radius=0,  # No jitter for validation
+            supplement_n=config.get('supplement_n', 104),
+        )
+
+        if anchors.shape[0] < 10:
+            continue
+
+        # Extract features at anchor locations
+        encoder_at_anchors = extract_at_locations(encoder_data, anchors)
+        distance_at_anchors = extract_at_locations(distance_data, anchors)
+
+        # Compute distances
+        feature_distances = torch.cdist(distance_at_anchors, distance_at_anchors)
+        spatial_distances = compute_spatial_distances(anchors)
+
+        # Generate pairs
+        pos_pairs, neg_pairs = generate_pairs_with_spatial_constraint(
+            feature_distances,
+            spatial_distances,
+            positive_k=config.get('positive_k', 16),
+            positive_min_spatial=config.get('positive_min_spatial', 4.0),
+            negative_quantile_low=config.get('negative_quantile_low', 0.5),
+            negative_quantile_high=config.get('negative_quantile_high', 0.75),
+            negative_min_spatial=config.get('negative_min_spatial', 8.0),
+        )
+
+        if pos_pairs.shape[0] == 0 or neg_pairs.shape[0] == 0:
+            continue
+
+        # Encode through network
+        encoder_input = encoder_at_anchors.T.unsqueeze(0).unsqueeze(2)
+        z_type = encoder(encoder_input)
+        z_type = z_type.squeeze(0).squeeze(1).T
+
+        # Compute loss
+        loss = contrastive_loss(
+            z_type,
+            pos_pairs,
+            neg_pairs,
+            temperature=config.get('temperature', 0.07),
+            similarity='l2',
+        )
+
+        total_loss += loss.item()
+        n_valid += 1
+        total_pos_pairs += pos_pairs.shape[0]
+        total_neg_pairs += neg_pairs.shape[0]
+
+    if n_valid == 0:
+        return {'loss': 0.0, 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
+
+    return {
+        'loss': total_loss / n_valid,
+        'n_valid': n_valid,
+        'pos_pairs': total_pos_pairs // n_valid,
+        'neg_pairs': total_neg_pairs // n_valid,
+    }
+
+
+def validate_epoch(
+    val_dataloader: DataLoader,
+    feature_builder: FeatureBuilder,
+    encoder: nn.Module,
+    device: torch.device,
+    config: dict,
+) -> float:
+    """Run validation on entire validation set."""
+    total_loss = 0.0
+    total_batches = 0
+
+    for batch in val_dataloader:
+        stats = validate_one_batch(batch, feature_builder, encoder, device, config)
+        if stats['n_valid'] > 0:
+            total_loss += stats['loss']
+            total_batches += 1
+
+    if total_batches == 0:
+        return 0.0
+
+    return total_loss / total_batches
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train representation encoder')
     parser.add_argument(
@@ -394,21 +533,40 @@ def main():
     device = torch.device(device_str)
     logger.info(f"Using device: {device}")
 
-    # Create dataset
-    logger.info("Creating dataset...")
+    # Create train dataset
+    logger.info("Creating train dataset...")
     patch_size = training_config.sampling.patch_size
-    dataset = ForestDatasetV2(
+    train_dataset = ForestDatasetV2(
         bindings_config,
         split='train',
         patch_size=patch_size,
         min_aoi_fraction=0.3,
     )
-    logger.info(f"Dataset has {len(dataset)} patches")
+    logger.info(f"Train dataset has {len(train_dataset)} patches")
 
-    dataloader = DataLoader(
-        dataset,
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=training_config.hardware.num_workers,
+        pin_memory=training_config.hardware.pin_memory,
+        collate_fn=collate_fn,
+    )
+
+    # Create validation dataset
+    logger.info("Creating validation dataset...")
+    val_dataset = ForestDatasetV2(
+        bindings_config,
+        split='val',
+        patch_size=patch_size,
+        min_aoi_fraction=0.3,
+    )
+    logger.info(f"Validation dataset has {len(val_dataset)} patches")
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=training_config.hardware.num_workers,
         pin_memory=training_config.hardware.pin_memory,
         collate_fn=collate_fn,
@@ -443,10 +601,10 @@ def main():
 
     # Create scheduler with optional warmup
     scheduler_config = training_config.scheduler
-    total_steps = num_epochs * len(dataloader)
+    total_steps = num_epochs * len(train_dataloader)
 
     if scheduler_config.warmup.enabled:
-        warmup_steps = scheduler_config.warmup.epochs * len(dataloader)
+        warmup_steps = scheduler_config.warmup.epochs * len(train_dataloader)
         logger.info(f"Using cosine scheduler with {warmup_steps} warmup steps")
 
         # Linear warmup + cosine annealing
@@ -466,7 +624,7 @@ def main():
         logger.info(f"Using cosine scheduler: T_max={scheduler_config.T_max}, eta_min={scheduler_config.eta_min}")
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=scheduler_config.T_max * len(dataloader),
+            T_max=scheduler_config.T_max * len(train_dataloader),
             eta_min=scheduler_config.eta_min,
         )
 
@@ -493,12 +651,13 @@ def main():
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
-        dataset.on_epoch_start()  # Reshuffle patches
+        train_dataset.on_epoch_start()  # Reshuffle patches
+        encoder.train()
 
         epoch_loss = 0.0
         epoch_batches = 0
 
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in enumerate(train_dataloader):
             stats = train_one_batch(
                 batch,
                 feature_builder,
@@ -517,16 +676,23 @@ def main():
                 if batch_idx % 10 == 0:
                     logger.info(
                         f"Epoch {epoch+1}/{num_epochs} | "
-                        f"Batch {batch_idx+1}/{len(dataloader)} | "
+                        f"Batch {batch_idx+1}/{len(train_dataloader)} | "
                         f"Loss: {stats['loss']:.4f} | "
                         f"Pos: {stats['pos_pairs']} | "
                         f"Neg: {stats['neg_pairs']} | "
                         f"LR: {scheduler.get_last_lr()[0]:.2e}"
                     )
 
-        if epoch_batches > 0:
-            avg_loss = epoch_loss / epoch_batches
-            logger.info(f"Epoch {epoch+1} complete | Avg Loss: {avg_loss:.4f}")
+        train_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0.0
+
+        # Validation
+        val_loss = validate_epoch(val_dataloader, feature_builder, encoder, device, loss_config)
+
+        logger.info(
+            f"Epoch {epoch+1} complete | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Val Loss: {val_loss:.4f}"
+        )
 
         # Save checkpoint
         ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
@@ -535,7 +701,8 @@ def main():
             'encoder_state_dict': encoder.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'loss': avg_loss if epoch_batches > 0 else None,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
         }, ckpt_path)
         logger.info(f"Saved checkpoint to {ckpt_path}")
 
