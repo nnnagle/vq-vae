@@ -9,12 +9,12 @@ This script trains a simple encoder using InfoNCE contrastive loss:
 - Loss: InfoNCE with auxiliary distance-based pair selection
 
 Usage:
-    python frl/scripts/train_representation.py
+    python scripts/train_representation.py
 
     # Or with custom config paths:
-    python frl/scripts/train_representation.py \
-        --bindings frl/config/frl_binding_v1.yaml \
-        --training frl/config/frl_training_v1.yaml
+    python scripts/train_representation.py \
+        --bindings config/frl_binding_v1.yaml \
+        --training config/frl_training_v1.yaml
 """
 
 import argparse
@@ -28,12 +28,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 # FRL imports
-from frl.data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
-from frl.data.loaders.config.training_config_parser import TrainingConfigParser
-from frl.data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
-from frl.data.loaders.builders.feature_builder import FeatureBuilder
-from frl.models import Conv2DEncoder
-from frl.losses import contrastive_loss, pairs_mutual_knn, pairs_quantile
+from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
+from data.loaders.config.training_config_parser import TrainingConfigParser
+from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
+from data.loaders.builders.feature_builder import FeatureBuilder
+from models import Conv2DEncoder
+from losses import contrastive_loss, pairs_mutual_knn, pairs_quantile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -335,13 +335,13 @@ def main():
     parser.add_argument(
         '--bindings',
         type=str,
-        default='frl/config/frl_binding_v1.yaml',
+        default='config/frl_binding_v1.yaml',
         help='Path to bindings config'
     )
     parser.add_argument(
         '--training',
         type=str,
-        default='frl/config/frl_training_v1.yaml',
+        default='config/frl_training_v1.yaml',
         help='Path to training config'
     )
     parser.add_argument(
