@@ -313,57 +313,6 @@ class SpatialDomainConfig:
 
 
 @dataclass
-class TemporalBundleConfig:
-    """Temporal window bundle configuration"""
-    enabled: bool = True
-    size: int = 3
-    offsets: List[int] = field(default_factory=lambda: [0, -2, -4])
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'TemporalBundleConfig':
-        return cls(
-            enabled=d.get('enabled', True),
-            size=d.get('size', 3),
-            offsets=d.get('offsets', [0, -2, -4])
-        )
-
-
-@dataclass
-class TemporalSamplingConfig:
-    """Temporal sampling strategy"""
-    mode: str = "weighted"  # 'uniform', 'weighted', 'balanced'
-    weights: Optional[Dict[int, float]] = None
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'TemporalSamplingConfig':
-        return cls(
-            mode=d.get('mode', 'weighted'),
-            weights=d.get('weights')
-        )
-
-
-@dataclass
-class TemporalDomainConfig:
-    """Temporal domain configuration"""
-    end_years: List[int]
-    window_length: int
-    bundle: TemporalBundleConfig = field(default_factory=TemporalBundleConfig)
-    sampling: TemporalSamplingConfig = field(default_factory=TemporalSamplingConfig)
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'TemporalDomainConfig':
-        bundle = TemporalBundleConfig.from_dict(d.get('bundle', {}))
-        sampling = TemporalSamplingConfig.from_dict(d.get('sampling', {}))
-        
-        return cls(
-            end_years=d['end_years'],
-            window_length=d['window_length'],
-            bundle=bundle,
-            sampling=sampling
-        )
-
-
-@dataclass
 class GridSubsampleConfig:
     """Grid subsampling for contrastive learning"""
     enabled: bool = True
@@ -386,204 +335,21 @@ class ForestSamplesConfig:
 
 
 @dataclass
-class AugmentationConfig:
-    """Data augmentation configuration"""
-    enabled: bool = True
-    random_flip: Optional[Dict[str, Any]] = None
-    random_rotation: Optional[Dict[str, Any]] = None
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'AugmentationConfig':
-        return cls(
-            enabled=d.get('enabled', True),
-            random_flip=d.get('random_flip'),
-            random_rotation=d.get('random_rotation')
-        )
-
-
-@dataclass
 class SamplingConfig:
     """Spatial sampling configuration"""
     patch_size: int
     grid_subsample: GridSubsampleConfig = field(default_factory=GridSubsampleConfig)
     forest_samples: ForestSamplesConfig = field(default_factory=ForestSamplesConfig)
-    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
-    
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SamplingConfig':
         grid_subsample = GridSubsampleConfig.from_dict(d.get('grid_subsample', {}))
         forest_samples = ForestSamplesConfig.from_dict(d.get('forest_samples', {}))
-        augmentation = AugmentationConfig.from_dict(d.get('augmentation', {}))
-        
+
         return cls(
             patch_size=d['patch_size'],
             grid_subsample=grid_subsample,
-            forest_samples=forest_samples,
-            augmentation=augmentation
-        )
-
-
-@dataclass
-class LossWeightSchedule:
-    """Loss weight schedule entry"""
-    epoch: List[Optional[int]]  # [start, end] where None means open-ended
-    value: Union[float, str]    # Float value or 'linear' for ramping
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'LossWeightSchedule':
-        return cls(
-            epoch=d['epoch'],
-            value=d['value']
-        )
-    
-    def get_weight_at_epoch(self, epoch: int) -> float:
-        """Get the weight value for a given epoch"""
-        start, end = self.epoch
-        
-        # Check if epoch is in range
-        if start is not None and epoch < start:
-            return 0.0
-        if end is not None and epoch > end:
-            return 0.0
-        
-        # Handle linear ramping
-        if isinstance(self.value, str) and self.value == 'linear':
-            if start is None or end is None:
-                raise ValueError("Linear schedule requires both start and end epochs")
-            # Linear interpolation from 0 to 1
-            progress = (epoch - start) / (end - start)
-            return max(0.0, min(1.0, progress))
-        
-        return float(self.value)
-
-
-@dataclass
-class TripletLossConfig:
-    """Triplet loss configuration"""
-    enabled: bool = True
-    weight_schedule: List[LossWeightSchedule] = field(default_factory=list)
-    triplet_mining: Optional[Dict[str, Any]] = None
-    
-    def get_weight_at_epoch(self, epoch: int) -> float:
-        """Get the current weight for this loss at given epoch"""
-        if not self.enabled:
-            return 0.0
-        
-        for schedule in self.weight_schedule:
-            start, end = schedule.epoch
-            if start is not None and epoch < start:
-                continue
-            if end is not None and epoch > end:
-                continue
-            return schedule.get_weight_at_epoch(epoch)
-        
-        return 0.0
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'TripletLossConfig':
-        weight_schedule = [
-            LossWeightSchedule.from_dict(s) 
-            for s in d.get('weight_schedule', [])
-        ]
-        
-        return cls(
-            enabled=d.get('enabled', True),
-            weight_schedule=weight_schedule,
-            triplet_mining=d.get('triplet_mining')
-        )
-
-
-@dataclass
-class VQLossConfig:
-    """Vector quantization loss configuration"""
-    enabled: bool = True
-    weight: float = 1.0
-    commitment_cost: float = 0.25
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'VQLossConfig':
-        return cls(**{k: v for k, v in d.items() if k in cls.__annotations__})
-
-
-@dataclass
-class MonotonicityConstraint:
-    """Phase monotonicity constraint"""
-    when: Dict[str, Any]  # Condition (e.g., {ysfc_in: [0, 1]})
-    order: List[str]      # Expected order (e.g., [t0, t4, t2])
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'MonotonicityConstraint':
-        return cls(
-            when=d['when'],
-            order=d['order']
-        )
-
-
-@dataclass
-class PhaseMonotonicityLossConfig:
-    """Phase monotonicity loss configuration"""
-    enabled: bool = True
-    weight_schedule: List[LossWeightSchedule] = field(default_factory=list)
-    constraints: List[MonotonicityConstraint] = field(default_factory=list)
-    
-    def get_weight_at_epoch(self, epoch: int) -> float:
-        """Get the current weight for this loss at given epoch"""
-        if not self.enabled:
-            return 0.0
-        
-        for schedule in self.weight_schedule:
-            start, end = schedule.epoch
-            if start is not None and epoch < start:
-                continue
-            if end is not None and epoch > end:
-                continue
-            return schedule.get_weight_at_epoch(epoch)
-        
-        return 0.0
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'PhaseMonotonicityLossConfig':
-        weight_schedule = [
-            LossWeightSchedule.from_dict(s) 
-            for s in d.get('weight_schedule', [])
-        ]
-        constraints = [
-            MonotonicityConstraint.from_dict(c)
-            for c in d.get('constraints', [])
-        ]
-        
-        return cls(
-            enabled=d.get('enabled', True),
-            weight_schedule=weight_schedule,
-            constraints=constraints
-        )
-
-
-@dataclass
-class LossesConfig:
-    """All loss configurations"""
-    z_type_triplet: TripletLossConfig = field(default_factory=TripletLossConfig)
-    vq_loss: VQLossConfig = field(default_factory=VQLossConfig)
-    phase_monotonicity: PhaseMonotonicityLossConfig = field(default_factory=PhaseMonotonicityLossConfig)
-    
-    def get_total_weight_at_epoch(self, epoch: int) -> Dict[str, float]:
-        """Get all loss weights for a given epoch"""
-        return {
-            'z_type_triplet': self.z_type_triplet.get_weight_at_epoch(epoch),
-            'vq_loss': self.vq_loss.weight if self.vq_loss.enabled else 0.0,
-            'phase_monotonicity': self.phase_monotonicity.get_weight_at_epoch(epoch)
-        }
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'LossesConfig':
-        z_type_triplet = TripletLossConfig.from_dict(d.get('z_type_triplet', {}))
-        vq_loss = VQLossConfig.from_dict(d.get('vq_loss', {}))
-        phase_monotonicity = PhaseMonotonicityLossConfig.from_dict(d.get('phase_monotonicity', {}))
-        
-        return cls(
-            z_type_triplet=z_type_triplet,
-            vq_loss=vq_loss,
-            phase_monotonicity=phase_monotonicity
+            forest_samples=forest_samples
         )
 
 
@@ -656,9 +422,7 @@ class TrainingConfiguration:
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     spatial_domain: SpatialDomainConfig
-    temporal_domain: TemporalDomainConfig
     sampling: SamplingConfig
-    losses: LossesConfig
     masking: MaskingConfig
     metrics: MetricsConfig
     visualization: VisualizationConfig
@@ -735,9 +499,7 @@ class TrainingConfigParser:
             optimizer=OptimizerConfig.from_dict(self.raw_config.get('optimizer', {})),
             scheduler=SchedulerConfig.from_dict(self.raw_config.get('scheduler', {})),
             spatial_domain=SpatialDomainConfig.from_dict(self.raw_config.get('spatial_domain', {})),
-            temporal_domain=TemporalDomainConfig.from_dict(self.raw_config.get('temporal_domain', {})),
             sampling=SamplingConfig.from_dict(self.raw_config.get('sampling', {})),
-            losses=LossesConfig.from_dict(self.raw_config.get('losses', {})),
             masking=MaskingConfig.from_dict(self.raw_config.get('masking', {})),
             metrics=MetricsConfig.from_dict(self.raw_config.get('metrics', {})),
             visualization=VisualizationConfig.from_dict(self.raw_config.get('visualization', {})),
@@ -782,19 +544,7 @@ class TrainingConfigParser:
                 f"Window width ({window.width}) not divisible by patch_size "
                 f"({self.config.sampling.patch_size})"
             )
-        
-        # Validate temporal domain
-        if self.config.temporal_domain.bundle.enabled:
-            if self.config.temporal_domain.bundle.size != len(self.config.temporal_domain.bundle.offsets):
-                errors.append(
-                    f"Bundle size ({self.config.temporal_domain.bundle.size}) "
-                    f"doesn't match number of offsets ({len(self.config.temporal_domain.bundle.offsets)})"
-                )
-        
-        # Validate loss schedules
-        if self.config.losses.z_type_triplet.enabled and not self.config.losses.z_type_triplet.weight_schedule:
-            warnings.append("Triplet loss enabled but no weight schedule defined")
-        
+
         # Check hardware settings
         if self.config.hardware.device == 'cuda' and not self.config.hardware.gpu_ids:
             errors.append("Device is 'cuda' but no GPU IDs specified")
@@ -875,53 +625,12 @@ class TrainingConfigParser:
         
         lines.extend([
             "",
-            "TEMPORAL DOMAIN",
-            f"  End years: {self.config.temporal_domain.end_years}",
-            f"  Window length: {self.config.temporal_domain.window_length} years",
-            f"  Bundle: {self.config.temporal_domain.bundle.enabled} "
-            f"(offsets: {self.config.temporal_domain.bundle.offsets})",
-            "",
-            "LOSSES",
-            f"  VQ loss: {self.config.losses.vq_loss.enabled}",
-            f"  Triplet loss: {self.config.losses.z_type_triplet.enabled}",
-            f"  Phase monotonicity: {self.config.losses.phase_monotonicity.enabled}",
-            "",
             "SAMPLING",
             f"  Grid subsample: {self.config.sampling.grid_subsample.enabled}",
             f"  Forest samples: {self.config.sampling.forest_samples.enabled}",
-            f"  Augmentation: {self.config.sampling.augmentation.enabled}",
             "",
             "=" * 70
         ])
-        
-        return "\n".join(lines)
-    
-    def get_loss_schedule(self) -> str:
-        """
-        Generate a summary of the loss schedule across epochs.
-        
-        Returns:
-            Formatted schedule string
-        """
-        if self.config is None:
-            raise ValueError("Must call parse() before get_loss_schedule()")
-        
-        lines = ["Loss Weight Schedule", "=" * 50]
-        
-        # Sample epochs
-        sample_epochs = [0, 10, 20, 30, 50, self.config.training.num_epochs - 1]
-        
-        lines.append(f"{'Epoch':<10} {'VQ':<10} {'Triplet':<10} {'Monoton.':<10}")
-        lines.append("-" * 50)
-        
-        for epoch in sample_epochs:
-            weights = self.config.losses.get_total_weight_at_epoch(epoch)
-            lines.append(
-                f"{epoch:<10} "
-                f"{weights['vq_loss']:<10.2f} "
-                f"{weights['z_type_triplet']:<10.2f} "
-                f"{weights['phase_monotonicity']:<10.2f}"
-            )
         
         return "\n".join(lines)
 
@@ -964,11 +673,7 @@ if __name__ == '__main__':
     
     # Print summary
     print(parser.summary())
-    
-    # Print loss schedule
-    print("\n")
-    print(parser.get_loss_schedule())
-    
+
     # Example queries
     print("\n" + "=" * 70)
     print("Example Queries")
@@ -978,5 +683,3 @@ if __name__ == '__main__':
     print(f"Patch size: {config.sampling.patch_size}")
     print(f"Learning rate: {config.optimizer.lr}")
     print(f"Active window size: {config.spatial_domain.active_window.size}")
-    print(f"Temporal end years: {config.temporal_domain.end_years}")
-    print(f"VQ loss enabled? {config.losses.vq_loss.enabled}")
