@@ -36,7 +36,14 @@ from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
 from models import Conv2DEncoder
 from losses import contrastive_loss, pairs_with_spatial_constraint
-from utils import compute_spatial_distances, extract_at_locations
+from utils import (
+    compute_spatial_distances,
+    compute_spatial_distances_rectangular,
+    extract_at_locations,
+    find_anchor_indices_in_candidates,
+    get_valid_pixel_coords,
+)
+from losses import pairs_knn, pairs_quantile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,8 +91,10 @@ def process_batch(
     # Process each sample in batch (pair generation is per-patch)
     total_loss = 0.0
     n_valid = 0
-    total_pos_pairs = 0
-    total_neg_pairs = 0
+    total_spectral_pos_pairs = 0
+    total_spectral_neg_pairs = 0
+    total_spatial_pos_pairs = 0
+    total_spatial_neg_pairs = 0
 
     batch_size = len(batch['metadata'])
 
@@ -123,17 +132,17 @@ def process_batch(
         if anchors.shape[0] < 10:
             continue
 
-        # Extract features at anchor locations
+        # Extract features at anchor locations for spectral loss
         encoder_at_anchors = extract_at_locations(encoder_data, anchors)
         distance_at_anchors = extract_at_locations(distance_data, anchors)
 
-        # Compute distances
+        # Compute distances for spectral loss
         # Mahalanobis transform already applied by FeatureBuilder, so L2 here = Mahalanobis
         feature_distances = torch.cdist(distance_at_anchors, distance_at_anchors)
         spatial_distances = compute_spatial_distances(anchors)
 
-        # Generate pairs
-        pos_pairs, neg_pairs = pairs_with_spatial_constraint(
+        # Generate pairs for spectral loss
+        spectral_pos_pairs, spectral_neg_pairs = pairs_with_spatial_constraint(
             feature_distances,
             spatial_distances,
             positive_k=config.get('positive_k', 16),
@@ -143,23 +152,96 @@ def process_batch(
             negative_min_spatial=config.get('negative_min_spatial', 8.0),
         )
 
-        if pos_pairs.shape[0] == 0 or neg_pairs.shape[0] == 0:
+        # --- Spatial InfoNCE Loss ---
+        # Get all valid pixel coordinates for spatial loss candidates
+        valid_pixel_coords = get_valid_pixel_coords(combined_mask)
+
+        if valid_pixel_coords.shape[0] < 100:
+            # Not enough valid pixels for meaningful spatial loss
             continue
 
-        # Encode through network
-        # Add batch and remove: [N, C] -> [1, C, 1, N] -> conv -> [1, D, 1, N] -> [N, D]
-        encoder_input = encoder_at_anchors.T.unsqueeze(0).unsqueeze(2)
-        z_type = encoder(encoder_input)
-        z_type = z_type.squeeze(0).squeeze(1).T
+        # Compute rectangular spatial distance matrix: [num_anchors x num_valid_pixels]
+        spatial_dist_rect = compute_spatial_distances_rectangular(anchors, valid_pixel_coords)
 
-        # Compute loss
-        loss = contrastive_loss(
-            z_type,
-            pos_pairs,
-            neg_pairs,
-            temperature=config.get('temperature', 0.07),
-            similarity='l2',
+        # Find anchor indices in valid_pixel_coords for self-exclusion
+        anchor_cols = find_anchor_indices_in_candidates(anchors, valid_pixel_coords)
+
+        # For spatial positives: k=4 nearest neighbors within max_distance=8
+        # Mask distances > max_distance before knn selection
+        spatial_max_dist = config.get('spatial_positive_max_dist', 8.0)
+        spatial_dist_for_pos = spatial_dist_rect.clone()
+        spatial_dist_for_pos[spatial_dist_rect > spatial_max_dist] = float('inf')
+
+        spatial_pos_pairs = pairs_knn(
+            spatial_dist_for_pos,
+            k=config.get('spatial_positive_k', 4),
+            anchor_cols=anchor_cols,
         )
+
+        # For spatial negatives: quantile [0.65, 0.90] with min_distance=16
+        spatial_min_dist = config.get('spatial_negative_min_dist', 16.0)
+        spatial_dist_for_neg = spatial_dist_rect.clone()
+        spatial_dist_for_neg[spatial_dist_rect < spatial_min_dist] = float('inf')
+
+        spatial_neg_pairs = pairs_quantile(
+            spatial_dist_for_neg,
+            low=config.get('spatial_negative_quantile_low', 0.65),
+            high=config.get('spatial_negative_quantile_high', 0.90),
+            anchor_cols=anchor_cols,
+            max_pairs=config.get('spatial_max_neg_pairs', 10000),
+        )
+
+        # Check if we have valid pairs for both losses
+        has_spectral = spectral_pos_pairs.shape[0] > 0 and spectral_neg_pairs.shape[0] > 0
+        has_spatial = spatial_pos_pairs.shape[0] > 0 and spatial_neg_pairs.shape[0] > 0
+
+        if not has_spectral and not has_spatial:
+            continue
+
+        # Encode the full patch for efficient embedding extraction
+        # encoder_data: [C, H, W] -> [1, C, H, W] -> conv -> [1, D, H, W]
+        encoder_input_full = encoder_data.unsqueeze(0)
+        z_full = encoder(encoder_input_full)  # [1, D, H, W]
+        z_full = z_full.squeeze(0)  # [D, H, W]
+
+        # Extract embeddings at anchor locations for spectral loss
+        z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
+
+        # Compute spectral loss
+        spectral_loss_val = torch.tensor(0.0, device=device)
+        if has_spectral:
+            spectral_loss_val = contrastive_loss(
+                z_anchors,
+                spectral_pos_pairs,
+                spectral_neg_pairs,
+                temperature=config.get('temperature', 0.07),
+                similarity='l2',
+            )
+
+        # Compute spatial loss
+        spatial_loss_val = torch.tensor(0.0, device=device)
+        if has_spatial:
+            # Extract embeddings at all valid pixel locations
+            z_valid_pixels = extract_at_locations(z_full, valid_pixel_coords)  # [num_valid, D]
+
+            # For spatial loss, anchors index into z_anchors (rows 0 to num_anchors-1)
+            # and targets index into z_valid_pixels (columns)
+            # But pairs_knn returns pairs where anchor_id = anchor_cols[row], target_id = col
+            # So anchor_id indexes into valid_pixel_coords, and target_id indexes into valid_pixel_coords
+            # We need embeddings indexed by valid_pixel_coords indices
+
+            spatial_loss_val = contrastive_loss(
+                z_valid_pixels,
+                spatial_pos_pairs,
+                spatial_neg_pairs,
+                temperature=config.get('spatial_temperature', 0.07),
+                similarity='l2',
+            )
+
+        # Combine losses with weights
+        spectral_weight = config.get('spectral_loss_weight', 1.0)
+        spatial_weight = config.get('spatial_loss_weight', 1.0)
+        loss = spectral_weight * spectral_loss_val + spatial_weight * spatial_loss_val
 
         # Skip if loss is NaN or Inf (numerical instability)
         if not torch.isfinite(loss):
@@ -172,11 +254,17 @@ def process_batch(
         else:
             total_loss += loss.item()
         n_valid += 1
-        total_pos_pairs += pos_pairs.shape[0]
-        total_neg_pairs += neg_pairs.shape[0]
+        total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
+        total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
+        total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
+        total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
     if n_valid == 0:
-        return {'loss': 0.0, 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
+        return {
+            'loss': 0.0, 'n_valid': 0,
+            'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
+            'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
+        }
 
     # Average loss over valid samples in batch
     mean_loss = total_loss / n_valid
@@ -185,7 +273,11 @@ def process_batch(
         # Final NaN check before backward
         if not torch.isfinite(mean_loss):
             logger.warning(f"Skipping batch with non-finite mean loss: {mean_loss.item()}")
-            return {'loss': float('nan'), 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
+            return {
+                'loss': float('nan'), 'n_valid': 0,
+                'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
+                'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
+            }
 
         # Backward
         mean_loss.backward()
@@ -203,8 +295,10 @@ def process_batch(
     return {
         'loss': mean_loss,
         'n_valid': n_valid,
-        'pos_pairs': total_pos_pairs // n_valid,
-        'neg_pairs': total_neg_pairs // n_valid,
+        'spectral_pos_pairs': total_spectral_pos_pairs // n_valid,
+        'spectral_neg_pairs': total_spectral_neg_pairs // n_valid,
+        'spatial_pos_pairs': total_spatial_pos_pairs // n_valid,
+        'spatial_neg_pairs': total_spatial_neg_pairs // n_valid,
     }
 
 
@@ -241,8 +335,8 @@ def train_epoch(
                     f"Epoch {epoch+1}/{num_epochs} | "
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
                     f"Loss: {stats['loss']:.4f} | "
-                    f"Pos: {stats['pos_pairs']} | "
-                    f"Neg: {stats['neg_pairs']} | "
+                    f"Spectral(+/-): {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']} | "
+                    f"Spatial(+/-): {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
                 )
 
@@ -440,16 +534,30 @@ def main():
 
     # Loss and training config
     loss_config = {
+        # Sampling
         'stride': 16,
         'border': 16,
         'jitter_radius': 4,
         'supplement_n': 104,
+        # Spectral InfoNCE loss
         'positive_k': 16,
         'positive_min_spatial': 4.0,
         'negative_quantile_low': 0.5,
         'negative_quantile_high': 0.75,
         'negative_min_spatial': 8.0,
         'temperature': 0.07,
+        # Spatial InfoNCE loss
+        'spatial_positive_k': 4,
+        'spatial_positive_max_dist': 8.0,
+        'spatial_negative_min_dist': 16.0,
+        'spatial_negative_quantile_low': 0.65,
+        'spatial_negative_quantile_high': 0.90,
+        'spatial_max_neg_pairs': 10000,
+        'spatial_temperature': 0.07,
+        # Loss weights
+        'spectral_loss_weight': 1.0,
+        'spatial_loss_weight': 1.0,
+        # Training
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
         'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
     }
