@@ -3,7 +3,7 @@
 Minimal training script for representation learning.
 
 This script trains a simple encoder using InfoNCE contrastive loss:
-- Input: features.ccdc_history (15 channels)
+- Input: features.ccdc_history (16 channels)
 - Encoder: Conv2D kernel=1, two layers [128, 64]
 - Output: z_type (64-dim embedding per pixel)
 - Loss: InfoNCE with auxiliary distance-based pair selection
@@ -48,6 +48,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+    # a: [N, C], pairs: [P, 2] -> returns [P]
+    v1 = a[pairs[:, 0]]
+    v2 = a[pairs[:, 1]]
+    return torch.norm(v1 - v2, dim=1)
 
 
 def process_batch(
@@ -209,6 +215,28 @@ def process_batch(
             neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
             neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
             spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
+            
+        # --- Spectral weighting for spatial pairs ---
+        # Use distance_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
+        dist_unique = extract_at_locations(distance_data, unique_coords)  # [Nuniq, Cdist]
+
+        tau = config.get("spatial_spectral_tau", 1.0)  # tune this
+        min_w = config.get("spatial_min_w", 0.05)
+        
+        pos_weights = None
+        neg_weights = None
+        
+        if spatial_pos_pairs.numel() > 0:
+            dpos = pair_l2(dist_unique, spatial_pos_pairs)
+            pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
+            
+        if spatial_neg_pairs.numel() > 0:
+            dneg = pair_l2(dist_unique, spatial_neg_pairs)
+            neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
+
+        # Should check this to see that weights separate.
+        #print("pos dists:", dpos.min().item(), dpos.median().item(), dpos.max().item())
+        #print("neg dists:", dneg.min().item(), dneg.median().item(), dneg.max().item())
 
         # Check if we have valid pairs for both losses
         has_spectral = spectral_pos_pairs.shape[0] > 0 and spectral_neg_pairs.shape[0] > 0
@@ -247,6 +275,8 @@ def process_batch(
                 z_spatial,
                 spatial_pos_pairs,
                 spatial_neg_pairs,
+                pos_weights=pos_weights,
+                neg_weights=neg_weights,
                 temperature=config.get('spatial_temperature', 0.07),
                 similarity='l2',
             )
@@ -337,9 +367,11 @@ def train_epoch(
     epoch: int,
     num_epochs: int,
     log_interval: int = 10,
-) -> float:
+) -> dict:
     """Run training on entire training set for one epoch."""
     total_loss = 0.0
+    total_spectral_loss = 0.0
+    total_spatial_loss = 0.0
     total_batches = 0
 
     for batch_idx, batch in enumerate(train_dataloader):
@@ -352,11 +384,13 @@ def train_epoch(
 
         if stats['n_valid'] > 0:
             total_loss += stats['loss']
+            total_spectral_loss += stats['spectral_loss']
+            total_spatial_loss += stats['spatial_loss']
             total_batches += 1
 
             if batch_idx % log_interval == 0:
                 logger.info(
-                    f"Epoch {epoch+1}/{num_epochs} | "
+                    f"Epoch {epoch+1} | "
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
                     f"Loss: {stats['loss']:.4f} (spec: {stats['spectral_loss']:.4f}, spat: {stats['spatial_loss']:.4f}) | "
                     f"Pairs(+/-): spec {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']}, "
@@ -365,10 +399,14 @@ def train_epoch(
                 )
 
     if total_batches == 0:
-        return 0.0
+        return {'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0}
 
-    return total_loss / total_batches
-
+    return {
+        'loss': total_loss / total_batches,
+        'spectral_loss': total_spectral_loss / total_batches,
+        'spatial_loss': total_spatial_loss / total_batches,
+        'batches': total_batches,
+    }
 
 def validate_epoch(
     val_dataloader: DataLoader,
@@ -376,9 +414,11 @@ def validate_epoch(
     encoder: nn.Module,
     device: torch.device,
     config: dict,
-) -> float:
+) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
+    total_spectral_loss = 0.0
+    total_spatial_loss = 0.0
     total_batches = 0
 
     with torch.no_grad():
@@ -389,13 +429,20 @@ def validate_epoch(
             )
             if stats['n_valid'] > 0:
                 total_loss += stats['loss']
+                total_spectral_loss += stats['spectral_loss']
+                total_spatial_loss += stats['spatial_loss']
                 total_batches += 1
 
     if total_batches == 0:
-        return 0.0
+        return {'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0}
 
-    return total_loss / total_batches
 
+    return {
+        'loss': total_loss / total_batches,
+        'spectral_loss': total_spectral_loss / total_batches,
+        'spatial_loss': total_spatial_loss / total_batches,
+        'batches': total_batches,
+    }
 
 def main():
     parser = argparse.ArgumentParser(description='Train representation encoder')
@@ -507,7 +554,7 @@ def main():
     # Create encoder
     logger.info("Creating encoder...")
     encoder = Conv2DEncoder(
-        in_channels=15,  # ccdc_history has 15 channels
+        in_channels=16,  # ccdc_history has 16 channels
         channels=[128, 64],  # Two layers: 128, 64
         kernel_size=1,
         padding=0,
@@ -576,9 +623,11 @@ def main():
         'spatial_negative_min_dist': 96.0,  # min distance for negatives
         'spatial_negative_max_dist': 192.0,  # max distance for negatives
         'spatial_negatives_per_anchor': 16,  # number of negatives per anchor
+        'spatial_spectral_tau': 2, # dist. metric on spectral dist, ideally ~ .5*sqrt(2*ndim)
+        'spatial_min_w': .03,
         'spatial_temperature': 0.07,
         # Loss weights
-        'spectral_loss_weight': 1.0,
+        'spectral_loss_weight': 0.2,
         'spatial_loss_weight': 1.0,
         # Training
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
@@ -593,19 +642,22 @@ def main():
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         train_dataset.on_epoch_start()  # Reshuffle patches
-
-        train_loss = train_epoch(
-            train_dataloader, feature_builder, encoder, optimizer, scheduler,
-            device, loss_config, epoch, num_epochs,
+        
+        train_stats = train_epoch(
+          train_dataloader, feature_builder, encoder, optimizer, scheduler,
+          device, loss_config, epoch, num_epochs,
         )
-        val_loss = validate_epoch(
-            val_dataloader, feature_builder, encoder, device, loss_config,
+        
+        val_stats = validate_epoch(
+          val_dataloader, feature_builder, encoder, device, loss_config,
         )
 
         logger.info(
-            f"Epoch {epoch+1} complete | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f}"
+            f"Epoch {epoch+1}/{num_epochs} complete | "
+            f"Train Loss: {train_stats['loss']:.4f} "
+            f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}) | "
+            f"Val Loss: {train_stats['loss']:.4f} "
+            f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}) | "
         )
 
         # Save checkpoint
@@ -615,8 +667,12 @@ def main():
             'encoder_state_dict': encoder.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
+            'train_loss': train_stats['loss'],
+            'train_spectral_loss': train_stats['spectral_loss'],
+            'train_spatial_loss': train_stats['spatial_loss'],
+            'val_loss': val_stats['loss'],
+            'val_spectral_loss': val_stats['spectral_loss'],
+            'val_spatial_loss': val_stats['spatial_loss'],
         }, ckpt_path)
         logger.info(f"Saved checkpoint to {ckpt_path}")
 

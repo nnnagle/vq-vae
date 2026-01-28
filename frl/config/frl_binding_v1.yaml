@@ -204,6 +204,7 @@ features:
       static.spectral_distance_per_decade: {norm: robust_iqr}
       static.mean_decline_rate: {norm: robust_iqr}
       static.num_segments: {norm: robust_iqr}
+      static.variance_ndvi: {norm: robust_iqr}
   infonce_type_spectral:
     dim: [C,H,W]
     channels:
@@ -350,6 +351,6 @@ losses:
       candidates: patch
       selection:
         type: spatial-quantile
-        range: [0.65, 0.90]  # Far away (not middle)
+        range: [0.65, 0.75]  # Far away (not middle)
         min_distance: 16        
         

@@ -440,7 +440,7 @@ def main():
     parser.add_argument(
         '--lr',
         type=float,
-        default=1e-3,
+        default=1e-1,
         help='Learning rate for probe head'
     )
     parser.add_argument(
@@ -517,7 +517,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
     encoder = Conv2DEncoder(
-        in_channels=15,  # ccdc_history has 15 channels
+        in_channels=16,  # ccdc_history has 16 channels
         channels=[128, 64],
         kernel_size=1,
         padding=0,
