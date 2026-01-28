@@ -88,6 +88,8 @@ def process_batch(
 
     # Process each sample in batch (pair generation is per-patch)
     total_loss = 0.0
+    total_spectral_loss = 0.0
+    total_spatial_loss = 0.0
     n_valid = 0
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
@@ -262,8 +264,12 @@ def process_batch(
         # Accumulate: keep as tensor for training (backward), use .item() for validation
         if training:
             total_loss += loss
+            total_spectral_loss += spectral_loss_val
+            total_spatial_loss += spatial_loss_val
         else:
             total_loss += loss.item()
+            total_spectral_loss += spectral_loss_val.item()
+            total_spatial_loss += spatial_loss_val.item()
         n_valid += 1
         total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
         total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
@@ -272,20 +278,23 @@ def process_batch(
 
     if n_valid == 0:
         return {
-            'loss': 0.0, 'n_valid': 0,
+            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
         }
 
-    # Average loss over valid samples in batch
+    # Average losses over valid samples in batch
     mean_loss = total_loss / n_valid
+    mean_spectral_loss = total_spectral_loss / n_valid
+    mean_spatial_loss = total_spatial_loss / n_valid
 
     if training:
         # Final NaN check before backward
         if not torch.isfinite(mean_loss):
             logger.warning(f"Skipping batch with non-finite mean loss: {mean_loss.item()}")
             return {
-                'loss': float('nan'), 'n_valid': 0,
+                'loss': float('nan'), 'spectral_loss': float('nan'), 'spatial_loss': float('nan'),
+                'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
             }
@@ -302,9 +311,13 @@ def process_batch(
 
         optimizer.step()
         mean_loss = mean_loss.item()
+        mean_spectral_loss = mean_spectral_loss.item()
+        mean_spatial_loss = mean_spatial_loss.item()
 
     return {
         'loss': mean_loss,
+        'spectral_loss': mean_spectral_loss,
+        'spatial_loss': mean_spatial_loss,
         'n_valid': n_valid,
         'spectral_pos_pairs': total_spectral_pos_pairs // n_valid,
         'spectral_neg_pairs': total_spectral_neg_pairs // n_valid,
@@ -345,9 +358,9 @@ def train_epoch(
                 logger.info(
                     f"Epoch {epoch+1}/{num_epochs} | "
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
-                    f"Loss: {stats['loss']:.4f} | "
-                    f"Spectral(+/-): {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']} | "
-                    f"Spatial(+/-): {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
+                    f"Loss: {stats['loss']:.4f} (spec: {stats['spectral_loss']:.4f}, spat: {stats['spatial_loss']:.4f}) | "
+                    f"Pairs(+/-): spec {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']}, "
+                    f"spat {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
                 )
 
