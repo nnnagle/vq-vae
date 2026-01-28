@@ -573,9 +573,9 @@ def main():
         # Spatial InfoNCE loss (offset-grid approach)
         'spatial_positive_k': 4,
         'spatial_positive_max_dist': 8,  # max radius for positive neighbors
-        'spatial_negative_min_dist': 16.0,  # min distance for negatives
-        'spatial_negative_max_dist': None,  # max distance for negatives (None = no limit)
-        'spatial_negatives_per_anchor': 4,  # number of negatives per anchor
+        'spatial_negative_min_dist': 96.0,  # min distance for negatives
+        'spatial_negative_max_dist': 192.0,  # max distance for negatives
+        'spatial_negatives_per_anchor': 16,  # number of negatives per anchor
         'spatial_temperature': 0.07,
         # Loss weights
         'spectral_loss_weight': 1.0,
