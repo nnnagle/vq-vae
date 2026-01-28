@@ -6,6 +6,8 @@ from .spatial import (
     extract_at_locations,
     find_anchor_indices_in_candidates,
     get_valid_pixel_coords,
+    spatial_knn_pairs,
+    spatial_negative_pairs,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     'extract_at_locations',
     'find_anchor_indices_in_candidates',
     'get_valid_pixel_coords',
+    'spatial_knn_pairs',
+    'spatial_negative_pairs',
 ]

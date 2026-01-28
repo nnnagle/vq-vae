@@ -38,12 +38,10 @@ from models import Conv2DEncoder
 from losses import contrastive_loss, pairs_with_spatial_constraint
 from utils import (
     compute_spatial_distances,
-    compute_spatial_distances_rectangular,
     extract_at_locations,
-    find_anchor_indices_in_candidates,
-    get_valid_pixel_coords,
+    spatial_knn_pairs,
+    spatial_negative_pairs,
 )
-from losses import pairs_knn, pairs_quantile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -153,43 +151,62 @@ def process_batch(
         )
 
         # --- Spatial InfoNCE Loss ---
-        # Get all valid pixel coordinates for spatial loss candidates
-        valid_pixel_coords = get_valid_pixel_coords(combined_mask)
+        # Use efficient offset-based pair generation (no large distance matrix)
 
-        if valid_pixel_coords.shape[0] < 100:
-            # Not enough valid pixels for meaningful spatial loss
-            continue
-
-        # Compute rectangular spatial distance matrix: [num_anchors x num_valid_pixels]
-        spatial_dist_rect = compute_spatial_distances_rectangular(anchors, valid_pixel_coords)
-
-        # Find anchor indices in valid_pixel_coords for self-exclusion
-        anchor_cols = find_anchor_indices_in_candidates(anchors, valid_pixel_coords)
-
-        # For spatial positives: k=4 nearest neighbors within max_distance=8
-        # Mask distances > max_distance before knn selection
-        spatial_max_dist = config.get('spatial_positive_max_dist', 8.0)
-        spatial_dist_for_pos = spatial_dist_rect.clone()
-        spatial_dist_for_pos[spatial_dist_rect > spatial_max_dist] = float('inf')
-
-        spatial_pos_pairs = pairs_knn(
-            spatial_dist_for_pos,
+        # Get spatial positive pairs (k nearest neighbors within max_radius)
+        pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
+            anchors,
+            combined_mask,
             k=config.get('spatial_positive_k', 4),
-            anchor_cols=anchor_cols,
+            max_radius=int(config.get('spatial_positive_max_dist', 8)),
         )
 
-        # For spatial negatives: quantile [0.65, 0.90] with min_distance=16
-        spatial_min_dist = config.get('spatial_negative_min_dist', 16.0)
-        spatial_dist_for_neg = spatial_dist_rect.clone()
-        spatial_dist_for_neg[spatial_dist_rect < spatial_min_dist] = float('inf')
-
-        spatial_neg_pairs = pairs_quantile(
-            spatial_dist_for_neg,
-            low=config.get('spatial_negative_quantile_low', 0.65),
-            high=config.get('spatial_negative_quantile_high', 0.90),
-            anchor_cols=anchor_cols,
-            max_pairs=config.get('spatial_max_neg_pairs', 10000),
+        # Get spatial negative pairs (random sample from distance range)
+        neg_anchor_idx, neg_neighbor_coords = spatial_negative_pairs(
+            anchors,
+            combined_mask,
+            min_distance=config.get('spatial_negative_min_dist', 16.0),
+            max_distance=config.get('spatial_negative_max_dist', None),
+            n_per_anchor=config.get('spatial_negatives_per_anchor', 4),
         )
+
+        # Build coordinate-to-index mapping for spatial loss
+        # Collect all unique coordinates: anchors + positive neighbors + negative neighbors
+        all_spatial_coords = [anchors]
+        if pos_neighbor_coords.numel() > 0:
+            all_spatial_coords.append(pos_neighbor_coords)
+        if neg_neighbor_coords.numel() > 0:
+            all_spatial_coords.append(neg_neighbor_coords)
+
+        all_spatial_coords = torch.cat(all_spatial_coords, dim=0)  # [N+M+K, 2]
+
+        # Get unique coordinates
+        unique_coords, inverse_indices = torch.unique(
+            all_spatial_coords, dim=0, return_inverse=True
+        )
+
+        # Map anchor indices (first N in all_spatial_coords)
+        n_anchors_spatial = anchors.shape[0]
+        anchor_to_unique = inverse_indices[:n_anchors_spatial]
+
+        # Convert pairs to index into unique_coords
+        n_pos = pos_neighbor_coords.shape[0] if pos_neighbor_coords.numel() > 0 else 0
+        n_neg = neg_neighbor_coords.shape[0] if neg_neighbor_coords.numel() > 0 else 0
+
+        spatial_pos_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+        spatial_neg_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+
+        if n_pos > 0:
+            # pos_neighbor indices in all_spatial_coords: [n_anchors_spatial : n_anchors_spatial + n_pos]
+            pos_neighbor_unique = inverse_indices[n_anchors_spatial : n_anchors_spatial + n_pos]
+            pos_anchor_unique = anchor_to_unique[pos_anchor_idx]
+            spatial_pos_pairs = torch.stack([pos_anchor_unique, pos_neighbor_unique], dim=1)
+
+        if n_neg > 0:
+            # neg_neighbor indices in all_spatial_coords: [n_anchors_spatial + n_pos : ]
+            neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
+            neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
+            spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
 
         # Check if we have valid pairs for both losses
         has_spectral = spectral_pos_pairs.shape[0] > 0 and spectral_neg_pairs.shape[0] > 0
@@ -221,17 +238,11 @@ def process_batch(
         # Compute spatial loss
         spatial_loss_val = torch.tensor(0.0, device=device)
         if has_spatial:
-            # Extract embeddings at all valid pixel locations
-            z_valid_pixels = extract_at_locations(z_full, valid_pixel_coords)  # [num_valid, D]
-
-            # For spatial loss, anchors index into z_anchors (rows 0 to num_anchors-1)
-            # and targets index into z_valid_pixels (columns)
-            # But pairs_knn returns pairs where anchor_id = anchor_cols[row], target_id = col
-            # So anchor_id indexes into valid_pixel_coords, and target_id indexes into valid_pixel_coords
-            # We need embeddings indexed by valid_pixel_coords indices
+            # Extract embeddings at unique coordinate locations
+            z_spatial = extract_at_locations(z_full, unique_coords)  # [num_unique, D]
 
             spatial_loss_val = contrastive_loss(
-                z_valid_pixels,
+                z_spatial,
                 spatial_pos_pairs,
                 spatial_neg_pairs,
                 temperature=config.get('spatial_temperature', 0.07),
@@ -546,13 +557,12 @@ def main():
         'negative_quantile_high': 0.75,
         'negative_min_spatial': 8.0,
         'temperature': 0.07,
-        # Spatial InfoNCE loss
+        # Spatial InfoNCE loss (offset-grid approach)
         'spatial_positive_k': 4,
-        'spatial_positive_max_dist': 8.0,
-        'spatial_negative_min_dist': 16.0,
-        'spatial_negative_quantile_low': 0.65,
-        'spatial_negative_quantile_high': 0.90,
-        'spatial_max_neg_pairs': 10000,
+        'spatial_positive_max_dist': 8,  # max radius for positive neighbors
+        'spatial_negative_min_dist': 16.0,  # min distance for negatives
+        'spatial_negative_max_dist': None,  # max distance for negatives (None = no limit)
+        'spatial_negatives_per_anchor': 4,  # number of negatives per anchor
         'spatial_temperature': 0.07,
         # Loss weights
         'spectral_loss_weight': 1.0,

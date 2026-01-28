@@ -153,3 +153,162 @@ def extract_at_locations(
     rows, cols = coords[:, 0], coords[:, 1]
     # feature[:, rows, cols] gives [C, N], transpose to [N, C]
     return feature[:, rows, cols].T
+
+
+def spatial_knn_pairs(
+    anchor_coords: torch.Tensor,
+    mask: torch.Tensor,
+    k: int = 4,
+    max_radius: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Find k nearest spatial neighbors for each anchor using offset grid.
+
+    This is an efficient implementation that avoids computing a full distance
+    matrix. Instead, it precomputes neighbor offsets within max_radius and
+    applies them to all anchors simultaneously.
+
+    Args:
+        anchor_coords: Tensor [N, 2] of (row, col) anchor coordinates
+        mask: Boolean mask [H, W] indicating valid pixels
+        k: Number of nearest neighbors per anchor
+        max_radius: Maximum distance to consider for neighbors
+
+    Returns:
+        Tuple of:
+            - anchor_indices: Tensor [M] of anchor indices (into anchor_coords)
+            - neighbor_coords: Tensor [M, 2] of neighbor (row, col) coordinates
+        Only returns pairs where the neighbor is valid in the mask.
+    """
+    device = anchor_coords.device
+    n_anchors = anchor_coords.shape[0]
+    H, W = mask.shape
+
+    # Create offset grid: all (dr, dc) within max_radius
+    r = max_radius
+    dr = torch.arange(-r, r + 1, device=device)
+    dc = torch.arange(-r, r + 1, device=device)
+    grid_r, grid_c = torch.meshgrid(dr, dc, indexing='ij')
+    offsets = torch.stack([grid_r.flatten(), grid_c.flatten()], dim=1)  # [(2r+1)^2, 2]
+
+    # Compute distance from center for each offset
+    offset_dists = torch.sqrt((offsets[:, 0].float() ** 2) + (offsets[:, 1].float() ** 2))
+
+    # Exclude self (distance 0) and offsets beyond max_radius
+    valid_offset_mask = (offset_dists > 0) & (offset_dists <= max_radius)
+    valid_offsets = offsets[valid_offset_mask]
+    valid_dists = offset_dists[valid_offset_mask]
+
+    # Sort by distance and take top k
+    sorted_indices = torch.argsort(valid_dists)
+    k_actual = min(k, len(sorted_indices))
+    top_k_indices = sorted_indices[:k_actual]
+    neighbor_offsets = valid_offsets[top_k_indices]  # [k, 2]
+
+    # Apply offsets to all anchors: [N, 1, 2] + [1, k, 2] -> [N, k, 2]
+    anchor_exp = anchor_coords.unsqueeze(1)  # [N, 1, 2]
+    offset_exp = neighbor_offsets.unsqueeze(0)  # [1, k, 2]
+    neighbor_coords = anchor_exp + offset_exp  # [N, k, 2]
+
+    # Check bounds
+    in_bounds = (
+        (neighbor_coords[:, :, 0] >= 0) &
+        (neighbor_coords[:, :, 0] < H) &
+        (neighbor_coords[:, :, 1] >= 0) &
+        (neighbor_coords[:, :, 1] < W)
+    )  # [N, k]
+
+    # Check mask validity (only for in-bounds coordinates)
+    neighbor_r = neighbor_coords[:, :, 0].clamp(0, H - 1).long()
+    neighbor_c = neighbor_coords[:, :, 1].clamp(0, W - 1).long()
+    mask_valid = mask[neighbor_r, neighbor_c] & in_bounds  # [N, k]
+
+    # Create anchor index tensor
+    anchor_indices = torch.arange(n_anchors, device=device).unsqueeze(1).expand(-1, k_actual)
+
+    # Get valid pairs
+    valid_pairs_mask = mask_valid.flatten()
+    anchor_flat = anchor_indices.flatten()[valid_pairs_mask]
+    neighbor_coords_flat = neighbor_coords.reshape(-1, 2)[valid_pairs_mask].long()
+
+    return anchor_flat, neighbor_coords_flat
+
+
+def spatial_negative_pairs(
+    anchor_coords: torch.Tensor,
+    mask: torch.Tensor,
+    min_distance: float = 16.0,
+    max_distance: float | None = None,
+    n_per_anchor: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample spatially distant negative pairs for each anchor.
+
+    For each anchor, randomly samples valid pixels within a distance range.
+    This avoids computing quantiles over large distance matrices.
+
+    Args:
+        anchor_coords: Tensor [N, 2] of (row, col) anchor coordinates
+        mask: Boolean mask [H, W] indicating valid pixels
+        min_distance: Minimum distance for negatives
+        max_distance: Maximum distance for negatives (None = no limit)
+        n_per_anchor: Number of negatives to sample per anchor
+
+    Returns:
+        Tuple of:
+            - anchor_indices: Tensor [M] of anchor indices (into anchor_coords)
+            - neighbor_coords: Tensor [M, 2] of neighbor (row, col) coordinates
+    """
+    device = anchor_coords.device
+    n_anchors = anchor_coords.shape[0]
+    H, W = mask.shape
+
+    # Get all valid pixel coordinates
+    valid_coords = get_valid_pixel_coords(mask)  # [V, 2]
+    n_valid = valid_coords.shape[0]
+
+    if n_valid == 0:
+        return (
+            torch.zeros(0, dtype=torch.long, device=device),
+            torch.zeros((0, 2), dtype=torch.long, device=device),
+        )
+
+    # Compute distances from each anchor to all valid pixels
+    # This is [N, V] but we process per-anchor to avoid huge matrix
+    all_anchor_indices = []
+    all_neighbor_coords = []
+
+    for i in range(n_anchors):
+        anchor = anchor_coords[i].float()  # [2]
+
+        # Compute distances to all valid pixels
+        dists = torch.sqrt(
+            ((valid_coords.float() - anchor) ** 2).sum(dim=1)
+        )  # [V]
+
+        # Filter by distance range
+        dist_mask = dists >= min_distance
+        if max_distance is not None:
+            dist_mask = dist_mask & (dists <= max_distance)
+
+        candidate_indices = torch.where(dist_mask)[0]
+
+        if candidate_indices.numel() == 0:
+            continue
+
+        # Random sample
+        n_sample = min(n_per_anchor, candidate_indices.numel())
+        perm = torch.randperm(candidate_indices.numel(), device=device)[:n_sample]
+        sampled_indices = candidate_indices[perm]
+
+        # Collect results
+        all_anchor_indices.append(torch.full((n_sample,), i, dtype=torch.long, device=device))
+        all_neighbor_coords.append(valid_coords[sampled_indices])
+
+    if len(all_anchor_indices) == 0:
+        return (
+            torch.zeros(0, dtype=torch.long, device=device),
+            torch.zeros((0, 2), dtype=torch.long, device=device),
+        )
+
+    return torch.cat(all_anchor_indices), torch.cat(all_neighbor_coords)
