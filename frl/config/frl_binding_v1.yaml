@@ -117,7 +117,8 @@ dataset: # These exist in the zarr
       - {name: spectral_distance_per_decade,  source: static/ccdc_metrics_history/data/spectral_distance_per_decade,  fill_value: -9999}
       - {name: mean_decline_rate, source: static/ccdc_metrics_history/data/mean_decline_rate, fill_value: -9999}
       - {name: num_segments, source: static/ccdc_metrics_history/data/num_segments, fill_value: -9999}
-      
+      - {name: variance_ndvi, source: static/ccdc_metrics_history/data/variance_ndvi, fill_value: -9999}
+
       
 
 # -------------------------------------------------------------------
@@ -241,6 +242,14 @@ features:
       annual.ndvi_amplitude: {norm: zscore}
       annual.ndvi_summer_p95: {norm: zscore}
       annual.ndvi_winter_max: {norm: zscore}
+  target_metrics:
+    dim: [C,H,W]
+    channels: 
+      static.mean_ndvi: {norm: robust_iqr}
+      static.mean_ndmi: {norm: robust_iqr}
+      static.mean_nbr: {norm: robust_iqr}
+      static.mean_seasonal_amp_nir: {norm: robust_iqr}
+      static.variance_ndvi: {norm: robust_iqr}
 
 ######################
 # Losses template
