@@ -35,46 +35,13 @@ from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
 from models import Conv2DEncoder
 from losses import contrastive_loss, pairs_with_spatial_constraint
+from utils import compute_spatial_distances, extract_at_locations
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-def compute_spatial_distances(coords: torch.Tensor) -> torch.Tensor:
-    """
-    Compute pairwise L2 spatial distances between coordinates.
-
-    Args:
-        coords: Tensor of shape [N, 2] with (row, col) coordinates
-
-    Returns:
-        Distance matrix [N, N]
-    """
-    coords_float = coords.float()
-    return torch.cdist(coords_float, coords_float)
-
-
-def extract_at_locations(
-    feature: torch.Tensor,
-    coords: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Extract feature vectors at given pixel locations.
-
-    Args:
-        feature: Feature tensor [C, H, W]
-        coords: Coordinates [N, 2] as (row, col)
-
-    Returns:
-        Extracted features [N, C]
-    """
-    C, H, W = feature.shape
-    rows, cols = coords[:, 0], coords[:, 1]
-    # feature[:, rows, cols] gives [C, N], transpose to [N, C]
-    return feature[:, rows, cols].T
 
 
 def train_one_batch(
