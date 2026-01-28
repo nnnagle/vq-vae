@@ -3,7 +3,7 @@
 Linear probe training script for evaluating learned representations.
 
 This script trains a linear head on top of frozen encoder representations
-to predict target metrics (e.g., annual spectral indices from phase_ls8).
+to predict target metrics (static spectral indices from target_metrics feature).
 
 The linear probe tests whether the encoder's learned representations
 contain information predictive of the target metrics.
@@ -13,11 +13,6 @@ Usage:
         --checkpoint checkpoints/encoder_epoch_050.pt \
         --bindings config/frl_binding_v1.yaml \
         --training config/frl_training_v1.yaml
-
-    # Predict a specific year (default: last year in time window)
-    python training/train_linear_probe.py \
-        --checkpoint checkpoints/encoder_epoch_050.pt \
-        --target-year 2020
 """
 
 from __future__ import annotations
@@ -48,15 +43,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Target metrics from phase_ls8 (excluding temporal_position)
+# Target metrics from target_metrics feature (static [C,H,W])
 TARGET_METRICS = [
-    'annual.evi2_summer_p95',
-    'annual.nbr_annual_min',
-    'annual.nbr_summer_p95',
-    'annual.ndmi_summer_mean',
-    'annual.ndvi_amplitude',
-    'annual.ndvi_summer_p95',
-    'annual.ndvi_winter_max',
+    'static.mean_ndvi',
+    'static.mean_ndmi',
+    'static.mean_nbr',
+    'static.mean_seasonal_amp_nir',
+    'static.variance_ndvi',
 ]
 
 
@@ -104,7 +97,6 @@ def process_batch(
     encoder: nn.Module,
     probe_head: nn.Module,
     device: torch.device,
-    target_year_idx: int,
     training: bool = True,
     optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> Tuple[Dict[str, float], Dict[str, float], int]:
@@ -117,7 +109,6 @@ def process_batch(
         encoder: Frozen encoder network
         probe_head: Linear probe head (trainable)
         device: Device to use
-        target_year_idx: Index of target year in temporal dimension
         training: If True, run optimizer step
         optimizer: Optimizer (required if training=True)
 
@@ -160,19 +151,18 @@ def process_batch(
         # Build encoder input feature (ccdc_history)
         encoder_feature = feature_builder.build_feature('ccdc_history', sample)
 
-        # Build target feature (phase_ls8)
-        target_feature = feature_builder.build_feature('phase_ls8', sample)
+        # Build target feature (target_metrics) - static [C, H, W]
+        target_feature = feature_builder.build_feature('target_metrics', sample)
 
         # Get encoder input [C, H, W]
         encoder_data = torch.from_numpy(encoder_feature.data).float()
 
-        # Get target data [C, T, H, W] -> select year -> [C, H, W]
-        # Exclude first channel (temporal_position)
-        target_data = torch.from_numpy(target_feature.data[1:, target_year_idx, :, :]).float()
+        # Get target data [C, H, W]
+        target_data = torch.from_numpy(target_feature.data).float()
 
-        # Combined mask: encoder mask AND target mask for selected year
+        # Combined mask: encoder mask AND target mask
         encoder_mask = torch.from_numpy(encoder_feature.mask)
-        target_mask = torch.from_numpy(target_feature.mask[target_year_idx, :, :])
+        target_mask = torch.from_numpy(target_feature.mask)
         combined_mask = encoder_mask & target_mask
 
         encoder_inputs.append(encoder_data)
@@ -244,7 +234,6 @@ def train_epoch(
     probe_head: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    target_year_idx: int,
     epoch: int,
     num_epochs: int,
     log_interval: int = 10,
@@ -261,7 +250,7 @@ def train_epoch(
     for batch_idx, batch in enumerate(dataloader):
         batch_mse, batch_r2, n_pixels = process_batch(
             batch, feature_builder, encoder, probe_head, device,
-            target_year_idx, training=True, optimizer=optimizer,
+            training=True, optimizer=optimizer,
         )
 
         if n_pixels > 0:
@@ -306,7 +295,6 @@ def validate_epoch(
     encoder: nn.Module,
     probe_head: nn.Module,
     device: torch.device,
-    target_year_idx: int,
 ) -> ProbeMetrics:
     """Run validation and compute proper R² across entire dataset."""
 
@@ -335,18 +323,14 @@ def validate_epoch(
 
                 # Build features
                 encoder_feature = feature_builder.build_feature('ccdc_history', sample)
-                target_feature = feature_builder.build_feature('phase_ls8', sample)
+                target_feature = feature_builder.build_feature('target_metrics', sample)
 
-                # Prepare tensors
+                # Prepare tensors - both are static [C, H, W]
                 encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
-                target_data = torch.from_numpy(
-                    target_feature.data[1:, target_year_idx, :, :]
-                ).float().to(device)
+                target_data = torch.from_numpy(target_feature.data).float().to(device)
 
                 encoder_mask = torch.from_numpy(encoder_feature.mask).to(device)
-                target_mask = torch.from_numpy(
-                    target_feature.mask[target_year_idx, :, :]
-                ).to(device)
+                target_mask = torch.from_numpy(target_feature.mask).to(device)
                 combined_mask = encoder_mask & target_mask
 
                 if combined_mask.sum() == 0:
@@ -415,7 +399,7 @@ def log_metrics(metrics: ProbeMetrics, prefix: str = ""):
         mse = metrics.mse_per_metric.get(metric_name, 0.0)
         r2 = metrics.r2_per_metric.get(metric_name, 0.0)
         # Shorten metric name for display
-        short_name = metric_name.replace('annual.', '')
+        short_name = metric_name.replace('static.', '')
         logger.info(f"{short_name:<30} {mse:>10.4f} {r2:>10.4f}")
     logger.info("-" * 52)
     logger.info(f"{'Average':<30} {metrics.mse_total:>10.4f} {metrics.r2_total:>10.4f}")
@@ -440,12 +424,6 @@ def main():
         type=str,
         default='config/frl_training_v1.yaml',
         help='Path to training config'
-    )
-    parser.add_argument(
-        '--target-year',
-        type=int,
-        default=None,
-        help='Target year to predict (default: last year in time window)'
     )
     parser.add_argument(
         '--epochs',
@@ -491,24 +469,6 @@ def main():
     device_str = args.device or training_config.hardware.device
     device = torch.device(device_str)
     logger.info(f"Using device: {device}")
-
-    # Determine target year index
-    time_start = bindings_config.time_window.start
-    time_end = bindings_config.time_window.end
-    n_years = time_end - time_start
-
-    if args.target_year is not None:
-        if args.target_year < time_start or args.target_year >= time_end:
-            raise ValueError(
-                f"Target year {args.target_year} outside time window [{time_start}, {time_end})"
-            )
-        target_year_idx = args.target_year - time_start
-    else:
-        # Default to last year
-        target_year_idx = n_years - 1
-
-    target_year = time_start + target_year_idx
-    logger.info(f"Predicting target year: {target_year} (index {target_year_idx})")
 
     # Create datasets
     logger.info("Creating train dataset...")
@@ -608,13 +568,13 @@ def main():
         # Train
         train_metrics = train_epoch(
             train_dataloader, feature_builder, encoder, probe_head,
-            optimizer, device, target_year_idx, epoch, args.epochs,
+            optimizer, device, epoch, args.epochs,
         )
 
         # Validate
         val_metrics = validate_epoch(
             val_dataloader, feature_builder, encoder, probe_head,
-            device, target_year_idx,
+            device,
         )
 
         logger.info(
@@ -639,7 +599,7 @@ def main():
                 'val_r2': val_metrics.r2_total,
                 'val_mse_per_metric': val_metrics.mse_per_metric,
                 'val_r2_per_metric': val_metrics.r2_per_metric,
-                'target_year': target_year,
+                'target_metrics': TARGET_METRICS,
                 'encoder_checkpoint': args.checkpoint,
             }, best_path)
             logger.info(f"Saved best model to {best_path} (R² = {best_val_r2:.4f})")
@@ -654,7 +614,7 @@ def main():
         'val_r2': val_metrics.r2_total,
         'val_mse_per_metric': val_metrics.mse_per_metric,
         'val_r2_per_metric': val_metrics.r2_per_metric,
-        'target_year': target_year,
+        'target_metrics': TARGET_METRICS,
         'encoder_checkpoint': args.checkpoint,
     }, final_path)
 
