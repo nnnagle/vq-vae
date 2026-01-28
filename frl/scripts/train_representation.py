@@ -17,10 +17,11 @@ Usage:
         --training config/frl_training_v1.yaml
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 from pathlib import Path
-from typing import Tuple, Optional
 
 import numpy as np
 import torch
@@ -44,178 +45,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def train_one_batch(
+def process_batch(
     batch: dict,
     feature_builder: FeatureBuilder,
     encoder: nn.Module,
-    optimizer: torch.optim.Optimizer,
     device: torch.device,
     config: dict,
+    training: bool = True,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> dict:
     """
-    Train on a single batch.
+    Process a single batch for training or validation.
 
     Args:
         batch: Batch from dataloader
         feature_builder: FeatureBuilder instance
         encoder: Encoder network
-        optimizer: Optimizer
         device: Device to use
         config: Loss config dict
+        training: If True, run in training mode (gradients, optimizer step).
+                  If False, run in eval mode (no gradients, no jitter).
+        optimizer: Optimizer (required if training=True)
 
     Returns:
         Dict with loss values and stats
     """
-    encoder.train()
-    optimizer.zero_grad()
+    if training:
+        if optimizer is None:
+            raise ValueError("optimizer is required when training=True")
+        encoder.train()
+        optimizer.zero_grad()
+    else:
+        encoder.eval()
+
+    # Use jitter only during training
+    jitter_radius = config.get('jitter_radius', 4) if training else 0
 
     # Process each sample in batch (pair generation is per-patch)
-    total_loss = 0.0
-    n_valid = 0
-    total_pos_pairs = 0
-    total_neg_pairs = 0
-
-    batch_size = len(batch['metadata'])
-
-    for i in range(batch_size):
-        # Extract single sample from batch
-        sample = {
-            key: val[i].numpy() if isinstance(val, torch.Tensor) else val[i]
-            for key, val in batch.items()
-            if key != 'metadata'
-        }
-        sample['metadata'] = batch['metadata'][i]
-
-        # Build features
-        encoder_feature = feature_builder.build_feature('ccdc_history', sample)
-        distance_feature = feature_builder.build_feature('infonce_type_spectral', sample)
-
-        # Convert to tensors
-        encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)  # [C, H, W]
-        distance_data = torch.from_numpy(distance_feature.data).float().to(device)  # [C, H, W]
-        mask = torch.from_numpy(encoder_feature.mask).to(device)  # [H, W]
-
-        # Also apply distance feature mask
-        dist_mask = torch.from_numpy(distance_feature.mask).to(device)
-        combined_mask = mask & dist_mask
-
-        # Sample anchor locations
-        anchors = sample_anchors_grid_plus_supplement(
-            combined_mask,
-            stride=config.get('stride', 16),
-            border=config.get('border', 16),
-            jitter_radius=config.get('jitter_radius', 4),
-            supplement_n=config.get('supplement_n', 104),
-        )
-
-        if anchors.shape[0] < 10:
-            # Skip if too few valid anchors
-            continue
-
-        # Extract features at anchor locations
-        encoder_at_anchors = extract_at_locations(encoder_data, anchors)  # [N, 15]
-        distance_at_anchors = extract_at_locations(distance_data, anchors)  # [N, 7]
-
-        # Compute distances
-        # Mahalanobis transform already applied by FeatureBuilder, so L2 here = Mahalanobis
-        feature_distances = torch.cdist(distance_at_anchors, distance_at_anchors)
-        spatial_distances = compute_spatial_distances(anchors)
-
-        # Generate pairs
-        pos_pairs, neg_pairs = pairs_with_spatial_constraint(
-            feature_distances,
-            spatial_distances,
-            positive_k=config.get('positive_k', 16),
-            positive_min_spatial=config.get('positive_min_spatial', 4.0),
-            negative_quantile_low=config.get('negative_quantile_low', 0.5),
-            negative_quantile_high=config.get('negative_quantile_high', 0.75),
-            negative_min_spatial=config.get('negative_min_spatial', 8.0),
-        )
-
-        if pos_pairs.shape[0] == 0 or neg_pairs.shape[0] == 0:
-            continue
-
-        # Encode through network
-        # Add batch and remove: [N, C] -> [1, C, 1, N] -> conv -> [1, D, 1, N] -> [N, D]
-        encoder_input = encoder_at_anchors.T.unsqueeze(0).unsqueeze(2)  # [1, C, 1, N]
-        z_type = encoder(encoder_input)  # [1, D, 1, N]
-        z_type = z_type.squeeze(0).squeeze(1).T  # [N, D]
-
-        # Compute loss
-        loss = contrastive_loss(
-            z_type,
-            pos_pairs,
-            neg_pairs,
-            temperature=config.get('temperature', 0.07),
-            similarity='l2',
-        )
-
-        # Skip if loss is NaN or Inf (numerical instability)
-        if not torch.isfinite(loss):
-            logger.warning(f"Skipping sample with non-finite loss: {loss.item()}")
-            continue
-
-        total_loss += loss
-        n_valid += 1
-        total_pos_pairs += pos_pairs.shape[0]
-        total_neg_pairs += neg_pairs.shape[0]
-
-    if n_valid == 0:
-        return {'loss': 0.0, 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
-
-    # Average loss over valid samples in batch
-    # Note: contrastive_loss already averages over anchors within each sample,
-    # so this averages across samples (standard mini-batch averaging)
-    mean_loss = total_loss / n_valid
-
-    # Final NaN check before backward
-    if not torch.isfinite(mean_loss):
-        logger.warning(f"Skipping batch with non-finite mean loss: {mean_loss.item()}")
-        return {'loss': float('nan'), 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
-
-    # Backward
-    mean_loss.backward()
-
-    # Gradient clipping
-    if config.get('gradient_clip_enabled', True):
-        torch.nn.utils.clip_grad_norm_(
-            encoder.parameters(),
-            max_norm=config.get('gradient_clip_max_norm', 1.0)
-        )
-
-    optimizer.step()
-
-    return {
-        'loss': mean_loss.item(),
-        'n_valid': n_valid,
-        'pos_pairs': total_pos_pairs // n_valid,
-        'neg_pairs': total_neg_pairs // n_valid,
-    }
-
-
-@torch.no_grad()
-def validate_one_batch(
-    batch: dict,
-    feature_builder: FeatureBuilder,
-    encoder: nn.Module,
-    device: torch.device,
-    config: dict,
-) -> dict:
-    """
-    Validate on a single batch (no gradient updates).
-
-    Args:
-        batch: Batch from dataloader
-        feature_builder: FeatureBuilder instance
-        encoder: Encoder network
-        device: Device to use
-        config: Loss config dict
-
-    Returns:
-        Dict with loss values and stats
-    """
-    encoder.eval()
-
     total_loss = 0.0
     n_valid = 0
     total_pos_pairs = 0
@@ -245,12 +111,12 @@ def validate_one_batch(
         dist_mask = torch.from_numpy(distance_feature.mask).to(device)
         combined_mask = mask & dist_mask
 
-        # Sample anchor locations (no jitter for deterministic validation)
+        # Sample anchor locations
         anchors = sample_anchors_grid_plus_supplement(
             combined_mask,
             stride=config.get('stride', 16),
             border=config.get('border', 16),
-            jitter_radius=0,  # No jitter for validation
+            jitter_radius=jitter_radius,
             supplement_n=config.get('supplement_n', 104),
         )
 
@@ -262,6 +128,7 @@ def validate_one_batch(
         distance_at_anchors = extract_at_locations(distance_data, anchors)
 
         # Compute distances
+        # Mahalanobis transform already applied by FeatureBuilder, so L2 here = Mahalanobis
         feature_distances = torch.cdist(distance_at_anchors, distance_at_anchors)
         spatial_distances = compute_spatial_distances(anchors)
 
@@ -280,6 +147,7 @@ def validate_one_batch(
             continue
 
         # Encode through network
+        # Add batch and remove: [N, C] -> [1, C, 1, N] -> conv -> [1, D, 1, N] -> [N, D]
         encoder_input = encoder_at_anchors.T.unsqueeze(0).unsqueeze(2)
         z_type = encoder(encoder_input)
         z_type = z_type.squeeze(0).squeeze(1).T
@@ -293,7 +161,16 @@ def validate_one_batch(
             similarity='l2',
         )
 
-        total_loss += loss.item()
+        # Skip if loss is NaN or Inf (numerical instability)
+        if not torch.isfinite(loss):
+            logger.warning(f"Skipping sample with non-finite loss: {loss.item()}")
+            continue
+
+        # Accumulate: keep as tensor for training (backward), use .item() for validation
+        if training:
+            total_loss += loss
+        else:
+            total_loss += loss.item()
         n_valid += 1
         total_pos_pairs += pos_pairs.shape[0]
         total_neg_pairs += neg_pairs.shape[0]
@@ -301,8 +178,30 @@ def validate_one_batch(
     if n_valid == 0:
         return {'loss': 0.0, 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
 
+    # Average loss over valid samples in batch
+    mean_loss = total_loss / n_valid
+
+    if training:
+        # Final NaN check before backward
+        if not torch.isfinite(mean_loss):
+            logger.warning(f"Skipping batch with non-finite mean loss: {mean_loss.item()}")
+            return {'loss': float('nan'), 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
+
+        # Backward
+        mean_loss.backward()
+
+        # Gradient clipping
+        if config.get('gradient_clip_enabled', True):
+            torch.nn.utils.clip_grad_norm_(
+                encoder.parameters(),
+                max_norm=config.get('gradient_clip_max_norm', 1.0)
+            )
+
+        optimizer.step()
+        mean_loss = mean_loss.item()
+
     return {
-        'loss': total_loss / n_valid,
+        'loss': mean_loss,
         'n_valid': n_valid,
         'pos_pairs': total_pos_pairs // n_valid,
         'neg_pairs': total_neg_pairs // n_valid,
@@ -320,11 +219,15 @@ def validate_epoch(
     total_loss = 0.0
     total_batches = 0
 
-    for batch in val_dataloader:
-        stats = validate_one_batch(batch, feature_builder, encoder, device, config)
-        if stats['n_valid'] > 0:
-            total_loss += stats['loss']
-            total_batches += 1
+    with torch.no_grad():
+        for batch in val_dataloader:
+            stats = process_batch(
+                batch, feature_builder, encoder, device, config,
+                training=False,
+            )
+            if stats['n_valid'] > 0:
+                total_loss += stats['loss']
+                total_batches += 1
 
     if total_batches == 0:
         return 0.0
@@ -521,13 +424,9 @@ def main():
         epoch_batches = 0
 
         for batch_idx, batch in enumerate(train_dataloader):
-            stats = train_one_batch(
-                batch,
-                feature_builder,
-                encoder,
-                optimizer,
-                device,
-                loss_config,
+            stats = process_batch(
+                batch, feature_builder, encoder, device, loss_config,
+                training=True, optimizer=optimizer,
             )
 
             scheduler.step()
