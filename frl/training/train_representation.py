@@ -160,31 +160,6 @@ def process_batch(
             # Not enough valid pixels for meaningful spatial loss
             continue
 
-        # Subsample valid pixels if too many (to avoid memory issues with large distance matrices)
-        max_spatial_candidates = config.get('spatial_max_candidates', 8000)
-        if valid_pixel_coords.shape[0] > max_spatial_candidates:
-            # Random subsample, but always include anchors
-            n_extra = max_spatial_candidates - anchors.shape[0]
-            if n_extra > 0:
-                # Find indices of non-anchor pixels
-                anchor_set = set(map(tuple, anchors.tolist()))
-                non_anchor_mask = torch.tensor(
-                    [tuple(c.tolist()) not in anchor_set for c in valid_pixel_coords],
-                    device=valid_pixel_coords.device,
-                )
-                non_anchor_indices = torch.where(non_anchor_mask)[0]
-
-                # Randomly sample from non-anchors
-                perm = torch.randperm(non_anchor_indices.shape[0], device=valid_pixel_coords.device)
-                sampled_indices = non_anchor_indices[perm[:n_extra]]
-
-                # Combine anchor indices with sampled indices
-                anchor_indices = torch.where(~non_anchor_mask)[0]
-                all_indices = torch.cat([anchor_indices, sampled_indices])
-                all_indices = all_indices.sort()[0]  # Keep spatial ordering
-
-                valid_pixel_coords = valid_pixel_coords[all_indices]
-
         # Compute rectangular spatial distance matrix: [num_anchors x num_valid_pixels]
         spatial_dist_rect = compute_spatial_distances_rectangular(anchors, valid_pixel_coords)
 
@@ -578,7 +553,6 @@ def main():
         'spatial_negative_quantile_low': 0.65,
         'spatial_negative_quantile_high': 0.90,
         'spatial_max_neg_pairs': 10000,
-        'spatial_max_candidates': 8000,  # Limit valid pixel candidates to avoid memory issues
         'spatial_temperature': 0.07,
         # Loss weights
         'spectral_loss_weight': 1.0,
