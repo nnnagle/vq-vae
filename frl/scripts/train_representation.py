@@ -208,6 +208,50 @@ def process_batch(
     }
 
 
+def train_epoch(
+    train_dataloader: DataLoader,
+    feature_builder: FeatureBuilder,
+    encoder: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    device: torch.device,
+    config: dict,
+    epoch: int,
+    num_epochs: int,
+    log_interval: int = 10,
+) -> float:
+    """Run training on entire training set for one epoch."""
+    total_loss = 0.0
+    total_batches = 0
+
+    for batch_idx, batch in enumerate(train_dataloader):
+        stats = process_batch(
+            batch, feature_builder, encoder, device, config,
+            training=True, optimizer=optimizer,
+        )
+
+        scheduler.step()
+
+        if stats['n_valid'] > 0:
+            total_loss += stats['loss']
+            total_batches += 1
+
+            if batch_idx % log_interval == 0:
+                logger.info(
+                    f"Epoch {epoch+1}/{num_epochs} | "
+                    f"Batch {batch_idx+1}/{len(train_dataloader)} | "
+                    f"Loss: {stats['loss']:.4f} | "
+                    f"Pos: {stats['pos_pairs']} | "
+                    f"Neg: {stats['neg_pairs']} | "
+                    f"LR: {scheduler.get_last_lr()[0]:.2e}"
+                )
+
+    if total_batches == 0:
+        return 0.0
+
+    return total_loss / total_batches
+
+
 def validate_epoch(
     val_dataloader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -418,37 +462,14 @@ def main():
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         train_dataset.on_epoch_start()  # Reshuffle patches
-        encoder.train()
 
-        epoch_loss = 0.0
-        epoch_batches = 0
-
-        for batch_idx, batch in enumerate(train_dataloader):
-            stats = process_batch(
-                batch, feature_builder, encoder, device, loss_config,
-                training=True, optimizer=optimizer,
-            )
-
-            scheduler.step()
-
-            if stats['n_valid'] > 0:
-                epoch_loss += stats['loss']
-                epoch_batches += 1
-
-                if batch_idx % 10 == 0:
-                    logger.info(
-                        f"Epoch {epoch+1}/{num_epochs} | "
-                        f"Batch {batch_idx+1}/{len(train_dataloader)} | "
-                        f"Loss: {stats['loss']:.4f} | "
-                        f"Pos: {stats['pos_pairs']} | "
-                        f"Neg: {stats['neg_pairs']} | "
-                        f"LR: {scheduler.get_last_lr()[0]:.2e}"
-                    )
-
-        train_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0.0
-
-        # Validation
-        val_loss = validate_epoch(val_dataloader, feature_builder, encoder, device, loss_config)
+        train_loss = train_epoch(
+            train_dataloader, feature_builder, encoder, optimizer, scheduler,
+            device, loss_config, epoch, num_epochs,
+        )
+        val_loss = validate_epoch(
+            val_dataloader, feature_builder, encoder, device, loss_config,
+        )
 
         logger.info(
             f"Epoch {epoch+1} complete | "
