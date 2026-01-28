@@ -25,7 +25,14 @@ from __future__ import annotations
 from losses.categorical import categorical_loss
 from losses.contrastive import contrastive_loss
 from losses.count import count_loss
-from losses.pairs import pairs_knn, pairs_mutual_knn, pairs_quantile, pairs_radius
+from losses.pairs import (
+    pairs_knn,
+    pairs_mutual_knn,
+    pairs_quantile,
+    pairs_radius,
+    pairs_with_spatial_constraint,
+    apply_spatial_constraint,
+)
 from losses.reconstruction import reconstruction_loss
 from losses.variance_covariance import (
     covariance_loss,
@@ -34,6 +41,7 @@ from losses.variance_covariance import (
 )
 
 __all__ = [
+    "apply_spatial_constraint",
     "categorical_loss",
     "contrastive_loss",
     "count_loss",
@@ -42,6 +50,7 @@ __all__ = [
     "pairs_mutual_knn",
     "pairs_quantile",
     "pairs_radius",
+    "pairs_with_spatial_constraint",
     "reconstruction_loss",
     "variance_covariance_loss",
     "variance_loss",

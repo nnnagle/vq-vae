@@ -32,81 +32,15 @@ from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
 from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
+from data.sampling import sample_anchors_grid_plus_supplement
 from models import Conv2DEncoder
-from losses import contrastive_loss, pairs_mutual_knn, pairs_quantile
+from losses import contrastive_loss, pairs_with_spatial_constraint
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-def sample_anchors_grid_plus_supplement(
-    mask: torch.Tensor,
-    stride: int = 16,
-    border: int = 16,
-    jitter_radius: int = 4,
-    supplement_n: int = 104,
-) -> torch.Tensor:
-    """
-    Sample anchor pixel locations using grid-plus-supplement strategy.
-
-    Args:
-        mask: Valid pixel mask [H, W], True = valid
-        stride: Grid stride in pixels
-        border: Border to exclude from grid
-        jitter_radius: Random jitter applied to grid origin
-        supplement_n: Number of additional random samples
-
-    Returns:
-        Tensor of shape [N, 2] with (row, col) coordinates of anchors
-    """
-    H, W = mask.shape
-    device = mask.device
-
-    # Apply random jitter to grid origin
-    jitter_r = torch.randint(-jitter_radius, jitter_radius + 1, (1,), device=device).item()
-    jitter_c = torch.randint(-jitter_radius, jitter_radius + 1, (1,), device=device).item()
-
-    # Generate grid points
-    grid_rows = torch.arange(border + jitter_r, H - border, stride, device=device)
-    grid_cols = torch.arange(border + jitter_c, W - border, stride, device=device)
-
-    # Create meshgrid of grid points
-    row_grid, col_grid = torch.meshgrid(grid_rows, grid_cols, indexing='ij')
-    grid_coords = torch.stack([row_grid.flatten(), col_grid.flatten()], dim=1)  # [G, 2]
-
-    # Filter to valid grid points
-    if grid_coords.shape[0] > 0:
-        grid_valid = mask[grid_coords[:, 0], grid_coords[:, 1]]
-        grid_coords = grid_coords[grid_valid]
-
-    # Sample supplement points from valid pixels (weighted by mask value if float)
-    valid_indices = torch.where(mask.flatten())[0]
-
-    if len(valid_indices) > 0 and supplement_n > 0:
-        # Random sample from valid pixels
-        n_supplement = min(supplement_n, len(valid_indices))
-        perm = torch.randperm(len(valid_indices), device=device)[:n_supplement]
-        supplement_flat = valid_indices[perm]
-
-        # Convert flat indices to (row, col)
-        supplement_rows = supplement_flat // W
-        supplement_cols = supplement_flat % W
-        supplement_coords = torch.stack([supplement_rows, supplement_cols], dim=1)
-    else:
-        supplement_coords = torch.empty((0, 2), dtype=torch.long, device=device)
-
-    # Combine grid and supplement
-    if grid_coords.shape[0] > 0 and supplement_coords.shape[0] > 0:
-        anchors = torch.cat([grid_coords, supplement_coords], dim=0)
-    elif grid_coords.shape[0] > 0:
-        anchors = grid_coords
-    else:
-        anchors = supplement_coords
-
-    return anchors.long()
 
 
 def compute_spatial_distances(coords: torch.Tensor) -> torch.Tensor:
@@ -141,54 +75,6 @@ def extract_at_locations(
     rows, cols = coords[:, 0], coords[:, 1]
     # feature[:, rows, cols] gives [C, N], transpose to [N, C]
     return feature[:, rows, cols].T
-
-
-def generate_pairs_with_spatial_constraint(
-    feature_distances: torch.Tensor,
-    spatial_distances: torch.Tensor,
-    positive_k: int = 16,
-    positive_min_spatial: float = 4.0,
-    negative_quantile_low: float = 0.5,
-    negative_quantile_high: float = 0.75,
-    negative_min_spatial: float = 8.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Generate positive and negative pairs with spatial distance constraints.
-
-    Args:
-        feature_distances: Distance matrix [N, N] in feature space (Mahalanobis)
-        spatial_distances: Distance matrix [N, N] in pixel space
-        positive_k: K for mutual KNN positive selection
-        positive_min_spatial: Minimum spatial distance for positives
-        negative_quantile_low: Lower quantile for negative selection
-        negative_quantile_high: Upper quantile for negative selection
-        negative_min_spatial: Minimum spatial distance for negatives
-
-    Returns:
-        Tuple of (pos_pairs, neg_pairs), each [P, 2] with (anchor, target) indices
-    """
-    N = feature_distances.shape[0]
-    device = feature_distances.device
-
-    # Create masked distance matrices
-    # Set distances to inf where spatial constraint is violated
-    pos_dist = feature_distances.clone()
-    pos_dist[spatial_distances < positive_min_spatial] = float('inf')
-
-    neg_dist = feature_distances.clone()
-    neg_dist[spatial_distances < negative_min_spatial] = float('inf')
-
-    # Generate positive pairs using mutual KNN
-    pos_pairs = pairs_mutual_knn(pos_dist, k=positive_k)
-
-    # Generate negative pairs using quantile selection
-    neg_pairs = pairs_quantile(
-        neg_dist,
-        low=negative_quantile_low,
-        high=negative_quantile_high
-    )
-
-    return pos_pairs, neg_pairs
 
 
 def train_one_batch(
@@ -269,7 +155,7 @@ def train_one_batch(
         spatial_distances = compute_spatial_distances(anchors)
 
         # Generate pairs
-        pos_pairs, neg_pairs = generate_pairs_with_spatial_constraint(
+        pos_pairs, neg_pairs = pairs_with_spatial_constraint(
             feature_distances,
             spatial_distances,
             positive_k=config.get('positive_k', 16),
@@ -403,7 +289,7 @@ def validate_one_batch(
         spatial_distances = compute_spatial_distances(anchors)
 
         # Generate pairs
-        pos_pairs, neg_pairs = generate_pairs_with_spatial_constraint(
+        pos_pairs, neg_pairs = pairs_with_spatial_constraint(
             feature_distances,
             spatial_distances,
             positive_k=config.get('positive_k', 16),

@@ -429,3 +429,100 @@ def pairs_radius(
         pairs = _add_symmetric_pairs(pairs, anchor_cols)
 
     return _sample_pairs(pairs, max_pairs)
+
+
+def apply_spatial_constraint(
+    distances: torch.Tensor,
+    spatial_distances: torch.Tensor,
+    min_spatial_distance: float,
+) -> torch.Tensor:
+    """
+    Apply spatial distance constraint to a distance matrix.
+
+    Sets distances to infinity where spatial distance is below threshold,
+    effectively excluding those pairs from selection.
+
+    Args:
+        distances: Distance matrix [N, N] in feature space
+        spatial_distances: Distance matrix [N, N] in pixel space
+        min_spatial_distance: Minimum spatial distance required
+
+    Returns:
+        Modified distance matrix with inf where spatial constraint violated
+    """
+    masked = distances.clone()
+    masked[spatial_distances < min_spatial_distance] = float('inf')
+    return masked
+
+
+def pairs_with_spatial_constraint(
+    feature_distances: torch.Tensor,
+    spatial_distances: torch.Tensor,
+    positive_strategy: str = 'mutual-knn',
+    positive_k: int = 16,
+    positive_min_spatial: float = 4.0,
+    negative_strategy: str = 'quantile',
+    negative_quantile_low: float = 0.5,
+    negative_quantile_high: float = 0.75,
+    negative_min_spatial: float = 8.0,
+    max_pairs: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generate positive and negative pairs with spatial distance constraints.
+
+    This combines feature-based pair selection with spatial constraints to
+    prevent selecting trivially similar spatial neighbors.
+
+    Args:
+        feature_distances: Distance matrix [N, N] in feature space
+        spatial_distances: Distance matrix [N, N] in pixel space (L2)
+        positive_strategy: Strategy for positive selection ('mutual-knn' or 'knn')
+        positive_k: K for KNN-based positive selection
+        positive_min_spatial: Minimum spatial distance for positives
+        negative_strategy: Strategy for negative selection ('quantile')
+        negative_quantile_low: Lower quantile for negative selection
+        negative_quantile_high: Upper quantile for negative selection
+        negative_min_spatial: Minimum spatial distance for negatives
+        max_pairs: Maximum pairs to return (per positive/negative)
+
+    Returns:
+        Tuple of (pos_pairs, neg_pairs), each [P, 2] with (anchor, target) indices
+
+    Example:
+        >>> feature_dist = torch.cdist(features, features)
+        >>> spatial_dist = torch.cdist(coords.float(), coords.float())
+        >>> pos, neg = pairs_with_spatial_constraint(
+        ...     feature_dist, spatial_dist,
+        ...     positive_k=16, positive_min_spatial=4.0,
+        ...     negative_quantile_low=0.5, negative_quantile_high=0.75,
+        ...     negative_min_spatial=8.0
+        ... )
+    """
+    # Apply spatial constraints
+    pos_dist = apply_spatial_constraint(
+        feature_distances, spatial_distances, positive_min_spatial
+    )
+    neg_dist = apply_spatial_constraint(
+        feature_distances, spatial_distances, negative_min_spatial
+    )
+
+    # Generate positive pairs
+    if positive_strategy == 'mutual-knn':
+        pos_pairs = pairs_mutual_knn(pos_dist, k=positive_k, max_pairs=max_pairs)
+    elif positive_strategy == 'knn':
+        pos_pairs = pairs_knn(pos_dist, k=positive_k, max_pairs=max_pairs)
+    else:
+        raise ValueError(f"Unknown positive strategy: {positive_strategy}")
+
+    # Generate negative pairs
+    if negative_strategy == 'quantile':
+        neg_pairs = pairs_quantile(
+            neg_dist,
+            low=negative_quantile_low,
+            high=negative_quantile_high,
+            max_pairs=max_pairs,
+        )
+    else:
+        raise ValueError(f"Unknown negative strategy: {negative_strategy}")
+
+    return pos_pairs, neg_pairs
