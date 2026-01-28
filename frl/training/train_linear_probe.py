@@ -514,7 +514,7 @@ def main():
 
     # Load encoder and freeze
     logger.info(f"Loading encoder from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
     encoder = Conv2DEncoder(
         in_channels=15,  # ccdc_history has 15 channels
