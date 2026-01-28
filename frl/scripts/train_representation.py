@@ -150,6 +150,11 @@ def train_one_batch(
             similarity='l2',
         )
 
+        # Skip if loss is NaN or Inf (numerical instability)
+        if not torch.isfinite(loss):
+            logger.warning(f"Skipping sample with non-finite loss: {loss.item()}")
+            continue
+
         total_loss += loss
         n_valid += 1
         total_pos_pairs += pos_pairs.shape[0]
@@ -162,6 +167,11 @@ def train_one_batch(
     # Note: contrastive_loss already averages over anchors within each sample,
     # so this averages across samples (standard mini-batch averaging)
     mean_loss = total_loss / n_valid
+
+    # Final NaN check before backward
+    if not torch.isfinite(mean_loss):
+        logger.warning(f"Skipping batch with non-finite mean loss: {mean_loss.item()}")
+        return {'loss': float('nan'), 'n_valid': 0, 'pos_pairs': 0, 'neg_pairs': 0}
 
     # Backward
     mean_loss.backward()

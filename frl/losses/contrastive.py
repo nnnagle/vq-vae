@@ -200,8 +200,10 @@ def contrastive_loss(
     pos_sum.scatter_add_(0, pos_anchor_idx, pos_exp)
 
     # Compute log sums (add back the max)
-    log_pos_sum = torch.log(pos_sum) + max_logits  # log(sum(w_p * exp(s_p/t)))
-    log_all_sum = torch.log(all_sum) + max_logits  # log(sum(w * exp(s/t)))
+    # Add small epsilon to prevent log(0) = -inf when all exponentials round to 0
+    eps = 1e-8
+    log_pos_sum = torch.log(pos_sum + eps) + max_logits  # log(sum(w_p * exp(s_p/t)))
+    log_all_sum = torch.log(all_sum + eps) + max_logits  # log(sum(w * exp(s/t)))
 
     # Loss = -log(pos_sum / all_sum) = -log_pos_sum + log_all_sum
     loss_per_anchor = -log_pos_sum + log_all_sum
