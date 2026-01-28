@@ -97,13 +97,17 @@ class GatedResidualConv2D(nn.Module):
             nn.Sigmoid(),  # Gate values in [0, 1]
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_gate: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: Input tensor [B, C, H, W]
+            return_gate: If True, also return the gate tensor
 
         Returns:
-            [B, C, H, W] with adaptive spatial smoothing
+            If return_gate=False: [B, C, H, W] with adaptive spatial smoothing
+            If return_gate=True: tuple of (output, gate) where gate is [B, C, H, W]
         """
         # Compute smoothed features
         smoothed = self.conv_layers(x)
@@ -114,7 +118,11 @@ class GatedResidualConv2D(nn.Module):
         # Gated residual combination
         # gate ≈ 1: use smoothed features (smooth regions)
         # gate ≈ 0: use original input (preserve edges)
-        return gate * smoothed + (1 - gate) * x
+        output = gate * smoothed + (1 - gate) * x
+
+        if return_gate:
+            return output, gate
+        return output
 
 
 def build_gated_residual_conv2d_from_config(config: dict) -> GatedResidualConv2D:

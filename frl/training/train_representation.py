@@ -106,6 +106,11 @@ def process_batch(
     total_spatial_pos_pairs = 0
     total_spatial_neg_pairs = 0
 
+    # Collectors for distribution logging (accumulated across samples)
+    all_gate_values = []
+    all_pos_weights = []
+    all_neg_weights = []
+
     batch_size = len(batch['metadata'])
 
     for i in range(batch_size):
@@ -233,14 +238,12 @@ def process_batch(
         if spatial_pos_pairs.numel() > 0:
             dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
-            
+            all_pos_weights.append(pos_weights.detach())
+
         if spatial_neg_pairs.numel() > 0:
             dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
-
-        # Should check this to see that weights separate.
-        #print("pos dists:", dpos.min().item(), dpos.median().item(), dpos.max().item())
-        #print("neg dists:", dneg.min().item(), dneg.median().item(), dneg.max().item())
+            all_neg_weights.append(neg_weights.detach())
 
         # Check if we have valid pairs for both losses
         has_spectral = spectral_pos_pairs.shape[0] > 0 and spectral_neg_pairs.shape[0] > 0
@@ -253,8 +256,12 @@ def process_batch(
         # encoder_data: [C, H, W] -> [1, C, H, W] -> conv -> [1, D, H, W]
         encoder_input_full = encoder_data.unsqueeze(0)
         h_full = encoder(encoder_input_full)  # [1, D, H, W]
-        z_full = spatial_conv(h_full)  # [1, D, H, W] - apply gated spatial smoothing
+        z_full, gate = spatial_conv(h_full, return_gate=True)  # [1, D, H, W] each
         z_full = z_full.squeeze(0)  # [D, H, W]
+        gate = gate.squeeze(0)  # [D, H, W]
+
+        # Collect gate values (flatten to 1D for stats)
+        all_gate_values.append(gate.detach().flatten())
 
         # Extract embeddings at anchor locations for spectral loss
         z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
@@ -311,11 +318,15 @@ def process_batch(
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
+    empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
+                   'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
+            'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
+            'neg_weight_stats': empty_stats,
         }
 
     # Average losses over valid samples in batch
@@ -332,6 +343,8 @@ def process_batch(
                 'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
+                'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
+                'neg_weight_stats': empty_stats,
             }
 
         # Backward
@@ -350,15 +363,35 @@ def process_batch(
         mean_spectral_loss = mean_spectral_loss.item()
         mean_spatial_loss = mean_spatial_loss.item()
 
+    # Compute distribution statistics for gate values and weights
+    def compute_stats(tensors: list[torch.Tensor]) -> dict:
+        """Compute summary stats from list of tensors."""
+        if not tensors:
+            return {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
+                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
+        combined = torch.cat(tensors)
+        return {
+            'mean': combined.mean().item(),
+            'std': combined.std().item(),
+            'min': combined.min().item(),
+            'max': combined.max().item(),
+            'q25': torch.quantile(combined, 0.25).item(),
+            'q50': torch.quantile(combined, 0.50).item(),
+            'q75': torch.quantile(combined, 0.75).item(),
+        }
+
     return {
         'loss': mean_loss,
         'spectral_loss': mean_spectral_loss,
         'spatial_loss': mean_spatial_loss,
         'n_valid': n_valid,
-        'spectral_pos_pairs': total_spectral_pos_pairs // n_valid,
-        'spectral_neg_pairs': total_spectral_neg_pairs // n_valid,
-        'spatial_pos_pairs': total_spatial_pos_pairs // n_valid,
-        'spatial_neg_pairs': total_spatial_neg_pairs // n_valid,
+        'spectral_pos_pairs': total_spectral_pos_pairs // n_valid if n_valid > 0 else 0,
+        'spectral_neg_pairs': total_spectral_neg_pairs // n_valid if n_valid > 0 else 0,
+        'spatial_pos_pairs': total_spatial_pos_pairs // n_valid if n_valid > 0 else 0,
+        'spatial_neg_pairs': total_spatial_neg_pairs // n_valid if n_valid > 0 else 0,
+        'gate_stats': compute_stats(all_gate_values),
+        'pos_weight_stats': compute_stats(all_pos_weights),
+        'neg_weight_stats': compute_stats(all_neg_weights),
     }
 
 
@@ -381,6 +414,13 @@ def train_epoch(
     total_spatial_loss = 0.0
     total_batches = 0
 
+    # Keep last batch stats for epoch-level distribution logging
+    empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
+                   'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
+    last_gate_stats = empty_stats
+    last_pos_weight_stats = empty_stats
+    last_neg_weight_stats = empty_stats
+
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
             batch, feature_builder, encoder, spatial_conv, device, config,
@@ -395,6 +435,11 @@ def train_epoch(
             total_spatial_loss += stats['spatial_loss']
             total_batches += 1
 
+            # Update distribution stats from last valid batch
+            last_gate_stats = stats['gate_stats']
+            last_pos_weight_stats = stats['pos_weight_stats']
+            last_neg_weight_stats = stats['neg_weight_stats']
+
             if batch_idx % log_interval == 0:
                 logger.info(
                     f"Epoch {epoch+1} | "
@@ -406,13 +451,20 @@ def train_epoch(
                 )
 
     if total_batches == 0:
-        return {'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0}
+        return {
+            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0,
+            'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
+            'neg_weight_stats': empty_stats,
+        }
 
     return {
         'loss': total_loss / total_batches,
         'spectral_loss': total_spectral_loss / total_batches,
         'spatial_loss': total_spatial_loss / total_batches,
         'batches': total_batches,
+        'gate_stats': last_gate_stats,
+        'pos_weight_stats': last_pos_weight_stats,
+        'neg_weight_stats': last_neg_weight_stats,
     }
 
 def validate_epoch(
@@ -429,6 +481,13 @@ def validate_epoch(
     total_spatial_loss = 0.0
     total_batches = 0
 
+    # Keep last batch stats for epoch-level distribution logging
+    empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
+                   'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
+    last_gate_stats = empty_stats
+    last_pos_weight_stats = empty_stats
+    last_neg_weight_stats = empty_stats
+
     with torch.no_grad():
         for batch in val_dataloader:
             stats = process_batch(
@@ -441,15 +500,26 @@ def validate_epoch(
                 total_spatial_loss += stats['spatial_loss']
                 total_batches += 1
 
-    if total_batches == 0:
-        return {'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0}
+                # Update distribution stats from last valid batch
+                last_gate_stats = stats['gate_stats']
+                last_pos_weight_stats = stats['pos_weight_stats']
+                last_neg_weight_stats = stats['neg_weight_stats']
 
+    if total_batches == 0:
+        return {
+            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0,
+            'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
+            'neg_weight_stats': empty_stats,
+        }
 
     return {
         'loss': total_loss / total_batches,
         'spectral_loss': total_spectral_loss / total_batches,
         'spatial_loss': total_spatial_loss / total_batches,
         'batches': total_batches,
+        'gate_stats': last_gate_stats,
+        'pos_weight_stats': last_pos_weight_stats,
+        'neg_weight_stats': last_neg_weight_stats,
     }
 
 def main():
@@ -511,7 +581,13 @@ def main():
     lr = args.lr or training_config.optimizer.lr
     weight_decay = training_config.optimizer.weight_decay
     device_str = args.device or training_config.hardware.device
-    checkpoint_dir = args.checkpoint_dir or training_config.run.ckpt_dir
+
+    # Build run directory structure: {run_root}/{experiment_name}/{ckpt_dir|log_dir}
+    run_root = Path(training_config.run.run_root)
+    experiment_name = training_config.run.experiment_name
+    experiment_dir = run_root / experiment_name
+    checkpoint_dir = args.checkpoint_dir or str(experiment_dir / training_config.run.ckpt_dir)
+    log_dir = experiment_dir / training_config.run.log_dir
 
     device = torch.device(device_str)
     logger.info(f"Using device: {device}")
@@ -658,9 +734,12 @@ def main():
         'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
     }
 
-    # Create checkpoint directory
+    # Create output directories
     ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Checkpoint dir: {ckpt_dir}")
+    logger.info(f"Log dir: {log_dir}")
 
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs...")
@@ -683,6 +762,20 @@ def main():
             f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}) | "
             f"Val Loss: {val_stats['loss']:.4f} "
             f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}) | "
+        )
+
+        # Log distribution statistics
+        def fmt_stats(s: dict) -> str:
+            return f"mean={s['mean']:.3f}, std={s['std']:.3f}, [q25={s['q25']:.3f}, q50={s['q50']:.3f}, q75={s['q75']:.3f}]"
+
+        logger.info(
+            f"  Gate values: {fmt_stats(train_stats['gate_stats'])}"
+        )
+        logger.info(
+            f"  Spatial pos weights: {fmt_stats(train_stats['pos_weight_stats'])}"
+        )
+        logger.info(
+            f"  Spatial neg weights: {fmt_stats(train_stats['neg_weight_stats'])}"
         )
 
         # Save checkpoint
