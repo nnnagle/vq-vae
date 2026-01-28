@@ -34,7 +34,7 @@ from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
-from models import Conv2DEncoder
+from models import Conv2DEncoder, GatedResidualConv2D
 from losses import contrastive_loss, pairs_with_spatial_constraint
 from utils import (
     compute_spatial_distances,
@@ -60,6 +60,7 @@ def process_batch(
     batch: dict,
     feature_builder: FeatureBuilder,
     encoder: nn.Module,
+    spatial_conv: nn.Module,
     device: torch.device,
     config: dict,
     training: bool = True,
@@ -72,6 +73,7 @@ def process_batch(
         batch: Batch from dataloader
         feature_builder: FeatureBuilder instance
         encoder: Encoder network
+        spatial_conv: Gated spatial convolution module
         device: Device to use
         config: Loss config dict
         training: If True, run in training mode (gradients, optimizer step).
@@ -85,9 +87,11 @@ def process_batch(
         if optimizer is None:
             raise ValueError("optimizer is required when training=True")
         encoder.train()
+        spatial_conv.train()
         optimizer.zero_grad()
     else:
         encoder.eval()
+        spatial_conv.eval()
 
     # Use jitter only during training
     jitter_radius = config.get('jitter_radius', 4) if training else 0
@@ -248,7 +252,8 @@ def process_batch(
         # Encode the full patch for efficient embedding extraction
         # encoder_data: [C, H, W] -> [1, C, H, W] -> conv -> [1, D, H, W]
         encoder_input_full = encoder_data.unsqueeze(0)
-        z_full = encoder(encoder_input_full)  # [1, D, H, W]
+        h_full = encoder(encoder_input_full)  # [1, D, H, W]
+        z_full = spatial_conv(h_full)  # [1, D, H, W] - apply gated spatial smoothing
         z_full = z_full.squeeze(0)  # [D, H, W]
 
         # Extract embeddings at anchor locations for spectral loss
@@ -332,10 +337,11 @@ def process_batch(
         # Backward
         mean_loss.backward()
 
-        # Gradient clipping
+        # Gradient clipping (both encoder and spatial_conv)
         if config.get('gradient_clip_enabled', True):
+            all_params = list(encoder.parameters()) + list(spatial_conv.parameters())
             torch.nn.utils.clip_grad_norm_(
-                encoder.parameters(),
+                all_params,
                 max_norm=config.get('gradient_clip_max_norm', 1.0)
             )
 
@@ -360,6 +366,7 @@ def train_epoch(
     train_dataloader: DataLoader,
     feature_builder: FeatureBuilder,
     encoder: nn.Module,
+    spatial_conv: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
@@ -376,7 +383,7 @@ def train_epoch(
 
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
-            batch, feature_builder, encoder, device, config,
+            batch, feature_builder, encoder, spatial_conv, device, config,
             training=True, optimizer=optimizer,
         )
 
@@ -412,6 +419,7 @@ def validate_epoch(
     val_dataloader: DataLoader,
     feature_builder: FeatureBuilder,
     encoder: nn.Module,
+    spatial_conv: nn.Module,
     device: torch.device,
     config: dict,
 ) -> dict:
@@ -424,7 +432,7 @@ def validate_epoch(
     with torch.no_grad():
         for batch in val_dataloader:
             stats = process_batch(
-                batch, feature_builder, encoder, device, config,
+                batch, feature_builder, encoder, spatial_conv, device, config,
                 training=False,
             )
             if stats['n_valid'] > 0:
@@ -563,13 +571,29 @@ def main():
     ).to(device)
 
     logger.info(f"Encoder: {encoder}")
-    n_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-    logger.info(f"Trainable parameters: {n_params:,}")
 
-    # Create optimizer
+    # Create gated spatial convolution
+    logger.info("Creating spatial convolution...")
+    spatial_conv = GatedResidualConv2D(
+        channels=64,  # matches encoder output
+        num_layers=2,
+        kernel_size=3,
+        padding=1,
+        gate_hidden=64,
+        gate_kernel_size=1,
+    ).to(device)
+
+    logger.info(f"Spatial conv: {spatial_conv}")
+
+    # Count parameters
+    encoder_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    spatial_params = sum(p.numel() for p in spatial_conv.parameters() if p.requires_grad)
+    logger.info(f"Trainable parameters: encoder={encoder_params:,}, spatial={spatial_params:,}, total={encoder_params + spatial_params:,}")
+
+    # Create optimizer with both encoder and spatial_conv parameters
     logger.info(f"Creating optimizer: lr={lr}, weight_decay={weight_decay}")
     optimizer = torch.optim.AdamW(
-        encoder.parameters(),
+        list(encoder.parameters()) + list(spatial_conv.parameters()),
         lr=lr,
         weight_decay=weight_decay,
     )
@@ -642,21 +666,22 @@ def main():
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         train_dataset.on_epoch_start()  # Reshuffle patches
-        
+
         train_stats = train_epoch(
-          train_dataloader, feature_builder, encoder, optimizer, scheduler,
-          device, loss_config, epoch, num_epochs,
+          train_dataloader, feature_builder, encoder, spatial_conv,
+          optimizer, scheduler, device, loss_config, epoch, num_epochs,
         )
-        
+
         val_stats = validate_epoch(
-          val_dataloader, feature_builder, encoder, device, loss_config,
+          val_dataloader, feature_builder, encoder, spatial_conv,
+          device, loss_config,
         )
 
         logger.info(
             f"Epoch {epoch+1}/{num_epochs} complete | "
             f"Train Loss: {train_stats['loss']:.4f} "
             f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}) | "
-            f"Val Loss: {train_stats['loss']:.4f} "
+            f"Val Loss: {val_stats['loss']:.4f} "
             f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}) | "
         )
 
@@ -665,6 +690,7 @@ def main():
         torch.save({
             'epoch': epoch + 1,
             'encoder_state_dict': encoder.state_dict(),
+            'spatial_conv_state_dict': spatial_conv.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'train_loss': train_stats['loss'],
