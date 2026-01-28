@@ -115,16 +115,16 @@ def process_batch(
 
         # Build features
         encoder_feature = feature_builder.build_feature('ccdc_history', sample)
-        distance_feature = feature_builder.build_feature('infonce_type_spectral', sample)
+        spec_dist_feature = feature_builder.build_feature('infonce_type_spectral', sample)
 
         # Convert to tensors
         encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
-        distance_data = torch.from_numpy(distance_feature.data).float().to(device)
+        spec_dist_data = torch.from_numpy(spec_dist_feature.data).float().to(device)
         mask = torch.from_numpy(encoder_feature.mask).to(device)
 
         # Also apply distance feature mask
-        dist_mask = torch.from_numpy(distance_feature.mask).to(device)
-        combined_mask = mask & dist_mask
+        spec_dist_mask = torch.from_numpy(spec_dist_feature.mask).to(device)
+        combined_mask = mask & spec_dist_mask
 
         # Sample anchor locations
         anchors = sample_anchors_grid_plus_supplement(
@@ -140,16 +140,16 @@ def process_batch(
 
         # Extract features at anchor locations for spectral loss
         encoder_at_anchors = extract_at_locations(encoder_data, anchors)
-        distance_at_anchors = extract_at_locations(distance_data, anchors)
+        spec_dist_at_anchors = extract_at_locations(spec_dist_data, anchors)
 
         # Compute distances for spectral loss
         # Mahalanobis transform already applied by FeatureBuilder, so L2 here = Mahalanobis
-        feature_distances = torch.cdist(distance_at_anchors, distance_at_anchors)
+        spec_feat_distances = torch.cdist(spec_dist_at_anchors, spec_dist_at_anchors)
         spatial_distances = compute_spatial_distances(anchors)
 
         # Generate pairs for spectral loss
         spectral_pos_pairs, spectral_neg_pairs = pairs_with_spatial_constraint(
-            feature_distances,
+            spec_feat_distances,
             spatial_distances,
             positive_k=config.get('positive_k', 16),
             positive_min_spatial=config.get('positive_min_spatial', 4.0),
@@ -217,8 +217,8 @@ def process_batch(
             spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
             
         # --- Spectral weighting for spatial pairs ---
-        # Use distance_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
-        dist_unique = extract_at_locations(distance_data, unique_coords)  # [Nuniq, Cdist]
+        # Use spec_dist_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
+        spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
 
         tau = config.get("spatial_spectral_tau", 1.0)  # tune this
         min_w = config.get("spatial_min_w", 0.05)
@@ -227,11 +227,11 @@ def process_batch(
         neg_weights = None
         
         if spatial_pos_pairs.numel() > 0:
-            dpos = pair_l2(dist_unique, spatial_pos_pairs)
+            dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
             
         if spatial_neg_pairs.numel() > 0:
-            dneg = pair_l2(dist_unique, spatial_neg_pairs)
+            dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
 
         # Should check this to see that weights separate.
