@@ -3,8 +3,8 @@
 Closed-form linear probe for evaluating learned representations.
 
 What it does
-- Loads a frozen encoder checkpoint.
-- Runs the encoder over the TRAIN split to extract per-pixel embeddings z (D=64).
+- Loads a frozen encoder + spatial conv checkpoint.
+- Runs encoder -> spatial_conv over the TRAIN split to extract per-pixel embeddings z (D=64).
 - Fits a linear probe (W,b) in CLOSED FORM via streaming ridge regression on valid pixels:
       argmin_{W,b} ||XW + b - Y||^2 + λ||W||^2
   without ever materializing the full design matrix X (millions of pixels).
@@ -48,7 +48,7 @@ from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
 from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
-from models import Conv2DEncoder
+from models import Conv2DEncoder, GatedResidualConv2D
 
 logging.basicConfig(
     level=logging.INFO,
@@ -137,6 +137,7 @@ def fit_closed_form_ridge(
     train_loader: DataLoader,
     feature_builder: FeatureBuilder,
     encoder: nn.Module,
+    spatial_conv: nn.Module,
     device: torch.device,
     ridge_lambda: float = 1e-3,
     max_batches_train: int = 0,
@@ -150,6 +151,7 @@ def fit_closed_form_ridge(
         b: [T]
     """
     encoder.eval()
+    spatial_conv.eval()
     D = 64
     T = len(TARGET_METRICS)
     Da = D + 1  # augmented with bias term
@@ -163,7 +165,8 @@ def fit_closed_form_ridge(
     with torch.no_grad():
         for batch in _iter_batches(train_loader, max_batches_train):
             Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
-            z = encoder(Ximg)  # [B, D, H, W]
+            h = encoder(Ximg)          # [B, D, H, W]
+            z = spatial_conv(h)        # [B, D, H, W]
 
             # Flatten pixels
             z_perm = z.permute(0, 2, 3, 1).contiguous()     # [B, H, W, D]
@@ -204,6 +207,7 @@ def evaluate_probe(
     loader: DataLoader,
     feature_builder: FeatureBuilder,
     encoder: nn.Module,
+    spatial_conv: nn.Module,
     W: torch.Tensor,
     b: torch.Tensor,
     device: torch.device,
@@ -213,6 +217,7 @@ def evaluate_probe(
     Evaluate MSE and R² per metric (masked) across an entire split.
     """
     encoder.eval()
+    spatial_conv.eval()
     D = W.shape[0]
     T = W.shape[1]
     assert T == len(TARGET_METRICS)
@@ -228,7 +233,8 @@ def evaluate_probe(
     with torch.no_grad():
         for batch in _iter_batches(loader, max_batches_eval):
             Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
-            z = encoder(Ximg)  # [B, D, H, W]
+            h = encoder(Ximg)          # [B, D, H, W]
+            z = spatial_conv(h)        # [B, D, H, W]
 
             # Predict: [B, T, H, W]
             pred = torch.einsum("bdhw,dt->bthw", z, W) + b.view(1, -1, 1, 1)
@@ -367,7 +373,7 @@ def main():
     logger.info("Creating feature builder...")
     feature_builder = FeatureBuilder(bindings_config)
 
-    logger.info(f"Loading encoder from {args.checkpoint}")
+    logger.info(f"Loading checkpoint from {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
     encoder = Conv2DEncoder(
@@ -380,17 +386,31 @@ def main():
     ).to(device)
     encoder.load_state_dict(checkpoint["encoder_state_dict"])
 
+    spatial_conv = GatedResidualConv2D(
+        channels=64,
+        num_layers=2,
+        kernel_size=3,
+        padding=1,
+        gate_hidden=64,
+        gate_kernel_size=1,
+    ).to(device)
+    spatial_conv.load_state_dict(checkpoint["spatial_conv_state_dict"])
+
     for p in encoder.parameters():
         p.requires_grad = False
+    for p in spatial_conv.parameters():
+        p.requires_grad = False
     encoder.eval()
+    spatial_conv.eval()
 
-    logger.info("Encoder loaded and frozen.")
+    logger.info("Encoder and spatial conv loaded and frozen.")
 
     # Fit closed-form probe
     W, b = fit_closed_form_ridge(
         train_loader,
         feature_builder,
         encoder,
+        spatial_conv,
         device,
         ridge_lambda=args.ridge_lambda,
         max_batches_train=args.max_batches_train,
@@ -401,6 +421,7 @@ def main():
         train_loader,
         feature_builder,
         encoder,
+        spatial_conv,
         W,
         b,
         device,
@@ -410,6 +431,7 @@ def main():
         val_loader,
         feature_builder,
         encoder,
+        spatial_conv,
         W,
         b,
         device,
