@@ -317,11 +317,22 @@ def _select_gate_channels(
         if vals:
             channel_vars[d] = np.concatenate(vals).var()
 
-    # Sort channels by variance and pick evenly spaced quantiles
-    order = np.argsort(channel_vars)
-    n_pick = min(n_channels, D)
-    pick_positions = np.linspace(0, len(order) - 1, n_pick, dtype=int)
-    selected = sorted(order[pick_positions].tolist())
+    # Filter to channels with sd >= 0.1
+    channel_sds = np.sqrt(channel_vars)
+    eligible = np.where(channel_sds >= 0.1)[0]
+    logger.info(
+        f"  {len(eligible)}/{D} gate channels have spatial sd >= 0.1"
+    )
+
+    if len(eligible) == 0:
+        logger.warning("  No gate channels meet the sd >= 0.1 threshold; skipping gate plots")
+        return []
+
+    # Sort eligible channels by variance and pick evenly spaced quantiles
+    eligible_sorted = eligible[np.argsort(channel_vars[eligible])]
+    n_pick = min(n_channels, len(eligible_sorted))
+    pick_positions = np.linspace(0, len(eligible_sorted) - 1, n_pick, dtype=int)
+    selected = sorted(eligible_sorted[pick_positions].tolist())
 
     for idx in selected:
         logger.info(
