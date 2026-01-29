@@ -182,8 +182,10 @@ def collect_patch_data(
             combined_mask = aoi_mask & forest_mask & tgt_mask & enc_f.mask
 
             # Back-transform each target metric channel
+            gate_full = gate.cpu().numpy()  # [D, H, W]
             record: Dict[str, np.ndarray] = {
-                "gate_mean": gate.cpu().numpy().mean(axis=0),  # [H,W]
+                "gate_full": gate_full,                        # [D,H,W]
+                "gate_mean": gate_full.mean(axis=0),           # [H,W]
                 "aoi_mask": aoi_mask,
                 "forest_mask": forest_mask,
                 "combined_mask": combined_mask,
@@ -292,71 +294,119 @@ def plot_variable_sheet(
     logger.info(f"  Saved {output_path.name}")
 
 
-def plot_gate_sheet(
+def _select_gate_channels(
     records: List[Dict[str, np.ndarray]],
-    output_path: Path,
+    n_channels: int = 6,
+) -> List[int]:
+    """Pick gate channels that span the variance range.
+
+    Computes the spatial variance of each gate channel (pooled across
+    all patches, masked pixels only) and returns *n_channels* indices
+    spread evenly from lowest to highest variance.
+    """
+    # gate_full shape: [D, H, W]
+    D = records[0]["gate_full"].shape[0]
+    channel_vars = np.zeros(D)
+
+    for d in range(D):
+        vals = []
+        for rec in records:
+            v = rec["gate_full"][d][rec["combined_mask"]]
+            if v.size > 0:
+                vals.append(v)
+        if vals:
+            channel_vars[d] = np.concatenate(vals).var()
+
+    # Sort channels by variance and pick evenly spaced quantiles
+    order = np.argsort(channel_vars)
+    n_pick = min(n_channels, D)
+    pick_positions = np.linspace(0, len(order) - 1, n_pick, dtype=int)
+    selected = sorted(order[pick_positions].tolist())
+
+    for idx in selected:
+        logger.info(
+            f"  Gate channel {idx:3d}: spatial var = {channel_vars[idx]:.6f}"
+        )
+
+    return selected
+
+
+def plot_gate_channels(
+    records: List[Dict[str, np.ndarray]],
+    output_dir: Path,
+    n_channels: int = 6,
     max_cols: int = 4,
 ) -> None:
-    """Create a figure showing mean gate values for each patch."""
+    """Create one sheet per selected gate channel, tiled across patches.
+
+    Channels are chosen to span the variance distribution (low → high).
+    Each sheet uses a data-driven colour range (2nd–98th percentile).
+    """
+    selected = _select_gate_channels(records, n_channels=n_channels)
     n_patches = len(records)
-    n_cols = min(max_cols, n_patches)
-    n_rows = int(np.ceil(n_patches / n_cols))
 
-    fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(3.5 * n_cols, 3.0 * n_rows),
-        squeeze=False,
-    )
+    for ch_idx in selected:
+        n_cols = min(max_cols, n_patches)
+        n_rows = int(np.ceil(n_patches / n_cols))
 
-    # Compute data-driven colour limits from masked gate values
-    all_gate = []
-    for rec in records:
-        vals = rec["gate_mean"][rec["combined_mask"]]
-        if vals.size > 0:
-            all_gate.append(vals)
-    if all_gate:
-        combined_gate = np.concatenate(all_gate)
-        vmin = float(np.nanpercentile(combined_gate, 2))
-        vmax = float(np.nanpercentile(combined_gate, 98))
-        # Small guard so the range is never degenerate
-        if vmax - vmin < 0.01:
-            mid = (vmin + vmax) / 2
-            vmin, vmax = mid - 0.05, mid + 0.05
-    else:
-        vmin, vmax = 0.0, 1.0
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(3.5 * n_cols, 3.0 * n_rows),
+            squeeze=False,
+        )
 
-    for i, rec in enumerate(records):
-        row = i // n_cols
-        col = i % n_cols
-        ax = axes[row, col]
+        # Data-driven colour limits for this channel
+        all_vals = []
+        for rec in records:
+            v = rec["gate_full"][ch_idx][rec["combined_mask"]]
+            if v.size > 0:
+                all_vals.append(v)
+        if all_vals:
+            combined = np.concatenate(all_vals)
+            vmin = float(np.nanpercentile(combined, 2))
+            vmax = float(np.nanpercentile(combined, 98))
+            if vmax - vmin < 0.01:
+                mid = (vmin + vmax) / 2
+                vmin, vmax = mid - 0.05, mid + 0.05
+        else:
+            vmin, vmax = 0.0, 1.0
 
-        mask = rec["combined_mask"]
-        gate = _make_masked(rec["gate_mean"], mask)
+        for i, rec in enumerate(records):
+            row = i // n_cols
+            col = i % n_cols
+            ax = axes[row, col]
 
-        im = ax.imshow(gate, vmin=vmin, vmax=vmax, cmap="RdYlBu_r", interpolation="nearest")
-        ax.set_title(f"Patch #{i}", fontsize=8)
-        ax.set_xticks([])
-        ax.set_yticks([])
+            mask = rec["combined_mask"]
+            gate = _make_masked(rec["gate_full"][ch_idx], mask)
 
-    # Turn off unused axes
-    for r in range(n_rows):
-        for c in range(n_cols):
-            idx = r * n_cols + c
-            if idx >= n_patches:
-                axes[r, c].axis("off")
+            im = ax.imshow(
+                gate, vmin=vmin, vmax=vmax,
+                cmap="RdYlBu_r", interpolation="nearest",
+            )
+            ax.set_title(f"Patch #{i}", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
 
-    fig.suptitle(
-        f"Spatial gate (channel-mean, range [{vmin:.2f}, {vmax:.2f}])",
-        fontsize=11,
-    )
-    fig.tight_layout(rect=[0, 0, 0.92, 0.96])
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if r * n_cols + c >= n_patches:
+                    axes[r, c].axis("off")
 
-    cbar_ax = fig.add_axes([0.93, 0.08, 0.015, 0.84])
-    fig.colorbar(im, cax=cbar_ax)
+        spatial_var = np.concatenate(all_vals).var() if all_vals else 0.0
+        fig.suptitle(
+            f"Gate channel {ch_idx}  (var={spatial_var:.4f}, "
+            f"range [{vmin:.2f}, {vmax:.2f}])",
+            fontsize=11,
+        )
+        fig.tight_layout(rect=[0, 0, 0.92, 0.96])
 
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.info(f"  Saved {output_path.name}")
+        cbar_ax = fig.add_axes([0.93, 0.08, 0.015, 0.84])
+        fig.colorbar(im, cax=cbar_ax)
+
+        out_path = output_dir / f"test_gate_ch{ch_idx:03d}.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  Saved {out_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +512,8 @@ def main():
         out_path = output_dir / f"test_{safe_name}.png"
         plot_variable_sheet(records, cref, out_path)
 
-    # Gate sheet
-    plot_gate_sheet(records, output_dir / "test_gate_mean.png")
+    # Gate sheets — one per representative channel, stratified by variance
+    plot_gate_channels(records, output_dir, n_channels=6)
 
     logger.info("Done.")
 
