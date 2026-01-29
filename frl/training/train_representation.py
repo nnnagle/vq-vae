@@ -43,10 +43,6 @@ from utils import (
     spatial_negative_pairs,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
@@ -738,6 +734,20 @@ def main():
     ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up logging to both console and file
+    log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_format)
+    root_logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(log_dir / 'training.log')
+    file_handler.setFormatter(log_format)
+    root_logger.addHandler(file_handler)
+
     logger.info(f"Checkpoint dir: {ckpt_dir}")
     logger.info(f"Log dir: {log_dir}")
 
