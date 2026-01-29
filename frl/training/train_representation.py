@@ -723,7 +723,7 @@ def main():
         'spatial_negative_min_dist': 96.0,  # min distance for negatives
         'spatial_negative_max_dist': 192.0,  # max distance for negatives
         'spatial_negatives_per_anchor': 16,  # number of negatives per anchor
-        'spatial_spectral_tau': 2, # dist. metric on spectral dist, ideally ~ .5*sqrt(2*ndim)
+        'spatial_spectral_tau': 200, # dist. metric on spectral dist, ideally ~ .5*sqrt(2*ndim)
         'spatial_min_w': .03,
         'spatial_temperature': 0.07,
         # Loss weights
