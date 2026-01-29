@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -562,6 +563,12 @@ def main():
         default=None,
         help='Directory to save checkpoints (overrides config)'
     )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        default=False,
+        help='Overwrite existing experiment directory if it exists'
+    )
     args = parser.parse_args()
 
     # Parse configs first to get defaults
@@ -582,6 +589,19 @@ def main():
     run_root = Path(training_config.run.run_root)
     experiment_name = training_config.run.experiment_name
     experiment_dir = run_root / experiment_name
+
+    # Check if experiment directory already exists
+    if experiment_dir.exists():
+        if args.overwrite:
+            logger.info(f"Overwriting existing experiment directory: {experiment_dir}")
+            shutil.rmtree(experiment_dir)
+        else:
+            logger.error(
+                f"Experiment directory already exists: {experiment_dir}. "
+                f"Use --overwrite to replace it."
+            )
+            raise SystemExit(1)
+
     checkpoint_dir = args.checkpoint_dir or str(experiment_dir / training_config.run.ckpt_dir)
     log_dir = experiment_dir / training_config.run.log_dir
 
