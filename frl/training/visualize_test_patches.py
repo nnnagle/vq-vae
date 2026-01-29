@@ -308,6 +308,23 @@ def plot_gate_sheet(
         squeeze=False,
     )
 
+    # Compute data-driven colour limits from masked gate values
+    all_gate = []
+    for rec in records:
+        vals = rec["gate_mean"][rec["combined_mask"]]
+        if vals.size > 0:
+            all_gate.append(vals)
+    if all_gate:
+        combined_gate = np.concatenate(all_gate)
+        vmin = float(np.nanpercentile(combined_gate, 2))
+        vmax = float(np.nanpercentile(combined_gate, 98))
+        # Small guard so the range is never degenerate
+        if vmax - vmin < 0.01:
+            mid = (vmin + vmax) / 2
+            vmin, vmax = mid - 0.05, mid + 0.05
+    else:
+        vmin, vmax = 0.0, 1.0
+
     for i, rec in enumerate(records):
         row = i // n_cols
         col = i % n_cols
@@ -316,7 +333,7 @@ def plot_gate_sheet(
         mask = rec["combined_mask"]
         gate = _make_masked(rec["gate_mean"], mask)
 
-        im = ax.imshow(gate, vmin=0.0, vmax=1.0, cmap="RdYlBu_r", interpolation="nearest")
+        im = ax.imshow(gate, vmin=vmin, vmax=vmax, cmap="RdYlBu_r", interpolation="nearest")
         ax.set_title(f"Patch #{i}", fontsize=8)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -328,7 +345,10 @@ def plot_gate_sheet(
             if idx >= n_patches:
                 axes[r, c].axis("off")
 
-    fig.suptitle("Spatial gate (channel-mean, 0=keep original, 1=max residual)", fontsize=11)
+    fig.suptitle(
+        f"Spatial gate (channel-mean, range [{vmin:.2f}, {vmax:.2f}])",
+        fontsize=11,
+    )
     fig.tight_layout(rect=[0, 0, 0.92, 0.96])
 
     cbar_ax = fig.add_axes([0.93, 0.08, 0.015, 0.84])
