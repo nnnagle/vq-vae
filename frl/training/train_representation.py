@@ -26,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 # FRL imports
@@ -35,7 +34,7 @@ from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
-from models import Conv2DEncoder, GatedResidualConv2D
+from models import RepresentationModel
 from losses import contrastive_loss, pairs_with_spatial_constraint
 from utils import (
     compute_spatial_distances,
@@ -56,8 +55,7 @@ def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
 def process_batch(
     batch: dict,
     feature_builder: FeatureBuilder,
-    encoder: nn.Module,
-    spatial_conv: nn.Module,
+    model: RepresentationModel,
     device: torch.device,
     config: dict,
     training: bool = True,
@@ -69,8 +67,7 @@ def process_batch(
     Args:
         batch: Batch from dataloader
         feature_builder: FeatureBuilder instance
-        encoder: Encoder network
-        spatial_conv: Gated spatial convolution module
+        model: RepresentationModel (encoder + spatial conv)
         device: Device to use
         config: Loss config dict
         training: If True, run in training mode (gradients, optimizer step).
@@ -83,12 +80,10 @@ def process_batch(
     if training:
         if optimizer is None:
             raise ValueError("optimizer is required when training=True")
-        encoder.train()
-        spatial_conv.train()
+        model.train()
         optimizer.zero_grad()
     else:
-        encoder.eval()
-        spatial_conv.eval()
+        model.eval()
 
     # Use jitter only during training
     jitter_radius = config.get('jitter_radius', 4) if training else 0
@@ -250,10 +245,9 @@ def process_batch(
             continue
 
         # Encode the full patch for efficient embedding extraction
-        # encoder_data: [C, H, W] -> [1, C, H, W] -> conv -> [1, D, H, W]
+        # encoder_data: [C, H, W] -> [1, C, H, W] -> model -> [1, D, H, W]
         encoder_input_full = encoder_data.unsqueeze(0)
-        h_full = encoder(encoder_input_full)  # [1, D, H, W]
-        z_full, gate = spatial_conv(h_full, return_gate=True)  # [1, D, H, W] each
+        z_full, gate = model(encoder_input_full, return_gate=True)  # [1, D, H, W] each
         z_full = z_full.squeeze(0)  # [D, H, W]
         gate = gate.squeeze(0)  # [D, H, W]
 
@@ -347,11 +341,10 @@ def process_batch(
         # Backward
         mean_loss.backward()
 
-        # Gradient clipping (both encoder and spatial_conv)
+        # Gradient clipping
         if config.get('gradient_clip_enabled', True):
-            all_params = list(encoder.parameters()) + list(spatial_conv.parameters())
             torch.nn.utils.clip_grad_norm_(
-                all_params,
+                model.parameters(),
                 max_norm=config.get('gradient_clip_max_norm', 1.0)
             )
 
@@ -395,8 +388,7 @@ def process_batch(
 def train_epoch(
     train_dataloader: DataLoader,
     feature_builder: FeatureBuilder,
-    encoder: nn.Module,
-    spatial_conv: nn.Module,
+    model: RepresentationModel,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
@@ -420,7 +412,7 @@ def train_epoch(
 
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
-            batch, feature_builder, encoder, spatial_conv, device, config,
+            batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
         )
 
@@ -467,8 +459,7 @@ def train_epoch(
 def validate_epoch(
     val_dataloader: DataLoader,
     feature_builder: FeatureBuilder,
-    encoder: nn.Module,
-    spatial_conv: nn.Module,
+    model: RepresentationModel,
     device: torch.device,
     config: dict,
 ) -> dict:
@@ -488,7 +479,7 @@ def validate_epoch(
     with torch.no_grad():
         for batch in val_dataloader:
             stats = process_batch(
-                batch, feature_builder, encoder, spatial_conv, device, config,
+                batch, feature_builder, model, device, config,
                 training=False,
             )
             if stats['n_valid'] > 0:
@@ -651,41 +642,20 @@ def main():
     logger.info("Creating feature builder...")
     feature_builder = FeatureBuilder(bindings_config)
 
-    # Create encoder
-    logger.info("Creating encoder...")
-    encoder = Conv2DEncoder(
-        in_channels=16,  # ccdc_history has 16 channels
-        channels=[128, 64],  # Two layers: 128, 64
-        kernel_size=1,
-        padding=0,
-        dropout_rate=0.1,
-        num_groups=8,  # GroupNorm with 8 groups
-    ).to(device)
-
-    logger.info(f"Encoder: {encoder}")
-
-    # Create gated spatial convolution
-    logger.info("Creating spatial convolution...")
-    spatial_conv = GatedResidualConv2D(
-        channels=64,  # matches encoder output
-        num_layers=2,
-        kernel_size=3,
-        padding=1,
-        gate_hidden=64,
-        gate_kernel_size=1,
-    ).to(device)
-
-    logger.info(f"Spatial conv: {spatial_conv}")
+    # Create model
+    logger.info("Creating representation model...")
+    model = RepresentationModel().to(device)
+    logger.info(f"Model (v{RepresentationModel.VERSION}): {model}")
 
     # Count parameters
-    encoder_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-    spatial_params = sum(p.numel() for p in spatial_conv.parameters() if p.requires_grad)
+    encoder_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    spatial_params = sum(p.numel() for p in model.spatial_conv.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: encoder={encoder_params:,}, spatial={spatial_params:,}, total={encoder_params + spatial_params:,}")
 
-    # Create optimizer with both encoder and spatial_conv parameters
+    # Create optimizer
     logger.info(f"Creating optimizer: lr={lr}, weight_decay={weight_decay}")
     optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(spatial_conv.parameters()),
+        model.parameters(),
         lr=lr,
         weight_decay=weight_decay,
     )
@@ -771,18 +741,24 @@ def main():
     logger.info(f"Checkpoint dir: {ckpt_dir}")
     logger.info(f"Log dir: {log_dir}")
 
+    # Save experiment artifacts for reproducibility
+    shutil.copy2(args.bindings, experiment_dir / Path(args.bindings).name)
+    shutil.copy2(args.training, experiment_dir / Path(args.training).name)
+    shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
+    logger.info(f"Saved config and model source to {experiment_dir}")
+
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         train_dataset.on_epoch_start()  # Reshuffle patches
 
         train_stats = train_epoch(
-          train_dataloader, feature_builder, encoder, spatial_conv,
+          train_dataloader, feature_builder, model,
           optimizer, scheduler, device, loss_config, epoch, num_epochs,
         )
 
         val_stats = validate_epoch(
-          val_dataloader, feature_builder, encoder, spatial_conv,
+          val_dataloader, feature_builder, model,
           device, loss_config,
         )
 
@@ -812,8 +788,8 @@ def main():
         ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
         torch.save({
             'epoch': epoch + 1,
-            'encoder_state_dict': encoder.state_dict(),
-            'spatial_conv_state_dict': spatial_conv.state_dict(),
+            'model_version': RepresentationModel.VERSION,
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'train_loss': train_stats['loss'],

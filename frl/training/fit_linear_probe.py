@@ -39,8 +39,6 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # FRL imports
@@ -48,7 +46,7 @@ from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
 from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
-from models import Conv2DEncoder, GatedResidualConv2D
+from models import RepresentationModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,8 +134,7 @@ def extract_batch_tensors(
 def fit_closed_form_ridge(
     train_loader: DataLoader,
     feature_builder: FeatureBuilder,
-    encoder: nn.Module,
-    spatial_conv: nn.Module,
+    model: RepresentationModel,
     device: torch.device,
     ridge_lambda: float = 1e-3,
     max_batches_train: int = 0,
@@ -150,8 +147,7 @@ def fit_closed_form_ridge(
         W: [D, T]
         b: [T]
     """
-    encoder.eval()
-    spatial_conv.eval()
+    model.eval()
     D = 64
     T = len(TARGET_METRICS)
     Da = D + 1  # augmented with bias term
@@ -165,8 +161,7 @@ def fit_closed_form_ridge(
     with torch.no_grad():
         for batch in _iter_batches(train_loader, max_batches_train):
             Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
-            h = encoder(Ximg)          # [B, D, H, W]
-            z = spatial_conv(h)        # [B, D, H, W]
+            z = model(Ximg)            # [B, D, H, W]
 
             # Flatten pixels
             z_perm = z.permute(0, 2, 3, 1).contiguous()     # [B, H, W, D]
@@ -206,8 +201,7 @@ def fit_closed_form_ridge(
 def evaluate_probe(
     loader: DataLoader,
     feature_builder: FeatureBuilder,
-    encoder: nn.Module,
-    spatial_conv: nn.Module,
+    model: RepresentationModel,
     W: torch.Tensor,
     b: torch.Tensor,
     device: torch.device,
@@ -216,8 +210,7 @@ def evaluate_probe(
     """
     Evaluate MSE and R² per metric (masked) across an entire split.
     """
-    encoder.eval()
-    spatial_conv.eval()
+    model.eval()
     D = W.shape[0]
     T = W.shape[1]
     assert T == len(TARGET_METRICS)
@@ -233,8 +226,7 @@ def evaluate_probe(
     with torch.no_grad():
         for batch in _iter_batches(loader, max_batches_eval):
             Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
-            h = encoder(Ximg)          # [B, D, H, W]
-            z = spatial_conv(h)        # [B, D, H, W]
+            z = model(Ximg)            # [B, D, H, W]
 
             # Predict: [B, T, H, W]
             pred = torch.einsum("bdhw,dt->bthw", z, W) + b.view(1, -1, 1, 1)
@@ -374,43 +366,13 @@ def main():
     feature_builder = FeatureBuilder(bindings_config)
 
     logger.info(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-
-    encoder = Conv2DEncoder(
-        in_channels=16,
-        channels=[128, 64],
-        kernel_size=1,
-        padding=0,
-        dropout_rate=0.1,
-        num_groups=8,
-    ).to(device)
-    encoder.load_state_dict(checkpoint["encoder_state_dict"])
-
-    spatial_conv = GatedResidualConv2D(
-        channels=64,
-        num_layers=2,
-        kernel_size=3,
-        padding=1,
-        gate_hidden=64,
-        gate_kernel_size=1,
-    ).to(device)
-    spatial_conv.load_state_dict(checkpoint["spatial_conv_state_dict"])
-
-    for p in encoder.parameters():
-        p.requires_grad = False
-    for p in spatial_conv.parameters():
-        p.requires_grad = False
-    encoder.eval()
-    spatial_conv.eval()
-
-    logger.info("Encoder and spatial conv loaded and frozen.")
+    model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
     # Fit closed-form probe
     W, b = fit_closed_form_ridge(
         train_loader,
         feature_builder,
-        encoder,
-        spatial_conv,
+        model,
         device,
         ridge_lambda=args.ridge_lambda,
         max_batches_train=args.max_batches_train,
@@ -420,8 +382,7 @@ def main():
     train_metrics = evaluate_probe(
         train_loader,
         feature_builder,
-        encoder,
-        spatial_conv,
+        model,
         W,
         b,
         device,
@@ -430,8 +391,7 @@ def main():
     val_metrics = evaluate_probe(
         val_loader,
         feature_builder,
-        encoder,
-        spatial_conv,
+        model,
         W,
         b,
         device,
