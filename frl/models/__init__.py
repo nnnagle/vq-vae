@@ -31,6 +31,9 @@ from .spatial import (
     build_gated_residual_conv2d_from_config,
 )
 
+# Representation model (unified encoder pipeline)
+from .representation import RepresentationModel
+
 # Conditioning
 from .conditioning import (
     FiLMLayer,
@@ -60,6 +63,8 @@ __all__ = [
     # Spatial
     'GatedResidualConv2D',
     'build_gated_residual_conv2d_from_config',
+    # Representation
+    'RepresentationModel',
     # Conditioning
     'FiLMLayer',
     'FiLMConditionedBlock',
