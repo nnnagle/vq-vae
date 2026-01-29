@@ -109,16 +109,24 @@ class GatedResidualConv2D(nn.Module):
             If return_gate=False: [B, C, H, W] with adaptive spatial smoothing
             If return_gate=True: tuple of (output, gate) where gate is [B, C, H, W]
         """
+        # OLD #
         # Compute smoothed features
-        smoothed = self.conv_layers(x)
+        #smoothed = self.conv_layers(x)
 
         # Compute per-location gates
-        gate = self.gate_network(x)
+        #gate = self.gate_network(x)
 
         # Gated residual combination
         # gate ≈ 1: use smoothed features (smooth regions)
         # gate ≈ 0: use original input (preserve edges)
-        output = gate * smoothed + (1 - gate) * x
+        #output = gate * smoothed + (1 - gate) * x
+        
+        # NEW #
+        smoothed = self.conv_layers(x)
+        residual = x - smoothed
+        gate = self.gate_network(residual)
+        output = x + gate * residual
+
 
         if return_gate:
             return output, gate

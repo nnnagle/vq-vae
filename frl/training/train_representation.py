@@ -727,7 +727,7 @@ def main():
         'spatial_min_w': .03,
         'spatial_temperature': 0.07,
         # Loss weights
-        'spectral_loss_weight': 0.2,
+        'spectral_loss_weight': 1.0,
         'spatial_loss_weight': 1.0,
         # Training
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
