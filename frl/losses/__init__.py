@@ -34,6 +34,11 @@ from losses.pairs import (
     apply_spatial_constraint,
 )
 from losses.reconstruction import reconstruction_loss
+from losses.triplet_phase import (
+    build_triplet_constraints_batch,
+    classify_triplet,
+    phase_triplet_loss,
+)
 from losses.variance_covariance import (
     covariance_loss,
     variance_covariance_loss,
@@ -42,7 +47,9 @@ from losses.variance_covariance import (
 
 __all__ = [
     "apply_spatial_constraint",
+    "build_triplet_constraints_batch",
     "categorical_loss",
+    "classify_triplet",
     "contrastive_loss",
     "count_loss",
     "covariance_loss",
@@ -51,6 +58,7 @@ __all__ = [
     "pairs_quantile",
     "pairs_radius",
     "pairs_with_spatial_constraint",
+    "phase_triplet_loss",
     "reconstruction_loss",
     "variance_covariance_loss",
     "variance_loss",
