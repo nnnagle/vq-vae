@@ -88,6 +88,7 @@ dataset: # These exist in the zarr
       - {name: ndvi_winter_max, source: annual/ls8day/data/NDVI_winter_max}
       - name: temporal_position               # in [0,1]
         formula: "t / (T - 1)" #T is inferred from time_window
+      - {name: ysfc, source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024}
 
   
   static:
@@ -243,6 +244,10 @@ features:
       annual.ndvi_amplitude: {norm: zscore}
       annual.ndvi_summer_p95: {norm: zscore}
       annual.ndvi_winter_max: {norm: zscore}
+  ysfc:
+    dim: [C,T,H,W]
+    channels:
+      annual.ysfc: {norm: identity}
   target_metrics:
     dim: [C,H,W]
     channels: 
