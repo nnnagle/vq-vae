@@ -33,7 +33,13 @@ from losses.pairs import (
     pairs_with_spatial_constraint,
     apply_spatial_constraint,
 )
+from losses.phase_neighborhood import (
+    build_phase_neighborhood_batch,
+    build_ysfc_overlap_mask,
+    phase_neighborhood_loss,
+)
 from losses.reconstruction import reconstruction_loss
+from losses.soft_neighborhood import soft_neighborhood_matching_loss
 from losses.triplet_phase import (
     build_triplet_constraints_batch,
     classify_triplet,
@@ -47,7 +53,9 @@ from losses.variance_covariance import (
 
 __all__ = [
     "apply_spatial_constraint",
+    "build_phase_neighborhood_batch",
     "build_triplet_constraints_batch",
+    "build_ysfc_overlap_mask",
     "categorical_loss",
     "classify_triplet",
     "contrastive_loss",
@@ -58,8 +66,10 @@ __all__ = [
     "pairs_quantile",
     "pairs_radius",
     "pairs_with_spatial_constraint",
+    "phase_neighborhood_loss",
     "phase_triplet_loss",
     "reconstruction_loss",
+    "soft_neighborhood_matching_loss",
     "variance_covariance_loss",
     "variance_loss",
 ]
