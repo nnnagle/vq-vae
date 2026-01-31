@@ -7,9 +7,9 @@ import torch
 
 from losses.soft_neighborhood import soft_neighborhood_matching_loss
 from losses.phase_neighborhood import (
-    build_ysfc_overlap_mask,
-    align_distance_matrices,
+    average_features_by_ysfc,
     build_phase_neighborhood_batch,
+    build_ysfc_overlap,
     phase_neighborhood_loss,
 )
 
@@ -147,8 +147,6 @@ class TestSoftNeighborhoodLoss:
         loss_soft, _ = soft_neighborhood_matching_loss(
             d_ref, d_learned, mask, tau_ref=1.0, tau_learned=1.0,
         )
-        # These should differ (not asserting direction — just that
-        # temperature has an effect).
         assert abs(loss_sharp.item() - loss_soft.item()) > 1e-4
 
     def test_min_valid_per_row_validation(self):
@@ -168,122 +166,114 @@ class TestSoftNeighborhoodLoss:
 
 
 class TestYsfcOverlap:
-    """Tests for build_ysfc_overlap_mask."""
+    """Tests for build_ysfc_overlap."""
 
     def test_full_overlap_self_pair(self):
         """A pixel paired with itself has full overlap."""
         ysfc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.float32)
-        idx_i, idx_j, vals = build_ysfc_overlap_mask(ysfc, ysfc)
+        shared, groups_i, groups_j = build_ysfc_overlap(ysfc, ysfc)
 
-        # Every time step maps to itself.
-        assert idx_i.shape[0] == 5
-        assert idx_j.shape[0] == 5
-        # Indices should be identical for self-pair.
-        assert torch.equal(idx_i, idx_j)
+        assert shared.shape[0] == 5
+        assert len(groups_i) == 5
+        assert len(groups_j) == 5
+        # For self-pair, groups should be identical.
+        for gi, gj in zip(groups_i, groups_j):
+            assert torch.equal(gi, gj)
 
     def test_partial_overlap(self):
         """Two pixels with partial ysfc overlap."""
         ysfc_i = torch.tensor([0, 1, 2, 3, 4], dtype=torch.float32)
         ysfc_j = torch.tensor([3, 4, 5, 6, 7], dtype=torch.float32)
-        idx_i, idx_j, vals = build_ysfc_overlap_mask(ysfc_i, ysfc_j)
+        shared, groups_i, groups_j = build_ysfc_overlap(ysfc_i, ysfc_j)
 
-        # Overlap values: {3, 4}
-        assert set(vals.tolist()) == {3.0, 4.0}
-        assert idx_i.shape[0] == 2  # one time step per value, no duplicates
+        assert set(shared.tolist()) == {3.0, 4.0}
+        assert len(groups_i) == 2
 
-        # Check correct time indices.
         # ysfc=3 at i: t=3, at j: t=0
-        # ysfc=4 at i: t=4, at j: t=1
-        val_3_mask = vals == 3.0
-        assert idx_i[val_3_mask].item() == 3
-        assert idx_j[val_3_mask].item() == 0
+        idx_3 = (shared == 3.0).nonzero(as_tuple=False).item()
+        assert groups_i[idx_3].tolist() == [3]
+        assert groups_j[idx_3].tolist() == [0]
 
     def test_no_overlap(self):
         """Disjoint ysfc ranges produce empty overlap."""
         ysfc_i = torch.tensor([0, 1, 2], dtype=torch.float32)
         ysfc_j = torch.tensor([5, 6, 7], dtype=torch.float32)
-        idx_i, idx_j, vals = build_ysfc_overlap_mask(ysfc_i, ysfc_j)
+        shared, groups_i, groups_j = build_ysfc_overlap(ysfc_i, ysfc_j)
 
-        assert idx_i.shape[0] == 0
-        assert idx_j.shape[0] == 0
+        assert shared.shape[0] == 0
+        assert len(groups_i) == 0
 
-    def test_stuttering_ysfc(self):
-        """Repeated ysfc values (stuttering) produce cross-product entries."""
+    def test_stuttering_ysfc_groups(self):
+        """Repeated ysfc values produce groups with multiple time indices."""
         ysfc_i = torch.tensor([0, 0, 1, 2, 3], dtype=torch.float32)
         ysfc_j = torch.tensor([0, 1, 2, 3, 4], dtype=torch.float32)
-        idx_i, idx_j, vals = build_ysfc_overlap_mask(ysfc_i, ysfc_j)
+        shared, groups_i, groups_j = build_ysfc_overlap(ysfc_i, ysfc_j)
 
-        # ysfc=0: i has 2 occurrences (t=0,1), j has 1 (t=0) → 2 entries
-        # ysfc=1: i has 1 (t=2), j has 1 (t=1) → 1 entry
-        # ysfc=2: 1 × 1 = 1
-        # ysfc=3: 1 × 1 = 1
-        # Total: 5
-        assert idx_i.shape[0] == 5
-        n_val_0 = (vals == 0.0).sum().item()
-        assert n_val_0 == 2
+        # ysfc=0: i has 2 time steps, j has 1.
+        idx_0 = (shared == 0.0).nonzero(as_tuple=False).item()
+        assert groups_i[idx_0].tolist() == [0, 1]  # two occurrences
+        assert groups_j[idx_0].tolist() == [0]  # one occurrence
 
     def test_pre_and_post_disturbance_overlap(self):
         """Pixel with pre- and post-disturbance ysfc values overlaps
         with a post-disturbance-only pixel."""
-        # Pixel i: disturbed at t=2 → ysfc = [20, 21, 0, 1, 2]
         ysfc_i = torch.tensor([20, 21, 0, 1, 2], dtype=torch.float32)
-        # Pixel j: disturbed at t=0 → ysfc = [0, 1, 2, 3, 4]
         ysfc_j = torch.tensor([0, 1, 2, 3, 4], dtype=torch.float32)
 
-        idx_i, idx_j, vals = build_ysfc_overlap_mask(ysfc_i, ysfc_j)
+        shared, groups_i, groups_j = build_ysfc_overlap(ysfc_i, ysfc_j)
+        assert set(shared.tolist()) == {0.0, 1.0, 2.0}
 
-        # Overlap: {0, 1, 2}
-        assert set(vals.tolist()) == {0.0, 1.0, 2.0}
-        assert idx_i.shape[0] == 3
+    def test_sorted_output(self):
+        """Shared values should be sorted."""
+        ysfc_i = torch.tensor([4, 2, 0, 1, 3], dtype=torch.float32)
+        ysfc_j = torch.tensor([3, 1, 4, 0, 2], dtype=torch.float32)
+        shared, _, _ = build_ysfc_overlap(ysfc_i, ysfc_j)
+        assert shared.tolist() == sorted(shared.tolist())
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Alignment
+# Feature averaging
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestAlignDistanceMatrices:
+class TestAverageFeatures:
 
-    def test_basic_alignment(self):
-        """Aligned matrix has correct values from the full matrix."""
-        T = 5
-        # Symmetric distance matrix.
-        d_full = torch.arange(T * T, dtype=torch.float32).reshape(T, T)
-        d_full = (d_full + d_full.T) / 2
+    def test_single_entry_groups(self):
+        """When each group has one entry, averaging is identity."""
+        T, C = 5, 3
+        features = torch.randn(T, C)
+        groups = [torch.tensor([t]) for t in range(T)]
+        result = average_features_by_ysfc(features, groups, K=T)
+        assert torch.allclose(result, features)
 
-        # Suppose overlap maps to time indices [1, 3] at this pixel.
-        indices = torch.tensor([1, 3])
-        M = 3  # pad to 3
+    def test_averaging_reduces_duplicates(self):
+        """Groups with multiple entries produce the mean."""
+        features = torch.tensor([
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+        ])
+        # Group 0: t=0,1 → mean [2, 3]
+        # Group 1: t=2,3 → mean [6, 7]
+        groups = [torch.tensor([0, 1]), torch.tensor([2, 3])]
+        result = average_features_by_ysfc(features, groups, K=2)
 
-        d_ref, d_learn, mask = align_distance_matrices(
-            d_full, d_full, indices, indices, M,
-        )
+        expected = torch.tensor([[2.0, 3.0], [6.0, 7.0]])
+        assert torch.allclose(result, expected)
 
-        # Top-left 2×2 should have values from d_full at [1,3]×[1,3].
-        assert d_ref[0, 0].item() == d_full[1, 1].item()
-        assert d_ref[0, 1].item() == d_full[1, 3].item()
-        assert d_ref[1, 0].item() == d_full[3, 1].item()
-        assert d_ref[1, 1].item() == d_full[3, 3].item()
+    def test_gradient_flows_through_averaging(self):
+        """Gradients should propagate through the averaging."""
+        features = torch.randn(5, 3, requires_grad=True)
+        groups = [torch.tensor([0, 1]), torch.tensor([2]), torch.tensor([3, 4])]
+        result = average_features_by_ysfc(features, groups, K=3)
+        result.sum().backward()
 
-        # Padding row/col 2 should be zero.
-        assert d_ref[2, :].sum().item() == 0.0
-        assert d_ref[:, 2].sum().item() == 0.0
-
-        # Mask: diagonal false, padding false.
-        assert mask[0, 1].item() is True
-        assert mask[1, 0].item() is True
-        assert mask[0, 0].item() is False  # diagonal
-        assert mask[2, 0].item() is False  # padding
-
-    def test_empty_overlap(self):
-        """Empty indices produce all-zero matrices and all-false mask."""
-        d_full = torch.rand(5, 5)
-        indices = torch.empty(0, dtype=torch.long)
-        d_ref, d_learn, mask = align_distance_matrices(
-            d_full, d_full, indices, indices, M=5,
-        )
-        assert d_ref.sum().item() == 0.0
-        assert mask.any().item() is False
+        assert features.grad is not None
+        # t=0 and t=1 are in a group of 2, so gradient = 1/2.
+        assert torch.allclose(features.grad[0], torch.tensor([0.5, 0.5, 0.5]))
+        # t=2 is alone, gradient = 1.
+        assert torch.allclose(features.grad[2], torch.tensor([1.0, 1.0, 1.0]))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -305,17 +295,15 @@ class TestBuildBatch:
             [3, 4, 5, 6, 7],
         ], dtype=torch.float32)
 
-        # Self-pairs: (0,0), (1,1), (2,2)
         pairs = torch.tensor([[0, 0], [1, 1], [2, 2]])
+        batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
 
-        d_ref, d_learn, mask, valid, M = build_phase_neighborhood_batch(
-            spec, emb, ysfc, pairs, min_overlap=3,
-        )
-
-        assert valid.all()
-        assert M == 5  # full overlap for self-pairs
-        # All self-pairs should have 5×5 masks (minus diagonal).
-        assert mask.sum(dim=(1, 2)).tolist() == [20, 20, 20]
+        assert batch["valid_pair_mask"].all()
+        assert batch["M"] == 5
+        # Self-similarity mask: 5×5 minus diagonal = 20 per pair.
+        assert batch["mask_self"].sum(dim=(1, 2)).tolist() == [20, 20, 20]
+        # Cross-pixel mask: 5×5 = 25 per pair (diagonal included).
+        assert batch["mask_cross"].sum(dim=(1, 2)).tolist() == [25, 25, 25]
 
     def test_insufficient_overlap_filtered(self):
         """Pairs with too little overlap are excluded."""
@@ -324,39 +312,47 @@ class TestBuildBatch:
         spec = torch.randn(N, T, C)
         emb = torch.randn(N, T, D)
 
-        # Only 2 values overlap — below min_overlap=3.
         ysfc = torch.tensor([
             [0, 1, 2, 3, 4],
             [3, 4, 5, 6, 7],
         ], dtype=torch.float32)
 
         pairs = torch.tensor([[0, 1]])
-        d_ref, d_learn, mask, valid, M = build_phase_neighborhood_batch(
-            spec, emb, ysfc, pairs, min_overlap=3,
-        )
+        batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
 
-        assert not valid[0].item()
-        assert d_ref.shape[0] == 0
+        assert not batch["valid_pair_mask"][0].item()
+        assert batch["d_ref_self"].shape[0] == 0
 
-    def test_mixed_valid_and_invalid_pairs(self):
-        """Batch with both valid and invalid pairs."""
-        N, T, C, D = 3, 5, 4, 8
+    def test_stuttering_ysfc_averaging(self):
+        """Pixels with repeated ysfc values should produce averaged features."""
+        N, T, C, D = 1, 5, 2, 2
+        # ysfc has ysfc=0 at t=0 and t=1.
+        ysfc = torch.tensor([[0, 0, 1, 2, 3]], dtype=torch.float32)
+        spec = torch.randn(N, T, C)
+        emb = torch.randn(N, T, D)
+
+        pairs = torch.tensor([[0, 0]])
+        batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
+
+        # 4 unique ysfc values: {0, 1, 2, 3}
+        assert batch["valid_pair_mask"][0].item()
+        assert batch["M"] == 4
+
+    def test_both_distance_types_computed(self):
+        """Both self-similarity and cross-pixel matrices should be non-zero."""
+        N, T, C, D = 3, 8, 4, 8
         torch.manual_seed(0)
         spec = torch.randn(N, T, C)
         emb = torch.randn(N, T, D)
-        ysfc = torch.tensor([
-            [0, 1, 2, 3, 4],  # pixel 0
-            [2, 3, 4, 5, 6],  # pixel 1: overlap with 0 = {2,3,4} = 3
-            [8, 9, 10, 11, 12],  # pixel 2: no overlap with 0
-        ], dtype=torch.float32)
+        ysfc = torch.arange(T, dtype=torch.float32).unsqueeze(0).expand(N, T)
 
-        pairs = torch.tensor([[0, 0], [0, 1], [0, 2]])
-        d_ref, d_learn, mask, valid, M = build_phase_neighborhood_batch(
-            spec, emb, ysfc, pairs, min_overlap=3,
-        )
+        pairs = torch.tensor([[0, 1], [1, 2]])
+        batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
 
-        assert valid.tolist() == [True, True, False]
-        assert d_ref.shape[0] == 2  # 2 valid pairs
+        assert batch["d_ref_self"].abs().sum() > 0
+        assert batch["d_ref_cross"].abs().sum() > 0
+        assert batch["d_learned_self"].abs().sum() > 0
+        assert batch["d_learned_cross"].abs().sum() > 0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -368,10 +364,9 @@ class TestPhaseNeighborhoodLoss:
 
     def test_self_pair_identical_embeddings_low_loss(self):
         """Self-pair where embeddings reproduce spectral structure → low loss."""
-        N, T, C, D = 1, 8, 4, 4
+        N, T, C = 1, 8, 4
         torch.manual_seed(42)
         spec = torch.randn(N, T, C)
-        # Make embeddings proportional to spectral features.
         emb = spec.clone()
 
         ysfc = torch.arange(T, dtype=torch.float32).unsqueeze(0)
@@ -386,37 +381,27 @@ class TestPhaseNeighborhoodLoss:
             tau_learned=0.1,
             min_overlap=3,
         )
-        assert loss.item() < 0.1
+        assert stats["loss_self"] < 0.1
         assert stats["n_pairs_sufficient_overlap"] == 1
 
     def test_random_embeddings_higher_loss(self):
         """Random embeddings should produce higher loss than matched ones."""
-        N, T, C, D = 2, 8, 4, 8
+        N, T, C = 2, 8, 4
         torch.manual_seed(42)
         spec = torch.randn(N, T, C)
 
         ysfc = torch.arange(T, dtype=torch.float32).unsqueeze(0).expand(N, T)
         pairs = torch.tensor([[0, 0], [1, 1]])
 
-        # Matched embeddings.
-        emb_good = spec[:, :, :D] if D <= C else torch.cat(
-            [spec, torch.randn(N, T, D - C)], dim=2
-        )
-        # Use spectral features directly as embeddings (same distance structure).
         emb_good = spec.clone()
-
         loss_good, _ = phase_neighborhood_loss(
-            spec, emb_good, ysfc, pairs,
-            tau_ref=0.1, tau_learned=0.1,
+            spec, emb_good, ysfc, pairs, tau_ref=0.1, tau_learned=0.1,
         )
 
-        # Random embeddings.
         torch.manual_seed(999)
         emb_bad = torch.randn(N, T, C)
-
         loss_bad, _ = phase_neighborhood_loss(
-            spec, emb_bad, ysfc, pairs,
-            tau_ref=0.1, tau_learned=0.1,
+            spec, emb_bad, ysfc, pairs, tau_ref=0.1, tau_learned=0.1,
         )
 
         assert loss_good.item() < loss_bad.item()
@@ -432,8 +417,7 @@ class TestPhaseNeighborhoodLoss:
         pairs = torch.tensor([[0, 0], [0, 1], [1, 2]])
 
         loss, _ = phase_neighborhood_loss(
-            spec, emb, ysfc, pairs,
-            tau_ref=0.1, tau_learned=0.1,
+            spec, emb, ysfc, pairs, tau_ref=0.1, tau_learned=0.1,
         )
         loss.backward()
         assert emb.grad is not None
@@ -444,7 +428,6 @@ class TestPhaseNeighborhoodLoss:
         N, T, C, D = 2, 5, 4, 8
         spec = torch.randn(N, T, C)
         emb = torch.randn(N, T, D)
-        # Disjoint ysfc.
         ysfc = torch.tensor([
             [0, 1, 2, 3, 4],
             [10, 11, 12, 13, 14],
@@ -468,32 +451,27 @@ class TestPhaseNeighborhoodLoss:
 
         pairs = torch.tensor([[0, 0], [1, 1], [2, 2]])
 
-        # Make pixel 0's embeddings very wrong.
         emb_mod = emb.clone()
         emb_mod[0] = emb_mod[0] * 10.0
 
         w_high_on_0 = torch.tensor([10.0, 1.0, 1.0])
         loss_high, _ = phase_neighborhood_loss(
-            spec, emb_mod, ysfc, pairs,
-            pair_weights=w_high_on_0,
+            spec, emb_mod, ysfc, pairs, pair_weights=w_high_on_0,
         )
 
         w_low_on_0 = torch.tensor([0.1, 1.0, 1.0])
         loss_low, _ = phase_neighborhood_loss(
-            spec, emb_mod, ysfc, pairs,
-            pair_weights=w_low_on_0,
+            spec, emb_mod, ysfc, pairs, pair_weights=w_low_on_0,
         )
 
         assert loss_high.item() > loss_low.item()
 
     def test_cross_pixel_disturbance_alignment(self):
-        """Two pixels disturbed at different calendar years but with
-        overlapping ysfc should produce a valid loss."""
+        """Two pixels disturbed at different calendar years should produce
+        a valid loss via ysfc alignment."""
         T, C, D = 10, 4, 8
         torch.manual_seed(0)
 
-        # Pixel 0: disturbed at t=2 → ysfc = [20, 21, 0, 1, 2, 3, 4, 5, 6, 7]
-        # Pixel 1: disturbed at t=5 → ysfc = [20, 21, 22, 23, 24, 0, 1, 2, 3, 4]
         ysfc = torch.tensor([
             [20, 21, 0, 1, 2, 3, 4, 5, 6, 7],
             [20, 21, 22, 23, 24, 0, 1, 2, 3, 4],
@@ -504,13 +482,52 @@ class TestPhaseNeighborhoodLoss:
         pairs = torch.tensor([[0, 1]])
 
         loss, stats = phase_neighborhood_loss(
-            spec, emb, ysfc, pairs,
-            min_overlap=3,
+            spec, emb, ysfc, pairs, min_overlap=3,
         )
 
-        # Should have overlap on {0, 1, 2, 3, 4, 20, 21} = 7 values.
         assert stats["n_pairs_sufficient_overlap"] == 1
         assert loss.item() > 0.0
-
         loss.backward()
         assert emb.grad is not None
+
+    def test_self_and_cross_loss_reported_separately(self):
+        """Stats should report self-similarity and cross-pixel losses."""
+        N, T, C, D = 3, 6, 4, 8
+        torch.manual_seed(0)
+        spec = torch.randn(N, T, C)
+        emb = torch.randn(N, T, D)
+        ysfc = torch.arange(T, dtype=torch.float32).unsqueeze(0).expand(N, T)
+
+        pairs = torch.tensor([[0, 0], [0, 1]])
+
+        loss, stats = phase_neighborhood_loss(
+            spec, emb, ysfc, pairs, tau_ref=0.1, tau_learned=0.1,
+        )
+
+        assert "loss_self" in stats
+        assert "loss_cross" in stats
+        assert stats["loss_self"] >= 0.0
+        assert stats["loss_cross"] >= 0.0
+
+    def test_loss_weights(self):
+        """self_similarity_weight and cross_pixel_weight should control
+        the contribution of each term."""
+        N, T, C, D = 2, 8, 4, 8
+        torch.manual_seed(42)
+        spec = torch.randn(N, T, C)
+        emb = torch.randn(N, T, D)
+        ysfc = torch.arange(T, dtype=torch.float32).unsqueeze(0).expand(N, T)
+
+        pairs = torch.tensor([[0, 1]])
+
+        loss_self_only, stats_self_only = phase_neighborhood_loss(
+            spec, emb, ysfc, pairs,
+            self_similarity_weight=1.0, cross_pixel_weight=0.0,
+        )
+        loss_cross_only, stats_cross_only = phase_neighborhood_loss(
+            spec, emb, ysfc, pairs,
+            self_similarity_weight=0.0, cross_pixel_weight=1.0,
+        )
+
+        assert abs(loss_self_only.item() - stats_self_only["loss_self"]) < 1e-5
+        assert abs(loss_cross_only.item() - stats_cross_only["loss_cross"]) < 1e-5

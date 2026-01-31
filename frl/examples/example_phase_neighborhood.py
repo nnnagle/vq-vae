@@ -5,9 +5,9 @@ Demonstrates the full flow:
 
 1. Simulated landscape with a mix of disturbed and undisturbed pixels.
 2. ysfc alignment identifies shared recovery stages across pixels.
-3. Reference distributions from Mahalanobis-whitened LS8 spectra.
-4. Learned distributions from phase embeddings (synthetic here).
-5. KL divergence trains embeddings to match spectral structure.
+3. ysfc averaging collapses duplicate time steps per recovery stage.
+4. Self-similarity matching teaches trajectory shape.
+5. Cross-pixel matching anchors embeddings in a shared metric space.
 6. Type-similarity weighting focuses the loss on comparable pixels.
 
 In real training, replace synthetic data with:
@@ -20,7 +20,7 @@ In real training, replace synthetic data with:
 import torch
 
 from losses.phase_neighborhood import (
-    build_ysfc_overlap_mask,
+    build_ysfc_overlap,
     phase_neighborhood_loss,
 )
 
@@ -128,33 +128,52 @@ def example_overlap_inspection():
     print("=" * 60)
 
     # Two pixels disturbed at different times.
-    # Pixel 0: disturbed at t=3 → ysfc = [20, 21, 22, 0, 1, 2, 3, 4]
-    # Pixel 1: disturbed at t=6 → ysfc = [15, 16, 17, 18, 19, 20, 0, 1]
+    # Pixel 0: disturbed at t=3 -> ysfc = [20, 21, 22, 0, 1, 2, 3, 4]
+    # Pixel 1: disturbed at t=6 -> ysfc = [15, 16, 17, 18, 19, 20, 0, 1]
     ysfc_0 = torch.tensor([20, 21, 22, 0, 1, 2, 3, 4], dtype=torch.float32)
     ysfc_1 = torch.tensor([15, 16, 17, 18, 19, 20, 0, 1], dtype=torch.float32)
 
-    idx_0, idx_1, vals = build_ysfc_overlap_mask(ysfc_0, ysfc_1)
+    shared_values, groups_0, groups_1 = build_ysfc_overlap(ysfc_0, ysfc_1)
 
     print(f"\nPixel 0 ysfc: {ysfc_0.tolist()}")
     print(f"Pixel 1 ysfc: {ysfc_1.tolist()}")
-    print(f"\nOverlap ysfc values: {sorted(set(vals.tolist()))}")
-    print(f"Number of overlap entries: {idx_0.shape[0]}")
+    print(f"\nShared ysfc values: {shared_values.tolist()}")
+    print(f"Number of shared values: {shared_values.shape[0]}")
     print(f"\nAlignment mapping:")
-    for k in range(idx_0.shape[0]):
-        t_i = idx_0[k].item()
-        t_j = idx_1[k].item()
-        y = vals[k].item()
+    for k in range(shared_values.shape[0]):
+        val = shared_values[k].item()
+        t_0 = groups_0[k].tolist()
+        t_1 = groups_1[k].tolist()
         print(
-            f"  ysfc={y:>3.0f} → pixel 0 at t={t_i} "
-            f"(calendar {2010+t_i}), pixel 1 at t={t_j} "
-            f"(calendar {2010+t_j})"
+            f"  ysfc={val:>3.0f} -> pixel 0 at t={t_0}, "
+            f"pixel 1 at t={t_1}"
+        )
+
+    # Show stuttering example: pixel with two disturbances.
+    print(f"\n--- Stuttering example ---")
+    # Pixel 2 has two disturbances: ysfc repeats 0, 1, 2.
+    ysfc_2 = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4], dtype=torch.float32)
+    ysfc_3 = torch.tensor([5, 6, 0, 1, 2, 3, 4, 5], dtype=torch.float32)
+
+    shared_values, groups_2, groups_3 = build_ysfc_overlap(ysfc_2, ysfc_3)
+
+    print(f"\nPixel 2 ysfc: {ysfc_2.tolist()}")
+    print(f"Pixel 3 ysfc: {ysfc_3.tolist()}")
+    print(f"\nShared ysfc values: {shared_values.tolist()}")
+    for k in range(shared_values.shape[0]):
+        val = shared_values[k].item()
+        t_2 = groups_2[k].tolist()
+        t_3 = groups_3[k].tolist()
+        print(
+            f"  ysfc={val:>3.0f} -> pixel 2 at t={t_2} (averaged), "
+            f"pixel 3 at t={t_3}"
         )
 
 
 def example_loss_computation():
     """Compute the phase neighborhood loss on a synthetic landscape."""
     print("\n" + "=" * 60)
-    print("Example 2: Phase neighborhood loss computation")
+    print("Example 2: Phase neighborhood loss (self + cross)")
     print("=" * 60)
 
     spectral, embeddings, ysfc, pairs, weights = make_synthetic_landscape()
@@ -165,7 +184,7 @@ def example_loss_computation():
     print(f"Disturbed pixels: 8")
     print(f"Weight range: [{weights.min():.3f}, {weights.max():.3f}]")
 
-    # Compute loss.
+    # Compute loss with both self-similarity and cross-pixel terms.
     loss, stats = phase_neighborhood_loss(
         spectral_features=spectral,
         phase_embeddings=embeddings,
@@ -175,15 +194,26 @@ def example_loss_computation():
         tau_ref=0.1,
         tau_learned=0.1,
         min_overlap=3,
+        self_similarity_weight=1.0,
+        cross_pixel_weight=1.0,
     )
 
-    print(f"\nLoss: {loss.item():.4f}")
-    print(f"\nStatistics:")
-    for k, v in stats.items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
-        else:
-            print(f"  {k}: {v}")
+    print(f"\nCombined loss: {loss.item():.4f}")
+    print(f"  Self-similarity loss: {stats['loss_self']:.4f}")
+    print(f"  Cross-pixel loss:     {stats['loss_cross']:.4f}")
+    print(f"\nPair statistics:")
+    print(f"  Input pairs: {stats['n_pairs_input']}")
+    print(f"  Sufficient overlap: {stats['n_pairs_sufficient_overlap']}")
+    print(f"\nSelf-similarity stats:")
+    print(f"  Active pairs: {stats['self_n_pairs_active']}")
+    print(f"  Valid rows:   {stats['self_n_rows_valid']}")
+    print(f"  Mean KL:      {stats['self_mean_kl']:.4f}")
+    print(f"  Mean overlap: {stats['self_mean_overlap']:.1f}")
+    print(f"\nCross-pixel stats:")
+    print(f"  Active pairs: {stats['cross_n_pairs_active']}")
+    print(f"  Valid rows:   {stats['cross_n_rows_valid']}")
+    print(f"  Mean KL:      {stats['cross_mean_kl']:.4f}")
+    print(f"  Mean overlap: {stats['cross_mean_overlap']:.1f}")
 
     # Verify gradient flow.
     loss.backward()
@@ -194,13 +224,13 @@ def example_loss_computation():
 def example_self_vs_cross():
     """Compare loss contributions from self-pairs vs cross-pixel pairs."""
     print("\n" + "=" * 60)
-    print("Example 3: Self-pair vs cross-pixel loss")
+    print("Example 3: Self-pair vs cross-pixel loss breakdown")
     print("=" * 60)
 
     spectral, embeddings, ysfc, _, _ = make_synthetic_landscape()
     N = spectral.shape[0]
 
-    # Self-pairs only.
+    # Self-pairs only: teaches trajectory shape within each pixel.
     self_pairs = torch.tensor([[i, i] for i in range(N)])
     emb_detached = embeddings.detach().requires_grad_(True)
 
@@ -208,10 +238,12 @@ def example_self_vs_cross():
         spectral, emb_detached, ysfc, self_pairs,
         tau_ref=0.1, tau_learned=0.1,
     )
-    print(f"\nSelf-pairs only:")
-    print(f"  Loss: {loss_self.item():.4f}")
-    print(f"  Active pairs: {stats_self['n_pairs_active']}")
-    print(f"  Valid rows: {stats_self['n_rows_valid']}")
+    print(f"\nSelf-pairs only (trajectory shape):")
+    print(f"  Combined loss: {loss_self.item():.4f}")
+    print(f"  Self-similarity loss: {stats_self['loss_self']:.4f}")
+    print(f"  Cross-pixel loss:     {stats_self['loss_cross']:.4f}")
+    print(f"  Active pairs (self): {stats_self['self_n_pairs_active']}")
+    print(f"  Active pairs (cross): {stats_self['cross_n_pairs_active']}")
 
     # Cross-pixel pairs among first 8 (disturbed) pixels.
     cross_pairs = []
@@ -226,10 +258,25 @@ def example_self_vs_cross():
         tau_ref=0.1, tau_learned=0.1,
     )
     print(f"\nCross-pixel pairs (disturbed only):")
-    print(f"  Loss: {loss_cross.item():.4f}")
-    print(f"  Active pairs: {stats_cross['n_pairs_active']}")
-    print(f"  Valid rows: {stats_cross['n_rows_valid']}")
-    print(f"  Mean overlap: {stats_cross['mean_overlap']:.1f}")
+    print(f"  Combined loss: {loss_cross.item():.4f}")
+    print(f"  Self-similarity loss: {stats_cross['loss_self']:.4f}")
+    print(f"  Cross-pixel loss:     {stats_cross['loss_cross']:.4f}")
+    print(f"  Active pairs (self): {stats_cross['self_n_pairs_active']}")
+    print(f"  Active pairs (cross): {stats_cross['cross_n_pairs_active']}")
+    print(f"  Mean overlap: {stats_cross['self_mean_overlap']:.1f}")
+
+    # Demonstrate weight tuning: emphasize cross-pixel anchoring.
+    emb_detached3 = embeddings.detach().requires_grad_(True)
+    loss_anchored, stats_anchored = phase_neighborhood_loss(
+        spectral, emb_detached3, ysfc, cross_pairs,
+        tau_ref=0.1, tau_learned=0.1,
+        self_similarity_weight=0.5,
+        cross_pixel_weight=2.0,
+    )
+    print(f"\nCross-pixel pairs (weighted: self=0.5, cross=2.0):")
+    print(f"  Combined loss: {loss_anchored.item():.4f}")
+    print(f"  Self-similarity loss: {stats_anchored['loss_self']:.4f}")
+    print(f"  Cross-pixel loss:     {stats_anchored['loss_cross']:.4f}")
 
 
 if __name__ == "__main__":
