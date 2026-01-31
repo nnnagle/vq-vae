@@ -34,8 +34,9 @@ from losses.pairs import (
     apply_spatial_constraint,
 )
 from losses.phase_neighborhood import (
+    average_features_by_ysfc,
     build_phase_neighborhood_batch,
-    build_ysfc_overlap_mask,
+    build_ysfc_overlap,
     phase_neighborhood_loss,
 )
 from losses.reconstruction import reconstruction_loss
@@ -55,7 +56,8 @@ __all__ = [
     "apply_spatial_constraint",
     "build_phase_neighborhood_batch",
     "build_triplet_constraints_batch",
-    "build_ysfc_overlap_mask",
+    "average_features_by_ysfc",
+    "build_ysfc_overlap",
     "categorical_loss",
     "classify_triplet",
     "contrastive_loss",
