@@ -234,8 +234,13 @@ def _apply_weight_transform(
     """Apply a named transform to a weight channel.
 
     Supported transforms:
-        ``inverse``  – linearly maps [min, max] → [1, 0] and adds a small
-        floor (1 / (n_unique + 1)) so no valid pixel gets zero weight.
+        ``inverse``  – inverse **frequency** weighting.  Each pixel gets
+        weight ``1 / count(v)`` where ``count(v)`` is the number of finite
+        pixels in the patch that share value ``v``.  This upweights pixels
+        whose discrete value covers a small fraction of the patch area so
+        that supplement samples are drawn more uniformly across all levels.
+        Designed for discrete-valued channels (e.g. ~40 unique ``ysfc_min``
+        levels stored as float16).
 
     Args:
         data: [H, W] channel tensor (float32).
@@ -245,22 +250,22 @@ def _apply_weight_transform(
         Transformed weight tensor [H, W], all values ≥ 0.
     """
     if transform == 'inverse':
-        finite = data[data.isfinite()]
+        finite_mask = data.isfinite()
+        finite = data[finite_mask]
         if finite.numel() == 0:
             return torch.ones_like(data)
-        lo = finite.min()
-        hi = finite.max()
-        span = hi - lo
-        if span == 0:
-            return torch.ones_like(data)
-        # Map min → 1, max → 0
-        w = (hi - data) / span
-        # Floor so that even the highest ysfc_min still has some weight
-        n_unique = finite.unique().numel()
-        floor = 1.0 / (n_unique + 1)
-        w = w.clamp(min=floor)
-        # Zero out non-finite pixels (they will be masked anyway)
-        w[~data.isfinite()] = 0.0
+
+        # Count pixels per unique value
+        unique_vals, inverse_idx = finite.unique(return_inverse=True)
+        counts = torch.zeros(unique_vals.shape[0], device=data.device)
+        counts.scatter_add_(0, inverse_idx, torch.ones_like(inverse_idx, dtype=counts.dtype))
+
+        # Weight = 1 / count for each pixel's value
+        per_pixel_weight = 1.0 / counts[inverse_idx]
+
+        # Write back into [H, W] weight map
+        w = torch.zeros_like(data)
+        w[finite_mask] = per_pixel_weight
         return w
     else:
         raise ValueError(f"Unknown weight transform: '{transform}'")

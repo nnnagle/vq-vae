@@ -322,7 +322,7 @@ sampling-strategy:
           - static_mask.aoi
           - static_mask.forest
           - channel: static.ysfc_min
-            transform: inverse    # weight ∝ (max - val) / (max - min); upweights low ysfc_min
+            transform: inverse    # weight ∝ 1/count(value); upweights rare ysfc_min levels
 
 losses:
   # Ecological similarity (context-driven)
