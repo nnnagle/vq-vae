@@ -119,8 +119,9 @@ dataset: # These exist in the zarr
       - {name: mean_decline_rate, source: static/ccdc_metrics_history/data/mean_decline_rate, fill_value: -9999}
       - {name: num_segments, source: static/ccdc_metrics_history/data/num_segments, fill_value: -9999}
       - {name: variance_ndvi, source: static/ccdc_metrics_history/data/variance_ndvi, fill_value: -9999}
-
-      
+      - name: ysfc_min
+        source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024
+        reducer: min
 
 # -------------------------------------------------------------------
 # Normalization policies
