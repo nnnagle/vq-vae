@@ -89,6 +89,7 @@ dataset: # These exist in the zarr
       - name: temporal_position               # in [0,1]
         formula: "t / (T - 1)" #T is inferred from time_window
       - {name: ysfc, source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024}
+      - {name: ysfc_censored, source: annual/lcms_ysfc_censored/data/lcms_ysfc_censored_1985_2024}
 
   
   static:
@@ -121,6 +122,9 @@ dataset: # These exist in the zarr
       - {name: variance_ndvi, source: static/ccdc_metrics_history/data/variance_ndvi, fill_value: -9999}
       - name: ysfc_min
         source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024
+        reducer: min
+      - name: ysfc_censored_min
+        source: annual/lcms_ysfc_censored/data/lcms_ysfc_censored_1985_2024
         reducer: min
 
 # -------------------------------------------------------------------
@@ -245,10 +249,16 @@ features:
       annual.ndvi_amplitude: {norm: zscore}
       annual.ndvi_summer_p95: {norm: zscore}
       annual.ndvi_winter_max: {norm: zscore}
+  ysfc_min:
+    dim: [C,H,W]
+    channels:
+      static.ysfc_min: {norm: identity}
+      static.ysfc_censored_min: {norm: identity}
   ysfc:
     dim: [C,T,H,W]
     channels:
       annual.ysfc: {norm: identity}
+      annual.ysfc_censored: {norm: identity}
   target_metrics:
     dim: [C,H,W]
     channels: 
