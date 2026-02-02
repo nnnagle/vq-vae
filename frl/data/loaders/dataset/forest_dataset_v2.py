@@ -434,6 +434,11 @@ class ForestDatasetV2(Dataset):
                         f"(starting at year {self.zarr_start_year})"
                     )
                 data = arr[year_idx, row_slice, col_slice]
+            elif channel.requires_reduction():
+                # Load temporal data and reduce along time axis → [H, W]
+                temporal_data = self._load_temporal_with_padding(arr, spatial_window)
+                reduce_fn = channel.get_reducer_func()
+                data = reduce_fn(temporal_data, axis=0)
             else:
                 # Load full temporal range with padding if needed
                 data = self._load_temporal_with_padding(arr, spatial_window)

@@ -37,6 +37,20 @@ class ChannelConfig:
     # Fill value handling
     fill_value: Optional[float] = None
 
+    # Temporal reduction (e.g. 'min', 'max', 'mean', 'median')
+    # Collapses a temporal source [T, H, W] → [H, W] using a nan-safe reducer
+    reducer: Optional[str] = None
+
+    # Supported reducer names mapped to numpy functions
+    _REDUCERS = {
+        'min': 'nanmin',
+        'max': 'nanmax',
+        'mean': 'nanmean',
+        'median': 'nanmedian',
+        'std': 'nanstd',
+        'sum': 'nansum',
+    }
+
     def __post_init__(self):
         """Validate channel configuration."""
         # Normalize time specification
@@ -53,6 +67,22 @@ class ChannelConfig:
                 f"got source={self.source}, formula={self.formula}"
             )
 
+        # Validate reducer
+        if self.reducer is not None:
+            if self.reducer not in self._REDUCERS:
+                raise ValueError(
+                    f"Channel '{self.name}' has unsupported reducer '{self.reducer}', "
+                    f"expected one of {list(self._REDUCERS.keys())}"
+                )
+            if not has_source:
+                raise ValueError(
+                    f"Channel '{self.name}' has reducer but no source"
+                )
+            if self.year is not None:
+                raise ValueError(
+                    f"Channel '{self.name}' cannot have both 'reducer' and 'year'"
+                )
+
     def is_formula_based(self) -> bool:
         """Check if this channel is computed from a formula."""
         return self.formula is not None
@@ -68,6 +98,16 @@ class ChannelConfig:
     def requires_thresholding(self) -> bool:
         """Check if this channel needs thresholding."""
         return self.ok_if is not None
+
+    def requires_reduction(self) -> bool:
+        """Check if this channel needs temporal reduction."""
+        return self.reducer is not None
+
+    def get_reducer_func(self):
+        """Get the numpy nan-safe reduction function for this channel."""
+        if self.reducer is None:
+            return None
+        return getattr(np, self._REDUCERS[self.reducer])
 
 
 @dataclass

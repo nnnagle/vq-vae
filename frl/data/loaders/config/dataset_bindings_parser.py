@@ -234,6 +234,7 @@ class DatasetBindingsParser:
         time = channel_spec.get('time')
         ok_if = channel_spec.get('ok_if')
         fill_value = channel_spec.get('fill_value')
+        reducer = channel_spec.get('reducer')
 
         return ChannelConfig(
             name=name,
@@ -243,6 +244,7 @@ class DatasetBindingsParser:
             time=time,
             ok_if=ok_if,
             fill_value=fill_value,
+            reducer=reducer,
         )
 
     def _parse_stats(self) -> StatsConfig:
