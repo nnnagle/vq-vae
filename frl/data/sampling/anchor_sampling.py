@@ -8,6 +8,7 @@ positive and negative pairs are generated.
 Strategies:
     - grid: Regular grid of points with optional jitter
     - grid-plus-supplement: Grid points plus random supplement samples
+      (uniform or weighted)
 
 Example:
     >>> from data.sampling import build_anchor_sampler
@@ -15,6 +16,10 @@ Example:
     >>> # From config
     >>> sampler = build_anchor_sampler(bindings_config, 'grid-plus-supplement')
     >>> anchors = sampler(mask, training=True)
+    >>>
+    >>> # With weighted sampling (pass sample dict for weight resolution)
+    >>> sampler = build_anchor_sampler(bindings_config, 'grid-plus-supplement-ysfc')
+    >>> anchors = sampler(mask, training=True, sample=batch)
     >>>
     >>> # Direct usage
     >>> anchors = sample_anchors_grid_plus_supplement(
@@ -24,8 +29,8 @@ Example:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 
@@ -39,10 +44,23 @@ class GridConfig:
 
 
 @dataclass
+class WeightSpec:
+    """Specification for a single weight source.
+
+    Simple mask references (e.g. ``static_mask.aoi``) have only ``channel``
+    set.  Continuous channels that need a transform (e.g. inverse of
+    ``static.ysfc_min``) additionally carry a ``transform`` string.
+    """
+    channel: str            # e.g. "static_mask.aoi" or "static.ysfc_min"
+    transform: Optional[str] = None  # e.g. "inverse"
+
+
+@dataclass
 class GridPlusSupplementConfig:
     """Configuration for grid-plus-supplement anchor sampling."""
     grid: GridConfig
     supplement_n: int = 104
+    weight_specs: List[WeightSpec] = field(default_factory=list)
 
 
 def sample_anchors_grid(
@@ -98,12 +116,15 @@ def sample_anchors_grid_plus_supplement(
     border: int = 16,
     jitter_radius: int = 0,
     supplement_n: int = 104,
+    weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Sample anchor pixel locations using grid-plus-supplement strategy.
 
     Combines a regular grid of anchors with additional randomly sampled
-    points from valid pixels.
+    points from valid pixels.  When *weights* is provided the supplement
+    points are drawn proportionally to the weight at each valid pixel;
+    otherwise uniform random sampling is used.
 
     Args:
         mask: Valid pixel mask [H, W], True = valid
@@ -111,6 +132,8 @@ def sample_anchors_grid_plus_supplement(
         border: Border to exclude from grid
         jitter_radius: Random jitter applied to grid origin (0 for deterministic)
         supplement_n: Number of additional random samples
+        weights: Optional per-pixel sampling weight [H, W].  Only values at
+            valid (masked) pixels matter.  Need not be normalised.
 
     Returns:
         Tensor of shape [N, 2] with (row, col) coordinates of anchors
@@ -125,10 +148,24 @@ def sample_anchors_grid_plus_supplement(
     valid_indices = torch.where(mask.flatten())[0]
 
     if len(valid_indices) > 0 and supplement_n > 0:
-        # Random sample from valid pixels
         n_supplement = min(supplement_n, len(valid_indices))
-        perm = torch.randperm(len(valid_indices), device=device)[:n_supplement]
-        supplement_flat = valid_indices[perm]
+
+        if weights is not None:
+            # Weighted sampling: gather weights at valid pixel locations
+            flat_weights = weights.flatten()[valid_indices].float()
+            # Clamp negatives and ensure non-zero sum
+            flat_weights = flat_weights.clamp(min=0.0)
+            total = flat_weights.sum()
+            if total > 0:
+                probs = flat_weights / total
+            else:
+                probs = torch.ones_like(flat_weights) / len(flat_weights)
+            chosen = torch.multinomial(probs, n_supplement, replacement=False)
+            supplement_flat = valid_indices[chosen]
+        else:
+            # Uniform sampling
+            perm = torch.randperm(len(valid_indices), device=device)[:n_supplement]
+            supplement_flat = valid_indices[perm]
 
         # Convert flat indices to (row, col)
         supplement_rows = supplement_flat // W
@@ -148,6 +185,123 @@ def sample_anchors_grid_plus_supplement(
     return anchors.long()
 
 
+# ---------------------------------------------------------------------------
+# Weight resolution helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_channel_from_sample(
+    sample: Dict[str, Any],
+    channel_ref: str,
+) -> torch.Tensor:
+    """Resolve a ``dataset_group.channel_name`` reference into a [H, W] tensor.
+
+    Args:
+        sample: Batch dict as returned by the dataset ``__getitem__``.
+            Keys are group names (``static_mask``, ``static``, …) mapping to
+            tensors, plus ``metadata`` with ``channel_names``.
+        channel_ref: Dot-separated reference, e.g. ``static_mask.aoi`` or
+            ``static.ysfc_min``.
+
+    Returns:
+        2-D tensor [H, W] with the channel data (float32).
+    """
+    parts = channel_ref.split('.')
+    if len(parts) != 2:
+        raise ValueError(
+            f"weight_by channel reference must be 'group.channel', got '{channel_ref}'"
+        )
+    group_name, channel_name = parts
+
+    group_data = sample[group_name]  # [C, H, W] or [C, T, H, W]
+    channel_names = sample['metadata']['channel_names'][group_name]
+    if channel_name not in channel_names:
+        raise ValueError(
+            f"Channel '{channel_name}' not found in group '{group_name}'. "
+            f"Available: {channel_names}"
+        )
+    idx = channel_names.index(channel_name)
+    data = group_data[idx]  # [H, W] or [T, H, W]
+    if data.ndim == 3:
+        # Temporal – shouldn't normally appear in weights, but take first slice
+        data = data[0]
+    return data.float()
+
+
+def _apply_weight_transform(
+    data: torch.Tensor,
+    transform: str,
+) -> torch.Tensor:
+    """Apply a named transform to a weight channel.
+
+    Supported transforms:
+        ``inverse``  – linearly maps [min, max] → [1, 0] and adds a small
+        floor (1 / (n_unique + 1)) so no valid pixel gets zero weight.
+
+    Args:
+        data: [H, W] channel tensor (float32).
+        transform: Transform name.
+
+    Returns:
+        Transformed weight tensor [H, W], all values ≥ 0.
+    """
+    if transform == 'inverse':
+        finite = data[data.isfinite()]
+        if finite.numel() == 0:
+            return torch.ones_like(data)
+        lo = finite.min()
+        hi = finite.max()
+        span = hi - lo
+        if span == 0:
+            return torch.ones_like(data)
+        # Map min → 1, max → 0
+        w = (hi - data) / span
+        # Floor so that even the highest ysfc_min still has some weight
+        n_unique = finite.unique().numel()
+        floor = 1.0 / (n_unique + 1)
+        w = w.clamp(min=floor)
+        # Zero out non-finite pixels (they will be masked anyway)
+        w[~data.isfinite()] = 0.0
+        return w
+    else:
+        raise ValueError(f"Unknown weight transform: '{transform}'")
+
+
+def resolve_supplement_weights(
+    sample: Dict[str, Any],
+    weight_specs: List[WeightSpec],
+) -> torch.Tensor:
+    """Build a combined [H, W] weight map by multiplying all weight sources.
+
+    Each :class:`WeightSpec` is resolved from ``sample``, optionally
+    transformed, then multiplied together to produce a single per-pixel
+    weight tensor.
+
+    Args:
+        sample: Dataset sample dict (from ``__getitem__``).
+        weight_specs: List of weight specifications.
+
+    Returns:
+        Combined weight tensor [H, W] (float32, ≥ 0).
+    """
+    combined: Optional[torch.Tensor] = None
+    for spec in weight_specs:
+        data = _resolve_channel_from_sample(sample, spec.channel)
+        if spec.transform is not None:
+            data = _apply_weight_transform(data, spec.transform)
+        else:
+            # Binary masks – coerce to float
+            data = data.float()
+        if combined is None:
+            combined = data
+        else:
+            combined = combined * data
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Config-driven sampler
+# ---------------------------------------------------------------------------
+
 class AnchorSampler:
     """
     Callable anchor sampler configured from bindings config.
@@ -155,6 +309,11 @@ class AnchorSampler:
     Example:
         >>> sampler = AnchorSampler(config, 'grid-plus-supplement')
         >>> anchors = sampler(mask, training=True)
+
+        >>> # Weighted variant – pass sample dict
+        >>> sampler = AnchorSampler(config, 'grid-plus-supplement',
+        ...                         weight_specs=[...])
+        >>> anchors = sampler(mask, training=True, sample=batch)
     """
 
     def __init__(
@@ -164,6 +323,7 @@ class AnchorSampler:
         border: int = 16,
         jitter_radius: int = 4,
         supplement_n: int = 104,
+        weight_specs: Optional[List[WeightSpec]] = None,
     ):
         """
         Initialize anchor sampler.
@@ -174,17 +334,22 @@ class AnchorSampler:
             border: Border to exclude
             jitter_radius: Jitter radius for training (0 for validation)
             supplement_n: Number of supplement samples (for grid-plus-supplement)
+            weight_specs: Optional list of weight specifications for weighted
+                supplement sampling.  When provided, the ``sample`` kwarg must
+                be passed to ``__call__``.
         """
         self.strategy = strategy
         self.stride = stride
         self.border = border
         self.jitter_radius = jitter_radius
         self.supplement_n = supplement_n
+        self.weight_specs = weight_specs or []
 
     def __call__(
         self,
         mask: torch.Tensor,
         training: bool = True,
+        sample: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """
         Sample anchors from mask.
@@ -192,11 +357,17 @@ class AnchorSampler:
         Args:
             mask: Valid pixel mask [H, W]
             training: If True, apply jitter; if False, deterministic
+            sample: Dataset sample dict, required when weight_specs is non-empty
 
         Returns:
             Anchor coordinates [N, 2]
         """
         jitter = self.jitter_radius if training else 0
+
+        # Resolve weights if configured
+        weights = None
+        if self.weight_specs and sample is not None:
+            weights = resolve_supplement_weights(sample, self.weight_specs)
 
         if self.strategy == 'grid':
             return sample_anchors_grid(
@@ -205,16 +376,49 @@ class AnchorSampler:
                 border=self.border,
                 jitter_radius=jitter,
             )
-        elif self.strategy == 'grid-plus-supplement':
+        elif self.strategy in ('grid-plus-supplement', 'grid-plus-supplement-ysfc'):
             return sample_anchors_grid_plus_supplement(
                 mask,
                 stride=self.stride,
                 border=self.border,
                 jitter_radius=jitter,
                 supplement_n=self.supplement_n,
+                weights=weights,
             )
         else:
             raise ValueError(f"Unknown sampling strategy: {self.strategy}")
+
+
+def _parse_weight_by(weight_by_list: list) -> List[WeightSpec]:
+    """Parse the ``weight_by`` list from YAML into :class:`WeightSpec` objects.
+
+    Handles two formats:
+        - Simple string: ``"static_mask.aoi"`` → ``WeightSpec(channel=..., transform=None)``
+        - Dict with transform: ``{channel: "static.ysfc_min", transform: "inverse"}``
+
+    Args:
+        weight_by_list: Raw list from YAML config.
+
+    Returns:
+        List of WeightSpec.
+    """
+    specs = []
+    for item in weight_by_list:
+        if isinstance(item, str):
+            specs.append(WeightSpec(channel=item))
+        elif isinstance(item, dict):
+            channel = item.get('channel')
+            if channel is None:
+                raise ValueError(
+                    f"weight_by dict entry must have 'channel' key, got: {item}"
+                )
+            transform = item.get('transform')
+            specs.append(WeightSpec(channel=channel, transform=transform))
+        else:
+            raise ValueError(
+                f"weight_by entry must be a string or dict, got: {type(item)}"
+            )
+    return specs
 
 
 def build_anchor_sampler(
@@ -255,17 +459,23 @@ def build_anchor_sampler(
             supplement_n=0,
         )
 
-    elif strategy_name == 'grid-plus-supplement':
-        gps_config = strategies.get('grid-plus-supplement', {})
+    elif strategy_name in ('grid-plus-supplement', 'grid-plus-supplement-ysfc'):
+        gps_config = strategies.get(strategy_name, {})
         grid_config = gps_config.get('grid', {})
         supplement_config = gps_config.get('supplement', {})
+        sampling_config = supplement_config.get('sampling', {})
+
+        # Parse weight_by specifications
+        weight_by_raw = sampling_config.get('weight_by', [])
+        weight_specs = _parse_weight_by(weight_by_raw)
 
         return AnchorSampler(
-            strategy='grid-plus-supplement',
+            strategy=strategy_name,
             stride=grid_config.get('stride', 16),
             border=grid_config.get('exclude_border', 16),
             jitter_radius=grid_config.get('jitter', {}).get('radius', 4),
             supplement_n=supplement_config.get('n', 104),
+            weight_specs=weight_specs,
         )
 
     else:
