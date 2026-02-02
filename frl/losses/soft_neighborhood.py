@@ -105,11 +105,14 @@ def soft_neighborhood_matching_loss(
         )
 
     # --- Build masked logits -----------------------------------------------
-    # Set masked positions to -inf so they get zero probability after softmax.
-    neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
+    # Set masked positions to a large negative value so they get near-zero
+    # probability after softmax.  Using -inf would produce NaN on rows that
+    # are entirely masked (padding rows) because softmax(-inf, ..., -inf) is
+    # 0/0.  A finite sentinel (-1e9) underflows to 0.0 cleanly in float32.
+    large_neg = torch.tensor(-1e9, device=device, dtype=dtype)
 
-    logits_ref = torch.where(mask, -d_reference / tau_ref, neg_inf)      # [B, M, M]
-    logits_learned = torch.where(mask, -d_learned / tau_learned, neg_inf)  # [B, M, M]
+    logits_ref = torch.where(mask, -d_reference / tau_ref, large_neg)      # [B, M, M]
+    logits_learned = torch.where(mask, -d_learned / tau_learned, large_neg)  # [B, M, M]
 
     # --- Determine valid rows ----------------------------------------------
     # A row is valid if it has enough unmasked entries (excluding self).
