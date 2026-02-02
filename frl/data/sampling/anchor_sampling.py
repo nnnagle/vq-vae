@@ -227,59 +227,60 @@ def _resolve_channel_from_sample(
     return data.float()
 
 
-def _apply_weight_transform(
+def _apply_inverse_frequency(
     data: torch.Tensor,
-    transform: str,
+    valid_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply a named transform to a weight channel.
+    """Compute inverse-frequency weights over the valid region of a channel.
 
-    Supported transforms:
-        ``inverse``  – inverse **frequency** weighting.  Each pixel gets
-        weight ``1 / count(v)`` where ``count(v)`` is the number of finite
-        pixels in the patch that share value ``v``.  This upweights pixels
-        whose discrete value covers a small fraction of the patch area so
-        that supplement samples are drawn more uniformly across all levels.
-        Designed for discrete-valued channels (e.g. ~40 unique ``ysfc_min``
-        levels stored as float16).
+    Each valid pixel gets weight ``1 / count(v)`` where ``count(v)`` is the
+    number of **valid** pixels that share value ``v``.  This upweights pixels
+    whose discrete value covers a small fraction of the valid area so that
+    supplement samples are drawn more uniformly across all levels.
+
+    Designed for discrete-valued channels (e.g. ~40 unique ``ysfc_min``
+    levels stored as float16).  Pixels outside *valid_mask* get weight 0.
 
     Args:
         data: [H, W] channel tensor (float32).
-        transform: Transform name.
+        valid_mask: [H, W] boolean tensor – True where preceding binary
+            masks are all 1 and the channel value is finite.
 
     Returns:
-        Transformed weight tensor [H, W], all values ≥ 0.
+        Weight tensor [H, W] (float32, ≥ 0).
     """
-    if transform == 'inverse':
-        finite_mask = data.isfinite()
-        finite = data[finite_mask]
-        if finite.numel() == 0:
-            return torch.ones_like(data)
+    eligible = valid_mask & data.isfinite()
+    vals = data[eligible]
+    if vals.numel() == 0:
+        return torch.ones_like(data) * valid_mask.float()
 
-        # Count pixels per unique value
-        unique_vals, inverse_idx = finite.unique(return_inverse=True)
-        counts = torch.zeros(unique_vals.shape[0], device=data.device)
-        counts.scatter_add_(0, inverse_idx, torch.ones_like(inverse_idx, dtype=counts.dtype))
+    # Count pixels per unique value within the valid region
+    unique_vals, inverse_idx = vals.unique(return_inverse=True)
+    counts = torch.zeros(unique_vals.shape[0], device=data.device)
+    counts.scatter_add_(0, inverse_idx, torch.ones_like(inverse_idx, dtype=counts.dtype))
 
-        # Weight = 1 / count for each pixel's value
-        per_pixel_weight = 1.0 / counts[inverse_idx]
+    # Weight = 1 / count for each pixel's value
+    per_pixel_weight = 1.0 / counts[inverse_idx]
 
-        # Write back into [H, W] weight map
-        w = torch.zeros_like(data)
-        w[finite_mask] = per_pixel_weight
-        return w
-    else:
-        raise ValueError(f"Unknown weight transform: '{transform}'")
+    w = torch.zeros_like(data)
+    w[eligible] = per_pixel_weight
+    return w
 
 
 def resolve_supplement_weights(
     sample: Dict[str, Any],
     weight_specs: List[WeightSpec],
 ) -> torch.Tensor:
-    """Build a combined [H, W] weight map by multiplying all weight sources.
+    """Build a combined [H, W] weight map from weight specifications.
 
-    Each :class:`WeightSpec` is resolved from ``sample``, optionally
-    transformed, then multiplied together to produce a single per-pixel
-    weight tensor.
+    Processing order:
+        1. All specs **without** a transform (binary masks) are resolved
+           first and multiplied together to form a valid-pixel mask.
+        2. Specs **with** a transform (e.g. ``inverse-frequency``) are then
+           evaluated using only the pixels that survived step 1, so that
+           frequency counts reflect the masked region rather than the whole
+           patch.
+        3. The final weight map is the product of (1) and (2).
 
     Args:
         sample: Dataset sample dict (from ``__getitem__``).
@@ -288,18 +289,33 @@ def resolve_supplement_weights(
     Returns:
         Combined weight tensor [H, W] (float32, ≥ 0).
     """
+    # Separate plain masks from transformed specs
+    mask_specs = [s for s in weight_specs if s.transform is None]
+    transform_specs = [s for s in weight_specs if s.transform is not None]
+
+    # Step 1: multiply binary masks
     combined: Optional[torch.Tensor] = None
-    for spec in weight_specs:
-        data = _resolve_channel_from_sample(sample, spec.channel)
-        if spec.transform is not None:
-            data = _apply_weight_transform(data, spec.transform)
-        else:
-            # Binary masks – coerce to float
-            data = data.float()
+    for spec in mask_specs:
+        data = _resolve_channel_from_sample(sample, spec.channel).float()
         if combined is None:
             combined = data
         else:
             combined = combined * data
+
+    # Step 2: apply transforms using the mask from step 1
+    for spec in transform_specs:
+        data = _resolve_channel_from_sample(sample, spec.channel)
+        if spec.transform == 'inverse-frequency':
+            valid_mask = (combined > 0) if combined is not None else data.isfinite()
+            w = _apply_inverse_frequency(data, valid_mask)
+        else:
+            raise ValueError(f"Unknown weight transform: '{spec.transform}'")
+
+        if combined is None:
+            combined = w
+        else:
+            combined = combined * w
+
     return combined
 
 
