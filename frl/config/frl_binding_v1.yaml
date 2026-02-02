@@ -267,6 +267,22 @@ features:
       static.mean_nbr: {norm: robust_iqr}
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.variance_ndvi: {norm: robust_iqr}
+  soft_neighborhood_phase:
+    dim: [C,T,H,W]
+    channels:
+      annual.evi2_summer_p95: {norm: zscore}
+      annual.nbr_annual_min: {norm: zscore}
+      annual.nbr_summer_p95: {norm: zscore}
+      annual.ndmi_summer_mean: {norm: zscore}
+      annual.ndvi_amplitude: {norm: zscore}
+      annual.ndvi_summer_p95: {norm: zscore}
+      annual.ndvi_winter_max: {norm: zscore}
+    covariance: 
+      dim: [C,C]      
+      calculate: true
+      stat_domain: patch
+  
+
 
 ######################
 # Losses template
