@@ -298,8 +298,8 @@ sampling-strategy:
     grid:
       stride: 16              # 16×16 = 256 pixels per patch
       exclude_border: 16      # Exclude edge pixels
-      jitter: 
-        radius: 4               # jitter starting point by +/- 
+      jitter:
+        radius: 4               # jitter starting point by +/-
     supplement:
       n: 104
       sampling:
@@ -307,6 +307,22 @@ sampling-strategy:
         weight_by: # Multiply multiple weights/qualities.
           - static_mask.aoi
           - static_mask.forest
+
+  grid-plus-supplement-ysfc:
+    grid:
+      stride: 16
+      exclude_border: 16
+      jitter:
+        radius: 4
+    supplement:
+      n: 104
+      sampling:
+        type: weighted
+        weight_by:
+          - static_mask.aoi
+          - static_mask.forest
+          - channel: static.ysfc_min
+            transform: inverse-frequency  # weight ∝ 1/count(value) within masked area
 
 losses:
   # Ecological similarity (context-driven)
