@@ -206,6 +206,13 @@ def build_phase_pairs(
         'overlap_min': surviving_overlaps.min().item() if n_cross_pairs > 0 else 0,
         'weight_mean': cross_weights.mean().item() if n_cross_pairs > 0 else 0.0,
         'weight_std': cross_weights.std().item() if n_cross_pairs > 1 else 0.0,
+        'dist_mean': cross_dists.mean().item() if n_cross_pairs > 0 else 0.0,
+        'dist_std': cross_dists.std().item() if n_cross_pairs > 1 else 0.0,
+        'dist_q25': torch.quantile(cross_dists, 0.25).item() if n_cross_pairs > 0 else 0.0,
+        'dist_q50': torch.quantile(cross_dists, 0.50).item() if n_cross_pairs > 0 else 0.0,
+        'dist_q75': torch.quantile(cross_dists, 0.75).item() if n_cross_pairs > 0 else 0.0,
+        'dist_min': cross_dists.min().item() if n_cross_pairs > 0 else 0.0,
+        'dist_max': cross_dists.max().item() if n_cross_pairs > 0 else 0.0,
     }
 
     return all_pairs, all_weights, stats
