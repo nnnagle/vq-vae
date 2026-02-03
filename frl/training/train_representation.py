@@ -377,6 +377,9 @@ def process_batch(
         'n_self_pairs': 0, 'n_total_pairs': 0,
         'overlap_mean': 0.0, 'overlap_min': 0,
         'weight_mean': 0.0, 'weight_std': 0.0,
+        'dist_mean': 0.0, 'dist_std': 0.0,
+        'dist_q25': 0.0, 'dist_q50': 0.0, 'dist_q75': 0.0,
+        'dist_min': 0.0, 'dist_max': 0.0,
     }
 
     # Aggregate phase pair stats across samples
@@ -1035,8 +1038,13 @@ def main():
                 f"({ps['n_self_pairs']:.0f} self + {ps['n_total_pairs'] - ps['n_self_pairs']:.0f} cross) | "
                 f"Anchors: {ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} surviving | "
                 f"kNN candidates: {ps['n_candidates']:.0f} -> overlap filter: {ps['n_after_overlap']:.0f} | "
-                f"Overlap: mean={ps['overlap_mean']:.1f}, min={ps['overlap_min']} | "
-                f"Weights: {ps['weight_mean']:.3f}±{ps['weight_std']:.3f}"
+                f"Overlap: mean={ps['overlap_mean']:.1f}, min={ps['overlap_min']}"
+            )
+            logger.info(
+                f"  Phase spec dist: mean={ps['dist_mean']:.2f}±{ps['dist_std']:.2f}, "
+                f"[q25={ps['dist_q25']:.2f}, q50={ps['dist_q50']:.2f}, q75={ps['dist_q75']:.2f}], "
+                f"range=[{ps['dist_min']:.2f}, {ps['dist_max']:.2f}] | "
+                f"Weights(sigma={phase_config['sigma']}): {ps['weight_mean']:.3f}±{ps['weight_std']:.3f}"
             )
 
         # Save checkpoint
