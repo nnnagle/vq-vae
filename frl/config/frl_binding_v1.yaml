@@ -408,7 +408,7 @@ losses:
     # focuses on spatially-close pixels that are also spectrally similar.
     spectral_weighting:
       feature: features.infonce_type_spectral
-      tau: 200              # scale for exp(-d/tau); ~ 0.5*sqrt(2*n_dim)
+      tau: 5                # scale for exp(-d/tau)
       min_weight: 0.03
 
   # Phase trajectory matching (soft neighborhood KL)
