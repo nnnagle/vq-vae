@@ -335,9 +335,9 @@ def process_batch(
                 ysfc_spatial_mask = ysfc_mask
             phase_mask = combined_mask & ysfc_spatial_mask
 
-            # Sample separate anchors for phase loss
+            # Sample separate anchors for phase loss (CPU — weights are numpy-derived)
             phase_anchors = phase_sampler(
-                phase_mask, training=training, sample=sample
+                phase_mask.cpu(), training=training, sample=sample
             )
 
             if phase_anchors.shape[0] >= 10:
