@@ -224,6 +224,8 @@ def _resolve_channel_from_sample(
     if data.ndim == 3:
         # Temporal – shouldn't normally appear in weights, but take first slice
         data = data[0]
+    if not isinstance(data, torch.Tensor):
+        data = torch.from_numpy(data)
     return data.float()
 
 
