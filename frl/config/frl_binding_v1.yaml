@@ -409,8 +409,6 @@ losses:
     mask:
       - static_mask.aoi
       - static_mask.forest
-    temporal_mask:
-      - annual_mask.lcms_interp_ok
 
     # Reference distances: Mahalanobis-whitened LS8 spectral composites
     reference_feature: features.soft_neighborhood_phase
@@ -420,14 +418,6 @@ losses:
 
     anchor:
       population: grid-plus-supplement-ysfc
-
-    # Pair construction: all anchor pairs within spatial range
-    pair_strategy:
-      candidates: anchors
-      type: spatial-knn
-      k: 16
-      min_distance: 0   # include self-pairs (i==i) for within-pixel structure
-      max_distance: 32
 
     # Pair weighting from type encoder similarity (applied at training time)
     pair_weights:
