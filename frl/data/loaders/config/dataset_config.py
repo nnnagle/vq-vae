@@ -271,6 +271,165 @@ class FeatureConfig:
         return list(self.channels.keys())
 
 
+# ---------------------------------------------------------------------------
+# Sampling strategy configs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class JitterConfig:
+    """Jitter configuration for grid sampling."""
+    radius: int = 0
+
+
+@dataclass
+class GridConfig:
+    """Grid sampling configuration."""
+    stride: int = 16
+    exclude_border: int = 16
+    jitter: Optional[JitterConfig] = None
+
+
+@dataclass
+class WeightByEntry:
+    """A single entry in a supplement weight_by list.
+
+    Can be a simple mask reference (e.g. 'static_mask.aoi') or a
+    channel-based weight with a transform.
+    """
+    # Simple mask reference (e.g. 'static_mask.aoi')
+    mask_ref: Optional[str] = None
+    # Channel-based weight
+    channel: Optional[str] = None
+    transform: Optional[str] = None  # e.g. 'inverse-frequency'
+
+
+@dataclass
+class SupplementConfig:
+    """Supplement sampling configuration."""
+    n: int = 0
+    sampling_type: str = 'weighted'
+    weight_by: List[WeightByEntry] = field(default_factory=list)
+
+
+@dataclass
+class SamplingStrategyConfig:
+    """Configuration for a named sampling strategy.
+
+    Strategies can be one of:
+    - patch-only (just interior-only + border_width)
+    - grid-only (stride, exclude_border, jitter)
+    - grid-plus-supplement (grid + supplemental weighted sampling)
+    """
+    name: str
+    # Patch-level settings
+    interior_only: Optional[bool] = None
+    border_width: Optional[int] = None
+    # Grid settings (for grid and grid-plus-supplement)
+    grid: Optional[GridConfig] = None
+    # Supplement settings (for grid-plus-supplement)
+    supplement: Optional[SupplementConfig] = None
+
+
+# ---------------------------------------------------------------------------
+# Loss configs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuxiliaryDistanceConfig:
+    """Configuration for auxiliary distance used in pair selection."""
+    feature: str  # e.g. 'features.infonce_type_spectral'
+    metric: str = 'l2'
+    covariance: bool = False
+
+
+@dataclass
+class SelectionConfig:
+    """Configuration for a pair selection step."""
+    type: str  # 'mutual-knn', 'quantile', 'spatial-knn', 'spatial-quantile'
+    k: Optional[int] = None
+    min_distance: Optional[float] = None
+    max_distance: Optional[float] = None
+    range: Optional[List[float]] = None  # [low, high] for quantile
+
+
+@dataclass
+class PairEndpointStrategyConfig:
+    """Configuration for positive or negative pair endpoint selection."""
+    candidates: str = 'anchors'  # 'anchors' or 'patch'
+    distance: Optional[str] = None  # 'auxiliary' or None for spatial
+    selection: Optional[SelectionConfig] = None
+
+
+@dataclass
+class TypeSimilarityConfig:
+    """Stage 1 of knn-with-ysfc-overlap pair strategy."""
+    feature: str  # e.g. 'features.infonce_type_spectral'
+    k: int = 16
+
+
+@dataclass
+class YsfcOverlapConfig:
+    """Stage 2 of knn-with-ysfc-overlap pair strategy."""
+    channel: str  # e.g. 'annual.ysfc'
+    min_overlap: int = 3
+
+
+@dataclass
+class PairStrategyConfig:
+    """Configuration for pair selection in soft neighborhood losses."""
+    type: str  # e.g. 'knn-with-ysfc-overlap'
+    include_self: bool = True
+    type_similarity: Optional[TypeSimilarityConfig] = None
+    ysfc_overlap: Optional[YsfcOverlapConfig] = None
+    min_pairs: int = 5
+
+
+@dataclass
+class PairWeightsConfig:
+    """Configuration for continuous pair weighting."""
+    source: str  # 'type_embedding'
+    sigma: float = 5.0
+    self_pair_weight: float = 1.0
+
+
+@dataclass
+class CurriculumConfig:
+    """Configuration for loss curriculum (ramp-in schedule)."""
+    start_epoch: int = 0
+    ramp_epochs: int = 0
+
+
+@dataclass
+class LossConfig:
+    """Configuration for a named loss function.
+
+    Loss types:
+    - 'infonce': InfoNCE contrastive loss with positive/negative strategies
+    - 'soft_neighborhood': Soft neighborhood KL matching loss
+    """
+    name: str
+    weight: float = 1.0
+    type: str = 'infonce'
+    mask: Optional[List[str]] = None
+
+    # --- infonce-specific ---
+    auxiliary_distance: Optional[AuxiliaryDistanceConfig] = None
+    anchor_population: Optional[str] = None  # reference to sampling-strategy name
+    positive_strategy: Optional[PairEndpointStrategyConfig] = None
+    negative_strategy: Optional[PairEndpointStrategyConfig] = None
+
+    # --- soft_neighborhood-specific ---
+    neighborhood_target: Optional[str] = None  # e.g. 'features.soft_neighborhood_phase'
+    pair_strategy: Optional[PairStrategyConfig] = None
+    pair_weights: Optional[PairWeightsConfig] = None
+    tau_ref: Optional[float] = None
+    tau_learned: Optional[float] = None
+    min_valid_per_row: Optional[int] = None
+    self_similarity_weight: Optional[float] = None
+    cross_pixel_weight: Optional[float] = None
+    curriculum: Optional[CurriculumConfig] = None
+
+
 @dataclass
 class BindingsConfig:
     """Top-level bindings configuration.
@@ -287,6 +446,8 @@ class BindingsConfig:
     stats: Optional[StatsConfig] = None
     normalization_presets: Optional[Dict[str, NormalizationPresetConfig]] = None
     features: Optional[Dict[str, FeatureConfig]] = None
+    sampling_strategies: Optional[Dict[str, SamplingStrategyConfig]] = None
+    losses: Optional[Dict[str, LossConfig]] = None
 
     def get_group(self, name: str) -> Optional[DatasetGroupConfig]:
         """Get a dataset group by name."""
@@ -303,6 +464,18 @@ class BindingsConfig:
         if self.normalization_presets is None:
             return None
         return self.normalization_presets.get(name)
+
+    def get_sampling_strategy(self, name: str) -> Optional[SamplingStrategyConfig]:
+        """Get a sampling strategy by name."""
+        if self.sampling_strategies is None:
+            return None
+        return self.sampling_strategies.get(name)
+
+    def get_loss(self, name: str) -> Optional[LossConfig]:
+        """Get a loss configuration by name."""
+        if self.losses is None:
+            return None
+        return self.losses.get(name)
 
     def get_all_source_paths(self) -> List[str]:
         """Get all unique zarr source paths referenced in the config."""
