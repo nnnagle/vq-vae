@@ -403,6 +403,8 @@ losses:
         min_distance: 16
 
   # Phase trajectory matching (soft neighborhood KL)
+  # Learns phase embeddings whose distance structure reproduces the
+  # spectral distance structure at shared recovery stages (ysfc values).
   soft_neighborhood_phase:
     weight: 1.0
     type: soft_neighborhood
@@ -410,31 +412,47 @@ losses:
       - static_mask.aoi
       - static_mask.forest
 
-    # Reference distances: Mahalanobis-whitened LS8 spectral composites
-    reference_feature: features.soft_neighborhood_phase
-
-    # Temporal alignment signal
-    ysfc_channel: annual.ysfc  # years-since-fast-change for overlap alignment
+    # Feature whose distance structure the learned embeddings should reproduce.
+    # KL(softmax(d_target / tau) || softmax(d_learned / tau)) is minimised.
+    neighborhood_target: features.soft_neighborhood_phase
 
     anchor:
       population: grid-plus-supplement-ysfc
 
-    # Pair weighting from type encoder similarity (applied at training time)
+    # Two-stage pair selection:
+    #   1. Find type-similar candidates by spectral feature distance
+    #   2. Keep only those with sufficient ysfc temporal overlap
+    # Self-pairs (i==i) are always included and do not count toward k.
+    # Anchors with fewer than min_pairs surviving pairs are dropped.
+    pair_strategy:
+      type: knn-with-ysfc-overlap
+      include_self: true
+      # Stage 1: find type-similar candidates
+      type_similarity:
+        feature: features.infonce_type_spectral
+        k: 16                  # candidates per anchor
+      # Stage 2: keep only those with sufficient temporal overlap
+      ysfc_overlap:
+        channel: annual.ysfc
+        min_overlap: 3
+      # Drop anchor if fewer than this many cross-pixel pairs survive
+      min_pairs: 5
+
+    # Continuous pair weighting from type encoder similarity
     pair_weights:
-      source: type_embedding  # w_ij = exp(-||h_type_i - h_type_j|| / sigma)
+      source: type_embedding   # w_ij = exp(-||h_type_i - h_type_j|| / sigma)
       sigma: 5.0
-      self_pair_weight: 1.0   # self-pairs always weight 1
+      self_pair_weight: 1.0    # self-pairs always weight 1
 
     # Loss parameters
-    tau_ref: 0.1              # reference (spectral) temperature
-    tau_learned: 0.1          # learned (embedding) temperature
-    min_overlap: 3            # minimum shared ysfc values for a pair
-    min_valid_per_row: 2      # minimum neighbors per distribution row
-    self_similarity_weight: 1.0   # trajectory shape matching
-    cross_pixel_weight: 1.0       # shared metric space anchoring
+    tau_ref: 0.1               # temperature for target (spectral) distribution
+    tau_learned: 0.1           # temperature for learned (embedding) distribution
+    min_valid_per_row: 2       # minimum neighbors per distribution row
+    self_similarity_weight: 1.0    # trajectory shape matching
+    cross_pixel_weight: 1.0        # shared metric space anchoring
 
     # Curriculum: ramp in after type encoder stabilises
     curriculum:
-      start_epoch: 10         # begin contributing to total loss
-      ramp_epochs: 10         # linear ramp from 0 to full weight
+      start_epoch: 10          # begin contributing to total loss
+      ramp_epochs: 10          # linear ramp from 0 to full weight
 
