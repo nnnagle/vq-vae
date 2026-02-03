@@ -155,6 +155,24 @@ def extract_at_locations(
     return feature[:, rows, cols].T
 
 
+def extract_temporal_at_locations(
+    feature: torch.Tensor,
+    coords: torch.Tensor,
+) -> torch.Tensor:
+    """Extract temporal feature vectors at given pixel locations.
+
+    Args:
+        feature: Feature tensor [C, T, H, W]
+        coords: Coordinates [N, 2] as (row, col)
+
+    Returns:
+        Extracted features [N, T, C]
+    """
+    rows, cols = coords[:, 0], coords[:, 1]
+    # feature[:, :, rows, cols] gives [C, T, N], permute to [N, T, C]
+    return feature[:, :, rows, cols].permute(2, 1, 0)
+
+
 def spatial_knn_pairs(
     anchor_coords: torch.Tensor,
     mask: torch.Tensor,

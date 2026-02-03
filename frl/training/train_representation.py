@@ -34,11 +34,14 @@ from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
+from data.sampling.anchor_sampling import AnchorSampler, build_anchor_sampler
 from models import RepresentationModel
 from losses import contrastive_loss, pairs_with_spatial_constraint
+from losses.phase_pairs import build_phase_pairs
 from utils import (
     compute_spatial_distances,
     extract_at_locations,
+    extract_temporal_at_locations,
     spatial_knn_pairs,
     spatial_negative_pairs,
 )
@@ -60,6 +63,8 @@ def process_batch(
     config: dict,
     training: bool = True,
     optimizer: torch.optim.Optimizer | None = None,
+    phase_sampler: AnchorSampler | None = None,
+    phase_config: dict | None = None,
 ) -> dict:
     """
     Process a single batch for training or validation.
@@ -73,6 +78,8 @@ def process_batch(
         training: If True, run in training mode (gradients, optimizer step).
                   If False, run in eval mode (no gradients, no jitter).
         optimizer: Optimizer (required if training=True)
+        phase_sampler: Optional anchor sampler for phase loss pair construction
+        phase_config: Optional phase loss config dict (k, min_overlap, etc.)
 
     Returns:
         Dict with loss values and stats
@@ -102,6 +109,9 @@ def process_batch(
     all_gate_values = []
     all_pos_weights = []
     all_neg_weights = []
+
+    # Phase pair stats accumulators
+    all_phase_pair_stats = []
 
     batch_size = len(batch['metadata'])
 
@@ -309,8 +319,77 @@ def process_batch(
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
+        # --- Phase pair construction (no loss yet, just pairs + logging) ---
+        if phase_sampler is not None and phase_config is not None:
+            # Build ysfc feature via FeatureBuilder
+            ysfc_feature = feature_builder.build_feature('ysfc', sample)
+            ysfc_data = torch.from_numpy(ysfc_feature.data).float().to(device)
+            # ysfc_data: [1, T, H, W] (single channel)
+
+            # Combined mask for phase anchors: encoder mask AND ysfc validity
+            ysfc_mask = torch.from_numpy(ysfc_feature.mask).to(device)
+            # ysfc_mask is [T, H, W] for temporal; collapse to [H, W]
+            if ysfc_mask.ndim == 3:
+                ysfc_spatial_mask = ysfc_mask.all(dim=0)  # valid across all timesteps
+            else:
+                ysfc_spatial_mask = ysfc_mask
+            phase_mask = combined_mask & ysfc_spatial_mask
+
+            # Sample separate anchors for phase loss
+            phase_anchors = phase_sampler(
+                phase_mask, training=training, sample=sample
+            )
+
+            if phase_anchors.shape[0] >= 10:
+                # Extract spectral features at phase anchors (for kNN + weights)
+                phase_spec_at_anchors = extract_at_locations(
+                    spec_dist_data, phase_anchors
+                )  # [N_phase, C]
+
+                # Extract ysfc time series at phase anchors
+                # ysfc_data is [1, T, H, W]; squeeze channel dim for extraction
+                ysfc_at_anchors = extract_temporal_at_locations(
+                    ysfc_data, phase_anchors
+                )  # [N_phase, T, 1]
+                ysfc_at_anchors = ysfc_at_anchors.squeeze(-1)  # [N_phase, T]
+
+                # Build pairs
+                phase_pairs, phase_weights, phase_stats = build_phase_pairs(
+                    spec_features=phase_spec_at_anchors,
+                    ysfc=ysfc_at_anchors,
+                    k=phase_config.get('k', 16),
+                    min_overlap=phase_config.get('min_overlap', 3),
+                    min_pairs=phase_config.get('min_pairs', 5),
+                    include_self=phase_config.get('include_self', True),
+                    sigma=phase_config.get('sigma', 5.0),
+                    self_pair_weight=phase_config.get('self_pair_weight', 1.0),
+                )
+
+                all_phase_pair_stats.append(phase_stats)
+
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
+    empty_phase_stats = {
+        'n_anchors': 0, 'n_anchors_surviving': 0,
+        'n_candidates': 0, 'n_after_overlap': 0,
+        'n_self_pairs': 0, 'n_total_pairs': 0,
+        'overlap_mean': 0.0, 'overlap_min': 0,
+        'weight_mean': 0.0, 'weight_std': 0.0,
+    }
+
+    # Aggregate phase pair stats across samples
+    def aggregate_phase_stats(stats_list: list[dict]) -> dict:
+        if not stats_list:
+            return empty_phase_stats
+        agg = {}
+        for key in empty_phase_stats:
+            vals = [s[key] for s in stats_list]
+            if key.startswith('n_'):
+                agg[key] = sum(vals) / len(vals)  # mean per sample
+            else:
+                agg[key] = sum(vals) / len(vals)  # mean
+        return agg
+
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'n_valid': 0,
@@ -318,6 +397,7 @@ def process_batch(
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
+            'phase_pair_stats': empty_phase_stats,
         }
 
     # Average losses over valid samples in batch
@@ -336,6 +416,7 @@ def process_batch(
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
                 'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
                 'neg_weight_stats': empty_stats,
+                'phase_pair_stats': empty_phase_stats,
             }
 
         # Backward
@@ -382,6 +463,7 @@ def process_batch(
         'gate_stats': compute_stats(all_gate_values),
         'pos_weight_stats': compute_stats(all_pos_weights),
         'neg_weight_stats': compute_stats(all_neg_weights),
+        'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
     }
 
 
@@ -396,6 +478,8 @@ def train_epoch(
     epoch: int,
     num_epochs: int,
     log_interval: int = 10,
+    phase_sampler: AnchorSampler | None = None,
+    phase_config: dict | None = None,
 ) -> dict:
     """Run training on entire training set for one epoch."""
     total_loss = 0.0
@@ -409,11 +493,13 @@ def train_epoch(
     last_gate_stats = empty_stats
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
+    last_phase_pair_stats = None
 
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
+            phase_sampler=phase_sampler, phase_config=phase_config,
         )
 
         scheduler.step()
@@ -428,8 +514,19 @@ def train_epoch(
             last_gate_stats = stats['gate_stats']
             last_pos_weight_stats = stats['pos_weight_stats']
             last_neg_weight_stats = stats['neg_weight_stats']
+            last_phase_pair_stats = stats.get('phase_pair_stats')
 
             if batch_idx % log_interval == 0:
+                phase_msg = ""
+                ps = stats.get('phase_pair_stats')
+                if ps and ps['n_anchors'] > 0:
+                    phase_msg = (
+                        f" | Phase: {ps['n_total_pairs']:.0f} pairs "
+                        f"({ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} anchors, "
+                        f"overlap={ps['overlap_mean']:.1f}, "
+                        f"w={ps['weight_mean']:.3f}±{ps['weight_std']:.3f})"
+                    )
+
                 logger.info(
                     f"Epoch {epoch+1} | "
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
@@ -437,6 +534,7 @@ def train_epoch(
                     f"Pairs(+/-): spec {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']}, "
                     f"spat {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
+                    f"{phase_msg}"
                 )
 
     if total_batches == 0:
@@ -444,6 +542,7 @@ def train_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
+            'phase_pair_stats': None,
         }
 
     return {
@@ -454,6 +553,7 @@ def train_epoch(
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
+        'phase_pair_stats': last_phase_pair_stats,
     }
 
 def validate_epoch(
@@ -462,6 +562,8 @@ def validate_epoch(
     model: RepresentationModel,
     device: torch.device,
     config: dict,
+    phase_sampler: AnchorSampler | None = None,
+    phase_config: dict | None = None,
 ) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
@@ -475,12 +577,14 @@ def validate_epoch(
     last_gate_stats = empty_stats
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
+    last_phase_pair_stats = None
 
     with torch.no_grad():
         for batch in val_dataloader:
             stats = process_batch(
                 batch, feature_builder, model, device, config,
                 training=False,
+                phase_sampler=phase_sampler, phase_config=phase_config,
             )
             if stats['n_valid'] > 0:
                 total_loss += stats['loss']
@@ -492,12 +596,14 @@ def validate_epoch(
                 last_gate_stats = stats['gate_stats']
                 last_pos_weight_stats = stats['pos_weight_stats']
                 last_neg_weight_stats = stats['neg_weight_stats']
+                last_phase_pair_stats = stats.get('phase_pair_stats')
 
     if total_batches == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
+            'phase_pair_stats': None,
         }
 
     return {
@@ -508,6 +614,7 @@ def validate_epoch(
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
+        'phase_pair_stats': last_phase_pair_stats,
     }
 
 def main():
@@ -819,6 +926,39 @@ def main():
         f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']})"
     )
 
+    # --- Phase loss pair construction setup ---
+    phase_loss_cfg = bindings_config.get_loss('soft_neighborhood_phase')
+    phase_sampler = None
+    phase_config = None
+
+    if phase_loss_cfg is not None:
+        # Build the ysfc-weighted anchor sampler
+        phase_anchor_pop = (
+            phase_loss_cfg.anchor_population
+            if phase_loss_cfg.anchor_population
+            else 'grid-plus-supplement-ysfc'
+        )
+        phase_sampler = build_anchor_sampler(bindings_config, phase_anchor_pop)
+
+        # Extract pair construction params from parsed config
+        ps = phase_loss_cfg.pair_strategy
+        pw = phase_loss_cfg.pair_weights
+        phase_config = {
+            'k': ps.type_similarity.k if ps and ps.type_similarity else 16,
+            'min_overlap': ps.ysfc_overlap.min_overlap if ps and ps.ysfc_overlap else 3,
+            'min_pairs': ps.min_pairs if ps else 5,
+            'include_self': ps.include_self if ps else True,
+            'sigma': pw.sigma if pw else 5.0,
+            'self_pair_weight': pw.self_pair_weight if pw else 1.0,
+        }
+        logger.info(
+            f"Phase pair construction enabled: sampler={phase_anchor_pop}, "
+            f"k={phase_config['k']}, min_overlap={phase_config['min_overlap']}, "
+            f"min_pairs={phase_config['min_pairs']}, sigma={phase_config['sigma']}"
+        )
+    else:
+        logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
+
     # Create output directories
     ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -854,11 +994,13 @@ def main():
         train_stats = train_epoch(
           train_dataloader, feature_builder, model,
           optimizer, scheduler, device, loss_config, epoch, num_epochs,
+          phase_sampler=phase_sampler, phase_config=phase_config,
         )
 
         val_stats = validate_epoch(
           val_dataloader, feature_builder, model,
           device, loss_config,
+          phase_sampler=phase_sampler, phase_config=phase_config,
         )
 
         logger.info(
@@ -882,6 +1024,18 @@ def main():
         logger.info(
             f"  Spatial neg weights: {fmt_stats(train_stats['neg_weight_stats'])}"
         )
+
+        # Log phase pair construction stats
+        ps = train_stats.get('phase_pair_stats')
+        if ps and ps['n_anchors'] > 0:
+            logger.info(
+                f"  Phase pairs: {ps['n_total_pairs']:.0f} total "
+                f"({ps['n_self_pairs']:.0f} self + {ps['n_total_pairs'] - ps['n_self_pairs']:.0f} cross) | "
+                f"Anchors: {ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} surviving | "
+                f"kNN candidates: {ps['n_candidates']:.0f} -> overlap filter: {ps['n_after_overlap']:.0f} | "
+                f"Overlap: mean={ps['overlap_mean']:.1f}, min={ps['overlap_min']} | "
+                f"Weights: {ps['weight_mean']:.3f}±{ps['weight_std']:.3f}"
+            )
 
         # Save checkpoint
         ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
