@@ -320,30 +320,32 @@ def process_batch(
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
         # --- Phase pair construction (no loss yet, just pairs + logging) ---
+        # Entire block runs on CPU: build_ysfc_overlap is a Python loop,
+        # and the kNN cdist on ~360 anchors is cheap.  No GPU round-trips.
         if phase_sampler is not None and phase_config is not None:
-            # Build ysfc feature via FeatureBuilder
+            # Build ysfc feature via FeatureBuilder (returns numpy)
             ysfc_feature = feature_builder.build_feature('ysfc', sample)
-            ysfc_data = torch.from_numpy(ysfc_feature.data).float().to(device)
-            # ysfc_data: [1, T, H, W] (single channel)
+            ysfc_data = torch.from_numpy(ysfc_feature.data).float()
+            # ysfc_data: [1, T, H, W] (single channel, CPU)
 
             # Combined mask for phase anchors: encoder mask AND ysfc validity
-            ysfc_mask = torch.from_numpy(ysfc_feature.mask).to(device)
+            ysfc_mask = torch.from_numpy(ysfc_feature.mask)
             # ysfc_mask is [T, H, W] for temporal; collapse to [H, W]
             if ysfc_mask.ndim == 3:
                 ysfc_spatial_mask = ysfc_mask.all(dim=0)  # valid across all timesteps
             else:
                 ysfc_spatial_mask = ysfc_mask
-            phase_mask = combined_mask & ysfc_spatial_mask
+            phase_mask = combined_mask.cpu() & ysfc_spatial_mask
 
-            # Sample separate anchors for phase loss (CPU — weights are numpy-derived)
+            # Sample separate anchors for phase loss
             phase_anchors = phase_sampler(
-                phase_mask.cpu(), training=training, sample=sample
+                phase_mask, training=training, sample=sample
             )
 
             if phase_anchors.shape[0] >= 10:
-                # Extract spectral features at phase anchors (for kNN + weights)
+                # Extract spectral features at phase anchors (CPU for kNN + weights)
                 phase_spec_at_anchors = extract_at_locations(
-                    spec_dist_data, phase_anchors
+                    spec_dist_data.cpu(), phase_anchors
                 )  # [N_phase, C]
 
                 # Extract ysfc time series at phase anchors
@@ -353,7 +355,7 @@ def process_batch(
                 )  # [N_phase, T, 1]
                 ysfc_at_anchors = ysfc_at_anchors.squeeze(-1)  # [N_phase, T]
 
-                # Build pairs
+                # Build pairs (all CPU)
                 phase_pairs, phase_weights, phase_stats = build_phase_pairs(
                     spec_features=phase_spec_at_anchors,
                     ysfc=ysfc_at_anchors,
