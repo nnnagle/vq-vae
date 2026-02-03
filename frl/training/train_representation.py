@@ -689,36 +689,101 @@ def main():
             eta_min=scheduler_config.eta_min,
         )
 
-    # Loss and training config
+    # Loss and training config — sourced from parsed bindings where available,
+    # with hardcoded fallbacks for parameters not yet in the YAML.
+    spectral_loss_cfg = bindings_config.get_loss('infonce_type_spectral')
+    spatial_loss_cfg = bindings_config.get_loss('infonce_type_spatial')
+    sampling_cfg = bindings_config.get_sampling_strategy(
+        spectral_loss_cfg.anchor_population if spectral_loss_cfg else 'grid-plus-supplement'
+    )
+
+    # Grid/sampling params from sampling strategy
+    grid = sampling_cfg.grid if sampling_cfg and sampling_cfg.grid else None
+    supplement = sampling_cfg.supplement if sampling_cfg else None
+
     loss_config = {
-        # Sampling
-        'stride': 16,
-        'border': 16,
-        'jitter_radius': 4,
-        'supplement_n': 104,
-        # Spectral InfoNCE loss
-        'positive_k': 16,
-        'positive_min_spatial': 4.0,
-        'negative_quantile_low': 0.5,
-        'negative_quantile_high': 0.75,
-        'negative_min_spatial': 8.0,
-        'temperature': 0.07,
-        # Spatial InfoNCE loss (offset-grid approach)
-        'spatial_positive_k': 4,
-        'spatial_positive_max_dist': 8,  # max radius for positive neighbors
-        'spatial_negative_min_dist': 96.0,  # min distance for negatives
-        'spatial_negative_max_dist': 192.0,  # max distance for negatives
-        'spatial_negatives_per_anchor': 16,  # number of negatives per anchor
-        'spatial_spectral_tau': 200, # dist. metric on spectral dist, ideally ~ .5*sqrt(2*ndim)
+        # Sampling (from sampling-strategy config)
+        'stride': grid.stride if grid else 16,
+        'border': grid.exclude_border if grid else 16,
+        'jitter_radius': grid.jitter.radius if grid and grid.jitter else 4,
+        'supplement_n': supplement.n if supplement else 104,
+
+        # Spectral InfoNCE loss (from losses.infonce_type_spectral config)
+        'positive_k': (
+            spectral_loss_cfg.positive_strategy.selection.k
+            if spectral_loss_cfg and spectral_loss_cfg.positive_strategy
+            and spectral_loss_cfg.positive_strategy.selection
+            else 16
+        ),
+        'positive_min_spatial': (
+            spectral_loss_cfg.positive_strategy.selection.min_distance
+            if spectral_loss_cfg and spectral_loss_cfg.positive_strategy
+            and spectral_loss_cfg.positive_strategy.selection
+            else 4.0
+        ),
+        'negative_quantile_low': (
+            spectral_loss_cfg.negative_strategy.selection.range[0]
+            if spectral_loss_cfg and spectral_loss_cfg.negative_strategy
+            and spectral_loss_cfg.negative_strategy.selection
+            and spectral_loss_cfg.negative_strategy.selection.range
+            else 0.5
+        ),
+        'negative_quantile_high': (
+            spectral_loss_cfg.negative_strategy.selection.range[1]
+            if spectral_loss_cfg and spectral_loss_cfg.negative_strategy
+            and spectral_loss_cfg.negative_strategy.selection
+            and spectral_loss_cfg.negative_strategy.selection.range
+            else 0.75
+        ),
+        'negative_min_spatial': (
+            spectral_loss_cfg.negative_strategy.selection.min_distance
+            if spectral_loss_cfg and spectral_loss_cfg.negative_strategy
+            and spectral_loss_cfg.negative_strategy.selection
+            else 8.0
+        ),
+        'temperature': 0.07,  # TODO: add to YAML loss config
+
+        # Spatial InfoNCE loss (from losses.infonce_type_spatial config)
+        'spatial_positive_k': (
+            spatial_loss_cfg.positive_strategy.selection.k
+            if spatial_loss_cfg and spatial_loss_cfg.positive_strategy
+            and spatial_loss_cfg.positive_strategy.selection
+            else 4
+        ),
+        'spatial_positive_max_dist': (
+            spatial_loss_cfg.positive_strategy.selection.max_distance
+            if spatial_loss_cfg and spatial_loss_cfg.positive_strategy
+            and spatial_loss_cfg.positive_strategy.selection
+            else 8
+        ),
+        # Spatial negative params: trainer uses absolute distance, not the
+        # quantile-based strategy described in the YAML.  Keep hardcoded
+        # until the YAML spec and implementation are aligned.
+        'spatial_negative_min_dist': 96.0,
+        'spatial_negative_max_dist': 192.0,
+        'spatial_negatives_per_anchor': 16,
+        'spatial_spectral_tau': 200,
         'spatial_min_w': .03,
-        'spatial_temperature': 0.07,
-        # Loss weights
-        'spectral_loss_weight': 1.0,
-        'spatial_loss_weight': 1.0,
-        # Training
+        'spatial_temperature': 0.07,  # TODO: add to YAML loss config
+
+        # Loss weights (from losses config)
+        'spectral_loss_weight': spectral_loss_cfg.weight if spectral_loss_cfg else 1.0,
+        'spatial_loss_weight': spatial_loss_cfg.weight if spatial_loss_cfg else 1.0,
+
+        # Training (from training config)
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
         'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
     }
+
+    logger.info(
+        f"Loss config from bindings: "
+        f"stride={loss_config['stride']}, border={loss_config['border']}, "
+        f"supplement_n={loss_config['supplement_n']}, "
+        f"spectral(k={loss_config['positive_k']}, min_spatial={loss_config['positive_min_spatial']}, "
+        f"neg_q=[{loss_config['negative_quantile_low']}, {loss_config['negative_quantile_high']}], "
+        f"neg_min_spatial={loss_config['negative_min_spatial']}), "
+        f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']})"
+    )
 
     # Create output directories
     ckpt_dir = Path(checkpoint_dir)
