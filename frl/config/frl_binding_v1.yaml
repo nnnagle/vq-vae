@@ -345,19 +345,20 @@ losses:
   infonce_type_spectral:
     weight: 1.0
     type: infonce
-    mask: 
+    temperature: 0.07
+    mask:
       - static_mask.aoi
       - static_mask.forest
-    
+
     # Distance metric for selecting positives/negatives
-    auxiliary_distance: 
+    auxiliary_distance:
       feature: features.infonce_type_spectral
       metric: l2
       covariance: true  # Mahalanobis (L2 in whitened space)
-    
+
     anchor:
       population: grid-plus-supplement
-    
+
     positive_strategy:
       candidates: anchors
       distance: auxiliary
@@ -365,7 +366,7 @@ losses:
         type: mutual-knn
         k: 16
         min_distance: 4  # Prevent trivial spatial neighbors
-    
+
     negative_strategy:
       candidates: anchors
       distance: auxiliary
@@ -373,20 +374,21 @@ losses:
         type: quantile
         range: [0.5, 0.75]
         min_distance: 8
-  
+
   # Spatial smoothness (coordinate-driven)
   infonce_type_spatial:
     weight: 1.0
     type: infonce
-    mask: 
+    temperature: 0.07
+    mask:
       - static_mask.aoi
       - static_mask.forest
-    
+
     # Distance: pixel coordinates (implicit in spatial-knn)
-    
-    anchor: 
+
+    anchor:
       population: grid
-    
+
     positive_strategy:
       candidates: patch
       selection:
@@ -394,13 +396,21 @@ losses:
         k: 4
         min_distance: 1  # Not self
         max_distance: 8  # Local neighborhood only
-    
+
     negative_strategy:
       candidates: patch
       selection:
-        type: spatial-quantile
-        range: [0.65, 0.75]  # Far away (not middle)
-        min_distance: 16
+        type: spatial-range
+        min_distance: 96.0   # Far from anchor
+        max_distance: 192.0
+        n_per_anchor: 16
+
+    # Weight spatial pairs by spectral similarity so the loss
+    # focuses on spatially-close pixels that are also spectrally similar.
+    spectral_weighting:
+      feature: features.infonce_type_spectral
+      tau: 200              # scale for exp(-d/tau); ~ 0.5*sqrt(2*n_dim)
+      min_weight: 0.03
 
   # Phase trajectory matching (soft neighborhood KL)
   # Learns phase embeddings whose distance structure reproduces the

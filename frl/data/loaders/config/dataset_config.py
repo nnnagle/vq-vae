@@ -345,11 +345,12 @@ class AuxiliaryDistanceConfig:
 @dataclass
 class SelectionConfig:
     """Configuration for a pair selection step."""
-    type: str  # 'mutual-knn', 'quantile', 'spatial-knn', 'spatial-quantile'
+    type: str  # 'mutual-knn', 'quantile', 'spatial-knn', 'spatial-range'
     k: Optional[int] = None
     min_distance: Optional[float] = None
     max_distance: Optional[float] = None
     range: Optional[List[float]] = None  # [low, high] for quantile
+    n_per_anchor: Optional[int] = None  # for spatial-range: negatives per anchor
 
 
 @dataclass
@@ -393,6 +394,14 @@ class PairWeightsConfig:
 
 
 @dataclass
+class SpectralWeightingConfig:
+    """Configuration for weighting pairs by spectral similarity."""
+    feature: str  # e.g. 'features.infonce_type_spectral'
+    tau: float = 1.0  # temperature for exp(-d/tau)
+    min_weight: float = 0.01  # floor for pair weights
+
+
+@dataclass
 class CurriculumConfig:
     """Configuration for loss curriculum (ramp-in schedule)."""
     start_epoch: int = 0
@@ -411,12 +420,14 @@ class LossConfig:
     weight: float = 1.0
     type: str = 'infonce'
     mask: Optional[List[str]] = None
+    temperature: Optional[float] = None  # InfoNCE temperature
 
     # --- infonce-specific ---
     auxiliary_distance: Optional[AuxiliaryDistanceConfig] = None
     anchor_population: Optional[str] = None  # reference to sampling-strategy name
     positive_strategy: Optional[PairEndpointStrategyConfig] = None
     negative_strategy: Optional[PairEndpointStrategyConfig] = None
+    spectral_weighting: Optional[SpectralWeightingConfig] = None
 
     # --- soft_neighborhood-specific ---
     neighborhood_target: Optional[str] = None  # e.g. 'features.soft_neighborhood_phase'

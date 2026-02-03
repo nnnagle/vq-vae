@@ -689,8 +689,7 @@ def main():
             eta_min=scheduler_config.eta_min,
         )
 
-    # Loss and training config — sourced from parsed bindings where available,
-    # with hardcoded fallbacks for parameters not yet in the YAML.
+    # Loss and training config — sourced from parsed bindings YAML.
     spectral_loss_cfg = bindings_config.get_loss('infonce_type_spectral')
     spatial_loss_cfg = bindings_config.get_loss('infonce_type_spatial')
     sampling_cfg = bindings_config.get_sampling_strategy(
@@ -741,7 +740,11 @@ def main():
             and spectral_loss_cfg.negative_strategy.selection
             else 8.0
         ),
-        'temperature': 0.07,  # TODO: add to YAML loss config
+        'temperature': (
+            spectral_loss_cfg.temperature
+            if spectral_loss_cfg and spectral_loss_cfg.temperature is not None
+            else 0.07
+        ),
 
         # Spatial InfoNCE loss (from losses.infonce_type_spatial config)
         'spatial_positive_k': (
@@ -756,15 +759,42 @@ def main():
             and spatial_loss_cfg.positive_strategy.selection
             else 8
         ),
-        # Spatial negative params: trainer uses absolute distance, not the
-        # quantile-based strategy described in the YAML.  Keep hardcoded
-        # until the YAML spec and implementation are aligned.
-        'spatial_negative_min_dist': 96.0,
-        'spatial_negative_max_dist': 192.0,
-        'spatial_negatives_per_anchor': 16,
-        'spatial_spectral_tau': 200,
-        'spatial_min_w': .03,
-        'spatial_temperature': 0.07,  # TODO: add to YAML loss config
+        'spatial_negative_min_dist': (
+            spatial_loss_cfg.negative_strategy.selection.min_distance
+            if spatial_loss_cfg and spatial_loss_cfg.negative_strategy
+            and spatial_loss_cfg.negative_strategy.selection
+            and spatial_loss_cfg.negative_strategy.selection.min_distance is not None
+            else 96.0
+        ),
+        'spatial_negative_max_dist': (
+            spatial_loss_cfg.negative_strategy.selection.max_distance
+            if spatial_loss_cfg and spatial_loss_cfg.negative_strategy
+            and spatial_loss_cfg.negative_strategy.selection
+            and spatial_loss_cfg.negative_strategy.selection.max_distance is not None
+            else 192.0
+        ),
+        'spatial_negatives_per_anchor': (
+            spatial_loss_cfg.negative_strategy.selection.n_per_anchor
+            if spatial_loss_cfg and spatial_loss_cfg.negative_strategy
+            and spatial_loss_cfg.negative_strategy.selection
+            and spatial_loss_cfg.negative_strategy.selection.n_per_anchor is not None
+            else 16
+        ),
+        'spatial_spectral_tau': (
+            spatial_loss_cfg.spectral_weighting.tau
+            if spatial_loss_cfg and spatial_loss_cfg.spectral_weighting
+            else 200
+        ),
+        'spatial_min_w': (
+            spatial_loss_cfg.spectral_weighting.min_weight
+            if spatial_loss_cfg and spatial_loss_cfg.spectral_weighting
+            else 0.03
+        ),
+        'spatial_temperature': (
+            spatial_loss_cfg.temperature
+            if spatial_loss_cfg and spatial_loss_cfg.temperature is not None
+            else 0.07
+        ),
 
         # Loss weights (from losses config)
         'spectral_loss_weight': spectral_loss_cfg.weight if spectral_loss_cfg else 1.0,
@@ -781,7 +811,11 @@ def main():
         f"supplement_n={loss_config['supplement_n']}, "
         f"spectral(k={loss_config['positive_k']}, min_spatial={loss_config['positive_min_spatial']}, "
         f"neg_q=[{loss_config['negative_quantile_low']}, {loss_config['negative_quantile_high']}], "
-        f"neg_min_spatial={loss_config['negative_min_spatial']}), "
+        f"neg_min_spatial={loss_config['negative_min_spatial']}, temp={loss_config['temperature']}), "
+        f"spatial(neg_dist=[{loss_config['spatial_negative_min_dist']}, {loss_config['spatial_negative_max_dist']}], "
+        f"neg_per_anchor={loss_config['spatial_negatives_per_anchor']}, "
+        f"spec_tau={loss_config['spatial_spectral_tau']}, min_w={loss_config['spatial_min_w']}, "
+        f"temp={loss_config['spatial_temperature']}), "
         f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']})"
     )
 
