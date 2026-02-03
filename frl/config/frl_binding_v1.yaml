@@ -258,7 +258,6 @@ features:
     dim: [C,T,H,W]
     channels:
       annual.ysfc: {norm: identity}
-      annual.ysfc_censored: {norm: identity}
   target_metrics:
     dim: [C,H,W]
     channels: 
@@ -450,7 +449,7 @@ losses:
 
     # Continuous pair weighting from type encoder similarity
     pair_weights:
-      source: type_embedding   # w_ij = exp(-||h_type_i - h_type_j|| / sigma)
+      source: features.infonce_type_spectral   # w_ij = exp(-||d_spec_i - d_spec_j||₂ / sigma)
       sigma: 5.0
       self_pair_weight: 1.0    # self-pairs always weight 1
 

@@ -449,6 +449,9 @@ def build_anchor_sampler(
     """
     Build an anchor sampler from bindings configuration.
 
+    Supports both the parsed ``BindingsConfig`` (with typed
+    ``sampling_strategies`` dict) and legacy raw-dict configs.
+
     Args:
         bindings_config: Parsed bindings configuration
         strategy_name: Name of strategy (e.g., 'grid-plus-supplement')
@@ -456,48 +459,84 @@ def build_anchor_sampler(
     Returns:
         Configured AnchorSampler instance
     """
-    # Get sampling strategy config from bindings
-    # The config has a 'sampling_strategy' dict with strategy definitions
-    if not hasattr(bindings_config, 'sampling_strategy'):
-        # Fall back to defaults
-        return AnchorSampler(
-            strategy=strategy_name,
-            stride=16,
-            border=16,
-            jitter_radius=4,
-            supplement_n=104,
-        )
+    # Try parsed config first (typed dataclass objects)
+    strat_cfg = None
+    if hasattr(bindings_config, 'sampling_strategies') and bindings_config.sampling_strategies:
+        strat_cfg = bindings_config.sampling_strategies.get(strategy_name)
 
-    strategies = bindings_config.sampling_strategy
+    if strat_cfg is not None:
+        # Use parsed SamplingStrategyConfig
+        grid = strat_cfg.grid
+        supplement = strat_cfg.supplement
 
-    if strategy_name == 'grid':
-        grid_config = strategies.get('grid', {})
-        return AnchorSampler(
-            strategy='grid',
-            stride=grid_config.get('stride', 16),
-            border=grid_config.get('exclude_border', 16),
-            jitter_radius=grid_config.get('jitter', {}).get('radius', 4),
-            supplement_n=0,
-        )
+        # Convert WeightByEntry objects to WeightSpec objects
+        weight_specs: List[WeightSpec] = []
+        if supplement and supplement.weight_by:
+            for entry in supplement.weight_by:
+                if entry.mask_ref:
+                    weight_specs.append(WeightSpec(channel=entry.mask_ref))
+                elif entry.channel:
+                    weight_specs.append(WeightSpec(
+                        channel=entry.channel,
+                        transform=entry.transform,
+                    ))
 
-    elif strategy_name in ('grid-plus-supplement', 'grid-plus-supplement-ysfc'):
-        gps_config = strategies.get(strategy_name, {})
-        grid_config = gps_config.get('grid', {})
-        supplement_config = gps_config.get('supplement', {})
-        sampling_config = supplement_config.get('sampling', {})
+        if strategy_name == 'grid':
+            return AnchorSampler(
+                strategy='grid',
+                stride=grid.stride if grid else 16,
+                border=grid.exclude_border if grid else 16,
+                jitter_radius=grid.jitter.radius if grid and grid.jitter else 4,
+                supplement_n=0,
+            )
+        else:
+            return AnchorSampler(
+                strategy=strategy_name,
+                stride=grid.stride if grid else 16,
+                border=grid.exclude_border if grid else 16,
+                jitter_radius=grid.jitter.radius if grid and grid.jitter else 4,
+                supplement_n=supplement.n if supplement else 104,
+                weight_specs=weight_specs,
+            )
 
-        # Parse weight_by specifications
-        weight_by_raw = sampling_config.get('weight_by', [])
-        weight_specs = _parse_weight_by(weight_by_raw)
+    # Legacy raw-dict fallback
+    if hasattr(bindings_config, 'sampling_strategy') and bindings_config.sampling_strategy:
+        strategies = bindings_config.sampling_strategy
 
-        return AnchorSampler(
-            strategy=strategy_name,
-            stride=grid_config.get('stride', 16),
-            border=grid_config.get('exclude_border', 16),
-            jitter_radius=grid_config.get('jitter', {}).get('radius', 4),
-            supplement_n=supplement_config.get('n', 104),
-            weight_specs=weight_specs,
-        )
+        if strategy_name == 'grid':
+            grid_config = strategies.get('grid', {})
+            return AnchorSampler(
+                strategy='grid',
+                stride=grid_config.get('stride', 16),
+                border=grid_config.get('exclude_border', 16),
+                jitter_radius=grid_config.get('jitter', {}).get('radius', 4),
+                supplement_n=0,
+            )
+        elif strategy_name in ('grid-plus-supplement', 'grid-plus-supplement-ysfc'):
+            gps_config = strategies.get(strategy_name, {})
+            grid_config = gps_config.get('grid', {})
+            supplement_config = gps_config.get('supplement', {})
+            sampling_config = supplement_config.get('sampling', {})
 
-    else:
-        raise ValueError(f"Unknown sampling strategy: {strategy_name}")
+            weight_by_raw = sampling_config.get('weight_by', [])
+            weight_specs = _parse_weight_by(weight_by_raw)
+
+            return AnchorSampler(
+                strategy=strategy_name,
+                stride=grid_config.get('stride', 16),
+                border=grid_config.get('exclude_border', 16),
+                jitter_radius=grid_config.get('jitter', {}).get('radius', 4),
+                supplement_n=supplement_config.get('n', 104),
+                weight_specs=weight_specs,
+            )
+        else:
+            raise ValueError(f"Unknown sampling strategy: {strategy_name}")
+
+    # No config found — use defaults
+    return AnchorSampler(
+        strategy=strategy_name,
+        stride=16,
+        border=16,
+        jitter_radius=4,
+        supplement_n=104,
+    )
