@@ -147,15 +147,21 @@ class FeatureBuilder:
         # Build combined mask
         mask = self._build_combined_mask(sample, feature_config, channel_data)
 
-        # Apply normalization per channel
-        if apply_normalization:
-            channel_data = self._apply_normalization(
+        # Apply Mahalanobis transform if feature has covariance.
+        # Mahalanobis subsumes zscore (it centers and whitens), so skip
+        # per-channel normalization when whitening is applied.
+        use_mahalanobis = (
+            apply_mahalanobis
+            and feature_config.covariance
+            and feature_config.covariance.calculate
+        )
+
+        if use_mahalanobis:
+            channel_data = self._apply_mahalanobis_transform(
                 channel_data, feature_name, feature_config, mask
             )
-
-        # Apply Mahalanobis transform if feature has covariance
-        if apply_mahalanobis and feature_config.covariance and feature_config.covariance.calculate:
-            channel_data = self._apply_mahalanobis_transform(
+        elif apply_normalization:
+            channel_data = self._apply_normalization(
                 channel_data, feature_name, feature_config, mask
             )
 
@@ -536,6 +542,10 @@ class FeatureBuilder:
 
         # Reshape back
         transformed_data = transformed_flat.reshape(original_shape)
+
+        # Clamp to bound outlier influence
+        clamp_limit = 5.0
+        np.clip(transformed_data, -clamp_limit, clamp_limit, out=transformed_data)
 
         return transformed_data
 
