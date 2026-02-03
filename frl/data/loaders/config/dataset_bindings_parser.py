@@ -31,6 +31,7 @@ from .dataset_config import (
     TypeSimilarityConfig,
     YsfcOverlapConfig,
     PairStrategyConfig,
+    SpectralWeightingConfig,
     PairWeightsConfig,
     CurriculumConfig,
     LossConfig,
@@ -551,6 +552,16 @@ class DatasetBindingsParser:
                 spec['negative_strategy']
             )
 
+        # Spectral weighting (for spatial infonce)
+        spectral_weighting = None
+        if 'spectral_weighting' in spec:
+            sw = spec['spectral_weighting']
+            spectral_weighting = SpectralWeightingConfig(
+                feature=sw['feature'],
+                tau=sw.get('tau', 1.0),
+                min_weight=sw.get('min_weight', 0.01),
+            )
+
         # Soft neighborhood-specific
         neighborhood_target = spec.get('neighborhood_target')
 
@@ -580,10 +591,12 @@ class DatasetBindingsParser:
             weight=weight,
             type=loss_type,
             mask=mask,
+            temperature=spec.get('temperature'),
             auxiliary_distance=auxiliary_distance,
             anchor_population=anchor_population,
             positive_strategy=positive_strategy,
             negative_strategy=negative_strategy,
+            spectral_weighting=spectral_weighting,
             neighborhood_target=neighborhood_target,
             pair_strategy=pair_strategy,
             pair_weights=pair_weights,
@@ -608,6 +621,7 @@ class DatasetBindingsParser:
                 min_distance=sel.get('min_distance'),
                 max_distance=sel.get('max_distance'),
                 range=sel.get('range'),
+                n_per_anchor=sel.get('n_per_anchor'),
             )
 
         return PairEndpointStrategyConfig(
