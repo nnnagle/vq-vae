@@ -20,6 +20,20 @@ from .dataset_config import (
     FeatureConfig,
     FeatureChannelConfig,
     CovarianceConfig,
+    JitterConfig,
+    GridConfig,
+    WeightByEntry,
+    SupplementConfig,
+    SamplingStrategyConfig,
+    AuxiliaryDistanceConfig,
+    SelectionConfig,
+    PairEndpointStrategyConfig,
+    TypeSimilarityConfig,
+    YsfcOverlapConfig,
+    PairStrategyConfig,
+    PairWeightsConfig,
+    CurriculumConfig,
+    LossConfig,
 )
 
 
@@ -81,6 +95,8 @@ class DatasetBindingsParser:
             stats = self._parse_stats() if 'stats' in self.raw_config else None
             normalization_presets = self._parse_normalization() if 'normalization' in self.raw_config else None
             features = self._parse_features() if 'features' in self.raw_config else None
+            sampling_strategies = self._parse_sampling_strategies() if 'sampling-strategy' in self.raw_config else None
+            losses = self._parse_losses() if 'losses' in self.raw_config else None
 
             return BindingsConfig(
                 version=version,
@@ -91,6 +107,8 @@ class DatasetBindingsParser:
                 stats=stats,
                 normalization_presets=normalization_presets,
                 features=features,
+                sampling_strategies=sampling_strategies,
+                losses=losses,
             )
 
         except Exception as e:
@@ -408,4 +426,218 @@ class DatasetBindingsParser:
             mask=mask,
             quality=quality,
             norm=norm,
+        )
+
+    # ------------------------------------------------------------------
+    # Sampling strategies
+    # ------------------------------------------------------------------
+
+    def _parse_sampling_strategies(self) -> Dict[str, SamplingStrategyConfig]:
+        """Parse all sampling strategies."""
+        strategies_dict = self.raw_config.get('sampling-strategy', {})
+        strategies = {}
+        for name, spec in strategies_dict.items():
+            strategies[name] = self._parse_sampling_strategy(name, spec)
+        return strategies
+
+    def _parse_sampling_strategy(
+        self, name: str, spec: Dict[str, Any]
+    ) -> SamplingStrategyConfig:
+        """Parse a single sampling strategy."""
+        # Patch-only strategy (has interior-only / border_width at top level)
+        interior_only = spec.get('interior-only')
+        border_width = spec.get('border_width')
+
+        # Grid config — either at top level (grid-only) or nested under 'grid'
+        grid = None
+        grid_spec = spec.get('grid') if 'grid' in spec else None
+        if grid_spec is None and 'stride' in spec:
+            # Grid-only: top-level keys
+            grid_spec = spec
+        if grid_spec is not None and isinstance(grid_spec, dict):
+            jitter = None
+            if 'jitter' in grid_spec:
+                jitter = JitterConfig(radius=grid_spec['jitter'].get('radius', 0))
+            grid = GridConfig(
+                stride=grid_spec.get('stride', 16),
+                exclude_border=grid_spec.get('exclude_border', 16),
+                jitter=jitter,
+            )
+
+        # Supplement config
+        supplement = None
+        if 'supplement' in spec:
+            supplement = self._parse_supplement(spec['supplement'])
+
+        return SamplingStrategyConfig(
+            name=name,
+            interior_only=interior_only,
+            border_width=border_width,
+            grid=grid,
+            supplement=supplement,
+        )
+
+    def _parse_supplement(self, spec: Dict[str, Any]) -> SupplementConfig:
+        """Parse supplement sampling configuration."""
+        n = spec.get('n', 0)
+        sampling = spec.get('sampling', {})
+        sampling_type = sampling.get('type', 'weighted')
+
+        weight_by = []
+        for entry in sampling.get('weight_by', []):
+            if isinstance(entry, str):
+                # Simple mask reference
+                weight_by.append(WeightByEntry(mask_ref=entry))
+            elif isinstance(entry, dict):
+                # Channel-based weight with optional transform
+                weight_by.append(WeightByEntry(
+                    channel=entry.get('channel'),
+                    transform=entry.get('transform'),
+                ))
+            else:
+                raise BindingsParseError(
+                    f"Invalid weight_by entry: {entry}"
+                )
+
+        return SupplementConfig(
+            n=n,
+            sampling_type=sampling_type,
+            weight_by=weight_by,
+        )
+
+    # ------------------------------------------------------------------
+    # Losses
+    # ------------------------------------------------------------------
+
+    def _parse_losses(self) -> Dict[str, LossConfig]:
+        """Parse all loss configurations."""
+        losses_dict = self.raw_config.get('losses', {})
+        losses = {}
+        for name, spec in losses_dict.items():
+            losses[name] = self._parse_loss(name, spec)
+        return losses
+
+    def _parse_loss(self, name: str, spec: Dict[str, Any]) -> LossConfig:
+        """Parse a single loss configuration."""
+        loss_type = spec.get('type', 'infonce')
+
+        # Common fields
+        weight = spec.get('weight', 1.0)
+        mask = spec.get('mask')
+
+        # Anchor population
+        anchor_spec = spec.get('anchor', {})
+        anchor_population = anchor_spec.get('population') if anchor_spec else None
+
+        # InfoNCE-specific
+        auxiliary_distance = None
+        if 'auxiliary_distance' in spec:
+            ad = spec['auxiliary_distance']
+            auxiliary_distance = AuxiliaryDistanceConfig(
+                feature=ad['feature'],
+                metric=ad.get('metric', 'l2'),
+                covariance=ad.get('covariance', False),
+            )
+
+        positive_strategy = None
+        if 'positive_strategy' in spec:
+            positive_strategy = self._parse_pair_endpoint_strategy(
+                spec['positive_strategy']
+            )
+
+        negative_strategy = None
+        if 'negative_strategy' in spec:
+            negative_strategy = self._parse_pair_endpoint_strategy(
+                spec['negative_strategy']
+            )
+
+        # Soft neighborhood-specific
+        neighborhood_target = spec.get('neighborhood_target')
+
+        pair_strategy = None
+        if 'pair_strategy' in spec:
+            pair_strategy = self._parse_pair_strategy(spec['pair_strategy'])
+
+        pair_weights = None
+        if 'pair_weights' in spec:
+            pw = spec['pair_weights']
+            pair_weights = PairWeightsConfig(
+                source=pw['source'],
+                sigma=pw.get('sigma', 5.0),
+                self_pair_weight=pw.get('self_pair_weight', 1.0),
+            )
+
+        curriculum = None
+        if 'curriculum' in spec:
+            cur = spec['curriculum']
+            curriculum = CurriculumConfig(
+                start_epoch=cur.get('start_epoch', 0),
+                ramp_epochs=cur.get('ramp_epochs', 0),
+            )
+
+        return LossConfig(
+            name=name,
+            weight=weight,
+            type=loss_type,
+            mask=mask,
+            auxiliary_distance=auxiliary_distance,
+            anchor_population=anchor_population,
+            positive_strategy=positive_strategy,
+            negative_strategy=negative_strategy,
+            neighborhood_target=neighborhood_target,
+            pair_strategy=pair_strategy,
+            pair_weights=pair_weights,
+            tau_ref=spec.get('tau_ref'),
+            tau_learned=spec.get('tau_learned'),
+            min_valid_per_row=spec.get('min_valid_per_row'),
+            self_similarity_weight=spec.get('self_similarity_weight'),
+            cross_pixel_weight=spec.get('cross_pixel_weight'),
+            curriculum=curriculum,
+        )
+
+    def _parse_pair_endpoint_strategy(
+        self, spec: Dict[str, Any]
+    ) -> PairEndpointStrategyConfig:
+        """Parse a positive or negative pair endpoint strategy."""
+        selection = None
+        if 'selection' in spec:
+            sel = spec['selection']
+            selection = SelectionConfig(
+                type=sel['type'],
+                k=sel.get('k'),
+                min_distance=sel.get('min_distance'),
+                max_distance=sel.get('max_distance'),
+                range=sel.get('range'),
+            )
+
+        return PairEndpointStrategyConfig(
+            candidates=spec.get('candidates', 'anchors'),
+            distance=spec.get('distance'),
+            selection=selection,
+        )
+
+    def _parse_pair_strategy(self, spec: Dict[str, Any]) -> PairStrategyConfig:
+        """Parse pair strategy for soft neighborhood losses."""
+        type_similarity = None
+        if 'type_similarity' in spec:
+            ts = spec['type_similarity']
+            type_similarity = TypeSimilarityConfig(
+                feature=ts['feature'],
+                k=ts.get('k', 16),
+            )
+
+        ysfc_overlap = None
+        if 'ysfc_overlap' in spec:
+            yo = spec['ysfc_overlap']
+            ysfc_overlap = YsfcOverlapConfig(
+                channel=yo['channel'],
+                min_overlap=yo.get('min_overlap', 3),
+            )
+
+        return PairStrategyConfig(
+            type=spec.get('type', 'knn-with-ysfc-overlap'),
+            include_self=spec.get('include_self', True),
+            type_similarity=type_similarity,
+            ysfc_overlap=ysfc_overlap,
+            min_pairs=spec.get('min_pairs', 5),
         )
