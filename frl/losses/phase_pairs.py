@@ -27,7 +27,48 @@ from __future__ import annotations
 
 import torch
 
-from losses.phase_neighborhood import build_ysfc_overlap
+
+def _vectorized_ysfc_overlap(
+    ysfc: torch.Tensor,
+    candidate_pairs: torch.Tensor,
+) -> torch.Tensor:
+    """Count shared unique ysfc values for each candidate pair.
+
+    Builds a binary presence indicator ``[N, num_classes]`` and computes
+    pairwise overlap via matmul, then indexes into the result for each
+    candidate pair.  Replaces the per-pair Python loop over
+    ``build_ysfc_overlap``.
+
+    Parameters
+    ----------
+    ysfc : Tensor ``[N, T]``
+        Integer-valued ysfc time series per anchor pixel.
+    candidate_pairs : LongTensor ``[P, 2]``
+        Candidate pair indices into the N anchors.
+
+    Returns
+    -------
+    overlaps : LongTensor ``[P]``
+        Number of shared unique ysfc values per pair.
+    """
+    # Build binary presence matrix: presence[i, c] = 1 iff pixel i has
+    # ysfc value c at any timestep.  ysfc values are non-negative ints.
+    ysfc_long = ysfc.long()
+    num_classes = ysfc_long.max().item() + 1
+    N, T = ysfc_long.shape
+    device = ysfc.device
+
+    # Scatter ones into [N, num_classes] for each (pixel, timestep) value
+    presence = torch.zeros(N, num_classes, dtype=torch.float32, device=device)
+    presence.scatter_(1, ysfc_long, 1.0)
+    # presence is now binary: each row has 1s at the ysfc values present
+
+    # Pairwise overlap: overlap_matrix[i, j] = number of shared classes
+    overlap_matrix = presence @ presence.T  # [N, N]
+
+    # Index for candidate pairs
+    overlaps = overlap_matrix[candidate_pairs[:, 0], candidate_pairs[:, 1]]
+    return overlaps.long()
 
 
 def build_phase_pairs(
@@ -133,13 +174,7 @@ def build_phase_pairs(
     n_candidates = candidate_pairs.shape[0]
 
     # --- Stage 2: filter by ysfc overlap ---
-    overlaps = torch.zeros(n_candidates, dtype=torch.long, device=device)
-
-    for p in range(n_candidates):
-        i_idx = candidate_pairs[p, 0].item()
-        j_idx = candidate_pairs[p, 1].item()
-        shared, _, _ = build_ysfc_overlap(ysfc[i_idx], ysfc[j_idx])
-        overlaps[p] = shared.shape[0]
+    overlaps = _vectorized_ysfc_overlap(ysfc, candidate_pairs)
 
     # Keep pairs with sufficient overlap
     overlap_mask = overlaps >= min_overlap
