@@ -282,10 +282,12 @@ def fit_phase_probe(
 
             n_obs_total += zt_flat.shape[0]
 
-            # Build design matrix on GPU, then move to CPU for accumulation
-            X = _build_design_matrix(zt_flat, zp_flat)              # [N, 844]
-            ones = torch.ones((X.shape[0], 1), device=device, dtype=X.dtype)
-            Xaug = torch.cat([X, ones], dim=1).to(dtype=torch.float64, device="cpu")  # [N, 845]
+            # Move to CPU before building interaction (768 cols is large)
+            zt_cpu = zt_flat.cpu()
+            zp_cpu = zp_flat.cpu()
+            X = _build_design_matrix(zt_cpu, zp_cpu)                # [N, 844]
+            ones = torch.ones((X.shape[0], 1), dtype=X.dtype)
+            Xaug = torch.cat([X, ones], dim=1).to(torch.float64)   # [N, 845]
             Y64 = Y.to(dtype=torch.float64, device="cpu")
 
             A += Xaug.T @ Xaug       # [845, 845]
