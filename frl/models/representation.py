@@ -131,7 +131,10 @@ class RepresentationModel(nn.Module):
     ) -> torch.Tensor:
         """Phase pathway forward (dense, full spatial grid).
 
-        Use for inference when embeddings are needed at every pixel.
+        .. deprecated::
+            Prefer :meth:`forward_phase_at_locations` for training, which
+            runs the TCN only on sampled anchor pixels.  This dense method
+            is retained for inference when embeddings are needed at every pixel.
 
         Args:
             x_phase: Temporal input ``[B, 8, T, H, W]`` (phase_ls8 features).
