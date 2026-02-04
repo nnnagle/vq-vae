@@ -38,6 +38,7 @@ from data.sampling.anchor_sampling import AnchorSampler, build_anchor_sampler
 from models import RepresentationModel
 from losses import contrastive_loss, pairs_with_spatial_constraint
 from losses.phase_pairs import build_phase_pairs
+from losses.phase_neighborhood import phase_neighborhood_loss
 from utils import (
     compute_spatial_distances,
     extract_at_locations,
@@ -65,6 +66,7 @@ def process_batch(
     optimizer: torch.optim.Optimizer | None = None,
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
+    epoch: int = 0,
 ) -> dict:
     """
     Process a single batch for training or validation.
@@ -80,6 +82,7 @@ def process_batch(
         optimizer: Optimizer (required if training=True)
         phase_sampler: Optional anchor sampler for phase loss pair construction
         phase_config: Optional phase loss config dict (k, min_overlap, etc.)
+        epoch: Current epoch (0-indexed), used for curriculum weighting
 
     Returns:
         Dict with loss values and stats
@@ -99,6 +102,7 @@ def process_batch(
     total_loss = 0.0
     total_spectral_loss = 0.0
     total_spatial_loss = 0.0
+    total_phase_loss = 0.0
     n_valid = 0
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
@@ -112,6 +116,7 @@ def process_batch(
 
     # Phase pair stats accumulators
     all_phase_pair_stats = []
+    all_phase_loss_stats = []
 
     batch_size = len(batch['metadata'])
 
@@ -294,34 +299,10 @@ def process_batch(
                 similarity='l2',
             )
 
-        # Combine losses with weights
-        spectral_weight = config.get('spectral_loss_weight', 1.0)
-        spatial_weight = config.get('spatial_loss_weight', 1.0)
-        loss = spectral_weight * spectral_loss_val + spatial_weight * spatial_loss_val
-
-        # Skip if loss is NaN or Inf (numerical instability)
-        if not torch.isfinite(loss):
-            logger.warning(f"Skipping sample with non-finite loss: {loss.item()}")
-            continue
-
-        # Accumulate: keep as tensor for training (backward), use .item() for validation
-        if training:
-            total_loss += loss
-            total_spectral_loss += spectral_loss_val
-            total_spatial_loss += spatial_loss_val
-        else:
-            total_loss += loss.item()
-            total_spectral_loss += spectral_loss_val.item()
-            total_spatial_loss += spatial_loss_val.item()
-        n_valid += 1
-        total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
-        total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
-        total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
-        total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
-
-        # --- Phase pair construction (no loss yet, just pairs + logging) ---
-        # Entire block runs on CPU: build_ysfc_overlap is a Python loop,
-        # and the kNN cdist on ~360 anchors is cheap.  No GPU round-trips.
+        # --- Phase pair construction + loss ---
+        # Pair construction (kNN + overlap) runs on CPU.
+        # Loss computation runs on GPU (requires gradients through phase encoder).
+        phase_loss_val = torch.tensor(0.0, device=device)
         if phase_sampler is not None and phase_config is not None:
             # Build ysfc feature via FeatureBuilder (returns numpy)
             ysfc_feature = feature_builder.build_feature('ysfc', sample)
@@ -369,6 +350,103 @@ def process_batch(
 
                 all_phase_pair_stats.append(phase_stats)
 
+                # --- Compute phase loss if pairs survived ---
+                if phase_pairs.shape[0] > 0:
+                    # Curriculum weighting
+                    start_epoch = phase_config.get('curriculum_start_epoch', 10)
+                    ramp_epochs = phase_config.get('curriculum_ramp_epochs', 10)
+                    if epoch < start_epoch:
+                        curriculum_w = 0.0
+                    elif epoch >= start_epoch + ramp_epochs:
+                        curriculum_w = 1.0
+                    else:
+                        curriculum_w = (epoch - start_epoch) / ramp_epochs
+
+                    if curriculum_w > 0.0:
+                        # Build phase_ls8 temporal feature
+                        phase_ls8_feature = feature_builder.build_feature('phase_ls8', sample)
+                        phase_ls8_data = torch.from_numpy(
+                            phase_ls8_feature.data
+                        ).float().to(device)
+                        # phase_ls8_data: [C, T, H, W] -> [1, C, T, H, W]
+
+                        # Run phase encoder (stop-grad on z_type)
+                        z_phase = model.forward_phase(
+                            phase_ls8_data.unsqueeze(0),
+                            z_full.unsqueeze(0).detach(),
+                        )  # [1, 12, T, H, W]
+                        z_phase = z_phase.squeeze(0)  # [12, T, H, W]
+
+                        # Spectral reference: static [C,H,W] expanded to [N,T,C]
+                        T_phase = z_phase.shape[1]
+                        spec_at_phase_anchors = extract_at_locations(
+                            spec_dist_data, phase_anchors.to(device)
+                        )  # [N_phase, C]
+                        spec_at_phase_anchors = spec_at_phase_anchors.unsqueeze(
+                            1
+                        ).expand(-1, T_phase, -1)
+
+                        # Phase embeddings: [12, T, H, W] -> [N_phase, T, 12]
+                        z_phase_at_anchors = extract_temporal_at_locations(
+                            z_phase, phase_anchors.to(device)
+                        )  # [N_phase, T, 12]
+
+                        # ysfc on GPU for loss
+                        ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
+
+                        # Compute phase neighborhood loss
+                        p_loss, p_loss_stats = phase_neighborhood_loss(
+                            spectral_features=spec_at_phase_anchors,
+                            phase_embeddings=z_phase_at_anchors,
+                            ysfc=ysfc_at_anchors_gpu,
+                            pair_indices=phase_pairs.to(device),
+                            pair_weights=phase_weights.to(device),
+                            tau_ref=phase_config.get('tau_ref', 0.1),
+                            tau_learned=phase_config.get('tau_learned', 0.1),
+                            min_overlap=phase_config.get('min_overlap', 3),
+                            min_valid_per_row=phase_config.get(
+                                'min_valid_per_row', 2
+                            ),
+                            self_similarity_weight=phase_config.get(
+                                'self_similarity_weight', 1.0
+                            ),
+                            cross_pixel_weight=phase_config.get(
+                                'cross_pixel_weight', 1.0
+                            ),
+                        )
+
+                        phase_loss_weight = phase_config.get('weight', 1.0)
+                        phase_loss_val = phase_loss_weight * curriculum_w * p_loss
+                        p_loss_stats['curriculum_w'] = curriculum_w
+                        all_phase_loss_stats.append(p_loss_stats)
+
+        # Combine losses with weights
+        spectral_weight = config.get('spectral_loss_weight', 1.0)
+        spatial_weight = config.get('spatial_loss_weight', 1.0)
+        loss = spectral_weight * spectral_loss_val + spatial_weight * spatial_loss_val + phase_loss_val
+
+        # Skip if loss is NaN or Inf (numerical instability)
+        if not torch.isfinite(loss):
+            logger.warning(f"Skipping sample with non-finite loss: {loss.item()}")
+            continue
+
+        # Accumulate: keep as tensor for training (backward), use .item() for validation
+        if training:
+            total_loss += loss
+            total_spectral_loss += spectral_loss_val
+            total_spatial_loss += spatial_loss_val
+            total_phase_loss += phase_loss_val
+        else:
+            total_loss += loss.item()
+            total_spectral_loss += spectral_loss_val.item()
+            total_spatial_loss += spatial_loss_val.item()
+            total_phase_loss += phase_loss_val.item()
+        n_valid += 1
+        total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
+        total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
+        total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
+        total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
+
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
     empty_phase_stats = {
@@ -380,6 +458,11 @@ def process_batch(
         'dist_mean': 0.0, 'dist_std': 0.0,
         'dist_q25': 0.0, 'dist_q50': 0.0, 'dist_q75': 0.0,
         'dist_min': 0.0, 'dist_max': 0.0,
+    }
+    empty_phase_loss_stats = {
+        'n_pairs_input': 0, 'n_pairs_sufficient_overlap': 0,
+        'loss_self': 0.0, 'loss_cross': 0.0,
+        'curriculum_w': 0.0,
     }
 
     # Aggregate phase pair stats across samples
@@ -395,33 +478,47 @@ def process_batch(
                 agg[key] = sum(vals) / len(vals)  # mean
         return agg
 
+    def aggregate_phase_loss_stats(stats_list: list[dict]) -> dict:
+        if not stats_list:
+            return empty_phase_loss_stats
+        agg = {}
+        for key in empty_phase_loss_stats:
+            vals = [s.get(key, 0.0) for s in stats_list]
+            agg[key] = sum(vals) / len(vals)
+        return agg
+
     if n_valid == 0:
         return {
-            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'n_valid': 0,
+            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
+            'phase_loss': 0.0, 'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'phase_pair_stats': empty_phase_stats,
+            'phase_loss_stats': empty_phase_loss_stats,
         }
 
     # Average losses over valid samples in batch
     mean_loss = total_loss / n_valid
     mean_spectral_loss = total_spectral_loss / n_valid
     mean_spatial_loss = total_spatial_loss / n_valid
+    mean_phase_loss = total_phase_loss / n_valid
 
     if training:
         # Final NaN check before backward
         if not torch.isfinite(mean_loss):
             logger.warning(f"Skipping batch with non-finite mean loss: {mean_loss.item()}")
             return {
-                'loss': float('nan'), 'spectral_loss': float('nan'), 'spatial_loss': float('nan'),
+                'loss': float('nan'), 'spectral_loss': float('nan'),
+                'spatial_loss': float('nan'), 'phase_loss': float('nan'),
                 'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
                 'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
                 'neg_weight_stats': empty_stats,
                 'phase_pair_stats': empty_phase_stats,
+                'phase_loss_stats': empty_phase_loss_stats,
             }
 
         # Backward
@@ -438,6 +535,7 @@ def process_batch(
         mean_loss = mean_loss.item()
         mean_spectral_loss = mean_spectral_loss.item()
         mean_spatial_loss = mean_spatial_loss.item()
+        mean_phase_loss = mean_phase_loss.item()
 
     # Compute distribution statistics for gate values and weights
     def compute_stats(tensors: list[torch.Tensor]) -> dict:
@@ -460,6 +558,7 @@ def process_batch(
         'loss': mean_loss,
         'spectral_loss': mean_spectral_loss,
         'spatial_loss': mean_spatial_loss,
+        'phase_loss': mean_phase_loss,
         'n_valid': n_valid,
         'spectral_pos_pairs': total_spectral_pos_pairs // n_valid if n_valid > 0 else 0,
         'spectral_neg_pairs': total_spectral_neg_pairs // n_valid if n_valid > 0 else 0,
@@ -469,6 +568,7 @@ def process_batch(
         'pos_weight_stats': compute_stats(all_pos_weights),
         'neg_weight_stats': compute_stats(all_neg_weights),
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
+        'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
     }
 
 
@@ -490,6 +590,7 @@ def train_epoch(
     total_loss = 0.0
     total_spectral_loss = 0.0
     total_spatial_loss = 0.0
+    total_phase_loss = 0.0
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -499,12 +600,14 @@ def train_epoch(
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
     last_phase_pair_stats = None
+    last_phase_loss_stats = None
 
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
             phase_sampler=phase_sampler, phase_config=phase_config,
+            epoch=epoch,
         )
 
         scheduler.step()
@@ -513,6 +616,7 @@ def train_epoch(
             total_loss += stats['loss']
             total_spectral_loss += stats['spectral_loss']
             total_spatial_loss += stats['spatial_loss']
+            total_phase_loss += stats['phase_loss']
             total_batches += 1
 
             # Update distribution stats from last valid batch
@@ -520,10 +624,12 @@ def train_epoch(
             last_pos_weight_stats = stats['pos_weight_stats']
             last_neg_weight_stats = stats['neg_weight_stats']
             last_phase_pair_stats = stats.get('phase_pair_stats')
+            last_phase_loss_stats = stats.get('phase_loss_stats')
 
             if batch_idx % log_interval == 0:
                 phase_msg = ""
                 ps = stats.get('phase_pair_stats')
+                pls = stats.get('phase_loss_stats')
                 if ps and ps['n_anchors'] > 0:
                     phase_msg = (
                         f" | Phase: {ps['n_total_pairs']:.0f} pairs "
@@ -531,11 +637,18 @@ def train_epoch(
                         f"overlap={ps['overlap_mean']:.1f}, "
                         f"w={ps['weight_mean']:.3f}±{ps['weight_std']:.3f})"
                     )
+                if pls and pls.get('curriculum_w', 0) > 0:
+                    phase_msg += (
+                        f" | Phase loss: {stats['phase_loss']:.4f} "
+                        f"(self={pls['loss_self']:.4f}, cross={pls['loss_cross']:.4f}, "
+                        f"cw={pls['curriculum_w']:.2f})"
+                    )
 
                 logger.info(
                     f"Epoch {epoch+1} | "
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
-                    f"Loss: {stats['loss']:.4f} (spec: {stats['spectral_loss']:.4f}, spat: {stats['spatial_loss']:.4f}) | "
+                    f"Loss: {stats['loss']:.4f} (spec: {stats['spectral_loss']:.4f}, "
+                    f"spat: {stats['spatial_loss']:.4f}, phase: {stats['phase_loss']:.4f}) | "
                     f"Pairs(+/-): spec {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']}, "
                     f"spat {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
@@ -544,21 +657,24 @@ def train_epoch(
 
     if total_batches == 0:
         return {
-            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0,
+            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
+            'phase_loss': 0.0, 'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
-            'phase_pair_stats': None,
+            'phase_pair_stats': None, 'phase_loss_stats': None,
         }
 
     return {
         'loss': total_loss / total_batches,
         'spectral_loss': total_spectral_loss / total_batches,
         'spatial_loss': total_spatial_loss / total_batches,
+        'phase_loss': total_phase_loss / total_batches,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
         'phase_pair_stats': last_phase_pair_stats,
+        'phase_loss_stats': last_phase_loss_stats,
     }
 
 def validate_epoch(
@@ -569,11 +685,13 @@ def validate_epoch(
     config: dict,
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
+    epoch: int = 0,
 ) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
     total_spectral_loss = 0.0
     total_spatial_loss = 0.0
+    total_phase_loss = 0.0
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -583,6 +701,7 @@ def validate_epoch(
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
     last_phase_pair_stats = None
+    last_phase_loss_stats = None
 
     with torch.no_grad():
         for batch in val_dataloader:
@@ -590,11 +709,13 @@ def validate_epoch(
                 batch, feature_builder, model, device, config,
                 training=False,
                 phase_sampler=phase_sampler, phase_config=phase_config,
+                epoch=epoch,
             )
             if stats['n_valid'] > 0:
                 total_loss += stats['loss']
                 total_spectral_loss += stats['spectral_loss']
                 total_spatial_loss += stats['spatial_loss']
+                total_phase_loss += stats['phase_loss']
                 total_batches += 1
 
                 # Update distribution stats from last valid batch
@@ -602,24 +723,28 @@ def validate_epoch(
                 last_pos_weight_stats = stats['pos_weight_stats']
                 last_neg_weight_stats = stats['neg_weight_stats']
                 last_phase_pair_stats = stats.get('phase_pair_stats')
+                last_phase_loss_stats = stats.get('phase_loss_stats')
 
     if total_batches == 0:
         return {
-            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0, 'batches': 0,
+            'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
+            'phase_loss': 0.0, 'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
-            'phase_pair_stats': None,
+            'phase_pair_stats': None, 'phase_loss_stats': None,
         }
 
     return {
         'loss': total_loss / total_batches,
         'spectral_loss': total_spectral_loss / total_batches,
         'spatial_loss': total_spatial_loss / total_batches,
+        'phase_loss': total_phase_loss / total_batches,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
         'phase_pair_stats': last_phase_pair_stats,
+        'phase_loss_stats': last_phase_loss_stats,
     }
 
 def main():
@@ -762,7 +887,15 @@ def main():
     # Count parameters
     encoder_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     spatial_params = sum(p.numel() for p in model.spatial_conv.parameters() if p.requires_grad)
-    logger.info(f"Trainable parameters: encoder={encoder_params:,}, spatial={spatial_params:,}, total={encoder_params + spatial_params:,}")
+    phase_tcn_params = sum(p.numel() for p in model.phase_tcn.parameters() if p.requires_grad)
+    phase_film_params = sum(p.numel() for p in model.phase_film.parameters() if p.requires_grad)
+    phase_head_params = sum(p.numel() for p in model.phase_head.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        f"Trainable parameters: type(encoder={encoder_params:,}, spatial={spatial_params:,}), "
+        f"phase(tcn={phase_tcn_params:,}, film={phase_film_params:,}, head={phase_head_params:,}), "
+        f"total={total_params:,}"
+    )
 
     # Create optimizer
     logger.info(f"Creating optimizer: lr={lr}, weight_decay={weight_decay}")
@@ -945,21 +1078,37 @@ def main():
         )
         phase_sampler = build_anchor_sampler(bindings_config, phase_anchor_pop)
 
-        # Extract pair construction params from parsed config
+        # Extract pair construction + loss params from parsed config
         ps = phase_loss_cfg.pair_strategy
         pw = phase_loss_cfg.pair_weights
+        cur = phase_loss_cfg.curriculum
         phase_config = {
+            # Pair construction
             'k': ps.type_similarity.k if ps and ps.type_similarity else 16,
             'min_overlap': ps.ysfc_overlap.min_overlap if ps and ps.ysfc_overlap else 3,
             'min_pairs': ps.min_pairs if ps else 5,
             'include_self': ps.include_self if ps else True,
             'sigma': pw.sigma if pw else 5.0,
             'self_pair_weight': pw.self_pair_weight if pw else 1.0,
+            # Loss
+            'weight': phase_loss_cfg.weight if phase_loss_cfg.weight is not None else 1.0,
+            'tau_ref': phase_loss_cfg.tau_ref if phase_loss_cfg.tau_ref is not None else 0.1,
+            'tau_learned': phase_loss_cfg.tau_learned if phase_loss_cfg.tau_learned is not None else 0.1,
+            'min_valid_per_row': phase_loss_cfg.min_valid_per_row if phase_loss_cfg.min_valid_per_row is not None else 2,
+            'self_similarity_weight': phase_loss_cfg.self_similarity_weight if phase_loss_cfg.self_similarity_weight is not None else 1.0,
+            'cross_pixel_weight': phase_loss_cfg.cross_pixel_weight if phase_loss_cfg.cross_pixel_weight is not None else 1.0,
+            # Curriculum
+            'curriculum_start_epoch': cur.start_epoch if cur else 10,
+            'curriculum_ramp_epochs': cur.ramp_epochs if cur else 10,
         }
         logger.info(
-            f"Phase pair construction enabled: sampler={phase_anchor_pop}, "
+            f"Phase loss enabled: sampler={phase_anchor_pop}, "
             f"k={phase_config['k']}, min_overlap={phase_config['min_overlap']}, "
-            f"min_pairs={phase_config['min_pairs']}, sigma={phase_config['sigma']}"
+            f"min_pairs={phase_config['min_pairs']}, sigma={phase_config['sigma']}, "
+            f"tau_ref={phase_config['tau_ref']}, tau_learned={phase_config['tau_learned']}, "
+            f"weight={phase_config['weight']}, "
+            f"curriculum=[start={phase_config['curriculum_start_epoch']}, "
+            f"ramp={phase_config['curriculum_ramp_epochs']}]"
         )
     else:
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
@@ -1006,14 +1155,17 @@ def main():
           val_dataloader, feature_builder, model,
           device, loss_config,
           phase_sampler=phase_sampler, phase_config=phase_config,
+          epoch=epoch,
         )
 
         logger.info(
             f"Epoch {epoch+1}/{num_epochs} complete | "
             f"Train Loss: {train_stats['loss']:.4f} "
-            f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}) | "
+            f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}, "
+            f"phase: {train_stats['phase_loss']:.4f}) | "
             f"Val Loss: {val_stats['loss']:.4f} "
-            f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}) | "
+            f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}, "
+            f"phase: {val_stats['phase_loss']:.4f})"
         )
 
         # Log distribution statistics
@@ -1047,6 +1199,21 @@ def main():
                 f"Weights(sigma={phase_config['sigma']}): {ps['weight_mean']:.3f}±{ps['weight_std']:.3f}"
             )
 
+        # Log phase loss stats
+        pls = train_stats.get('phase_loss_stats')
+        if pls and pls.get('curriculum_w', 0) > 0:
+            logger.info(
+                f"  Phase loss: self={pls['loss_self']:.4f}, cross={pls['loss_cross']:.4f} | "
+                f"Pairs: {pls['n_pairs_input']:.0f} input, "
+                f"{pls['n_pairs_sufficient_overlap']:.0f} with overlap | "
+                f"Curriculum weight: {pls['curriculum_w']:.2f}"
+            )
+        elif pls:
+            logger.info(
+                f"  Phase loss: inactive (curriculum_w={pls['curriculum_w']:.2f}, "
+                f"starts epoch {phase_config['curriculum_start_epoch']+1})"
+            )
+
         # Save checkpoint
         ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
         torch.save({
@@ -1058,9 +1225,11 @@ def main():
             'train_loss': train_stats['loss'],
             'train_spectral_loss': train_stats['spectral_loss'],
             'train_spatial_loss': train_stats['spatial_loss'],
+            'train_phase_loss': train_stats['phase_loss'],
             'val_loss': val_stats['loss'],
             'val_spectral_loss': val_stats['spectral_loss'],
             'val_spatial_loss': val_stats['spatial_loss'],
+            'val_phase_loss': val_stats['phase_loss'],
         }, ckpt_path)
         logger.info(f"Saved checkpoint to {ckpt_path}")
 
