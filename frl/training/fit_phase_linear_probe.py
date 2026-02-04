@@ -6,10 +6,14 @@ What it does
 - Loads a frozen RepresentationModel checkpoint (type + phase pathways).
 - For every patch, runs the type encoder densely to get z_type [B, 64, H, W],
   then the phase encoder densely to get z_phase [B, 12, T, H, W].
-- Concatenates [z_type broadcast across T; z_phase] → [B, 76, T, H, W].
+- Builds a design matrix from z_type (64), z_phase (12), and their full
+  element-wise interaction z_type ⊗ z_phase (64×12 = 768), giving D = 844
+  features per (pixel, timestep) observation.
 - Fits a linear probe (W, b) in closed form via streaming ridge regression
   against the soft_neighborhood_phase target [B, 7, T, H, W] on the
   **original (un-normalized) data scale**.
+- The interaction terms capture the multiplicative type×phase structure that
+  FiLM conditioning creates in the encoder.
 - Only pixels whose spatial location is ≥ ``halo`` pixels from the patch
   edge contribute, avoiding boundary artefacts from the spatial conv.
 - Reports per-channel MSE and R² in original data scale.
@@ -179,6 +183,34 @@ def _iter_batches(dataloader: DataLoader, max_batches: int):
         yield batch
 
 
+def _build_design_matrix(
+    z_type_flat: torch.Tensor,
+    z_phase_flat: torch.Tensor,
+) -> torch.Tensor:
+    """Build [z_type, z_phase, z_type ⊗ z_phase] design matrix.
+
+    Args:
+        z_type_flat:  [N, 64]
+        z_phase_flat: [N, 12]
+
+    Returns:
+        X: [N, 844]  (64 + 12 + 64*12)
+    """
+    # Interaction: outer product per observation, flattened
+    # [N, 64, 1] * [N, 1, 12] → [N, 64, 12] → [N, 768]
+    interaction = (
+        z_type_flat.unsqueeze(2) * z_phase_flat.unsqueeze(1)
+    ).reshape(z_type_flat.shape[0], -1)
+
+    return torch.cat([z_type_flat, z_phase_flat, interaction], dim=1)
+
+
+D_TYPE = 64
+D_PHASE = 12
+D_INTERACTION = D_TYPE * D_PHASE  # 768
+D_TOTAL = D_TYPE + D_PHASE + D_INTERACTION  # 844
+
+
 def fit_phase_probe(
     train_loader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -190,29 +222,25 @@ def fit_phase_probe(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Streaming ridge regression for the phase linear probe.
 
-    The design matrix X is the concatenation of:
-        z_type  [B, 64, H, W]  broadcast to [B, 64, T, H, W]
-        z_phase [B, 12, T, H, W]
-    giving D = 76 features per (pixel, timestep) observation.
+    The design matrix X per (pixel, timestep) observation is:
+        [z_type (64), z_phase (12), z_type ⊗ z_phase (768)]  = 844 features.
 
-    The target Y is soft_neighborhood_phase [B, 7, T, H, W].
+    The interaction terms are computed on the flattened, masked observations
+    to avoid materialising a [B, 768, T, H, W] tensor.
 
-    Only (pixel, timestep) observations that satisfy the combined data mask
-    AND the halo constraint contribute.
+    Normal equations are accumulated on CPU in float64.
 
     Returns:
-        W: [D, C]  = [76, 7]
+        W: [D, C]  = [844, 7]
         b: [C]     = [7]
     """
     model.eval()
-    D_type = 64
-    D_phase = 12
-    D = D_type + D_phase            # 76
     C = len(PHASE_TARGET_CHANNELS)  # 7
-    Da = D + 1                      # augmented with bias
+    Da = D_TOTAL + 1               # 845 (augmented with bias)
 
-    A = torch.zeros((Da, Da), device=device, dtype=torch.float64)
-    B_mat = torch.zeros((Da, C), device=device, dtype=torch.float64)
+    # Accumulate on CPU — the matrices are small, CPU RAM is plentiful
+    A = torch.zeros((Da, Da), dtype=torch.float64)
+    B_mat = torch.zeros((Da, C), dtype=torch.float64)
     n_obs_total = 0
 
     with torch.no_grad():
@@ -220,7 +248,7 @@ def fit_phase_probe(
             Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
                 batch, feature_builder, device,
             )
-            Bsz, _, H, W = Ximg.shape
+            Bsz, _, H, W_sp = Ximg.shape
             T = Xphase.shape[2]
 
             # Type encoder (dense)
@@ -229,53 +257,54 @@ def fit_phase_probe(
             # Phase encoder (dense, stop-grad on z_type)
             z_phase = model.forward_phase(Xphase, z_type.detach())  # [B, 12, T, H, W]
 
-            # Broadcast z_type across T
-            z_type_t = z_type.unsqueeze(2).expand(-1, -1, T, -1, -1)  # [B, 64, T, H, W]
-
-            # Concatenate → [B, 76, T, H, W]
-            z_full = torch.cat([z_type_t, z_phase], dim=1)
-
             # Apply halo mask
-            halo_m = _halo_mask(H, W, halo, device)  # [H, W]
-            full_mask = M & halo_m.unsqueeze(0)       # [B, H, W]
+            halo_m = _halo_mask(H, W_sp, halo, device)  # [H, W]
+            full_mask = M & halo_m.unsqueeze(0)          # [B, H, W]
 
-            # Flatten to [B, T, H, W, D] and [B, T, H, W, C]
-            z_perm = z_full.permute(0, 2, 3, 4, 1).contiguous()    # [B, T, H, W, 76]
+            # Flatten z_type: [B, 64, H, W] → [B, H, W, 64], mask, broadcast T
+            zt = z_type.permute(0, 2, 3, 1).contiguous()            # [B, H, W, 64]
+            zp = z_phase.permute(0, 2, 3, 4, 1).contiguous()       # [B, T, H, W, 12]
             y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()      # [B, T, H, W, 7]
 
             # Broadcast mask: [B, H, W] → [B, T, H, W]
             m_t = full_mask.unsqueeze(1).expand(-1, T, -1, -1)     # [B, T, H, W]
             m_flat = m_t.reshape(-1)
 
-            X = z_perm.reshape(-1, D)[m_flat]   # [N, 76]
-            Y = y_perm.reshape(-1, C)[m_flat]   # [N, 7]
+            # Broadcast z_type across T: [B, H, W, 64] → [B, T, H, W, 64]
+            zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)       # [B, T, H, W, 64]
 
-            if X.numel() == 0:
+            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat]              # [N, 64]
+            zp_flat = zp.reshape(-1, D_PHASE)[m_flat]               # [N, 12]
+            Y = y_perm.reshape(-1, C)[m_flat]                       # [N, 7]
+
+            if zt_flat.shape[0] == 0:
                 continue
 
-            n_obs_total += X.shape[0]
+            n_obs_total += zt_flat.shape[0]
 
+            # Build design matrix on GPU, then move to CPU for accumulation
+            X = _build_design_matrix(zt_flat, zp_flat)              # [N, 844]
             ones = torch.ones((X.shape[0], 1), device=device, dtype=X.dtype)
-            Xaug = torch.cat([X, ones], dim=1).to(torch.float64)  # [N, 77]
-            Y64 = Y.to(torch.float64)
+            Xaug = torch.cat([X, ones], dim=1).to(dtype=torch.float64, device="cpu")  # [N, 845]
+            Y64 = Y.to(dtype=torch.float64, device="cpu")
 
-            A += Xaug.T @ Xaug       # [77, 77]
-            B_mat += Xaug.T @ Y64    # [77, 7]
+            A += Xaug.T @ Xaug       # [845, 845]
+            B_mat += Xaug.T @ Y64    # [845, 7]
 
     if n_obs_total == 0:
         raise RuntimeError("No valid observations found in training data; cannot fit probe.")
 
     # Ridge penalty (not on bias)
-    reg = torch.eye(Da, device=device, dtype=torch.float64) * ridge_lambda
+    reg = torch.eye(Da, dtype=torch.float64) * ridge_lambda
     reg[-1, -1] = 0.0
 
-    Wb = torch.linalg.solve(A + reg, B_mat)  # [77, 7]
-    W = Wb[:-1, :].to(torch.float32)          # [76, 7]
+    Wb = torch.linalg.solve(A + reg, B_mat)  # [845, 7]
+    W = Wb[:-1, :].to(torch.float32)          # [844, 7]
     b = Wb[-1, :].to(torch.float32)           # [7]
 
     logger.info(
         f"Fitted phase probe on {n_obs_total:,} observations "
-        f"(ridge_lambda={ridge_lambda:g}, halo={halo})."
+        f"(D={D_TOTAL}, ridge_lambda={ridge_lambda:g}, halo={halo})."
     )
     return W, b
 
@@ -296,12 +325,15 @@ def evaluate_phase_probe(
 ) -> PhaseProbeMetrics:
     """Evaluate MSE and R² per channel in original data scale."""
     model.eval()
-    D = W.shape[0]   # 76
     C = W.shape[1]   # 7
 
-    sse = torch.zeros(C, device=device, dtype=torch.float64)
-    sum_y = torch.zeros(C, device=device, dtype=torch.float64)
-    sum_y2 = torch.zeros(C, device=device, dtype=torch.float64)
+    # W and b live on CPU (returned from fit), keep accumulators on CPU too
+    W_cpu = W.cpu()
+    b_cpu = b.cpu()
+
+    sse = torch.zeros(C, dtype=torch.float64)
+    sum_y = torch.zeros(C, dtype=torch.float64)
+    sum_y2 = torch.zeros(C, dtype=torch.float64)
     n_obs = 0
 
     with torch.no_grad():
@@ -315,28 +347,31 @@ def evaluate_phase_probe(
             z_type = model(Ximg)
             z_phase = model.forward_phase(Xphase, z_type.detach())
 
-            z_type_t = z_type.unsqueeze(2).expand(-1, -1, T, -1, -1)
-            z_full = torch.cat([z_type_t, z_phase], dim=1)
-
             halo_m = _halo_mask(H, W_sp, halo, device)
             full_mask = M & halo_m.unsqueeze(0)
 
-            # Predict: [B, C, T, H, W]
-            pred = torch.einsum("bdthw,dc->bcthw", z_full, W) + b.view(1, -1, 1, 1, 1)
+            zt = z_type.permute(0, 2, 3, 1).contiguous()
+            zp = z_phase.permute(0, 2, 3, 4, 1).contiguous()
+            y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()
 
-            # Flatten
-            pred_perm = pred.permute(0, 2, 3, 4, 1).contiguous()    # [B,T,H,W,C]
-            y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()       # [B,T,H,W,C]
             m_t = full_mask.unsqueeze(1).expand(-1, T, -1, -1)
             m_flat = m_t.reshape(-1)
 
-            P = pred_perm.reshape(-1, C)[m_flat].to(torch.float64)  # [N, C]
-            Y = y_perm.reshape(-1, C)[m_flat].to(torch.float64)     # [N, C]
+            zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
+            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat]
+            zp_flat = zp.reshape(-1, D_PHASE)[m_flat]
+            Y = y_perm.reshape(-1, C)[m_flat]
 
-            if Y.numel() == 0:
+            if zt_flat.shape[0] == 0:
                 continue
 
-            n_obs += Y.shape[0]
+            n_obs += zt_flat.shape[0]
+
+            # Build design matrix on GPU, predict on CPU
+            X = _build_design_matrix(zt_flat, zp_flat).cpu().float()  # [N, 844]
+            Y = Y.cpu().to(torch.float64)
+
+            P = (X @ W_cpu + b_cpu).to(torch.float64)  # [N, 7]
 
             err = P - Y
             sse += (err * err).sum(dim=0)
@@ -500,8 +535,10 @@ def main():
             "halo": args.halo,
             "target_feature": PHASE_TARGET_FEATURE,
             "target_channels": PHASE_TARGET_CHANNELS,
-            "input_dim_type": 64,
-            "input_dim_phase": 12,
+            "input_dim_type": D_TYPE,
+            "input_dim_phase": D_PHASE,
+            "input_dim_interaction": D_INTERACTION,
+            "input_dim_total": D_TOTAL,
             "encoder_checkpoint": args.checkpoint,
             "train_mse_total": train_metrics.mse_total,
             "train_r2_total": train_metrics.r2_total,
