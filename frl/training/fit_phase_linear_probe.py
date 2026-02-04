@@ -8,16 +8,17 @@ What it does
   then the phase encoder densely to get z_phase [B, 12, T, H, W].
 - Concatenates [z_type broadcast across T; z_phase] → [B, 76, T, H, W].
 - Fits a linear probe (W, b) in closed form via streaming ridge regression
-  against the soft_neighborhood_phase target [B, 7, T, H, W] (Mahalanobis-
-  whitened spectral time-series).
+  against the soft_neighborhood_phase target [B, 7, T, H, W] on the
+  **original (un-normalized) data scale**.
 - Only pixels whose spatial location is ≥ ``halo`` pixels from the patch
   edge contribute, avoiding boundary artefacts from the spatial conv.
-- Reports per-channel MSE and R² in both whitened and original data scale.
+- Reports per-channel MSE and R² in original data scale.
 
-Denormalization
-- The soft_neighborhood_phase feature is produced by: center (subtract per-
-  channel mean), then whiten (W_whiten @ centered).  The inverse is:
-  (1) colour: inv(W_whiten) @ whitened, then (2) add back channel means.
+Targets
+- The soft_neighborhood_phase feature is extracted with normalization and
+  Mahalanobis whitening disabled (``apply_normalization=False,
+  apply_mahalanobis=False``), so the probe fits and predicts directly in
+  the original spectral units.
 
 Usage:
     python training/fit_phase_linear_probe.py \\
@@ -40,7 +41,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -75,65 +76,6 @@ PHASE_TARGET_CHANNELS = [
 
 
 # ---------------------------------------------------------------------------
-# Denormalization helpers
-# ---------------------------------------------------------------------------
-
-def _build_denorm_params(
-    feature_builder: FeatureBuilder,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Build the inverse-whitening matrix and channel-mean vector.
-
-    The forward transform in FeatureBuilder is:
-        centered = data - mean            (per channel)
-        whitened = W_whiten @ centered    (W_whiten = cholesky(cov_inv))
-
-    The inverse is:
-        centered = inv(W_whiten) @ whitened
-        original = centered + mean
-
-    Returns:
-        W_inv: [C, C] inverse whitening matrix (float64 for precision).
-        means: [C]    per-channel means (float64).
-    """
-    W_whiten = feature_builder._get_whitening_matrix(PHASE_TARGET_FEATURE)
-    if W_whiten is None:
-        raise RuntimeError(
-            f"No whitening matrix found for feature '{PHASE_TARGET_FEATURE}'. "
-            "Ensure the stats JSON contains a covariance entry for this feature."
-        )
-
-    W_inv = np.linalg.inv(W_whiten).astype(np.float64)
-
-    feature_config = feature_builder.config.get_feature(PHASE_TARGET_FEATURE)
-    means = np.array(
-        feature_builder._get_channel_means(PHASE_TARGET_FEATURE, feature_config),
-        dtype=np.float64,
-    )
-
-    return W_inv, means
-
-
-def denormalize(
-    whitened: torch.Tensor,
-    W_inv: torch.Tensor,
-    means: torch.Tensor,
-) -> torch.Tensor:
-    """Map predictions from whitened space back to original data scale.
-
-    Args:
-        whitened: [..., C] predictions in whitened space.
-        W_inv: [C, C] inverse whitening matrix.
-        means: [C] channel means.
-
-    Returns:
-        original: [..., C] predictions on the original data scale.
-    """
-    # whitened @ W_inv.T  =>  inv(W_whiten) @ whitened  (row-vector convention)
-    centered = whitened @ W_inv.T
-    return centered + means
-
-
-# ---------------------------------------------------------------------------
 # Halo mask
 # ---------------------------------------------------------------------------
 
@@ -157,10 +99,13 @@ def extract_phase_batch_tensors(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build encoder inputs, phase inputs, targets, and mask for a batch.
 
+    Targets are extracted on the **original data scale** (no normalization,
+    no Mahalanobis whitening).
+
     Returns:
         Ximg:       [B, 16, H, W]        ccdc_history encoder input
         Xphase:     [B, 8, T, H, W]      phase_ls8 temporal input
-        Yimg:       [B, 7, T, H, W]      soft_neighborhood_phase target (whitened)
+        Yimg:       [B, 7, T, H, W]      soft_neighborhood_phase target (original scale)
         M:          [B, H, W]            boolean mask (True = valid, all features)
     """
     batch_size = len(batch["metadata"])
@@ -179,7 +124,11 @@ def extract_phase_batch_tensors(
 
         enc_f = feature_builder.build_feature("ccdc_history", sample)
         phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
-        tgt_f = feature_builder.build_feature(PHASE_TARGET_FEATURE, sample)
+        tgt_f = feature_builder.build_feature(
+            PHASE_TARGET_FEATURE, sample,
+            apply_normalization=False,
+            apply_mahalanobis=False,
+        )
 
         enc = torch.from_numpy(enc_f.data).float()        # [16, H, W]
         phase = torch.from_numpy(phase_f.data).float()    # [8, T, H, W]
@@ -214,16 +163,12 @@ def extract_phase_batch_tensors(
 
 @dataclass
 class PhaseProbeMetrics:
+    """All metrics are in original (un-normalized) data scale."""
     mse_per_channel: Dict[str, float]
     r2_per_channel: Dict[str, float]
     mse_total: float
     r2_total: float
     n_observations: int
-    # Optionally populated with denormalized-scale metrics
-    mse_per_channel_original: Optional[Dict[str, float]] = None
-    r2_per_channel_original: Optional[Dict[str, float]] = None
-    mse_total_original: Optional[float] = None
-    r2_total_original: Optional[float] = None
 
 
 def _iter_batches(dataloader: DataLoader, max_batches: int):
@@ -348,33 +293,15 @@ def evaluate_phase_probe(
     device: torch.device,
     halo: int = 16,
     max_batches_eval: int = 0,
-    W_inv: Optional[torch.Tensor] = None,
-    channel_means: Optional[torch.Tensor] = None,
 ) -> PhaseProbeMetrics:
-    """Evaluate MSE and R² per channel (whitened space, and optionally original scale).
-
-    Args:
-        W_inv: [C, C] inverse whitening matrix (torch, float32). If provided
-            together with *channel_means*, metrics in original data scale are
-            also computed.
-        channel_means: [C] per-channel means (torch, float32).
-    """
+    """Evaluate MSE and R² per channel in original data scale."""
     model.eval()
     D = W.shape[0]   # 76
     C = W.shape[1]   # 7
 
-    compute_original = W_inv is not None and channel_means is not None
-
-    # Accumulators — whitened space
-    sse_w = torch.zeros(C, device=device, dtype=torch.float64)
-    sum_y_w = torch.zeros(C, device=device, dtype=torch.float64)
-    sum_y2_w = torch.zeros(C, device=device, dtype=torch.float64)
-
-    # Accumulators — original scale
-    sse_o = torch.zeros(C, device=device, dtype=torch.float64)
-    sum_y_o = torch.zeros(C, device=device, dtype=torch.float64)
-    sum_y2_o = torch.zeros(C, device=device, dtype=torch.float64)
-
+    sse = torch.zeros(C, device=device, dtype=torch.float64)
+    sum_y = torch.zeros(C, device=device, dtype=torch.float64)
+    sum_y2 = torch.zeros(C, device=device, dtype=torch.float64)
     n_obs = 0
 
     with torch.no_grad():
@@ -394,72 +321,48 @@ def evaluate_phase_probe(
             halo_m = _halo_mask(H, W_sp, halo, device)
             full_mask = M & halo_m.unsqueeze(0)
 
-            # Predict in whitened space: [B, C, T, H, W]
-            # z_full is [B, D, T, H, W]; W is [D, C]
-            pred_w = torch.einsum("bdthw,dc->bcthw", z_full, W) + b.view(1, -1, 1, 1, 1)
+            # Predict: [B, C, T, H, W]
+            pred = torch.einsum("bdthw,dc->bcthw", z_full, W) + b.view(1, -1, 1, 1, 1)
 
             # Flatten
-            pred_perm = pred_w.permute(0, 2, 3, 4, 1).contiguous()   # [B,T,H,W,C]
-            y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()        # [B,T,H,W,C]
+            pred_perm = pred.permute(0, 2, 3, 4, 1).contiguous()    # [B,T,H,W,C]
+            y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()       # [B,T,H,W,C]
             m_t = full_mask.unsqueeze(1).expand(-1, T, -1, -1)
             m_flat = m_t.reshape(-1)
 
-            P = pred_perm.reshape(-1, C)[m_flat].to(torch.float64)   # [N, C]
-            Y = y_perm.reshape(-1, C)[m_flat].to(torch.float64)      # [N, C]
+            P = pred_perm.reshape(-1, C)[m_flat].to(torch.float64)  # [N, C]
+            Y = y_perm.reshape(-1, C)[m_flat].to(torch.float64)     # [N, C]
 
             if Y.numel() == 0:
                 continue
 
             n_obs += Y.shape[0]
 
-            err_w = P - Y
-            sse_w += (err_w * err_w).sum(dim=0)
-            sum_y_w += Y.sum(dim=0)
-            sum_y2_w += (Y * Y).sum(dim=0)
+            err = P - Y
+            sse += (err * err).sum(dim=0)
+            sum_y += Y.sum(dim=0)
+            sum_y2 += (Y * Y).sum(dim=0)
 
-            if compute_original:
-                P_o = denormalize(P.float(), W_inv, channel_means).double()
-                Y_o = denormalize(Y.float(), W_inv, channel_means).double()
-                err_o = P_o - Y_o
-                sse_o += (err_o * err_o).sum(dim=0)
-                sum_y_o += Y_o.sum(dim=0)
-                sum_y2_o += (Y_o * Y_o).sum(dim=0)
-
-    # Compute metrics
-    def _compute_metrics(sse, sum_y, sum_y2, n):
-        mse_per = {}
-        r2_per = {}
-        for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
-            if n == 0:
-                mse_per[ch] = 0.0
-                r2_per[ch] = 0.0
-                continue
-            mse_per[ch] = float(sse[c_idx].item()) / n
-            sst_val = max(0.0, float(sum_y2[c_idx].item()) - float(sum_y[c_idx].item()) ** 2 / n)
-            if sst_val > 1e-8:
-                r2_per[ch] = 1.0 - float(sse[c_idx].item()) / sst_val
-            else:
-                r2_per[ch] = 0.0
-        mse_total = float(np.mean(list(mse_per.values())))
-        r2_total = float(np.mean(list(r2_per.values())))
-        return mse_per, r2_per, mse_total, r2_total
-
-    mse_w, r2_w, mse_wt, r2_wt = _compute_metrics(sse_w, sum_y_w, sum_y2_w, n_obs)
-
-    mse_o = r2_o = mse_ot = r2_ot = None
-    if compute_original:
-        mse_o, r2_o, mse_ot, r2_ot = _compute_metrics(sse_o, sum_y_o, sum_y2_o, n_obs)
+    mse_per: Dict[str, float] = {}
+    r2_per: Dict[str, float] = {}
+    for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+        if n_obs == 0:
+            mse_per[ch] = 0.0
+            r2_per[ch] = 0.0
+            continue
+        mse_per[ch] = float(sse[c_idx].item()) / n_obs
+        sst_val = max(0.0, float(sum_y2[c_idx].item()) - float(sum_y[c_idx].item()) ** 2 / n_obs)
+        if sst_val > 1e-8:
+            r2_per[ch] = 1.0 - float(sse[c_idx].item()) / sst_val
+        else:
+            r2_per[ch] = 0.0
 
     return PhaseProbeMetrics(
-        mse_per_channel=mse_w,
-        r2_per_channel=r2_w,
-        mse_total=mse_wt,
-        r2_total=r2_wt,
+        mse_per_channel=mse_per,
+        r2_per_channel=r2_per,
+        mse_total=float(np.mean(list(mse_per.values()))),
+        r2_total=float(np.mean(list(r2_per.values()))),
         n_observations=n_obs,
-        mse_per_channel_original=mse_o,
-        r2_per_channel_original=r2_o,
-        mse_total_original=mse_ot,
-        r2_total_original=r2_ot,
     )
 
 
@@ -469,8 +372,6 @@ def evaluate_phase_probe(
 
 def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
     logger.info(f"{prefix} results (observations: {metrics.n_observations:,}):")
-
-    logger.info(f"  Whitened space:")
     logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12}")
     logger.info(f"  {'-' * 56}")
     for ch in PHASE_TARGET_CHANNELS:
@@ -482,24 +383,6 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
         )
     logger.info(f"  {'-' * 56}")
     logger.info(f"  {'Average':<30} {metrics.mse_total:>12.6f} {metrics.r2_total:>12.6f}")
-
-    if metrics.mse_per_channel_original is not None:
-        logger.info(f"  Original data scale:")
-        logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12}")
-        logger.info(f"  {'-' * 56}")
-        for ch in PHASE_TARGET_CHANNELS:
-            short = ch.replace("annual.", "")
-            logger.info(
-                f"  {short:<30} "
-                f"{metrics.mse_per_channel_original[ch]:>12.6f} "
-                f"{metrics.r2_per_channel_original[ch]:>12.6f}"
-            )
-        logger.info(f"  {'-' * 56}")
-        logger.info(
-            f"  {'Average':<30} "
-            f"{metrics.mse_total_original:>12.6f} "
-            f"{metrics.r2_total_original:>12.6f}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -577,16 +460,6 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
-    # Build denormalization parameters
-    W_inv_np, means_np = _build_denorm_params(feature_builder)
-    W_inv_t = torch.from_numpy(W_inv_np).float().to(device)
-    means_t = torch.from_numpy(means_np).float().to(device)
-
-    logger.info(
-        f"Denormalization: W_inv {W_inv_t.shape}, means {means_t.shape} "
-        f"(channels: {PHASE_TARGET_CHANNELS})"
-    )
-
     # Fit
     W, b_bias = fit_phase_probe(
         train_loader,
@@ -603,15 +476,11 @@ def main():
         train_loader, feature_builder, model, W, b_bias, device,
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
-        W_inv=W_inv_t,
-        channel_means=means_t,
     )
     val_metrics = evaluate_phase_probe(
         val_loader, feature_builder, model, W, b_bias, device,
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
-        W_inv=W_inv_t,
-        channel_means=means_t,
     )
 
     log_metrics(train_metrics, prefix="TRAIN")
@@ -634,20 +503,12 @@ def main():
             "input_dim_type": 64,
             "input_dim_phase": 12,
             "encoder_checkpoint": args.checkpoint,
-            # Denormalization params
-            "denorm_W_inv": torch.from_numpy(W_inv_np).float(),
-            "denorm_means": torch.from_numpy(means_np).float(),
-            # Summary metrics
             "train_mse_total": train_metrics.mse_total,
             "train_r2_total": train_metrics.r2_total,
             "val_mse_total": val_metrics.mse_total,
             "val_r2_total": val_metrics.r2_total,
             "val_mse_per_channel": val_metrics.mse_per_channel,
             "val_r2_per_channel": val_metrics.r2_per_channel,
-            "val_mse_total_original": val_metrics.mse_total_original,
-            "val_r2_total_original": val_metrics.r2_total_original,
-            "val_mse_per_channel_original": val_metrics.mse_per_channel_original,
-            "val_r2_per_channel_original": val_metrics.r2_per_channel_original,
         },
         out_path,
     )
