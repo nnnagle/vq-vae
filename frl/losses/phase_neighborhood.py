@@ -62,6 +62,10 @@ def build_ysfc_overlap(
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
     """Find shared ysfc values and the time indices for each.
 
+    .. note:: Not used internally — ``build_phase_neighborhood_batch``
+       now computes overlap in vectorized form via indicator matrices.
+       Retained for debugging and external callers.
+
     Parameters
     ----------
     ysfc_i, ysfc_j : Tensor ``[T]``
@@ -109,6 +113,10 @@ def average_features_by_ysfc(
 ) -> torch.Tensor:
     """Average features within each ysfc group.
 
+    .. note:: Not used internally — ``build_phase_neighborhood_batch``
+       now averages features via batched matmul over indicator matrices.
+       Retained for debugging and external callers.
+
     Parameters
     ----------
     features : Tensor ``[T, C]``
@@ -143,6 +151,10 @@ def compute_aligned_distances(
     M: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Compute ysfc-aligned self-similarity and cross-pixel distance matrices.
+
+    .. note:: Not used internally — ``build_phase_neighborhood_batch``
+       now computes aligned distances for all pairs at once via batched
+       ``cdist``.  Retained for debugging and external callers.
 
     For each shared ysfc value, features are averaged across any
     duplicate time steps.  Then two pairs of distance matrices are
