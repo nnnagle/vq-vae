@@ -37,23 +37,37 @@ import torch
 import torch.nn as nn
 
 from .conv2d_encoder import Conv2DEncoder
+from .conditioning import FiLMLayer
 from .spatial import GatedResidualConv2D
+from .tcn import TCNEncoder
 
 logger = logging.getLogger(__name__)
 
 
 class RepresentationModel(nn.Module):
-    """Full encoder pipeline: Conv2DEncoder -> GatedResidualConv2D.
+    """Full encoder pipeline for type and phase embeddings.
+
+    **Type pathway** (v1):
+        ``[B, 16, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, 64, H, W]``
+
+    **Phase pathway** (v2):
+        ``[B, 8, T, H, W]`` → TCN → FiLM(stopgrad z_type) → 1×1 proj → z_phase ``[B, 12, T, H, W]``
+
+    The FiLM generates gamma/beta once from the spatial z_type and
+    broadcasts them across all timesteps (the type identity modulates
+    temporal features uniformly).
 
     Attributes:
         VERSION: Architecture version string. Bump this whenever the forward
             pipeline changes in a checkpoint-incompatible way.
     """
 
-    VERSION = "1"
+    VERSION = "2"
 
     def __init__(self) -> None:
         super().__init__()
+
+        # --- Type pathway ---
         self.encoder = Conv2DEncoder(
             in_channels=16,
             channels=[128, 64],
@@ -71,23 +85,77 @@ class RepresentationModel(nn.Module):
             gate_kernel_size=1,
         )
 
+        # --- Phase pathway ---
+        self.phase_tcn = TCNEncoder(
+            in_channels=8,
+            channels=[64, 64, 64],
+            kernel_size=3,
+            dilations=[1, 2, 4],
+            dropout_rate=0.1,
+            num_groups=8,
+            pooling='none',
+        )
+        # FiLM: generates gamma/beta from z_type [B, 64, H, W]
+        # to modulate TCN output (64-dim), broadcast across T
+        self.phase_film = FiLMLayer(
+            cond_dim=64,
+            target_dim=64,
+            hidden_dim=64,
+        )
+        # Project to final phase embedding dimension
+        self.phase_head = nn.Conv2d(64, 12, kernel_size=1)
+
     def forward(
         self, x: torch.Tensor, return_gate: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
+        """Type pathway forward.
+
         Args:
-            x: Input tensor ``[B, C_in, H, W]`` (e.g. 16-channel ccdc_history).
+            x: Input tensor ``[B, 16, H, W]`` (ccdc_history features).
             return_gate: If True, also return the spatial gate tensor.
 
         Returns:
-            If *return_gate* is False: ``z [B, D, H, W]`` embeddings.
-            If *return_gate* is True: ``(z, gate)`` where gate is ``[B, D, H, W]``.
+            If *return_gate* is False: ``z_type [B, 64, H, W]``.
+            If *return_gate* is True: ``(z_type, gate)``.
         """
         h = self.encoder(x)
         if return_gate:
             z, gate = self.spatial_conv(h, return_gate=True)
             return z, gate
         return self.spatial_conv(h)
+
+    def forward_phase(
+        self,
+        x_phase: torch.Tensor,
+        z_type: torch.Tensor,
+    ) -> torch.Tensor:
+        """Phase pathway forward.
+
+        Args:
+            x_phase: Temporal input ``[B, 8, T, H, W]`` (phase_ls8 features).
+            z_type: Type embeddings ``[B, 64, H, W]`` (**caller must
+                stop-grad** before passing in).
+
+        Returns:
+            z_phase: ``[B, 12, T, H, W]`` phase embeddings.
+        """
+        B, C, T, H, W = x_phase.shape
+
+        # TCN along time: [B, 8, T, H, W] -> [B, 64, T, H, W]
+        h = self.phase_tcn(x_phase)
+
+        # FiLM: generate gamma/beta from z_type once, broadcast across T
+        gamma, beta = self.phase_film(z_type)  # each [B, 64, H, W]
+        gamma = gamma.unsqueeze(2)  # [B, 64, 1, H, W]
+        beta = beta.unsqueeze(2)    # [B, 64, 1, H, W]
+        h = gamma * h + beta        # [B, 64, T, H, W]
+
+        # Project per-timestep: reshape to [B*T, 64, H, W] for Conv2d
+        h = h.permute(0, 2, 1, 3, 4).reshape(B * T, 64, H, W)
+        z_phase = self.phase_head(h)  # [B*T, 12, H, W]
+        z_phase = z_phase.reshape(B, T, 12, H, W).permute(0, 2, 1, 3, 4)
+
+        return z_phase  # [B, 12, T, H, W]
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
