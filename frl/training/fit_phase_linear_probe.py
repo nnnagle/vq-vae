@@ -186,23 +186,43 @@ def _iter_batches(dataloader: DataLoader, max_batches: int):
 def _build_design_matrix(
     z_type_flat: torch.Tensor,
     z_phase_flat: torch.Tensor,
+    design: str = "full",
 ) -> torch.Tensor:
-    """Build [z_type, z_phase, z_type ⊗ z_phase] design matrix.
+    """Build the design matrix according to *design*.
 
     Args:
         z_type_flat:  [N, 64]
         z_phase_flat: [N, 12]
+        design: one of
+            ``"full"``       – [z_type, z_phase, z_type ⊗ z_phase]  (844 cols)
+            ``"type-only"``  – [z_type]                               (64 cols)
+            ``"phase-only"`` – [z_phase]                              (12 cols)
 
     Returns:
-        X: [N, 844]  (64 + 12 + 64*12)
+        X: [N, D]
     """
-    # Interaction: outer product per observation, flattened
-    # [N, 64, 1] * [N, 1, 12] → [N, 64, 12] → [N, 768]
+    if design == "type-only":
+        return z_type_flat
+    if design == "phase-only":
+        return z_phase_flat
+
+    # full: main effects + interaction
     interaction = (
         z_type_flat.unsqueeze(2) * z_phase_flat.unsqueeze(1)
     ).reshape(z_type_flat.shape[0], -1)
-
     return torch.cat([z_type_flat, z_phase_flat, interaction], dim=1)
+
+
+def _design_dim(design: str) -> int:
+    """Return the number of columns produced by *design*."""
+    if design == "type-only":
+        return D_TYPE
+    if design == "phase-only":
+        return D_PHASE
+    return D_TOTAL
+
+
+DESIGN_CHOICES = ("full", "type-only", "phase-only")
 
 
 D_TYPE = 64
@@ -219,24 +239,24 @@ def fit_phase_probe(
     ridge_lambda: float = 1e-3,
     halo: int = 16,
     max_batches_train: int = 0,
+    design: str = "full",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Streaming ridge regression for the phase linear probe.
 
-    The design matrix X per (pixel, timestep) observation is:
-        [z_type (64), z_phase (12), z_type ⊗ z_phase (768)]  = 844 features.
-
-    The interaction terms are computed on the flattened, masked observations
-    to avoid materialising a [B, 768, T, H, W] tensor.
+    Args:
+        design: ``"full"`` (type + phase + interaction, 844 cols),
+            ``"type-only"`` (64 cols), or ``"phase-only"`` (12 cols).
 
     Normal equations are accumulated on CPU in float64.
 
     Returns:
-        W: [D, C]  = [844, 7]
-        b: [C]     = [7]
+        W: [D, C]
+        b: [C]
     """
     model.eval()
+    D = _design_dim(design)
     C = len(PHASE_TARGET_CHANNELS)  # 7
-    Da = D_TOTAL + 1               # 845 (augmented with bias)
+    Da = D + 1
 
     # Accumulate on CPU — the matrices are small, CPU RAM is plentiful
     A = torch.zeros((Da, Da), dtype=torch.float64)
@@ -282,10 +302,10 @@ def fit_phase_probe(
 
             n_obs_total += zt_flat.shape[0]
 
-            # Move to CPU before building interaction (768 cols is large)
+            # Move to CPU before building design matrix
             zt_cpu = zt_flat.cpu()
             zp_cpu = zp_flat.cpu()
-            X = _build_design_matrix(zt_cpu, zp_cpu)                # [N, 844]
+            X = _build_design_matrix(zt_cpu, zp_cpu, design)       # [N, D]
             ones = torch.ones((X.shape[0], 1), dtype=X.dtype)
             Xaug = torch.cat([X, ones], dim=1).to(torch.float64)   # [N, 845]
             Y64 = Y.to(dtype=torch.float64, device="cpu")
@@ -306,7 +326,7 @@ def fit_phase_probe(
 
     logger.info(
         f"Fitted phase probe on {n_obs_total:,} observations "
-        f"(D={D_TOTAL}, ridge_lambda={ridge_lambda:g}, halo={halo})."
+        f"(design={design}, D={D}, ridge_lambda={ridge_lambda:g}, halo={halo})."
     )
     return W, b
 
@@ -324,6 +344,7 @@ def evaluate_phase_probe(
     device: torch.device,
     halo: int = 16,
     max_batches_eval: int = 0,
+    design: str = "full",
 ) -> PhaseProbeMetrics:
     """Evaluate MSE and R² per channel in original data scale."""
     model.eval()
@@ -370,7 +391,7 @@ def evaluate_phase_probe(
             n_obs += zt_flat.shape[0]
 
             # Build design matrix on GPU, predict on CPU
-            X = _build_design_matrix(zt_flat, zp_flat).cpu().float()  # [N, 844]
+            X = _build_design_matrix(zt_flat, zp_flat, design).cpu().float()  # [N, D]
             Y = Y.cpu().to(torch.float64)
 
             P = (X @ W_cpu + b_cpu).to(torch.float64)  # [N, 7]
@@ -440,6 +461,10 @@ def main():
     parser.add_argument("--max-batches-train", type=int, default=0, help="Cap batches for fitting (0 = all)")
     parser.add_argument("--max-batches-eval", type=int, default=0, help="Cap batches for eval (0 = all)")
     parser.add_argument("--output", type=str, default=None, help="Optional path to save fitted probe (.pt)")
+    parser.add_argument(
+        "--design", type=str, default="full", choices=DESIGN_CHOICES,
+        help="Design matrix: full (type+phase+interaction), type-only, phase-only",
+    )
     args = parser.parse_args()
 
     logger.info(f"Loading bindings config from {args.bindings}")
@@ -497,6 +522,8 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
+    logger.info(f"Design matrix: {args.design} (D={_design_dim(args.design)})")
+
     # Fit
     W, b_bias = fit_phase_probe(
         train_loader,
@@ -506,6 +533,7 @@ def main():
         ridge_lambda=args.ridge_lambda,
         halo=args.halo,
         max_batches_train=args.max_batches_train,
+        design=args.design,
     )
 
     # Evaluate
@@ -513,11 +541,13 @@ def main():
         train_loader, feature_builder, model, W, b_bias, device,
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
+        design=args.design,
     )
     val_metrics = evaluate_phase_probe(
         val_loader, feature_builder, model, W, b_bias, device,
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
+        design=args.design,
     )
 
     log_metrics(train_metrics, prefix="TRAIN")
@@ -537,10 +567,8 @@ def main():
             "halo": args.halo,
             "target_feature": PHASE_TARGET_FEATURE,
             "target_channels": PHASE_TARGET_CHANNELS,
-            "input_dim_type": D_TYPE,
-            "input_dim_phase": D_PHASE,
-            "input_dim_interaction": D_INTERACTION,
-            "input_dim_total": D_TOTAL,
+            "design": args.design,
+            "input_dim": _design_dim(args.design),
             "encoder_checkpoint": args.checkpoint,
             "train_mse_total": train_metrics.mse_total,
             "train_r2_total": train_metrics.r2_total,
