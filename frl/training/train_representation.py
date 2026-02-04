@@ -368,28 +368,35 @@ def process_batch(
                         phase_ls8_data = torch.from_numpy(
                             phase_ls8_feature.data
                         ).float().to(device)
-                        # phase_ls8_data: [C, T, H, W] -> [1, C, T, H, W]
+                        # phase_ls8_data: [C, T, H, W]
 
-                        # Run phase encoder (stop-grad on z_type)
-                        z_phase = model.forward_phase(
-                            phase_ls8_data.unsqueeze(0),
-                            z_full.unsqueeze(0).detach(),
-                        )  # [1, 12, T, H, W]
-                        z_phase = z_phase.squeeze(0)  # [12, T, H, W]
+                        # Extract only anchor pixel time-series (avoid dense TCN)
+                        phase_anchors_dev = phase_anchors.to(device)
+                        phase_ls8_at_anchors = extract_temporal_at_locations(
+                            phase_ls8_data, phase_anchors_dev
+                        )  # [N_phase, T, C]
+                        phase_ls8_at_anchors = phase_ls8_at_anchors.permute(
+                            0, 2, 1
+                        )  # [N_phase, C, T]
+
+                        # Extract z_type at anchor locations (stop-grad)
+                        z_type_at_anchors = extract_at_locations(
+                            z_full.detach(), phase_anchors_dev
+                        )  # [N_phase, 64]
+
+                        # Run phase encoder on anchor pixels only
+                        z_phase_at_anchors = model.forward_phase_at_locations(
+                            phase_ls8_at_anchors, z_type_at_anchors
+                        )  # [N_phase, T, 12]
 
                         # Spectral reference: static [C,H,W] expanded to [N,T,C]
-                        T_phase = z_phase.shape[1]
+                        T_phase = z_phase_at_anchors.shape[1]
                         spec_at_phase_anchors = extract_at_locations(
-                            spec_dist_data, phase_anchors.to(device)
+                            spec_dist_data, phase_anchors_dev
                         )  # [N_phase, C]
                         spec_at_phase_anchors = spec_at_phase_anchors.unsqueeze(
                             1
                         ).expand(-1, T_phase, -1)
-
-                        # Phase embeddings: [12, T, H, W] -> [N_phase, T, 12]
-                        z_phase_at_anchors = extract_temporal_at_locations(
-                            z_phase, phase_anchors.to(device)
-                        )  # [N_phase, T, 12]
 
                         # ysfc on GPU for loss
                         ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
