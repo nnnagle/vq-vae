@@ -229,13 +229,15 @@ def build_phase_neighborhood_batch(
 ) -> dict[str, torch.Tensor | int]:
     """Prepare aligned distance matrices for a batch of pixel pairs.
 
-    For each pair ``(i, j)``:
+    Vectorized implementation — no Python loops over pairs.  The strategy:
 
-    1. Find shared ysfc values; average features within duplicates.
-    2. Compute self-similarity distances (reference at *j*, learned at *i*).
-    3. Compute cross-pixel distances (reference and learned between
-       *i* and *j*).
-    4. Pad all matrices to a common size M and build masks.
+    1. Build per-pixel indicator matrices ``[N, V, T]`` mapping each ysfc
+       value to its timestep(s).
+    2. Average features per ysfc value via batched matmul.
+    3. Compute per-pair overlap from presence vectors.
+    4. Align shared ysfc values to padded positions via a mapping matrix
+       and batched matmul (autograd-safe).
+    5. Compute all distance matrices with four batched ``cdist`` calls.
 
     Parameters
     ----------
@@ -272,26 +274,43 @@ def build_phase_neighborhood_batch(
         Padded matrix size.
     """
     B = pair_indices.shape[0]
-    T = spectral_features.shape[1]
+    N, T, C = spectral_features.shape
+    D = phase_embeddings.shape[2]
     device = spectral_features.device
     dtype = spectral_features.dtype
 
-    # --- First pass: compute overlap sizes ---------------------------------
-    overlap_data = []
-    overlap_sizes = []
+    # --- Remap ysfc to contiguous 0..V-1 ---
+    ysfc_long = ysfc.long()
+    unique_vals, ysfc_remapped = torch.unique(ysfc_long, return_inverse=True)
+    ysfc_remapped = ysfc_remapped.reshape(N, T)
+    V = unique_vals.shape[0]
 
-    for b in range(B):
-        i_idx = pair_indices[b, 0].item()
-        j_idx = pair_indices[b, 1].item()
-        shared_values, groups_i, groups_j = build_ysfc_overlap(
-            ysfc[i_idx], ysfc[j_idx]
-        )
-        K = shared_values.shape[0]
-        overlap_data.append((i_idx, j_idx, shared_values, groups_i, groups_j, K))
-        overlap_sizes.append(K)
+    # --- Build indicator matrix [N, V, T] ---
+    # indicator[n, v, t] = 1.0 if ysfc_remapped[n, t] == v
+    indicator = torch.zeros(N, V, T, device=device, dtype=dtype)
+    n_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(ysfc_remapped)
+    t_idx = torch.arange(T, device=device).unsqueeze(0).expand_as(ysfc_remapped)
+    indicator[n_idx, ysfc_remapped, t_idx] = 1.0
 
-    overlap_sizes_t = torch.tensor(overlap_sizes, device=device)
-    valid_pair_mask = overlap_sizes_t >= min_overlap
+    # --- Counts and presence per (pixel, ysfc value) ---
+    counts = indicator.sum(dim=2)  # [N, V]
+    presence = counts > 0          # [N, V]
+
+    # --- Average features per ysfc value via batched matmul ---
+    counts_safe = counts.clamp(min=1).unsqueeze(-1)  # [N, V, 1]
+    # [N, V, T] @ [N, T, C] -> [N, V, C]
+    avg_spec = torch.bmm(indicator, spectral_features) / counts_safe
+    # [N, V, T] @ [N, T, D] -> [N, V, D]
+    avg_phase = torch.bmm(indicator, phase_embeddings) / counts_safe
+
+    # --- Per-pair overlap ---
+    idx_i = pair_indices[:, 0]  # [B]
+    idx_j = pair_indices[:, 1]  # [B]
+    shared = presence[idx_i] & presence[idx_j]  # [B, V]
+    K_per_pair = shared.sum(dim=1)  # [B]
+
+    # --- Filter by min_overlap ---
+    valid_pair_mask = K_per_pair >= min_overlap
 
     empty_result = {
         "d_ref_self": torch.zeros(0, T, T, device=device, dtype=dtype),
@@ -307,59 +326,49 @@ def build_phase_neighborhood_batch(
     if not valid_pair_mask.any():
         return empty_result
 
-    M = overlap_sizes_t[valid_pair_mask].max().item()
+    # --- Restrict to valid pairs ---
+    valid_idx = valid_pair_mask.nonzero(as_tuple=False).squeeze(1)
+    B_valid = valid_idx.shape[0]
+    idx_i_v = idx_i[valid_idx]   # [B_valid]
+    idx_j_v = idx_j[valid_idx]   # [B_valid]
+    shared_v = shared[valid_idx]  # [B_valid, V]
+    K_valid = K_per_pair[valid_idx]  # [B_valid]
+    M = K_valid.max().item()
 
-    # --- Second pass: build aligned matrices -------------------------------
-    valid_indices = valid_pair_mask.nonzero(as_tuple=False).squeeze(1)
-    B_valid = valid_indices.shape[0]
+    # --- Build mapping matrix [B_valid, M, V] ---
+    # Maps each shared ysfc value to a compressed position 0..K-1.
+    # mapping[b, pos, v] = 1.0 iff ysfc value v is the pos-th shared
+    # value for pair b.  Used via bmm to align features.
+    positions = shared_v.long().cumsum(dim=1) - 1  # [B_valid, V]
+    b_nz, v_nz = shared_v.nonzero(as_tuple=True)
+    pos_nz = positions[b_nz, v_nz]
 
-    d_ref_self = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
-    d_learned_self = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
-    mask_self_batch = torch.zeros(B_valid, M, M, device=device, dtype=torch.bool)
+    mapping = torch.zeros(B_valid, M, V, device=device, dtype=dtype)
+    mapping[b_nz, pos_nz, v_nz] = 1.0
 
-    d_ref_cross = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
-    d_learned_cross = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
-    mask_cross_batch = torch.zeros(B_valid, M, M, device=device, dtype=torch.bool)
+    # --- Gather per-pair averaged features and align via bmm ---
+    avg_spec_i = avg_spec[idx_i_v]    # [B_valid, V, C]
+    avg_spec_j = avg_spec[idx_j_v]    # [B_valid, V, C]
+    avg_phase_i = avg_phase[idx_i_v]  # [B_valid, V, D]
+    avg_phase_j = avg_phase[idx_j_v]  # [B_valid, V, D]
 
-    for out_b, in_b in enumerate(valid_indices.tolist()):
-        i_idx, j_idx, shared_values, groups_i, groups_j, K = overlap_data[in_b]
+    aligned_i_spec = torch.bmm(mapping, avg_spec_i)    # [B_valid, M, C]
+    aligned_j_spec = torch.bmm(mapping, avg_spec_j)    # [B_valid, M, C]
+    aligned_i_phase = torch.bmm(mapping, avg_phase_i)  # [B_valid, M, D]
+    aligned_j_phase = torch.bmm(mapping, avg_phase_j)  # [B_valid, M, D]
 
-        # Average spectral features within ysfc groups.
-        r_i_avg = average_features_by_ysfc(
-            spectral_features[i_idx], groups_i, K
-        )  # [K, C]
-        r_j_avg = average_features_by_ysfc(
-            spectral_features[j_idx], groups_j, K
-        )  # [K, C]
+    # --- Batched distance matrices ---
+    d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)        # [B_valid, M, M]
+    d_learned_self = torch.cdist(aligned_i_phase, aligned_i_phase)   # [B_valid, M, M]
+    d_ref_cross = torch.cdist(aligned_i_spec, aligned_j_spec)       # [B_valid, M, M]
+    d_learned_cross = torch.cdist(aligned_i_phase, aligned_j_phase)  # [B_valid, M, M]
 
-        # Average phase embeddings within ysfc groups.
-        z_i_avg = average_features_by_ysfc(
-            phase_embeddings[i_idx], groups_i, K
-        )  # [K, D]
-        z_j_avg = average_features_by_ysfc(
-            phase_embeddings[j_idx], groups_j, K
-        )  # [K, D]
-
-        # Self-similarity: reference at j, learned at i.
-        d_ref_self[out_b, :K, :K] = torch.cdist(
-            r_j_avg.unsqueeze(0), r_j_avg.unsqueeze(0)
-        ).squeeze(0)
-        d_learned_self[out_b, :K, :K] = torch.cdist(
-            z_i_avg.unsqueeze(0), z_i_avg.unsqueeze(0)
-        ).squeeze(0)
-
-        mask_self_batch[out_b, :K, :K] = True
-        mask_self_batch[out_b, range(K), range(K)] = False
-
-        # Cross-pixel: i vs j.
-        d_ref_cross[out_b, :K, :K] = torch.cdist(
-            r_i_avg.unsqueeze(0), r_j_avg.unsqueeze(0)
-        ).squeeze(0)
-        d_learned_cross[out_b, :K, :K] = torch.cdist(
-            z_i_avg.unsqueeze(0), z_j_avg.unsqueeze(0)
-        ).squeeze(0)
-
-        mask_cross_batch[out_b, :K, :K] = True
+    # --- Masks ---
+    range_M = torch.arange(M, device=device)
+    valid_pos = range_M.unsqueeze(0) < K_valid.unsqueeze(1)  # [B_valid, M]
+    mask_cross_batch = valid_pos.unsqueeze(2) & valid_pos.unsqueeze(1)  # [B_valid, M, M]
+    diag = torch.eye(M, device=device, dtype=torch.bool).unsqueeze(0)
+    mask_self_batch = mask_cross_batch & ~diag
 
     return {
         "d_ref_self": d_ref_self,
