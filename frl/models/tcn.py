@@ -1,5 +1,9 @@
 """
-TCN (Temporal Convolutional Network) encoder for [B, C, T, H, W] tensors.
+TCN (Temporal Convolutional Network) encoder.
+
+Accepts either ``[N, C, T]`` (batch of sequences) or ``[B, C, T, H, W]``
+(spatial grid of sequences).  The 5-D path reshapes to ``[B*H*W, C, T]``,
+runs the same 1-D convolution stack, then reshapes back.
 
 Features:
 - Dilated causal or non-causal 1D convolutions along time dimension
@@ -109,10 +113,12 @@ class GatedResidualBlock(nn.Module):
 
 class TCNEncoder(nn.Module):
     """
-    Temporal Convolutional Network encoder for [B, C, T, H, W] tensors.
+    Temporal Convolutional Network encoder.
 
-    Processes each spatial location independently by applying 1D convolutions
-    along the time dimension with gated residual connections.
+    Accepts **3-D** ``[N, C, T]`` or **5-D** ``[B, C, T, H, W]`` inputs.
+    The 5-D path flattens spatial dims to the batch axis, runs the same
+    1-D convolution stack, then reshapes back.  The 3-D path skips the
+    spatial bookkeeping entirely.
 
     Args:
         in_channels: Number of input channels
@@ -136,9 +142,13 @@ class TCNEncoder(nn.Module):
         ...     num_groups=16,
         ...     pooling='stats'
         ... )
+        >>> # 5-D spatial input
         >>> x = torch.randn(2, 7, 10, 32, 32)  # [B, C, T, H, W]
-        >>> mask = torch.ones(2, 10, 32, 32, dtype=torch.bool)  # All valid
-        >>> out = tcn(x, mask=mask)  # [B, 256, 32, 32] if pooling='stats' (mean+std)
+        >>> mask = torch.ones(2, 10, 32, 32, dtype=torch.bool)
+        >>> out = tcn(x, mask=mask)  # [B, 256, 32, 32] if pooling='stats'
+        >>> # 3-D sequence input
+        >>> x = torch.randn(500, 7, 10)  # [N, C, T]
+        >>> out = tcn(x)  # [N, 256] if pooling='stats', [N, 128, 10] if 'none'
     """
 
     def __init__(
@@ -210,82 +220,84 @@ class TCNEncoder(nn.Module):
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            x: Input tensor [B, C, T, H, W]
-            mask: Optional validity mask [B, T, H, W] where True/1.0 = valid, False/0.0 = masked.
-                  Used during pooling to exclude invalid timesteps (e.g., clouds, missing data).
+            x: Input tensor, either:
+                - ``[N, C, T]``  — batch of sequences (no spatial dims), or
+                - ``[B, C, T, H, W]`` — spatial grid of sequences.
+            mask: Optional validity mask.
+                - For 3-D input: ``[N, T]``
+                - For 5-D input: ``[B, T, H, W]``
+                True/1.0 = valid, False/0.0 = masked.
+                Used during pooling to exclude invalid timesteps.
 
         Returns:
-            If pooling='stats': [B, 2*C_out, H, W] (mean and std concatenated)
-            If pooling='none': [B, C_out, T, H, W]
+            For 3-D input:
+                - pooling='stats': ``[N, 2*C_out]``
+                - pooling='none':  ``[N, C_out, T]``
+            For 5-D input:
+                - pooling='stats': ``[B, 2*C_out, H, W]``
+                - pooling='none':  ``[B, C_out, T, H, W]``
         """
-        B, C, T, H, W = x.shape
+        spatial = x.ndim == 5
 
-        # Reshape to [B*H*W, C, T] for 1D convolutions along time
-        x = x.permute(0, 3, 4, 1, 2)  # [B, H, W, C, T]
-        x = x.reshape(B * H * W, C, T)  # [B*H*W, C, T]
-
-        # Reshape mask if provided: [B, T, H, W] -> [B*H*W, T]
-        if mask is not None:
-            mask = mask.permute(0, 2, 3, 1)  # [B, H, W, T]
-            mask = mask.reshape(B * H * W, T)  # [B*H*W, T]
-            # Ensure mask is float for computation
-            mask = mask.float()
+        if spatial:
+            B, C, T, H, W = x.shape
+            # Flatten spatial dims into batch: [B*H*W, C, T]
+            x = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, C, T)
+            if mask is not None:
+                mask = mask.permute(0, 2, 3, 1).reshape(B * H * W, T)
+                mask = mask.float()
+        else:
+            T = x.size(2)
+            if mask is not None:
+                mask = mask.float()
 
         # Apply TCN layers
         for layer in self.layers:
-            x = layer(x)  # [B*H*W, C_out, T]
+            x = layer(x)  # [N, C_out, T]
 
         C_out = x.size(1)
 
         # Apply pooling
         if self.pooling == 'stats':
             if mask is not None:
-                # Masked mean and std computation
-                # Expand mask to match feature channels: [B*H*W, T] -> [B*H*W, 1, T]
-                mask_expanded = mask.unsqueeze(1)  # [B*H*W, 1, T]
-
-                # Count valid timesteps per location
-                valid_count = mask_expanded.sum(dim=2, keepdim=False)  # [B*H*W, 1]
-                valid_count = torch.clamp(valid_count, min=1.0)  # Avoid division by zero
-
-                # Masked mean: sum(x * mask) / count_valid
-                masked_x = x * mask_expanded  # [B*H*W, C_out, T]
-                mean = masked_x.sum(dim=2) / valid_count  # [B*H*W, C_out]
-
-                # Masked std: sqrt(sum((x - mean)^2 * mask) / count_valid)
-                mean_expanded = mean.unsqueeze(2)  # [B*H*W, C_out, 1]
-                squared_diff = ((x - mean_expanded) ** 2) * mask_expanded  # [B*H*W, C_out, T]
-                variance = squared_diff.sum(dim=2) / valid_count  # [B*H*W, C_out]
-                std = torch.sqrt(variance + 1e-8)  # Add small epsilon for numerical stability
+                mask_expanded = mask.unsqueeze(1)  # [N, 1, T]
+                valid_count = mask_expanded.sum(dim=2, keepdim=False)  # [N, 1]
+                valid_count = torch.clamp(valid_count, min=1.0)
+                masked_x = x * mask_expanded
+                mean = masked_x.sum(dim=2) / valid_count  # [N, C_out]
+                mean_expanded = mean.unsqueeze(2)
+                squared_diff = ((x - mean_expanded) ** 2) * mask_expanded
+                variance = squared_diff.sum(dim=2) / valid_count
+                std = torch.sqrt(variance + 1e-8)
             else:
-                # Standard mean and std across time dimension (no masking)
-                mean = x.mean(dim=2)  # [B*H*W, C_out]
-                std = x.std(dim=2)    # [B*H*W, C_out]
+                mean = x.mean(dim=2)  # [N, C_out]
+                std = x.std(dim=2)
 
-            x = torch.cat([mean, std], dim=1)  # [B*H*W, 2*C_out]
+            x = torch.cat([mean, std], dim=1)  # [N, 2*C_out]
 
-            # Reshape back to [B, 2*C_out, H, W]
-            x = x.reshape(B, H, W, 2 * C_out)
-            x = x.permute(0, 3, 1, 2)  # [B, 2*C_out, H, W]
-
-            # Post-pool normalization
-            if self.post_pool_norm:
-                # LayerNorm over channel dimension
-                x = x.permute(0, 2, 3, 1)  # [B, H, W, 2*C_out]
-                x = self.post_norm(x)
-                x = x.permute(0, 3, 1, 2)  # [B, 2*C_out, H, W]
+            if spatial:
+                x = x.reshape(B, H, W, 2 * C_out).permute(0, 3, 1, 2)
+                if self.post_pool_norm:
+                    x = x.permute(0, 2, 3, 1)
+                    x = self.post_norm(x)
+                    x = x.permute(0, 3, 1, 2)
+            else:
+                if self.post_pool_norm:
+                    x = self.post_norm(x)  # [N, 2*C_out]
 
         elif self.pooling == 'none':
-            # Keep temporal dimension: [B*H*W, C_out, T] -> [B, C_out, T, H, W]
-            x = x.reshape(B, H, W, C_out, T)
-            x = x.permute(0, 3, 4, 1, 2)  # [B, C_out, T, H, W]
-
-            # Post-pool normalization (applied per spatial location, over C dimension)
-            if self.post_pool_norm:
-                # Normalize over channel dimension at each time/spatial location
-                x = x.permute(0, 2, 3, 4, 1)  # [B, T, H, W, C_out]
-                x = self.post_norm(x)
-                x = x.permute(0, 4, 1, 2, 3)  # [B, C_out, T, H, W]
+            if spatial:
+                x = x.reshape(B, H, W, C_out, T).permute(0, 3, 4, 1, 2)
+                if self.post_pool_norm:
+                    x = x.permute(0, 2, 3, 4, 1)
+                    x = self.post_norm(x)
+                    x = x.permute(0, 4, 1, 2, 3)
+            else:
+                # x is already [N, C_out, T]
+                if self.post_pool_norm:
+                    x = x.permute(0, 2, 1)  # [N, T, C_out]
+                    x = self.post_norm(x)
+                    x = x.permute(0, 2, 1)  # [N, C_out, T]
 
         return x
 

@@ -181,10 +181,8 @@ class RepresentationModel(nn.Module):
         """
         N, C, T = x_phase_pixels.shape
 
-        # TCN layers operate on [N, C, T] directly (no spatial reshape)
-        h = x_phase_pixels
-        for layer in self.phase_tcn.layers:
-            h = layer(h)  # [N, 64, T]
+        # TCN accepts [N, C, T] directly (no spatial reshape needed)
+        h = self.phase_tcn(x_phase_pixels)  # [N, 64, T]
 
         # FiLM: z_type_pixels [N, 64] -> gamma/beta via the same FiLM layer
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
