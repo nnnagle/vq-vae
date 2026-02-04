@@ -129,7 +129,9 @@ class RepresentationModel(nn.Module):
         x_phase: torch.Tensor,
         z_type: torch.Tensor,
     ) -> torch.Tensor:
-        """Phase pathway forward.
+        """Phase pathway forward (dense, full spatial grid).
+
+        Use for inference when embeddings are needed at every pixel.
 
         Args:
             x_phase: Temporal input ``[B, 8, T, H, W]`` (phase_ls8 features).
@@ -156,6 +158,49 @@ class RepresentationModel(nn.Module):
         z_phase = z_phase.reshape(B, T, 12, H, W).permute(0, 2, 1, 3, 4)
 
         return z_phase  # [B, 12, T, H, W]
+
+    def forward_phase_at_locations(
+        self,
+        x_phase_pixels: torch.Tensor,
+        z_type_pixels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Phase pathway forward at sampled pixel locations only.
+
+        Runs the same TCN → FiLM → projection pipeline but only on the
+        supplied pixel time-series, avoiding the cost of processing the
+        full spatial grid.  Produces identical results to extracting from
+        the dense ``forward_phase`` output at the same locations.
+
+        Args:
+            x_phase_pixels: ``[N, C, T]`` temporal features at N pixels.
+            z_type_pixels: ``[N, 64]`` type embeddings at the same N pixels
+                (**caller must stop-grad**).
+
+        Returns:
+            z_phase_pixels: ``[N, T, 12]`` phase embeddings.
+        """
+        N, C, T = x_phase_pixels.shape
+
+        # TCN layers operate on [N, C, T] directly (no spatial reshape)
+        h = x_phase_pixels
+        for layer in self.phase_tcn.layers:
+            h = layer(h)  # [N, 64, T]
+
+        # FiLM: z_type_pixels [N, 64] -> gamma/beta via the same FiLM layer
+        # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
+        z_cond = z_type_pixels.unsqueeze(-1).unsqueeze(-1)  # [N, 64, 1, 1]
+        gamma, beta = self.phase_film(z_cond)  # each [N, 64, 1, 1]
+        gamma = gamma.squeeze(-1)  # [N, 64, 1]
+        beta = beta.squeeze(-1)    # [N, 64, 1]
+        h = gamma * h + beta       # [N, 64, T]
+
+        # Project: phase_head is Conv2d(64, 12, 1×1)
+        # Reshape [N, 64, T] -> [N*T, 64, 1, 1] for Conv2d
+        h = h.permute(0, 2, 1).reshape(N * T, 64, 1, 1)
+        z = self.phase_head(h)  # [N*T, 12, 1, 1]
+        z = z.reshape(N, T, 12)
+
+        return z  # [N, T, 12]
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
