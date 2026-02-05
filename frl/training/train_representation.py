@@ -1191,7 +1191,7 @@ def main():
 
         # Log phase pair construction stats
         ps = train_stats.get('phase_pair_stats')
-        if ps and ps['n_anchors'] > 0:
+        if ps and ps['n_anchors'] > 0 and phase_config is not None:
             logger.info(
                 f"  Phase pairs: {ps['n_total_pairs']:.0f} total "
                 f"({ps['n_self_pairs']:.0f} self + {ps['n_total_pairs'] - ps['n_self_pairs']:.0f} cross) | "
@@ -1215,7 +1215,7 @@ def main():
                 f"{pls['n_pairs_sufficient_overlap']:.0f} with overlap | "
                 f"Curriculum weight: {pls['curriculum_w']:.2f}"
             )
-        elif pls:
+        elif pls and phase_config is not None:
             logger.info(
                 f"  Phase loss: inactive (curriculum_w={pls['curriculum_w']:.2f}, "
                 f"starts epoch {phase_config['curriculum_start_epoch']+1})"
