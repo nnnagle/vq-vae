@@ -86,6 +86,17 @@ dataset: # These exist in the zarr
       - {name: ndvi_amplitude, source: annual/ls8day/data/NDVI_amplitude}
       - {name: ndvi_summer_p95, source: annual/ls8day/data/NDVI_summer_p95}
       - {name: ndvi_winter_max, source: annual/ls8day/data/NDVI_winter_max}
+      - {name: red, source: annual/ccdc_annual/data/red}
+      - {name: nbr, source: annual/ccdc_annual/data/nbr}
+      - {name: ndvi, source: annual/ccdc_annual/data/ndvi}
+      - {name: ndmi, source: annual/ccdc_annual/data/ndmi}
+      - {name: nir, source: annual/ccdc_annual/data/nir}
+      - {name: swir1, source: annual/ccdc_annual/data/swir1}
+      - {name: swir2, source: annual/ccdc_annual/data/swir2}
+      - {name: seas_amp_red, source: annual/ccdc_annual/data/seas_amp_red}
+      - {name: seas_amp_nir, source: annual/ccdc_annual/data/seas_amp_nir}
+      - {name: seas_amp_swir1, source: annual/ccdc_annual/data/seas_amp_swir1}
+      - {name: seas_amp_swir2, source: annual/ccdc_annual/data/seas_amp_swir2}
       - name: temporal_position               # in [0,1]
         formula: "t / (T - 1)" #T is inferred from time_window
 
