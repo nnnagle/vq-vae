@@ -250,17 +250,17 @@ features:
       dim: [C,C]      
       calculate: true
       stat_domain: patch
-  phase_ls8:
+  phase_ccdc:
     dim: [C,T,H,W]
     channels:
       annual.temporal_position: {norm: identity}
-      annual.evi2_summer_p95: {norm: zscore}
-      annual.nbr_annual_min: {norm: zscore}
-      annual.nbr_summer_p95: {norm: zscore}
-      annual.ndmi_summer_mean: {norm: zscore}
-      annual.ndvi_amplitude: {norm: zscore}
-      annual.ndvi_summer_p95: {norm: zscore}
-      annual.ndvi_winter_max: {norm: zscore}
+      annual.red: {norm: zscore}
+      annual.nir: {norm: zscore}
+      annual.nbr: {norm: zscore}
+      annual.ndmi: {norm: zscore}
+      annual.spectral_velocity: {norm: zscore}
+      annual.seas_amp_swir1: {norm: zscore}
+      annual.seas_amp_swir2: {norm: zscore}
   ccdc_annual:
     dim: [C,T,H,W]
     channels:
@@ -290,20 +290,6 @@ features:
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.variance_ndvi: {norm: robust_iqr}
   soft_neighborhood_phase:
-    dim: [C,T,H,W]
-    channels:
-      annual.evi2_summer_p95: {norm: zscore}
-      annual.nbr_annual_min: {norm: zscore}
-      annual.nbr_summer_p95: {norm: zscore}
-      annual.ndmi_summer_mean: {norm: zscore}
-      annual.ndvi_amplitude: {norm: zscore}
-      annual.ndvi_summer_p95: {norm: zscore}
-      annual.ndvi_winter_max: {norm: zscore}
-    covariance:
-      dim: [C,C]
-      calculate: true
-      stat_domain: patch
-  soft_neighborhood_phase_ccdc:
     dim: [C,T,H,W]
     channels:
       annual.red: {norm: zscore}
@@ -501,43 +487,4 @@ losses:
     curriculum:
       start_epoch: 10          # begin contributing to total loss
       ramp_epochs: 10          # linear ramp from 0 to full weight
-
-  # Phase trajectory matching using CCDC annual metrics
-  soft_neighborhood_phase_ccdc:
-    weight: 1.0
-    type: soft_neighborhood
-    mask:
-      - static_mask.aoi
-      - static_mask.forest
-
-    neighborhood_target: features.soft_neighborhood_phase_ccdc
-
-    anchor:
-      population: grid-plus-supplement-ysfc
-
-    pair_strategy:
-      type: knn-with-ysfc-overlap
-      include_self: true
-      type_similarity:
-        feature: features.infonce_type_spectral
-        k: 16
-      ysfc_overlap:
-        channel: annual.ysfc
-        min_overlap: 3
-      min_pairs: 5
-
-    pair_weights:
-      source: features.infonce_type_spectral
-      sigma: 5.0
-      self_pair_weight: 1.0
-
-    tau_ref: 0.1
-    tau_learned: 0.1
-    min_valid_per_row: 2
-    self_similarity_weight: 1.0
-    cross_pixel_weight: 1.0
-
-    curriculum:
-      start_epoch: 10
-      ramp_epochs: 10
 
