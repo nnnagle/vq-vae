@@ -97,6 +97,7 @@ dataset: # These exist in the zarr
       - {name: seas_amp_nir, source: annual/ccdc_annual/data/seas_amp_nir}
       - {name: seas_amp_swir1, source: annual/ccdc_annual/data/seas_amp_swir1}
       - {name: seas_amp_swir2, source: annual/ccdc_annual/data/seas_amp_swir2}
+      - {name: spectral_velocity, source: annual/ccdc_annual/data/spectral_velocity}
       - name: temporal_position               # in [0,1]
         formula: "t / (T - 1)" #T is inferred from time_window
       - {name: ysfc, source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024}
