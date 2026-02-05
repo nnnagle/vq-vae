@@ -128,3 +128,16 @@ dataset: # These exist in the zarr
       - {name: spectral_distance_per_decade,  source: static/ccdc-metric_history/data/spectral_distance_per_decade,  fill_value: -9999}
       - {name: mean_decline_rate, source: static/ccdc-metric_history/data/mean_decline_rate, fill_value: -9999}
       - {name: num_segments, source: static/ccdc-metric_history/data/num_segments, fill_value: -9999}
+
+features:
+  ccdc_annual:
+    dim: [C,T,H,W]
+    channels:
+      annual.temporal_position: {norm: identity}
+      annual.red: {norm: zscore}
+      annual.nir: {norm: zscore}
+      annual.nbr: {norm: zscore}
+      annual.ndmi: {norm: zscore}
+      annual.spectral_velocity: {norm: zscore}
+      annual.seas_amp_swir1: {norm: zscore}
+      annual.seas_amp_swir2: {norm: zscore}
