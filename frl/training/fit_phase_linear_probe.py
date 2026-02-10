@@ -66,16 +66,16 @@ logger = logging.getLogger("phase_linear_probe")
 
 
 PHASE_TARGET_FEATURE = "soft_neighborhood_phase"
-PHASE_INPUT_FEATURE = "phase_ls8"
+PHASE_INPUT_FEATURE = "phase_ccdc"
 
 PHASE_TARGET_CHANNELS = [
-    "annual.evi2_summer_p95",
-    "annual.nbr_annual_min",
-    "annual.nbr_summer_p95",
-    "annual.ndmi_summer_mean",
-    "annual.ndvi_amplitude",
-    "annual.ndvi_summer_p95",
-    "annual.ndvi_winter_max",
+    "annual.red",
+    "annual.nir",
+    "annual.nbr",
+    "annual.ndmi",
+    "annual.spectral_velocity",
+    "annual.seas_amp_swir1",
+    "annual.seas_amp_swir2",
 ]
 
 

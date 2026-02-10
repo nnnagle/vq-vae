@@ -363,19 +363,19 @@ def process_batch(
                         curriculum_w = (epoch - start_epoch) / ramp_epochs
 
                     if curriculum_w > 0.0:
-                        # Build phase_ls8 temporal feature
-                        phase_ls8_feature = feature_builder.build_feature('phase_ls8', sample)
-                        phase_ls8_data = torch.from_numpy(
-                            phase_ls8_feature.data
+                        # Build phase_ccdc temporal feature
+                        phase_ccdc_feature = feature_builder.build_feature('phase_ccdc', sample)
+                        phase_ccdc_data = torch.from_numpy(
+                            phase_ccdc_feature.data
                         ).float().to(device)
-                        # phase_ls8_data: [C, T, H, W]
+                        # phase_ccdc_data: [C, T, H, W]
 
                         # Extract only anchor pixel time-series (avoid dense TCN)
                         phase_anchors_dev = phase_anchors.to(device)
-                        phase_ls8_at_anchors = extract_temporal_at_locations(
-                            phase_ls8_data, phase_anchors_dev
+                        phase_ccdc_at_anchors = extract_temporal_at_locations(
+                            phase_ccdc_data, phase_anchors_dev
                         )  # [N_phase, T, C]
-                        phase_ls8_at_anchors = phase_ls8_at_anchors.permute(
+                        phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(
                             0, 2, 1
                         )  # [N_phase, C, T]
 
@@ -386,7 +386,7 @@ def process_batch(
 
                         # Run phase encoder on anchor pixels only
                         z_phase_at_anchors = model.forward_phase_at_locations(
-                            phase_ls8_at_anchors, z_type_at_anchors
+                            phase_ccdc_at_anchors, z_type_at_anchors
                         )  # [N_phase, T, 12]
 
                         # Spectral reference: static [C,H,W] expanded to [N,T,C]
