@@ -420,6 +420,7 @@ class DatasetBindingsParser:
         mask = channel_config.get('mask')
         quality = channel_config.get('quality')
         norm = channel_config.get('norm')
+        transform = channel_config.get('transform')
 
         return FeatureChannelConfig(
             dataset_group=dataset_group,
@@ -427,6 +428,7 @@ class DatasetBindingsParser:
             mask=mask,
             quality=quality,
             norm=norm,
+            transform=transform,
         )
 
     # ------------------------------------------------------------------

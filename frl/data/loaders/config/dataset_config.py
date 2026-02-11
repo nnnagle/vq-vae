@@ -247,6 +247,13 @@ class FeatureChannelConfig:
     mask: Optional[str] = None  # 'static_mask.dem_mask'
     quality: Optional[str] = None  # Quality mask (not used yet)
     norm: Optional[str] = None  # Normalization preset name
+    transform: Optional[str] = None  # Pre-normalization transform: 'log', 'log1p', 'sqrt', etc.
+
+    def __post_init__(self):
+        """Validate channel configuration."""
+        if self.transform is not None:
+            from ..transforms import validate_transform
+            validate_transform(self.transform)
 
 
 @dataclass

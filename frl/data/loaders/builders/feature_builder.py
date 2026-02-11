@@ -43,6 +43,7 @@ from ..config.dataset_config import (
     FeatureChannelConfig,
     NormalizationPresetConfig,
 )
+from ..transforms import apply_transform
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +368,13 @@ class FeatureBuilder:
 
         for c_idx, channel_ref in enumerate(channel_names):
             channel_config = feature_config.channels[channel_ref]
+
+            # Apply pre-normalization transform (log, sqrt, etc.)
+            if channel_config.transform:
+                normalized_data[c_idx] = apply_transform(
+                    normalized_data[c_idx], channel_config.transform
+                )
+
             norm_preset_name = channel_config.norm
 
             if not norm_preset_name or norm_preset_name == 'identity':
@@ -519,11 +527,21 @@ class FeatureBuilder:
             )
             return data
 
+        # Apply pre-normalization transforms (must match what StatsCalculator used)
+        transformed_data = data.copy()
+        channel_names = list(feature_config.channels.keys())
+        for c_idx, channel_ref in enumerate(channel_names):
+            channel_config = feature_config.channels[channel_ref]
+            if channel_config.transform:
+                transformed_data[c_idx] = apply_transform(
+                    transformed_data[c_idx], channel_config.transform
+                )
+
         # Get channel means for centering
         channel_means = self._get_channel_means(feature_name, feature_config)
 
         # Center the data
-        centered_data = data.copy()
+        centered_data = transformed_data
         for c_idx, mean in enumerate(channel_means):
             centered_data[c_idx] -= mean
 
@@ -716,6 +734,7 @@ class FeatureBuilder:
                 'dataset_group': channel_config.dataset_group,
                 'channel_name': channel_config.channel_name,
                 'mask': channel_config.mask,
+                'transform': channel_config.transform,
                 'normalization': channel_config.norm,
             })
 

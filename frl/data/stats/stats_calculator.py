@@ -17,6 +17,7 @@ from ..loaders.config.dataset_config import (
     FeatureChannelConfig,
 )
 from ..loaders.dataset.forest_dataset_v2 import ForestDatasetV2
+from ..loaders.transforms import apply_transform
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,17 @@ class StatsCalculator:
         # Stack channels: [C, H, W] or [C, T, H, W]
         feature_data = np.stack(channel_arrays, axis=0)
 
-        # Build valid mask from global masks
+        # Apply pre-normalization transforms (log, sqrt, etc.) so that
+        # statistics are computed on the transformed distribution.
+        for c_idx, (channel_ref, channel_config) in enumerate(
+            feature_config.channels.items()
+        ):
+            if channel_config.transform:
+                feature_data[c_idx] = apply_transform(
+                    feature_data[c_idx], channel_config.transform
+                )
+
+        # Build valid mask from global masks (NaN from transforms is caught here)
         valid_mask = self._build_valid_mask(sample, feature_data)
 
         return feature_data, valid_mask
