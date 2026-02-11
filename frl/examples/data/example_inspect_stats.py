@@ -10,6 +10,43 @@ import numpy as np
 from pathlib import Path
 
 
+def _format_transform(spec):
+    """Format a transform spec for display.
+
+    Args:
+        spec: A string name, a dict {name: ..., **params}, or None.
+
+    Returns:
+        Human-readable string, e.g. "log (epsilon=0.5)" or "sqrt".
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, dict):
+        name = spec.get('name', '?')
+        params = {k: v for k, v in spec.items() if k != 'name'}
+        if params:
+            param_str = ', '.join(f'{k}={v}' for k, v in params.items())
+            return f"{name} ({param_str})"
+        return name
+    return str(spec)
+
+
+def _print_channel_stats(channel_name, channel_stats):
+    """Print stats for a single channel, handling the transform key."""
+    transform = channel_stats.get('transform')
+    if transform is not None:
+        print(f"\n  Channel: {channel_name}  [transform: {_format_transform(transform)}]")
+    else:
+        print(f"\n  Channel: {channel_name}")
+
+    for stat_name, stat_value in channel_stats.items():
+        if stat_name == 'transform':
+            continue  # already shown in header
+        print(f"    {stat_name}: {stat_value:.6f}")
+
+
 def main():
     """Load and display statistics."""
 
@@ -41,9 +78,7 @@ def main():
                 if channel_name == 'covariance':
                     continue
 
-                print(f"\n  Channel: {channel_name}")
-                for stat_name, stat_value in channel_stats.items():
-                    print(f"    {stat_name}: {stat_value:.6f}")
+                _print_channel_stats(channel_name, channel_stats)
 
             # Print covariance
             cov_matrix = np.array(feature_stats['covariance'])
@@ -52,9 +87,7 @@ def main():
         else:
             # Just channel stats
             for channel_name, channel_stats in feature_stats.items():
-                print(f"\n  Channel: {channel_name}")
-                for stat_name, stat_value in channel_stats.items():
-                    print(f"    {stat_name}: {stat_value:.6f}")
+                _print_channel_stats(channel_name, channel_stats)
 
         print("\n")
 
