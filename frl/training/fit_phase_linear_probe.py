@@ -106,11 +106,16 @@ def extract_phase_batch_tensors(
     Targets are extracted on the **original data scale** (no normalization,
     no Mahalanobis whitening).
 
+    The mask restricts to pixels that are:
+      - inside the AOI (``static_mask.aoi``)
+      - classified as forest (``static_mask.forest``)
+      - valid across all features and timesteps
+
     Returns:
         Ximg:       [B, 16, H, W]        ccdc_history encoder input
-        Xphase:     [B, 8, T, H, W]      phase_ls8 temporal input
+        Xphase:     [B, 8, T, H, W]      phase_ccdc temporal input
         Yimg:       [B, 7, T, H, W]      soft_neighborhood_phase target (original scale)
-        M:          [B, H, W]            boolean mask (True = valid, all features)
+        M:          [B, H, W]            boolean mask (True = valid)
     """
     batch_size = len(batch["metadata"])
     encoder_inputs: List[torch.Tensor] = []
@@ -143,10 +148,21 @@ def extract_phase_batch_tensors(
         # Collapse target temporal mask to spatial: valid only if ALL timesteps valid
         tgt_mask_spatial = torch.from_numpy(tgt_f.mask).all(dim=0)  # [H, W]
         phase_mask_spatial = torch.from_numpy(phase_f.mask).all(dim=0)  # [H, W]
+
+        # AOI and forest masks from static_mask group
+        sm_names = sample["metadata"]["channel_names"]["static_mask"]
+        sm_data = sample["static_mask"]  # [C, H, W]
+        aoi_idx = sm_names.index("aoi")
+        forest_idx = sm_names.index("forest")
+        aoi_mask = torch.from_numpy(sm_data[aoi_idx]).bool()        # [H, W]
+        forest_mask = torch.from_numpy(sm_data[forest_idx]).bool()  # [H, W]
+
         m = (
             torch.from_numpy(enc_f.mask)
             & tgt_mask_spatial
             & phase_mask_spatial
+            & aoi_mask
+            & forest_mask
         )
 
         encoder_inputs.append(enc)
