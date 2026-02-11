@@ -13,9 +13,11 @@ Raw Sample (from ForestDatasetV2)
 │                                     │
 │  1. Extract channels by reference   │
 │  2. Build combined mask             │
-│  3. Apply normalization             │
-│  4. Apply Mahalanobis transform     │
-│  5. Zero out masked values          │
+│  3. Apply pre-normalization         │
+│     transform (log, sqrt, etc.)     │
+│  4. Apply normalization             │
+│  5. Apply Mahalanobis transform     │
+│  6. Zero out masked values          │
 │                                     │
 └─────────────────────────────────────┘
          │
@@ -183,6 +185,20 @@ Any NaN values in the feature data automatically invalidate those pixels. NaNs a
 ### Spatial Broadcast for Temporal Features
 
 For temporal features (shape `[C, T, H, W]`), spatial-only masks (shape `[H, W]`) are automatically broadcast across all timesteps.
+
+## Pre-Normalization Transforms
+
+Each channel can optionally specify a `transform` to reshape the distribution before normalization. See [transforms.md](transforms.md) for the full API reference and usage guide.
+
+```yaml
+features:
+  ccdc_history:
+    channels:
+      static.spectral_distance_per_decade: {transform: log1p, norm: robust_iqr}
+      static.variance_ndvi: {transform: sqrt, norm: robust_iqr}
+```
+
+Available transforms: `log`, `log1p`, `log10`, `sqrt`, `cbrt`.
 
 ## Normalization
 
