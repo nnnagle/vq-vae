@@ -10,19 +10,21 @@ What it does
   element-wise interaction z_type ⊗ z_phase (64×12 = 768), giving D = 844
   features per (pixel, timestep) observation.
 - Fits a linear probe (W, b) in closed form via streaming ridge regression
-  against the soft_neighborhood_phase target [B, 7, T, H, W] on the
-  **original (un-normalized) data scale**.
+  against the soft_neighborhood_phase target [B, 7, T, H, W] in the
+  **transformed + normalized (Mahalanobis-whitened) space**.
 - The interaction terms capture the multiplicative type×phase structure that
   FiLM conditioning creates in the encoder.
 - Only pixels whose spatial location is ≥ ``halo`` pixels from the patch
   edge contribute, avoiding boundary artefacts from the spatial conv.
-- Reports per-channel MSE and R² in original data scale.
+- Reports per-channel R² in both the normalized space and (after inverting
+  the whitening, centering, and per-channel transforms) the original data
+  scale.
 
 Targets
-- The soft_neighborhood_phase feature is extracted with normalization and
-  Mahalanobis whitening disabled (``apply_normalization=False,
-  apply_mahalanobis=False``), so the probe fits and predicts directly in
-  the original spectral units.
+- The soft_neighborhood_phase feature is extracted with full normalization
+  (transform + Mahalanobis whitening), so the probe fits in the space the
+  model actually optimises.  Predictions are then projected back to the
+  original spectral units via the inverse pipeline for interpretability.
 
 Usage:
     python training/fit_phase_linear_probe.py \\
@@ -56,6 +58,7 @@ from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
 from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
+from data.loaders.transforms import inverse_transform
 from models import RepresentationModel
 
 logging.basicConfig(
@@ -103,8 +106,8 @@ def extract_phase_batch_tensors(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build encoder inputs, phase inputs, targets, and mask for a batch.
 
-    Targets are extracted on the **original data scale** (no normalization,
-    no Mahalanobis whitening).
+    Targets are extracted in the **transformed + normalized** space (the
+    same space the model's loss operates in).
 
     The mask restricts to pixels that are:
       - inside the AOI (``static_mask.aoi``)
@@ -114,7 +117,7 @@ def extract_phase_batch_tensors(
     Returns:
         Ximg:       [B, 16, H, W]        ccdc_history encoder input
         Xphase:     [B, 8, T, H, W]      phase_ccdc temporal input
-        Yimg:       [B, 7, T, H, W]      soft_neighborhood_phase target (original scale)
+        Yimg:       [B, 7, T, H, W]      soft_neighborhood_phase target (normalized)
         M:          [B, H, W]            boolean mask (True = valid)
     """
     batch_size = len(batch["metadata"])
@@ -133,11 +136,7 @@ def extract_phase_batch_tensors(
 
         enc_f = feature_builder.build_feature("ccdc_history", sample)
         phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
-        tgt_f = feature_builder.build_feature(
-            PHASE_TARGET_FEATURE, sample,
-            apply_normalization=False,
-            apply_mahalanobis=False,
-        )
+        tgt_f = feature_builder.build_feature(PHASE_TARGET_FEATURE, sample)
 
         enc = torch.from_numpy(enc_f.data).float()        # [16, H, W]
         phase = torch.from_numpy(phase_f.data).float()    # [8, T, H, W]
@@ -183,11 +182,17 @@ def extract_phase_batch_tensors(
 
 @dataclass
 class PhaseProbeMetrics:
-    """All metrics are in original (un-normalized) data scale."""
+    """Metrics in both normalized and original data scales."""
+    # Normalized (transformed + whitened) space
     mse_per_channel: Dict[str, float]
     r2_per_channel: Dict[str, float]
     mse_total: float
     r2_total: float
+    # Original (un-normalized, un-transformed) space
+    mse_per_channel_original: Dict[str, float]
+    r2_per_channel_original: Dict[str, float]
+    mse_total_original: float
+    r2_total_original: float
     n_observations: int
 
 
@@ -348,6 +353,85 @@ def fit_phase_probe(
 
 
 # ---------------------------------------------------------------------------
+# Inverse normalization pipeline
+# ---------------------------------------------------------------------------
+
+def _build_inverse_normalization(
+    feature_builder: FeatureBuilder,
+) -> Tuple[np.ndarray, np.ndarray, List]:
+    """Pre-compute the objects needed to invert the Mahalanobis pipeline.
+
+    Returns:
+        inv_whitening: [C, C]  inverse of the whitening matrix
+        means:         [C]     per-channel means used for centering
+        transform_specs: list of per-channel transform specs (str/dict/None)
+    """
+    feature_config = feature_builder.config.get_feature(PHASE_TARGET_FEATURE)
+    C = len(PHASE_TARGET_CHANNELS)
+
+    # Whitening matrix and its inverse
+    whitening = feature_builder._get_whitening_matrix(PHASE_TARGET_FEATURE)
+    if whitening is not None:
+        inv_whitening = np.linalg.inv(whitening).astype(np.float32)
+    else:
+        inv_whitening = np.eye(C, dtype=np.float32)
+
+    # Per-channel means
+    means = np.array(
+        feature_builder._get_channel_means(PHASE_TARGET_FEATURE, feature_config),
+        dtype=np.float32,
+    )
+
+    # Per-channel transform specs
+    channel_names = list(feature_config.channels.keys())
+    transform_specs = [
+        feature_config.channels[ch].transform for ch in channel_names
+    ]
+
+    return inv_whitening, means, transform_specs
+
+
+def _invert_to_original_scale(
+    predictions: torch.Tensor,
+    inv_whitening: np.ndarray,
+    means: np.ndarray,
+    transform_specs: list,
+) -> torch.Tensor:
+    """Map predictions from normalized space back to original data scale.
+
+    Steps (reverse of the Mahalanobis pipeline):
+      1. Un-whiten:    x_centered = inv_whitening @ x_whitened
+      2. Un-center:    x_transformed = x_centered + mean
+      3. Un-transform: x_original = inverse_transform(x_transformed)
+
+    Args:
+        predictions: [N, C] tensor in normalized space (float64 or float32)
+        inv_whitening: [C, C] inverse whitening matrix
+        means: [C] channel means
+        transform_specs: per-channel transform specs
+
+    Returns:
+        [N, C] tensor in original data scale (same dtype as input)
+    """
+    dtype = predictions.dtype
+    P = predictions.numpy() if isinstance(predictions, torch.Tensor) else predictions
+    P = P.astype(np.float64)
+
+    # 1. Un-whiten: [N, C] @ [C, C]^T  (inv_whitening is lower-triangular)
+    P = P @ inv_whitening.astype(np.float64).T
+
+    # 2. Un-center
+    P = P + means.astype(np.float64)
+
+    # 3. Per-channel inverse transform
+    for c_idx, spec in enumerate(transform_specs):
+        if spec is not None:
+            P[:, c_idx] = inverse_transform(P[:, c_idx], spec)
+
+    return torch.from_numpy(P).to(dtype)
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -362,7 +446,11 @@ def evaluate_phase_probe(
     max_batches_eval: int = 0,
     design: str = "full",
 ) -> PhaseProbeMetrics:
-    """Evaluate MSE and R² per channel in original data scale."""
+    """Evaluate MSE and R² in both normalized and original data scales.
+
+    Predictions are made in the normalized (whitened) space, then inverted
+    back to the original spectral units for a second set of metrics.
+    """
     model.eval()
     C = W.shape[1]   # 7
 
@@ -370,9 +458,21 @@ def evaluate_phase_probe(
     W_cpu = W.cpu()
     b_cpu = b.cpu()
 
+    # Pre-compute inverse-normalization objects
+    inv_whitening, means, transform_specs = _build_inverse_normalization(
+        feature_builder,
+    )
+
+    # Accumulators — normalized space
     sse = torch.zeros(C, dtype=torch.float64)
     sum_y = torch.zeros(C, dtype=torch.float64)
     sum_y2 = torch.zeros(C, dtype=torch.float64)
+
+    # Accumulators — original space
+    sse_orig = torch.zeros(C, dtype=torch.float64)
+    sum_y_orig = torch.zeros(C, dtype=torch.float64)
+    sum_y2_orig = torch.zeros(C, dtype=torch.float64)
+
     n_obs = 0
 
     with torch.no_grad():
@@ -399,7 +499,7 @@ def evaluate_phase_probe(
             zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
             zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat]
             zp_flat = zp.reshape(-1, D_PHASE)[m_flat]
-            Y = y_perm.reshape(-1, C)[m_flat]
+            Y_norm = y_perm.reshape(-1, C)[m_flat]
 
             if zt_flat.shape[0] == 0:
                 continue
@@ -408,34 +508,62 @@ def evaluate_phase_probe(
 
             # Build design matrix on GPU, predict on CPU
             X = _build_design_matrix(zt_flat, zp_flat, design).cpu().float()  # [N, D]
-            Y = Y.cpu().to(torch.float64)
+            Y_norm = Y_norm.cpu().to(torch.float64)
 
-            P = (X @ W_cpu + b_cpu).to(torch.float64)  # [N, 7]
+            P_norm = (X @ W_cpu + b_cpu).to(torch.float64)  # [N, 7]
 
-            err = P - Y
+            # --- Normalized-space accumulators ---
+            err = P_norm - Y_norm
             sse += (err * err).sum(dim=0)
-            sum_y += Y.sum(dim=0)
-            sum_y2 += (Y * Y).sum(dim=0)
+            sum_y += Y_norm.sum(dim=0)
+            sum_y2 += (Y_norm * Y_norm).sum(dim=0)
 
-    mse_per: Dict[str, float] = {}
-    r2_per: Dict[str, float] = {}
-    for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
-        if n_obs == 0:
-            mse_per[ch] = 0.0
-            r2_per[ch] = 0.0
-            continue
-        mse_per[ch] = float(sse[c_idx].item()) / n_obs
-        sst_val = max(0.0, float(sum_y2[c_idx].item()) - float(sum_y[c_idx].item()) ** 2 / n_obs)
-        if sst_val > 1e-8:
-            r2_per[ch] = 1.0 - float(sse[c_idx].item()) / sst_val
-        else:
-            r2_per[ch] = 0.0
+            # --- Original-space accumulators ---
+            P_orig = _invert_to_original_scale(
+                P_norm, inv_whitening, means, transform_specs,
+            )
+            Y_orig = _invert_to_original_scale(
+                Y_norm, inv_whitening, means, transform_specs,
+            )
+            err_orig = P_orig - Y_orig
+            sse_orig += (err_orig * err_orig).sum(dim=0)
+            sum_y_orig += Y_orig.sum(dim=0)
+            sum_y2_orig += (Y_orig * Y_orig).sum(dim=0)
+
+    def _compute_mse_r2(sse_acc, sum_y_acc, sum_y2_acc, n):
+        mse_per: Dict[str, float] = {}
+        r2_per: Dict[str, float] = {}
+        for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+            if n == 0:
+                mse_per[ch] = 0.0
+                r2_per[ch] = 0.0
+                continue
+            mse_per[ch] = float(sse_acc[c_idx].item()) / n
+            sst_val = max(
+                0.0,
+                float(sum_y2_acc[c_idx].item())
+                - float(sum_y_acc[c_idx].item()) ** 2 / n,
+            )
+            if sst_val > 1e-8:
+                r2_per[ch] = 1.0 - float(sse_acc[c_idx].item()) / sst_val
+            else:
+                r2_per[ch] = 0.0
+        return mse_per, r2_per
+
+    mse_per, r2_per = _compute_mse_r2(sse, sum_y, sum_y2, n_obs)
+    mse_per_orig, r2_per_orig = _compute_mse_r2(
+        sse_orig, sum_y_orig, sum_y2_orig, n_obs,
+    )
 
     return PhaseProbeMetrics(
         mse_per_channel=mse_per,
         r2_per_channel=r2_per,
         mse_total=float(np.mean(list(mse_per.values()))),
         r2_total=float(np.mean(list(r2_per.values()))),
+        mse_per_channel_original=mse_per_orig,
+        r2_per_channel_original=r2_per_orig,
+        mse_total_original=float(np.mean(list(mse_per_orig.values()))),
+        r2_total_original=float(np.mean(list(r2_per_orig.values()))),
         n_observations=n_obs,
     )
 
@@ -446,6 +574,9 @@ def evaluate_phase_probe(
 
 def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
     logger.info(f"{prefix} results (observations: {metrics.n_observations:,}):")
+
+    # Normalized space
+    logger.info(f"  [Normalized space]")
     logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12}")
     logger.info(f"  {'-' * 56}")
     for ch in PHASE_TARGET_CHANNELS:
@@ -457,6 +588,20 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
         )
     logger.info(f"  {'-' * 56}")
     logger.info(f"  {'Average':<30} {metrics.mse_total:>12.6f} {metrics.r2_total:>12.6f}")
+
+    # Original space
+    logger.info(f"  [Original scale]")
+    logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12}")
+    logger.info(f"  {'-' * 56}")
+    for ch in PHASE_TARGET_CHANNELS:
+        short = ch.replace("annual.", "")
+        logger.info(
+            f"  {short:<30} "
+            f"{metrics.mse_per_channel_original[ch]:>12.6f} "
+            f"{metrics.r2_per_channel_original[ch]:>12.6f}"
+        )
+    logger.info(f"  {'-' * 56}")
+    logger.info(f"  {'Average':<30} {metrics.mse_total_original:>12.6f} {metrics.r2_total_original:>12.6f}")
 
 
 # ---------------------------------------------------------------------------
@@ -586,12 +731,20 @@ def main():
             "design": args.design,
             "input_dim": _design_dim(args.design),
             "encoder_checkpoint": args.checkpoint,
+            # Normalized space
             "train_mse_total": train_metrics.mse_total,
             "train_r2_total": train_metrics.r2_total,
             "val_mse_total": val_metrics.mse_total,
             "val_r2_total": val_metrics.r2_total,
             "val_mse_per_channel": val_metrics.mse_per_channel,
             "val_r2_per_channel": val_metrics.r2_per_channel,
+            # Original scale
+            "train_mse_total_original": train_metrics.mse_total_original,
+            "train_r2_total_original": train_metrics.r2_total_original,
+            "val_mse_total_original": val_metrics.mse_total_original,
+            "val_r2_total_original": val_metrics.r2_total_original,
+            "val_mse_per_channel_original": val_metrics.mse_per_channel_original,
+            "val_r2_per_channel_original": val_metrics.r2_per_channel_original,
         },
         out_path,
     )
