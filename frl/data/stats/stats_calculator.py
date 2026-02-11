@@ -341,6 +341,12 @@ class StatsCalculator:
                    channel_values[c].extend(valid_values.flatten())
 
 
+        # Build a map from channel_name -> transform spec (if any)
+        channel_transforms = {}
+        for channel_name, channel_config in zip(channel_names, feature_config.channels.values()):
+            if channel_config.transform is not None:
+                channel_transforms[channel_name] = channel_config.transform
+
         # Compute stats for each channel
         stats_dict = {}
         for channel_name, values in zip(channel_names, channel_values):
@@ -352,6 +358,13 @@ class StatsCalculator:
 
             # Compute requested stats
             channel_stats = {}
+
+            # Record which transform was applied (if any) so the JSON
+            # is self-documenting about what distribution these stats
+            # describe.
+            if channel_name in channel_transforms:
+                channel_stats['transform'] = channel_transforms[channel_name]
+
             if 'mean' in self.stats_config.stats:
                 channel_stats['mean'] = float(np.mean(values))
             if 'sd' in self.stats_config.stats:
