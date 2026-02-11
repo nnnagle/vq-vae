@@ -6,7 +6,7 @@ focusing on simple, typed data structures.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Union
 import numpy as np
 
 
@@ -247,7 +247,7 @@ class FeatureChannelConfig:
     mask: Optional[str] = None  # 'static_mask.dem_mask'
     quality: Optional[str] = None  # Quality mask (not used yet)
     norm: Optional[str] = None  # Normalization preset name
-    transform: Optional[str] = None  # Pre-normalization transform: 'log', 'log1p', 'sqrt', etc.
+    transform: Optional[Union[str, Dict[str, Any]]] = None  # Pre-normalization transform: 'log', 'log1p', 'sqrt', or {name: 'log', epsilon: 0.5}
 
     def __post_init__(self):
         """Validate channel configuration."""
