@@ -296,7 +296,7 @@ features:
       annual.nir: {norm: zscore}
       annual.nbr: {norm: zscore}
       annual.ndmi: {norm: zscore}
-      annual.spectral_velocity: {norm: zscore}
+      annual.spectral_velocity: {norm: zscore, transform: {name: log, epsilon: 0.001}}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
     covariance:
