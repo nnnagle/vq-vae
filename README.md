@@ -1,14 +1,13 @@
-# VQ-VAE Raster Compression Project
+# FoR-EST Forest Estimation with Embedded State Trajectories
 
 ## Purpose
 
-This project implements and trains a **Vector Quantized Variational Autoencoder (VQ-VAE)** for large raster time series stored in **chunked Zarr archives**.  
-The core goal is to learn compact, spatially and temporally aware latent representations of geospatial features (e.g., canopy, continuous and categorical variables) derived from NAIP and related datasets.
+A Representation Learning model for creating a distance metric between forest pixels for representing with FIA observations.
+The core goal is to learn compact, spatially and temporally aware latent representations of geospatial features (e.g., canopy, continuous and categorical variables) derived from geospatial datasets.
 
-It is intended to:
-- Enable lossy but structure-preserving compression of raster cubes.
-- Support downstream modeling (e.g., land-cover transitions, ecological forecasting).
-- Handle very large rasters efficiently using chunk-wise sampling.
+The embedding space is segmented into a forest *type* vector, representing atemporal forest type, and a tempral *phase* vector, representing temporal transitions for that forest type.
+
+Also contains associated data for pre-processing the data and building a zarr archive.
 
 ---
 
@@ -28,82 +27,25 @@ It is intended to:
 
 ## Training Workflow
 
-1. **Dataset**  
-   Implemented in `utils/loader.py` and `utils/loader_utils.py`.  
-   Loads samples from Zarr by chunk; supports both random and chunk-aware batching.
+1. **Configuration**
+  `/frl/config/`
 
-2. **Sampler**  
-   `utils/samplers.py` provides a *chunk-aware batch sampler*: each batch pulls from one chunk only, improving I/O locality.
+2. **Dataset**  
+   Implemented in `frl/data/loaders/dataset/forest_dataset_v2.py`.  
+   Loads samples from Zarr by chunk; supports deterministic "checkerboard" train/val/test split.
 
-3. **Model**  
-   `train_vqvae.py` builds and trains the VQ-VAE defined in `weights.py`.  
-   Uses loss components: reconstruction (`cont`, `cat`, `canopy`) and quantization (`vq`).
+3. **Feature Builder**  
+  `frl/data/loaders/builders/feature_builder.py'
+  Builds features specified in yaml
 
-4. **Configuration**  
-   All hyperparameters live in `scripts/config.yaml`.  
-   Key tuning levers:
-   - `chunk size` and `compression` affect data loading.
-   - `beta` (commitment cost) and `codebook_size` affect codebook utilization.
-   - `batch_size`, `num_workers`, and `prefetch_factor` control I/O performance.
+4. **Model**
+  `frl/models/representation.py` Main encoder logic
+  `frl/training/train_representation.py` training loop
 
-5. **Diagnostics**
-   Training logs include:
-   - `t_load`, `t_fwd`, `t_bwd`, `t_opt` — time per batch phase.
-   - `pplx` — codebook perplexity (diversity of code usage).
-   - `total`, `cont`, `cat`, `canopy`, `vq` — loss terms.
+
 
 ---
 
-## Notes for *Future Me*
-
-- **Performance tuning:**  
-  The biggest gains came from increasing chunk size along `time`, switching to LZ4, and matching `num_workers` to CPU cores (8–16).  
-  Keep `pin_memory=True` and `non_blocking=True` for GPU transfer.
-
-- **Training stability:**  
-  When the model collapses to low perplexity (`pplx ≈ 1–2`), try lowering `beta` or re-initializing the codebook.  
-  Typical convergence happens around 10 epochs.
-
-- **Samplers & chunking:**  
-  If you modify `ChunkBatchSampler`, run `pytest tests/test_samplers.py` first — it catches cross-chunk leakage.
-
-- **Crashes on shutdown:**  
-  If you see `terminate called without an active exception`, ensure DataLoader uses `multiprocessing_context="spawn"` and that rasterio/Blosc handles are opened per-worker.
-
-- **GPU utilization:**  
-  Aim for `t_load` ≤ `t_fwd + t_bwd + t_opt`. Increase batch size or grad accumulation until GPU is saturated (~80–90% util).
-
----
-
-## Notes for *Future ChatGPT*
-
-You are assisting in this repository.  
-When analyzing or generating code:
-
-1. **Respect directory semantics:**  
-   - `scripts/` → entry points (`train_vqvae.py`, `build_zarr.py`, etc.)  
-   - `utils/` → supporting logic (`argyaml.py`, `log.py.py`, `data_stack.py`, etc).  
-   - `tests/` → unit and integration tests.  
-   - `vqvae/` → vqvae specific logic (`model.py`, `chunking.py`, etc)
-
-2. **Understand data flow:**  
-   - `build_zarr.py` → produces Zarr archive.  
-   - `train_vqvae.py` → orchestrates training.
-
-3. **Assume**: PyTorch training on GPU, PyTorch 2.x, CUDA ≥ 12.  
-   Use spawn context for multiprocessing, pinned memory for GPU transfer, and handle per-worker rasterio environments.
-
-4. **When optimizing or refactoring:**
-   - Maintain chunk locality in sampling.
-   - Preserve deterministic batching for reproducibility (`seed` in samplers).
-   - Do not introduce I/O in the training loop; prefetch at DataLoader level.
-   - Any proposed rewrite must preserve the shape and dtype conventions of dataset outputs.
-
-5. **When adding new utilities:**  
-   - Keep CPU-only preprocessing out of training hot path.  
-   - Write fast, side-effect-free unit tests (mock Zarrs instead of creating real ones).
-
----
 
 ## Example Commands
 
@@ -121,30 +63,3 @@ pytest tests/test_samplers.py -v
 
 ---
 
-## House Style
-Use this template for utility headers.  See scripts/data_stack.py for example. 
-"""
-utils/<module>.py
------------------
-<One-line summary of what this file does.>
-
-Purpose
-    - <Bullet 1>
-    - <Bullet 2>
-    - <Bullet 3>
-
-Used by
-    - <script_or_module_a.py> : <very short why>
-    - <script_or_module_b.py> : <very short why>
-
-Design notes
-    - <Non-obvious constraint or invariant>
-    - <Evaluation strategy / performance note>
-    - <Shape/dtype conventions if relevant>
-
-Assistant guidance
-    When extending:
-        - <Actionable rule 1>
-        - <Actionable rule 2>
-        - <Actionable rule 3>
-"""
