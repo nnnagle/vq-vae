@@ -244,10 +244,34 @@ def collect_phase_diagnostics(
                     & (ysfc_min < 10)
                 ).sum()
             )
+
+            # Diagnostic: quantify temporal variation in z_phase and predictions
+            zp_np = zp.numpy()  # [T, H, W, 12]
+            mask_np = combined_mask
+            zp_masked = zp_np[:, mask_np, :]  # [T, N_valid, 12]
+            zp_temporal_std = zp_masked.std(axis=0).mean()
+            zp_spatial_std = zp_masked.std(axis=1).mean()
             logger.info(
                 f"  Patch {patch_idx}: T={T}, H={H}, W={W_sp}, "
                 f"mask={combined_mask.sum()}, ysfc<10={ysfc_count}"
             )
+            logger.info(
+                f"    z_phase temporal std (mean over pixels): {zp_temporal_std:.6f}, "
+                f"spatial std (mean over timesteps): {zp_spatial_std:.6f}"
+            )
+            for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+                pred_ch = pred_orig[c_idx][:, mask_np]  # [T, N_valid]
+                tgt_ch = tgt_orig[c_idx][:, mask_np]
+                pred_t_std = pred_ch.std(axis=0).mean()
+                pred_s_std = pred_ch.std(axis=1).mean()
+                tgt_t_std = tgt_ch.std(axis=0).mean()
+                tgt_s_std = tgt_ch.std(axis=1).mean()
+                logger.info(
+                    f"    {ch}: pred temporal_std={pred_t_std:.6f} "
+                    f"spatial_std={pred_s_std:.6f} | "
+                    f"obs temporal_std={tgt_t_std:.6f} "
+                    f"spatial_std={tgt_s_std:.6f}"
+                )
 
     return results
 
@@ -351,6 +375,123 @@ def plot_variable_timeseries(
 
     fig.suptitle(
         f"{short_name}  (observed vs predicted, original scale)", fontsize=11,
+    )
+    fig.tight_layout(rect=[0, 0, 0.94, 0.96])
+
+    if im is not None:
+        cbar_ax = fig.add_axes([0.95, 0.08, 0.012, 0.84])
+        fig.colorbar(im, cax=cbar_ax)
+
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved {output_path.name}")
+
+
+def plot_variable_anomaly(
+    records: List[Dict[str, np.ndarray]],
+    channel_ref: str,
+    output_path: Path,
+    years: List[int],
+) -> None:
+    """Temporal-anomaly maps: deviation from each pixel's temporal mean.
+
+    Uses per-pixel demeaning so the color scale highlights temporal change
+    rather than being dominated by spatial variation.
+    Layout: rows = patch x (obs anomaly, pred anomaly), columns = year.
+    """
+    n_patches = len(records)
+    T = records[0]["T"]
+
+    n_rows = n_patches * 2
+    n_cols = T
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(1.8 * n_cols, 1.8 * n_rows),
+        squeeze=False,
+    )
+
+    # Compute anomalies and global colour limits
+    obs_anomalies = []
+    pred_anomalies = []
+    all_anom_vals: List[np.ndarray] = []
+
+    for rec in records:
+        mask = rec["combined_mask"]
+        obs = rec[f"target_{channel_ref}"]   # [T, H, W]
+        pred = rec[f"pred_{channel_ref}"]    # [T, H, W]
+
+        # Temporal mean per pixel (masked)
+        obs_stack = np.where(mask[None, :, :], obs, np.nan)
+        pred_stack = np.where(mask[None, :, :], pred, np.nan)
+
+        obs_mean = np.nanmean(obs_stack, axis=0, keepdims=True)   # [1, H, W]
+        pred_mean = np.nanmean(pred_stack, axis=0, keepdims=True)
+
+        obs_anom = obs_stack - obs_mean    # [T, H, W]
+        pred_anom = pred_stack - pred_mean
+
+        obs_anomalies.append(obs_anom)
+        pred_anomalies.append(pred_anom)
+
+        for t in range(T):
+            vals = obs_anom[t][mask]
+            if vals.size > 0:
+                all_anom_vals.append(vals)
+            vals = pred_anom[t][mask]
+            if vals.size > 0:
+                all_anom_vals.append(vals)
+
+    if all_anom_vals:
+        combined = np.concatenate(all_anom_vals)
+        vlim = float(np.nanpercentile(np.abs(combined), 98))
+    else:
+        vlim = 1.0
+    vmin, vmax = -vlim, vlim
+
+    short_name = channel_ref.replace("annual.", "")
+
+    im = None
+    for p_idx, rec in enumerate(records):
+        mask = rec["combined_mask"]
+        obs_anom = obs_anomalies[p_idx]
+        pred_anom = pred_anomalies[p_idx]
+
+        obs_row = p_idx * 2
+        pred_row = obs_row + 1
+
+        for t in range(T):
+            ax_obs = axes[obs_row, t]
+            ax_pred = axes[pred_row, t]
+
+            im = ax_obs.imshow(
+                _make_masked(obs_anom[t], mask),
+                vmin=vmin, vmax=vmax, cmap="RdBu_r",
+                interpolation="nearest",
+            )
+            ax_pred.imshow(
+                _make_masked(pred_anom[t], mask),
+                vmin=vmin, vmax=vmax, cmap="RdBu_r",
+                interpolation="nearest",
+            )
+
+            ax_obs.set_xticks([])
+            ax_obs.set_yticks([])
+            ax_pred.set_xticks([])
+            ax_pred.set_yticks([])
+
+            if p_idx == 0:
+                yr = years[t] if t < len(years) else t
+                ax_obs.set_title(str(yr), fontsize=7)
+
+        axes[obs_row, 0].set_ylabel(
+            f"P{rec['patch_idx']} Obs\nanom", fontsize=6,
+        )
+        axes[pred_row, 0].set_ylabel("Pred\nanom", fontsize=6)
+
+    fig.suptitle(
+        f"{short_name}  (temporal anomaly: deviation from pixel mean)",
+        fontsize=11,
     )
     fig.tight_layout(rect=[0, 0, 0.94, 0.96])
 
@@ -528,11 +669,14 @@ def main():
     # ysfc_min overview
     plot_ysfc_map(records, output_dir / "forest_diag_ysfc_min.png")
 
-    # One sheet per target variable
+    # One sheet per target variable: absolute values and temporal anomalies
     for ch in PHASE_TARGET_CHANNELS:
         safe_name = ch.replace(".", "_")
         out_path = output_dir / f"forest_diag_{safe_name}.png"
         plot_variable_timeseries(records, ch, out_path, years=years)
+
+        anom_path = output_dir / f"forest_diag_{safe_name}_anomaly.png"
+        plot_variable_anomaly(records, ch, anom_path, years=years)
 
     logger.info("Done.")
 
