@@ -138,7 +138,20 @@ def extract_batch_tensors(
         # idx = [names.index(m) for m in TARGET_METRICS]
         # tgt = tgt[idx, :, :]
 
-        m = torch.from_numpy(enc_f.mask) & torch.from_numpy(tgt_f.mask)
+        # AOI and forest masks from static_mask group
+        sm_names = sample["metadata"]["channel_names"]["static_mask"]
+        sm_data = sample["static_mask"]  # [C, H, W]
+        aoi_idx = sm_names.index("aoi")
+        forest_idx = sm_names.index("forest")
+        aoi_mask = torch.from_numpy(sm_data[aoi_idx]).bool()        # [H, W]
+        forest_mask = torch.from_numpy(sm_data[forest_idx]).bool()  # [H, W]
+
+        m = (
+            torch.from_numpy(enc_f.mask)
+            & torch.from_numpy(tgt_f.mask)
+            & aoi_mask
+            & forest_mask
+        )
 
         encoder_inputs.append(enc)
         target_tensors.append(tgt)
