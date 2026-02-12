@@ -58,9 +58,28 @@ class ProbeMetrics:
     """Metrics for linear probe evaluation."""
     mse_per_metric: Dict[str, float]
     r2_per_metric: Dict[str, float]
+    spearman_rho2_per_metric: Dict[str, float]
     mse_total: float
     r2_total: float
+    spearman_rho2_total: float
     n_samples: int
+
+
+def _spearman_rho2(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """Compute Spearman's rank correlation squared (ρ²) for 1-D tensors."""
+    n = pred.shape[0]
+    if n < 2:
+        return 0.0
+    pred_ranks = pred.double().argsort().argsort().double()
+    tgt_ranks = target.double().argsort().argsort().double()
+    p = pred_ranks - pred_ranks.mean()
+    t = tgt_ranks - tgt_ranks.mean()
+    num = (p * t).sum()
+    den = torch.sqrt((p * p).sum() * (t * t).sum())
+    if den < 1e-12:
+        return 0.0
+    rho = num / den
+    return float(rho.item() ** 2)
 
 
 def compute_r2(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> float:
@@ -273,18 +292,22 @@ def train_epoch(
         for name in TARGET_METRICS:
             epoch_mse[name] /= n_batches
 
-    # For R², we need to recompute over validation set properly
-    # Training R² is approximate (batch-level)
+    # For R² and Spearman, we need to recompute over validation set properly
+    # Training metrics are approximate (batch-level)
     epoch_r2 = {name: 0.0 for name in TARGET_METRICS}
+    epoch_spearman = {name: 0.0 for name in TARGET_METRICS}
 
     mse_total = sum(epoch_mse.values()) / len(TARGET_METRICS)
     r2_total = sum(epoch_r2.values()) / len(TARGET_METRICS)
+    spearman_total = sum(epoch_spearman.values()) / len(TARGET_METRICS)
 
     return ProbeMetrics(
         mse_per_metric=epoch_mse,
         r2_per_metric=epoch_r2,
+        spearman_rho2_per_metric=epoch_spearman,
         mse_total=mse_total,
         r2_total=r2_total,
+        spearman_rho2_total=spearman_total,
         n_samples=total_pixels,
     )
 
@@ -361,8 +384,9 @@ def validate_epoch(
         for name in TARGET_METRICS:
             epoch_mse[name] /= n_batches
 
-    # Compute R² over all collected predictions
+    # Compute R² and Spearman ρ² over all collected predictions
     epoch_r2 = {}
+    epoch_spearman = {}
     for metric_name in TARGET_METRICS:
         if all_preds[metric_name]:
             all_pred = torch.cat(all_preds[metric_name])
@@ -375,34 +399,40 @@ def validate_epoch(
                 epoch_r2[metric_name] = 1 - (ss_res / ss_tot)
             else:
                 epoch_r2[metric_name] = 0.0
+
+            epoch_spearman[metric_name] = _spearman_rho2(all_pred, all_tgt)
         else:
             epoch_r2[metric_name] = 0.0
+            epoch_spearman[metric_name] = 0.0
 
     mse_total = sum(epoch_mse.values()) / len(TARGET_METRICS) if epoch_mse else 0.0
     r2_total = sum(epoch_r2.values()) / len(TARGET_METRICS) if epoch_r2 else 0.0
+    spearman_total = sum(epoch_spearman.values()) / len(TARGET_METRICS) if epoch_spearman else 0.0
 
     return ProbeMetrics(
         mse_per_metric=epoch_mse,
         r2_per_metric=epoch_r2,
+        spearman_rho2_per_metric=epoch_spearman,
         mse_total=mse_total,
         r2_total=r2_total,
+        spearman_rho2_total=spearman_total,
         n_samples=total_pixels,
     )
 
 
 def log_metrics(metrics: ProbeMetrics, prefix: str = ""):
-    """Log per-metric MSE and R² values."""
+    """Log per-metric MSE, R², and Spearman ρ² values."""
     logger.info(f"{prefix} Per-metric results:")
-    logger.info(f"{'Metric':<30} {'MSE':>10} {'R²':>10}")
-    logger.info("-" * 52)
+    logger.info(f"{'Metric':<30} {'MSE':>10} {'R²':>10} {'ρ²':>10}")
+    logger.info("-" * 64)
     for metric_name in TARGET_METRICS:
         mse = metrics.mse_per_metric.get(metric_name, 0.0)
         r2 = metrics.r2_per_metric.get(metric_name, 0.0)
-        # Shorten metric name for display
+        rho2 = metrics.spearman_rho2_per_metric.get(metric_name, 0.0)
         short_name = metric_name.replace('static.', '')
-        logger.info(f"{short_name:<30} {mse:>10.4f} {r2:>10.4f}")
-    logger.info("-" * 52)
-    logger.info(f"{'Average':<30} {metrics.mse_total:>10.4f} {metrics.r2_total:>10.4f}")
+        logger.info(f"{short_name:<30} {mse:>10.4f} {r2:>10.4f} {rho2:>10.4f}")
+    logger.info("-" * 64)
+    logger.info(f"{'Average':<30} {metrics.mse_total:>10.4f} {metrics.r2_total:>10.4f} {metrics.spearman_rho2_total:>10.4f}")
 
 
 def main():
@@ -597,8 +627,10 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_mse': val_metrics.mse_total,
                 'val_r2': val_metrics.r2_total,
+                'val_spearman_rho2': val_metrics.spearman_rho2_total,
                 'val_mse_per_metric': val_metrics.mse_per_metric,
                 'val_r2_per_metric': val_metrics.r2_per_metric,
+                'val_spearman_rho2_per_metric': val_metrics.spearman_rho2_per_metric,
                 'target_metrics': TARGET_METRICS,
                 'encoder_checkpoint': args.checkpoint,
             }, best_path)
@@ -612,8 +644,10 @@ def main():
         'optimizer_state_dict': optimizer.state_dict(),
         'val_mse': val_metrics.mse_total,
         'val_r2': val_metrics.r2_total,
+        'val_spearman_rho2': val_metrics.spearman_rho2_total,
         'val_mse_per_metric': val_metrics.mse_per_metric,
         'val_r2_per_metric': val_metrics.r2_per_metric,
+        'val_spearman_rho2_per_metric': val_metrics.spearman_rho2_per_metric,
         'target_metrics': TARGET_METRICS,
         'encoder_checkpoint': args.checkpoint,
     }, final_path)

@@ -180,19 +180,40 @@ def extract_phase_batch_tensors(
 # Streaming ridge regression
 # ---------------------------------------------------------------------------
 
+def _spearman_rho2(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """Compute Spearman's rank correlation squared (ρ²) for 1-D tensors."""
+    n = pred.shape[0]
+    if n < 2:
+        return 0.0
+    pred_ranks = pred.double().argsort().argsort().double()
+    tgt_ranks = target.double().argsort().argsort().double()
+    p = pred_ranks - pred_ranks.mean()
+    t = tgt_ranks - tgt_ranks.mean()
+    num = (p * t).sum()
+    den = torch.sqrt((p * p).sum() * (t * t).sum())
+    if den < 1e-12:
+        return 0.0
+    rho = num / den
+    return float(rho.item() ** 2)
+
+
 @dataclass
 class PhaseProbeMetrics:
     """Metrics in both normalized and original data scales."""
     # Normalized (transformed + whitened) space
     mse_per_channel: Dict[str, float]
     r2_per_channel: Dict[str, float]
+    spearman_rho2_per_channel: Dict[str, float]
     mse_total: float
     r2_total: float
+    spearman_rho2_total: float
     # Original (un-normalized, un-transformed) space
     mse_per_channel_original: Dict[str, float]
     r2_per_channel_original: Dict[str, float]
+    spearman_rho2_per_channel_original: Dict[str, float]
     mse_total_original: float
     r2_total_original: float
+    spearman_rho2_total_original: float
     n_observations: int
 
 
@@ -473,6 +494,12 @@ def evaluate_phase_probe(
     sum_y_orig = torch.zeros(C, dtype=torch.float64)
     sum_y2_orig = torch.zeros(C, dtype=torch.float64)
 
+    # Collect per-channel predictions/targets for Spearman ρ²
+    all_preds_norm = [[] for _ in range(C)]
+    all_targets_norm = [[] for _ in range(C)]
+    all_preds_orig = [[] for _ in range(C)]
+    all_targets_orig = [[] for _ in range(C)]
+
     n_obs = 0
 
     with torch.no_grad():
@@ -518,6 +545,10 @@ def evaluate_phase_probe(
             sum_y += Y_norm.sum(dim=0)
             sum_y2 += (Y_norm * Y_norm).sum(dim=0)
 
+            for c_idx in range(C):
+                all_preds_norm[c_idx].append(P_norm[:, c_idx].float())
+                all_targets_norm[c_idx].append(Y_norm[:, c_idx].float())
+
             # --- Original-space accumulators ---
             P_orig = _invert_to_original_scale(
                 P_norm, inv_whitening, means, transform_specs,
@@ -529,6 +560,10 @@ def evaluate_phase_probe(
             sse_orig += (err_orig * err_orig).sum(dim=0)
             sum_y_orig += Y_orig.sum(dim=0)
             sum_y2_orig += (Y_orig * Y_orig).sum(dim=0)
+
+            for c_idx in range(C):
+                all_preds_orig[c_idx].append(P_orig[:, c_idx].float())
+                all_targets_orig[c_idx].append(Y_orig[:, c_idx].float())
 
     def _compute_mse_r2(sse_acc, sum_y_acc, sum_y2_acc, n):
         mse_per: Dict[str, float] = {}
@@ -550,20 +585,37 @@ def evaluate_phase_probe(
                 r2_per[ch] = 0.0
         return mse_per, r2_per
 
+    def _compute_spearman(all_p, all_t):
+        spearman_per: Dict[str, float] = {}
+        for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+            if all_p[c_idx]:
+                p_cat = torch.cat(all_p[c_idx])
+                t_cat = torch.cat(all_t[c_idx])
+                spearman_per[ch] = _spearman_rho2(p_cat, t_cat)
+            else:
+                spearman_per[ch] = 0.0
+        return spearman_per
+
     mse_per, r2_per = _compute_mse_r2(sse, sum_y, sum_y2, n_obs)
     mse_per_orig, r2_per_orig = _compute_mse_r2(
         sse_orig, sum_y_orig, sum_y2_orig, n_obs,
     )
+    spearman_per = _compute_spearman(all_preds_norm, all_targets_norm)
+    spearman_per_orig = _compute_spearman(all_preds_orig, all_targets_orig)
 
     return PhaseProbeMetrics(
         mse_per_channel=mse_per,
         r2_per_channel=r2_per,
+        spearman_rho2_per_channel=spearman_per,
         mse_total=float(np.mean(list(mse_per.values()))),
         r2_total=float(np.mean(list(r2_per.values()))),
+        spearman_rho2_total=float(np.mean(list(spearman_per.values()))),
         mse_per_channel_original=mse_per_orig,
         r2_per_channel_original=r2_per_orig,
+        spearman_rho2_per_channel_original=spearman_per_orig,
         mse_total_original=float(np.mean(list(mse_per_orig.values()))),
         r2_total_original=float(np.mean(list(r2_per_orig.values()))),
+        spearman_rho2_total_original=float(np.mean(list(spearman_per_orig.values()))),
         n_observations=n_obs,
     )
 
@@ -577,31 +629,41 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
 
     # Normalized space
     logger.info(f"  [Normalized space]")
-    logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12}")
-    logger.info(f"  {'-' * 56}")
+    logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12} {'ρ²':>12}")
+    logger.info(f"  {'-' * 70}")
     for ch in PHASE_TARGET_CHANNELS:
         short = ch.replace("annual.", "")
         logger.info(
             f"  {short:<30} "
             f"{metrics.mse_per_channel[ch]:>12.6f} "
-            f"{metrics.r2_per_channel[ch]:>12.6f}"
+            f"{metrics.r2_per_channel[ch]:>12.6f} "
+            f"{metrics.spearman_rho2_per_channel[ch]:>12.6f}"
         )
-    logger.info(f"  {'-' * 56}")
-    logger.info(f"  {'Average':<30} {metrics.mse_total:>12.6f} {metrics.r2_total:>12.6f}")
+    logger.info(f"  {'-' * 70}")
+    logger.info(
+        f"  {'Average':<30} {metrics.mse_total:>12.6f} "
+        f"{metrics.r2_total:>12.6f} "
+        f"{metrics.spearman_rho2_total:>12.6f}"
+    )
 
     # Original space
     logger.info(f"  [Original scale]")
-    logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12}")
-    logger.info(f"  {'-' * 56}")
+    logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12} {'ρ²':>12}")
+    logger.info(f"  {'-' * 70}")
     for ch in PHASE_TARGET_CHANNELS:
         short = ch.replace("annual.", "")
         logger.info(
             f"  {short:<30} "
             f"{metrics.mse_per_channel_original[ch]:>12.6f} "
-            f"{metrics.r2_per_channel_original[ch]:>12.6f}"
+            f"{metrics.r2_per_channel_original[ch]:>12.6f} "
+            f"{metrics.spearman_rho2_per_channel_original[ch]:>12.6f}"
         )
-    logger.info(f"  {'-' * 56}")
-    logger.info(f"  {'Average':<30} {metrics.mse_total_original:>12.6f} {metrics.r2_total_original:>12.6f}")
+    logger.info(f"  {'-' * 70}")
+    logger.info(
+        f"  {'Average':<30} {metrics.mse_total_original:>12.6f} "
+        f"{metrics.r2_total_original:>12.6f} "
+        f"{metrics.spearman_rho2_total_original:>12.6f}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -734,17 +796,23 @@ def main():
             # Normalized space
             "train_mse_total": train_metrics.mse_total,
             "train_r2_total": train_metrics.r2_total,
+            "train_spearman_rho2_total": train_metrics.spearman_rho2_total,
             "val_mse_total": val_metrics.mse_total,
             "val_r2_total": val_metrics.r2_total,
+            "val_spearman_rho2_total": val_metrics.spearman_rho2_total,
             "val_mse_per_channel": val_metrics.mse_per_channel,
             "val_r2_per_channel": val_metrics.r2_per_channel,
+            "val_spearman_rho2_per_channel": val_metrics.spearman_rho2_per_channel,
             # Original scale
             "train_mse_total_original": train_metrics.mse_total_original,
             "train_r2_total_original": train_metrics.r2_total_original,
+            "train_spearman_rho2_total_original": train_metrics.spearman_rho2_total_original,
             "val_mse_total_original": val_metrics.mse_total_original,
             "val_r2_total_original": val_metrics.r2_total_original,
+            "val_spearman_rho2_total_original": val_metrics.spearman_rho2_total_original,
             "val_mse_per_channel_original": val_metrics.mse_per_channel_original,
             "val_r2_per_channel_original": val_metrics.r2_per_channel_original,
+            "val_spearman_rho2_per_channel_original": val_metrics.spearman_rho2_per_channel_original,
         },
         out_path,
     )

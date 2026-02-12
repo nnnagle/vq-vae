@@ -68,9 +68,28 @@ TARGET_METRICS = [
 class ProbeMetrics:
     mse_per_metric: Dict[str, float]
     r2_per_metric: Dict[str, float]
+    spearman_rho2_per_metric: Dict[str, float]
     mse_total: float
     r2_total: float
+    spearman_rho2_total: float
     n_pixels: int
+
+
+def _spearman_rho2(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """Compute Spearman's rank correlation squared (ρ²) for 1-D tensors."""
+    n = pred.shape[0]
+    if n < 2:
+        return 0.0
+    pred_ranks = pred.double().argsort().argsort().double()
+    tgt_ranks = target.double().argsort().argsort().double()
+    p = pred_ranks - pred_ranks.mean()
+    t = tgt_ranks - tgt_ranks.mean()
+    num = (p * t).sum()
+    den = torch.sqrt((p * p).sum() * (t * t).sum())
+    if den < 1e-12:
+        return 0.0
+    rho = num / den
+    return float(rho.item() ** 2)
 
 
 def _iter_batches(dataloader: DataLoader, max_batches: int):
@@ -223,6 +242,10 @@ def evaluate_probe(
     n = {m: 0 for m in TARGET_METRICS}
     total_pixels = 0
 
+    # Collect per-metric predictions/targets for Spearman ρ²
+    all_preds = {m: [] for m in TARGET_METRICS}
+    all_targets = {m: [] for m in TARGET_METRICS}
+
     with torch.no_grad():
         for batch in _iter_batches(loader, max_batches_eval):
             Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
@@ -245,7 +268,7 @@ def evaluate_probe(
             total_pixels += Y.shape[0]
 
             # Accumulate sufficient statistics per metric
-            # We’ll compute SSE directly, and compute SST using sums for stability:
+            # We'll compute SSE directly, and compute SST using sums for stability:
             # SST = sum((y - mean)^2) = sum(y^2) - (sum(y)^2)/n
             for t_idx, metric in enumerate(TARGET_METRICS):
                 yt = Y[:, t_idx]
@@ -257,13 +280,18 @@ def evaluate_probe(
                 sum_y2[metric] += float((yt * yt).sum().item())
                 n[metric] += int(yt.numel())
 
+                all_preds[metric].append(pt.cpu())
+                all_targets[metric].append(yt.cpu())
+
     mse_per = {}
     r2_per = {}
+    spearman_per = {}
 
     for metric in TARGET_METRICS:
         if n[metric] == 0:
             mse_per[metric] = 0.0
             r2_per[metric] = 0.0
+            spearman_per[metric] = 0.0
             continue
 
         mse_per[metric] = sse[metric] / n[metric]
@@ -277,27 +305,42 @@ def evaluate_probe(
         else:
             r2_per[metric] = 0.0
 
+        all_p = torch.cat(all_preds[metric])
+        all_t = torch.cat(all_targets[metric])
+        spearman_per[metric] = _spearman_rho2(all_p, all_t)
+
     mse_total = float(np.mean([mse_per[m] for m in TARGET_METRICS]))
     r2_total = float(np.mean([r2_per[m] for m in TARGET_METRICS]))
+    spearman_total = float(np.mean([spearman_per[m] for m in TARGET_METRICS]))
 
     return ProbeMetrics(
         mse_per_metric=mse_per,
         r2_per_metric=r2_per,
+        spearman_rho2_per_metric=spearman_per,
         mse_total=mse_total,
         r2_total=r2_total,
+        spearman_rho2_total=spearman_total,
         n_pixels=total_pixels,
     )
 
 
 def log_metrics(metrics: ProbeMetrics, prefix: str):
     logger.info(f"{prefix} results (valid pixels: {metrics.n_pixels:,}):")
-    logger.info(f"{'Metric':<28} {'MSE':>12} {'R²':>12}")
-    logger.info("-" * 56)
+    logger.info(f"{'Metric':<28} {'MSE':>12} {'R²':>12} {'ρ²':>12}")
+    logger.info("-" * 70)
     for m in TARGET_METRICS:
         short = m.replace("static.", "")
-        logger.info(f"{short:<28} {metrics.mse_per_metric[m]:>12.6f} {metrics.r2_per_metric[m]:>12.6f}")
-    logger.info("-" * 56)
-    logger.info(f"{'Average':<28} {metrics.mse_total:>12.6f} {metrics.r2_total:>12.6f}")
+        logger.info(
+            f"{short:<28} {metrics.mse_per_metric[m]:>12.6f} "
+            f"{metrics.r2_per_metric[m]:>12.6f} "
+            f"{metrics.spearman_rho2_per_metric[m]:>12.6f}"
+        )
+    logger.info("-" * 70)
+    logger.info(
+        f"{'Average':<28} {metrics.mse_total:>12.6f} "
+        f"{metrics.r2_total:>12.6f} "
+        f"{metrics.spearman_rho2_total:>12.6f}"
+    )
 
 
 def main():
@@ -416,10 +459,13 @@ def main():
             "encoder_checkpoint": args.checkpoint,
             "train_mse_total": train_metrics.mse_total,
             "train_r2_total": train_metrics.r2_total,
+            "train_spearman_rho2_total": train_metrics.spearman_rho2_total,
             "val_mse_total": val_metrics.mse_total,
             "val_r2_total": val_metrics.r2_total,
+            "val_spearman_rho2_total": val_metrics.spearman_rho2_total,
             "val_mse_per_metric": val_metrics.mse_per_metric,
             "val_r2_per_metric": val_metrics.r2_per_metric,
+            "val_spearman_rho2_per_metric": val_metrics.spearman_rho2_per_metric,
         },
         out_path,
     )
