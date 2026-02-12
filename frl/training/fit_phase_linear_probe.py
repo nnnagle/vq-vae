@@ -533,8 +533,10 @@ def evaluate_phase_probe(
 
             n_obs += zt_flat.shape[0]
 
-            # Build design matrix on GPU, predict on CPU
-            X = _build_design_matrix(zt_flat, zp_flat, design).cpu().float()  # [N, D]
+            # Build design matrix on CPU (interaction tensor is too large for GPU)
+            zt_cpu = zt_flat.cpu()
+            zp_cpu = zp_flat.cpu()
+            X = _build_design_matrix(zt_cpu, zp_cpu, design).float()  # [N, D]
             Y_norm = Y_norm.cpu().to(torch.float64)
 
             P_norm = (X @ W_cpu + b_cpu).to(torch.float64)  # [N, 7]
