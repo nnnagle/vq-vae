@@ -179,10 +179,18 @@ def process_batch(
         # Get target data [C, H, W]
         target_data = torch.from_numpy(target_feature.data).float()
 
-        # Combined mask: encoder mask AND target mask
+        # Combined mask: encoder mask AND target mask AND AOI AND forest
         encoder_mask = torch.from_numpy(encoder_feature.mask)
         target_mask = torch.from_numpy(target_feature.mask)
-        combined_mask = encoder_mask & target_mask
+
+        sm_names = sample["metadata"]["channel_names"]["static_mask"]
+        sm_data = sample["static_mask"]  # [C, H, W]
+        aoi_idx = sm_names.index("aoi")
+        forest_idx = sm_names.index("forest")
+        aoi_mask = torch.from_numpy(sm_data[aoi_idx]).bool()        # [H, W]
+        forest_mask = torch.from_numpy(sm_data[forest_idx]).bool()  # [H, W]
+
+        combined_mask = encoder_mask & target_mask & aoi_mask & forest_mask
 
         encoder_inputs.append(encoder_data)
         target_tensors.append(target_data)
@@ -354,7 +362,15 @@ def validate_epoch(
 
                 encoder_mask = torch.from_numpy(encoder_feature.mask).to(device)
                 target_mask = torch.from_numpy(target_feature.mask).to(device)
-                combined_mask = encoder_mask & target_mask
+
+                sm_names = sample["metadata"]["channel_names"]["static_mask"]
+                sm_data = sample["static_mask"]  # [C, H, W]
+                aoi_idx = sm_names.index("aoi")
+                forest_idx = sm_names.index("forest")
+                aoi_mask = torch.from_numpy(sm_data[aoi_idx]).bool().to(device)
+                forest_mask = torch.from_numpy(sm_data[forest_idx]).bool().to(device)
+
+                combined_mask = encoder_mask & target_mask & aoi_mask & forest_mask
 
                 if combined_mask.sum() == 0:
                     continue
