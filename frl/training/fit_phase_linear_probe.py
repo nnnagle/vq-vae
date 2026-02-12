@@ -1023,7 +1023,10 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
-    logger.info(f"Design matrix: {args.design} (D={_design_dim(args.design)})")
+    logger.info(
+        f"Design matrix: {args.design} (D_raw={_design_dim(args.design)}, "
+        f"interaction_pca_k={args.interaction_pca_k})"
+    )
 
     # Fit
     W, b_bias, preprocessor = fit_phase_probe(
