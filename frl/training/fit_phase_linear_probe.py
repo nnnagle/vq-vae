@@ -273,6 +273,260 @@ D_INTERACTION = D_TYPE * D_PHASE  # 768
 D_TOTAL = D_TYPE + D_PHASE + D_INTERACTION  # 844
 
 
+# ---------------------------------------------------------------------------
+# Preprocessing: column standardization + interaction PCA
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProbePreprocessor:
+    """Column-wise standardization + optional PCA compression of interaction.
+
+    Stores the mean/std computed from training data and (for ``"full"``
+    design) the top-k PCA components of the standardised interaction block.
+    The :meth:`transform` method applies the same pipeline at eval time.
+    """
+
+    mean: torch.Tensor           # [D_raw]
+    std: torch.Tensor            # [D_raw]
+    pca_components: torch.Tensor | None   # [D_INTERACTION, k] or None
+    interaction_pca_k: int       # 0 → no PCA
+    design: str                  # "full", "type-only", "phase-only"
+    pca_explained_variance_ratio: torch.Tensor | None  # [k] or None
+
+    @property
+    def output_dim(self) -> int:
+        if self.design == "type-only":
+            return D_TYPE
+        if self.design == "phase-only":
+            return D_PHASE
+        # full
+        if self.interaction_pca_k > 0 and self.pca_components is not None:
+            return D_TYPE + D_PHASE + self.interaction_pca_k
+        return D_TOTAL
+
+    def transform(
+        self,
+        z_type_flat: torch.Tensor,
+        z_phase_flat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build, standardise, and optionally PCA-compress the design matrix.
+
+        Args:
+            z_type_flat:  [N, 64]
+            z_phase_flat: [N, 12]
+
+        Returns:
+            [N, D_out]  where D_out = :pyattr:`output_dim`
+        """
+        X_raw = _build_design_matrix(z_type_flat, z_phase_flat, self.design)
+        X_std = (X_raw.double() - self.mean.double()) / self.std.double()
+
+        if (
+            self.design == "full"
+            and self.interaction_pca_k > 0
+            and self.pca_components is not None
+        ):
+            main = X_std[:, : D_TYPE + D_PHASE]
+            interaction_std = X_std[:, D_TYPE + D_PHASE :]
+            interaction_pca = interaction_std @ self.pca_components.double()
+            return torch.cat([main, interaction_pca], dim=1).float()
+
+        return X_std.float()
+
+    # -- serialisation helpers ------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Flatten into a plain dict suitable for ``torch.save``."""
+        return {
+            "preprocessor_mean": self.mean.cpu(),
+            "preprocessor_std": self.std.cpu(),
+            "preprocessor_pca_components": (
+                self.pca_components.cpu()
+                if self.pca_components is not None
+                else None
+            ),
+            "preprocessor_interaction_pca_k": self.interaction_pca_k,
+            "preprocessor_design": self.design,
+            "preprocessor_pca_explained_variance_ratio": (
+                self.pca_explained_variance_ratio.cpu()
+                if self.pca_explained_variance_ratio is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ProbePreprocessor":
+        """Reconstruct from a checkpoint dict."""
+        return cls(
+            mean=d["preprocessor_mean"],
+            std=d["preprocessor_std"],
+            pca_components=d.get("preprocessor_pca_components"),
+            interaction_pca_k=d.get("preprocessor_interaction_pca_k", 0),
+            design=d.get("preprocessor_design", "full"),
+            pca_explained_variance_ratio=d.get(
+                "preprocessor_pca_explained_variance_ratio"
+            ),
+        )
+
+
+def _compute_feature_statistics(
+    train_loader: DataLoader,
+    feature_builder: FeatureBuilder,
+    model: RepresentationModel,
+    device: torch.device,
+    halo: int,
+    max_batches_train: int,
+    design: str,
+    interaction_pca_k: int,
+) -> ProbePreprocessor:
+    """Pass 1: compute per-column mean/std and interaction PCA components.
+
+    This streams over training data once, accumulating sufficient statistics
+    (sum, sum-of-squares, and the interaction outer-product matrix) so that
+    standardisation parameters and PCA can be derived without materialising
+    the full design matrix.
+    """
+    model.eval()
+    D_raw = _design_dim(design)
+
+    sum_x = torch.zeros(D_raw, dtype=torch.float64)
+    sum_x2 = torch.zeros(D_raw, dtype=torch.float64)
+    n_obs = 0
+
+    need_pca = design == "full" and interaction_pca_k > 0
+    if need_pca:
+        sum_xx_int = torch.zeros(
+            D_INTERACTION, D_INTERACTION, dtype=torch.float64,
+        )
+
+    with torch.no_grad():
+        for batch in _iter_batches(train_loader, max_batches_train):
+            Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
+                batch, feature_builder, device,
+            )
+            Bsz, _, H, W_sp = Ximg.shape
+            T = Xphase.shape[2]
+
+            z_type = model(Ximg)
+            z_phase = model.forward_phase(Xphase, z_type.detach())
+
+            halo_m = _halo_mask(H, W_sp, halo, device)
+            full_mask = M & halo_m.unsqueeze(0)
+
+            zt = z_type.permute(0, 2, 3, 1).contiguous()
+            zp = z_phase.permute(0, 2, 3, 4, 1).contiguous()
+
+            m_t = full_mask.unsqueeze(1).expand(-1, T, -1, -1)
+            m_flat = m_t.reshape(-1)
+
+            zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
+            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat].cpu()
+            zp_flat = zp.reshape(-1, D_PHASE)[m_flat].cpu()
+
+            if zt_flat.shape[0] == 0:
+                continue
+
+            X_raw = _build_design_matrix(zt_flat, zp_flat, design).to(
+                torch.float64,
+            )
+
+            sum_x += X_raw.sum(dim=0)
+            sum_x2 += (X_raw * X_raw).sum(dim=0)
+            n_obs += X_raw.shape[0]
+
+            if need_pca:
+                X_int = X_raw[:, D_TYPE + D_PHASE :]
+                sum_xx_int += X_int.T @ X_int
+
+    if n_obs == 0:
+        raise RuntimeError("No valid observations for feature statistics.")
+
+    mean = sum_x / n_obs
+    var = sum_x2 / n_obs - mean * mean
+    std = var.clamp(min=1e-16).sqrt()
+
+    # Log scale diagnostics — directly tests the scale-mismatch hypothesis
+    if design == "full":
+        type_stds = std[:D_TYPE]
+        phase_stds = std[D_TYPE : D_TYPE + D_PHASE]
+        int_stds = std[D_TYPE + D_PHASE :]
+        logger.info(
+            f"Feature scale diagnostics ({n_obs:,} observations):"
+        )
+        logger.info(
+            f"  z_type  ({D_TYPE} cols): "
+            f"mean std = {type_stds.mean():.6f}  "
+            f"[{type_stds.min():.6f}, {type_stds.max():.6f}]"
+        )
+        logger.info(
+            f"  z_phase ({D_PHASE} cols): "
+            f"mean std = {phase_stds.mean():.6f}  "
+            f"[{phase_stds.min():.6f}, {phase_stds.max():.6f}]"
+        )
+        logger.info(
+            f"  interaction ({D_INTERACTION} cols): "
+            f"mean std = {int_stds.mean():.6f}  "
+            f"[{int_stds.min():.6f}, {int_stds.max():.6f}]"
+        )
+        logger.info(
+            f"  Scale ratio type/phase: "
+            f"{type_stds.mean() / phase_stds.mean():.2f}x"
+        )
+    else:
+        logger.info(
+            f"Feature statistics ({n_obs:,} observations): "
+            f"mean std = {std.mean():.6f}  "
+            f"[{std.min():.6f}, {std.max():.6f}]"
+        )
+
+    # PCA on the standardised interaction block
+    pca_components = None
+    pca_explained_variance_ratio = None
+
+    if need_pca:
+        int_mean = mean[D_TYPE + D_PHASE :]
+        int_std = std[D_TYPE + D_PHASE :]
+
+        # Covariance of raw interaction, then convert to standardised cov
+        cov_raw = sum_xx_int / n_obs - int_mean.unsqueeze(1) * int_mean.unsqueeze(0)
+        inv_std = 1.0 / int_std
+        cov_std = inv_std.unsqueeze(1) * cov_raw * inv_std.unsqueeze(0)
+
+        eigvals, eigvecs = torch.linalg.eigh(cov_std)
+        # eigh returns ascending order — take the top k
+        k = min(interaction_pca_k, D_INTERACTION)
+        top_eigvecs = eigvecs[:, -k:].flip(dims=[1])      # [768, k]
+        top_eigvals = eigvals[-k:].flip(dims=[0])          # [k]
+
+        # Normalise so that projected columns have unit variance:
+        #   Var(X_std @ v_i) = λ_i  →  divide by √λ_i
+        top_eigvals_safe = top_eigvals.clamp(min=1e-12)
+        pca_components = (
+            top_eigvecs / top_eigvals_safe.sqrt().unsqueeze(0)
+        ).to(torch.float32)  # [768, k]
+
+        explained_total = eigvals.clamp(min=0.0).sum()
+        pca_explained_variance_ratio = (
+            top_eigvals.clamp(min=0.0) / explained_total
+        ).to(torch.float32)
+        cumulative = pca_explained_variance_ratio.cumsum(0)
+
+        logger.info(
+            f"Interaction PCA: k={k}, "
+            f"cumulative explained variance = {cumulative[-1]:.4f} "
+            f"(PC1 = {cumulative[0]:.4f})"
+        )
+
+    return ProbePreprocessor(
+        mean=mean.to(torch.float32),
+        std=std.to(torch.float32),
+        pca_components=pca_components,
+        interaction_pca_k=interaction_pca_k,
+        design=design,
+        pca_explained_variance_ratio=pca_explained_variance_ratio,
+    )
+
+
 def fit_phase_probe(
     train_loader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -282,21 +536,41 @@ def fit_phase_probe(
     halo: int = 16,
     max_batches_train: int = 0,
     design: str = "full",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Streaming ridge regression for the phase linear probe.
+    interaction_pca_k: int = 20,
+) -> Tuple[torch.Tensor, torch.Tensor, ProbePreprocessor]:
+    """Two-pass streaming ridge regression for the phase linear probe.
+
+    **Pass 1** streams over the training data to compute per-column mean/std
+    and (for the ``"full"`` design) the top-k PCA components of the
+    standardised interaction block.
+
+    **Pass 2** streams again, applying the preprocessing (standardise +
+    PCA-compress) before accumulating the normal equations for ridge
+    regression.
 
     Args:
-        design: ``"full"`` (type + phase + interaction, 844 cols),
-            ``"type-only"`` (64 cols), or ``"phase-only"`` (12 cols).
-
-    Normal equations are accumulated on CPU in float64.
+        design: ``"full"`` (type + phase + interaction), ``"type-only"``,
+            or ``"phase-only"``.
+        interaction_pca_k: Number of PCA components to retain for the
+            768-column interaction block (``"full"`` design only).
+            Set to 0 to skip PCA and use standardisation alone.
 
     Returns:
-        W: [D, C]
+        W: [D_out, C]
         b: [C]
+        preprocessor: :class:`ProbePreprocessor` with stored mean/std/PCA
     """
+    # Pass 1 — feature statistics + PCA
+    logger.info("Pass 1/2: computing feature statistics …")
+    preprocessor = _compute_feature_statistics(
+        train_loader, feature_builder, model, device,
+        halo, max_batches_train, design, interaction_pca_k,
+    )
+
+    # Pass 2 — ridge regression on preprocessed features
+    logger.info("Pass 2/2: fitting ridge regression …")
     model.eval()
-    D = _design_dim(design)
+    D = preprocessor.output_dim
     C = len(PHASE_TARGET_CHANNELS)  # 7
     Da = D + 1
 
@@ -313,47 +587,36 @@ def fit_phase_probe(
             Bsz, _, H, W_sp = Ximg.shape
             T = Xphase.shape[2]
 
-            # Type encoder (dense)
-            z_type = model(Ximg)  # [B, 64, H, W]
+            z_type = model(Ximg)
+            z_phase = model.forward_phase(Xphase, z_type.detach())
 
-            # Phase encoder (dense, stop-grad on z_type)
-            z_phase = model.forward_phase(Xphase, z_type.detach())  # [B, 12, T, H, W]
+            halo_m = _halo_mask(H, W_sp, halo, device)
+            full_mask = M & halo_m.unsqueeze(0)
 
-            # Apply halo mask
-            halo_m = _halo_mask(H, W_sp, halo, device)  # [H, W]
-            full_mask = M & halo_m.unsqueeze(0)          # [B, H, W]
+            zt = z_type.permute(0, 2, 3, 1).contiguous()
+            zp = z_phase.permute(0, 2, 3, 4, 1).contiguous()
+            y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()
 
-            # Flatten z_type: [B, 64, H, W] → [B, H, W, 64], mask, broadcast T
-            zt = z_type.permute(0, 2, 3, 1).contiguous()            # [B, H, W, 64]
-            zp = z_phase.permute(0, 2, 3, 4, 1).contiguous()       # [B, T, H, W, 12]
-            y_perm = Yimg.permute(0, 2, 3, 4, 1).contiguous()      # [B, T, H, W, 7]
-
-            # Broadcast mask: [B, H, W] → [B, T, H, W]
-            m_t = full_mask.unsqueeze(1).expand(-1, T, -1, -1)     # [B, T, H, W]
+            m_t = full_mask.unsqueeze(1).expand(-1, T, -1, -1)
             m_flat = m_t.reshape(-1)
 
-            # Broadcast z_type across T: [B, H, W, 64] → [B, T, H, W, 64]
-            zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)       # [B, T, H, W, 64]
-
-            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat]              # [N, 64]
-            zp_flat = zp.reshape(-1, D_PHASE)[m_flat]               # [N, 12]
-            Y = y_perm.reshape(-1, C)[m_flat]                       # [N, 7]
+            zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
+            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat].cpu()
+            zp_flat = zp.reshape(-1, D_PHASE)[m_flat].cpu()
+            Y = y_perm.reshape(-1, C)[m_flat]
 
             if zt_flat.shape[0] == 0:
                 continue
 
             n_obs_total += zt_flat.shape[0]
 
-            # Move to CPU before building design matrix
-            zt_cpu = zt_flat.cpu()
-            zp_cpu = zp_flat.cpu()
-            X = _build_design_matrix(zt_cpu, zp_cpu, design)       # [N, D]
+            X = preprocessor.transform(zt_flat, zp_flat)
             ones = torch.ones((X.shape[0], 1), dtype=X.dtype)
-            Xaug = torch.cat([X, ones], dim=1).to(torch.float64)   # [N, 845]
+            Xaug = torch.cat([X, ones], dim=1).to(torch.float64)
             Y64 = Y.to(dtype=torch.float64, device="cpu")
 
-            A += Xaug.T @ Xaug       # [845, 845]
-            B_mat += Xaug.T @ Y64    # [845, 7]
+            A += Xaug.T @ Xaug
+            B_mat += Xaug.T @ Y64
 
     if n_obs_total == 0:
         raise RuntimeError("No valid observations found in training data; cannot fit probe.")
@@ -362,15 +625,16 @@ def fit_phase_probe(
     reg = torch.eye(Da, dtype=torch.float64) * ridge_lambda
     reg[-1, -1] = 0.0
 
-    Wb = torch.linalg.solve(A + reg, B_mat)  # [845, 7]
-    W = Wb[:-1, :].to(torch.float32)          # [844, 7]
-    b = Wb[-1, :].to(torch.float32)           # [7]
+    Wb = torch.linalg.solve(A + reg, B_mat)
+    W = Wb[:-1, :].to(torch.float32)
+    b = Wb[-1, :].to(torch.float32)
 
     logger.info(
         f"Fitted phase probe on {n_obs_total:,} observations "
-        f"(design={design}, D={D}, ridge_lambda={ridge_lambda:g}, halo={halo})."
+        f"(design={design}, D={D}, ridge_lambda={ridge_lambda:g}, "
+        f"halo={halo}, interaction_pca_k={interaction_pca_k})."
     )
-    return W, b
+    return W, b, preprocessor
 
 
 # ---------------------------------------------------------------------------
@@ -466,11 +730,16 @@ def evaluate_phase_probe(
     halo: int = 16,
     max_batches_eval: int = 0,
     design: str = "full",
+    preprocessor: ProbePreprocessor | None = None,
 ) -> PhaseProbeMetrics:
     """Evaluate MSE and R² in both normalized and original data scales.
 
     Predictions are made in the normalized (whitened) space, then inverted
     back to the original spectral units for a second set of metrics.
+
+    If *preprocessor* is provided, the design matrix is standardised (and
+    optionally PCA-compressed) before prediction.  Otherwise raw features
+    are used (legacy behaviour).
     """
     model.eval()
     C = W.shape[1]   # 7
@@ -533,10 +802,13 @@ def evaluate_phase_probe(
 
             n_obs += zt_flat.shape[0]
 
-            # Build design matrix on CPU (interaction tensor is too large for GPU)
+            # Build design matrix on CPU
             zt_cpu = zt_flat.cpu()
             zp_cpu = zp_flat.cpu()
-            X = _build_design_matrix(zt_cpu, zp_cpu, design).float()  # [N, D]
+            if preprocessor is not None:
+                X = preprocessor.transform(zt_cpu, zp_cpu)
+            else:
+                X = _build_design_matrix(zt_cpu, zp_cpu, design).float()
             Y_norm = Y_norm.cpu().to(torch.float64)
 
             P_norm = (X @ W_cpu + b_cpu).to(torch.float64)  # [N, 7]
@@ -690,6 +962,10 @@ def main():
         "--design", type=str, default="full", choices=DESIGN_CHOICES,
         help="Design matrix: full (type+phase+interaction), type-only, phase-only",
     )
+    parser.add_argument(
+        "--interaction-pca-k", type=int, default=20,
+        help="Number of PCA components for the interaction block (full design only, 0 = no PCA)",
+    )
     args = parser.parse_args()
 
     logger.info(f"Loading bindings config from {args.bindings}")
@@ -750,7 +1026,7 @@ def main():
     logger.info(f"Design matrix: {args.design} (D={_design_dim(args.design)})")
 
     # Fit
-    W, b_bias = fit_phase_probe(
+    W, b_bias, preprocessor = fit_phase_probe(
         train_loader,
         feature_builder,
         model,
@@ -759,6 +1035,7 @@ def main():
         halo=args.halo,
         max_batches_train=args.max_batches_train,
         design=args.design,
+        interaction_pca_k=args.interaction_pca_k,
     )
 
     # Evaluate
@@ -767,12 +1044,14 @@ def main():
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
         design=args.design,
+        preprocessor=preprocessor,
     )
     val_metrics = evaluate_phase_probe(
         val_loader, feature_builder, model, W, b_bias, device,
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
         design=args.design,
+        preprocessor=preprocessor,
     )
 
     log_metrics(train_metrics, prefix="TRAIN")
@@ -784,40 +1063,40 @@ def main():
     else:
         out_path = Path(args.checkpoint).parent / "phase_linear_probe.pt"
 
-    torch.save(
-        {
-            "W": W.cpu(),
-            "b": b_bias.cpu(),
-            "ridge_lambda": args.ridge_lambda,
-            "halo": args.halo,
-            "target_feature": PHASE_TARGET_FEATURE,
-            "target_channels": PHASE_TARGET_CHANNELS,
-            "design": args.design,
-            "input_dim": _design_dim(args.design),
-            "encoder_checkpoint": args.checkpoint,
-            # Normalized space
-            "train_mse_total": train_metrics.mse_total,
-            "train_r2_total": train_metrics.r2_total,
-            "train_spearman_rho2_total": train_metrics.spearman_rho2_total,
-            "val_mse_total": val_metrics.mse_total,
-            "val_r2_total": val_metrics.r2_total,
-            "val_spearman_rho2_total": val_metrics.spearman_rho2_total,
-            "val_mse_per_channel": val_metrics.mse_per_channel,
-            "val_r2_per_channel": val_metrics.r2_per_channel,
-            "val_spearman_rho2_per_channel": val_metrics.spearman_rho2_per_channel,
-            # Original scale
-            "train_mse_total_original": train_metrics.mse_total_original,
-            "train_r2_total_original": train_metrics.r2_total_original,
-            "train_spearman_rho2_total_original": train_metrics.spearman_rho2_total_original,
-            "val_mse_total_original": val_metrics.mse_total_original,
-            "val_r2_total_original": val_metrics.r2_total_original,
-            "val_spearman_rho2_total_original": val_metrics.spearman_rho2_total_original,
-            "val_mse_per_channel_original": val_metrics.mse_per_channel_original,
-            "val_r2_per_channel_original": val_metrics.r2_per_channel_original,
-            "val_spearman_rho2_per_channel_original": val_metrics.spearman_rho2_per_channel_original,
-        },
-        out_path,
-    )
+    save_dict = {
+        "W": W.cpu(),
+        "b": b_bias.cpu(),
+        "ridge_lambda": args.ridge_lambda,
+        "halo": args.halo,
+        "target_feature": PHASE_TARGET_FEATURE,
+        "target_channels": PHASE_TARGET_CHANNELS,
+        "design": args.design,
+        "input_dim": preprocessor.output_dim,
+        "interaction_pca_k": args.interaction_pca_k,
+        "encoder_checkpoint": args.checkpoint,
+        # Normalized space
+        "train_mse_total": train_metrics.mse_total,
+        "train_r2_total": train_metrics.r2_total,
+        "train_spearman_rho2_total": train_metrics.spearman_rho2_total,
+        "val_mse_total": val_metrics.mse_total,
+        "val_r2_total": val_metrics.r2_total,
+        "val_spearman_rho2_total": val_metrics.spearman_rho2_total,
+        "val_mse_per_channel": val_metrics.mse_per_channel,
+        "val_r2_per_channel": val_metrics.r2_per_channel,
+        "val_spearman_rho2_per_channel": val_metrics.spearman_rho2_per_channel,
+        # Original scale
+        "train_mse_total_original": train_metrics.mse_total_original,
+        "train_r2_total_original": train_metrics.r2_total_original,
+        "train_spearman_rho2_total_original": train_metrics.spearman_rho2_total_original,
+        "val_mse_total_original": val_metrics.mse_total_original,
+        "val_r2_total_original": val_metrics.r2_total_original,
+        "val_spearman_rho2_total_original": val_metrics.spearman_rho2_total_original,
+        "val_mse_per_channel_original": val_metrics.mse_per_channel_original,
+        "val_r2_per_channel_original": val_metrics.r2_per_channel_original,
+        "val_spearman_rho2_per_channel_original": val_metrics.spearman_rho2_per_channel_original,
+    }
+    save_dict.update(preprocessor.to_dict())
+    torch.save(save_dict, out_path)
     logger.info(f"Saved phase probe to {out_path}")
 
 

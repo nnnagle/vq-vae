@@ -45,6 +45,7 @@ from training.fit_phase_linear_probe import (
     PHASE_TARGET_CHANNELS,
     D_TYPE,
     D_PHASE,
+    ProbePreprocessor,
     _build_design_matrix,
     _build_inverse_normalization,
     _invert_to_original_scale,
@@ -124,11 +125,15 @@ def collect_phase_diagnostics(
     device: torch.device,
     patch_indices: List[int],
     design: str = "full",
+    preprocessor: "ProbePreprocessor | None" = None,
 ) -> List[Dict[str, np.ndarray]]:
     """Run encoder + phase probe on selected patches.
 
     Returns list of dicts with observed and predicted [T, H, W] arrays
     in original (back-transformed) scale, plus masks and ysfc_min.
+
+    If *preprocessor* is provided, the design matrix is standardised (and
+    optionally PCA-compressed) before prediction.
     """
     model.eval()
 
@@ -179,7 +184,10 @@ def collect_phase_diagnostics(
             for t in range(T):
                 zt_flat = zt.reshape(-1, D_TYPE)       # [H*W, 64]
                 zp_flat = zp[t].reshape(-1, D_PHASE)   # [H*W, 12]
-                X = _build_design_matrix(zt_flat, zp_flat, design)
+                if preprocessor is not None:
+                    X = preprocessor.transform(zt_flat, zp_flat)
+                else:
+                    X = _build_design_matrix(zt_flat, zp_flat, design)
                 pred_t = (X @ W_cpu + b_cpu)            # [H*W, 7]
                 pred_norm_list.append(pred_t.reshape(H, W_sp, C))
 
@@ -625,6 +633,19 @@ def main():
     W = probe_ckpt["W"]   # [D, 7]
     b = probe_ckpt["b"]   # [7]
     design = probe_ckpt.get("design", "full")
+
+    # Load preprocessor (standardisation + PCA) if present
+    if "preprocessor_mean" in probe_ckpt:
+        preprocessor = ProbePreprocessor.from_dict(probe_ckpt)
+        logger.info(
+            f"Probe preprocessor: design={preprocessor.design}, "
+            f"pca_k={preprocessor.interaction_pca_k}, "
+            f"output_dim={preprocessor.output_dim}"
+        )
+    else:
+        preprocessor = None
+        logger.info("No preprocessor in probe checkpoint; using raw features.")
+
     logger.info(
         f"Probe: design={design}, W shape={list(W.shape)}, "
         f"target channels="
@@ -660,6 +681,7 @@ def main():
     records = collect_phase_diagnostics(
         test_dataset, feature_builder, model, W, b,
         device, selected_indices, design=design,
+        preprocessor=preprocessor,
     )
     logger.info(f"Collected data for {len(records)} patches")
 
