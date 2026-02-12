@@ -237,6 +237,7 @@ def _build_design_matrix(
         z_phase_flat: [N, 12]
         design: one of
             ``"full"``       – [z_type, z_phase, z_type ⊗ z_phase]  (844 cols)
+            ``"additive"``   – [z_type, z_phase]                      (76 cols)
             ``"type-only"``  – [z_type]                               (64 cols)
             ``"phase-only"`` – [z_phase]                              (12 cols)
 
@@ -247,6 +248,8 @@ def _build_design_matrix(
         return z_type_flat
     if design == "phase-only":
         return z_phase_flat
+    if design == "additive":
+        return torch.cat([z_type_flat, z_phase_flat], dim=1)
 
     # full: main effects + interaction
     interaction = (
@@ -261,10 +264,12 @@ def _design_dim(design: str) -> int:
         return D_TYPE
     if design == "phase-only":
         return D_PHASE
+    if design == "additive":
+        return D_TYPE + D_PHASE
     return D_TOTAL
 
 
-DESIGN_CHOICES = ("full", "type-only", "phase-only")
+DESIGN_CHOICES = ("full", "additive", "type-only", "phase-only")
 
 
 D_TYPE = 64
@@ -290,7 +295,7 @@ class ProbePreprocessor:
     std: torch.Tensor            # [D_raw]
     pca_components: torch.Tensor | None   # [D_INTERACTION, k] or None
     interaction_pca_k: int       # 0 → no PCA
-    design: str                  # "full", "type-only", "phase-only"
+    design: str                  # "full", "additive", "type-only", "phase-only"
     pca_explained_variance_ratio: torch.Tensor | None  # [k] or None
 
     @property
@@ -299,6 +304,8 @@ class ProbePreprocessor:
             return D_TYPE
         if self.design == "phase-only":
             return D_PHASE
+        if self.design == "additive":
+            return D_TYPE + D_PHASE
         # full
         if self.interaction_pca_k > 0 and self.pca_components is not None:
             return D_TYPE + D_PHASE + self.interaction_pca_k
