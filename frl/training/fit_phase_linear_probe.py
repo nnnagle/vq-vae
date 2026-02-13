@@ -215,6 +215,16 @@ class PhaseProbeMetrics:
     r2_total_original: float
     spearman_rho2_total_original: float
     n_observations: int
+    # Temporal (within-pixel) decomposition — normalized space
+    r2_temporal_per_channel: Dict[str, float]
+    r2_temporal_total: float
+    # Temporal decomposition — original space
+    r2_temporal_per_channel_original: Dict[str, float]
+    r2_temporal_total_original: float
+    # Variance decomposition: fraction of total variance that is within-pixel
+    variance_fraction_temporal: Dict[str, float]
+    variance_fraction_temporal_total: float
+    n_pixels: int
 
 
 def _iter_batches(dataloader: DataLoader, max_batches: int):
@@ -778,6 +788,13 @@ def evaluate_phase_probe(
 
     n_obs = 0
 
+    # Temporal (within-pixel) decomposition accumulators
+    sse_temporal = torch.zeros(C, dtype=torch.float64)
+    sst_temporal = torch.zeros(C, dtype=torch.float64)
+    sse_temporal_orig = torch.zeros(C, dtype=torch.float64)
+    sst_temporal_orig = torch.zeros(C, dtype=torch.float64)
+    n_pixels_total = 0
+
     with torch.no_grad():
         for batch in _iter_batches(loader, max_batches_eval):
             Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
@@ -846,6 +863,37 @@ def evaluate_phase_probe(
                 all_preds_orig[c_idx].append(P_orig[:, c_idx].float())
                 all_targets_orig[c_idx].append(Y_orig[:, c_idx].float())
 
+            # --- Temporal (within-pixel) decomposition ---
+            # Split flattened predictions back into [T, N_b, C] per batch item.
+            # The mask is spatial (same for all T), so each batch item b
+            # contributes T * N_b contiguous entries in the flat arrays,
+            # ordered as [t=0 pixels..., t=1 pixels..., ...].
+            offset = 0
+            for b_idx in range(Bsz):
+                N_b = full_mask[b_idx].sum().item()
+                if N_b == 0:
+                    continue
+                n_obs_b = T * N_b
+
+                # Normalized space
+                p_bt = P_norm[offset:offset + n_obs_b].reshape(T, N_b, C)
+                y_bt = Y_norm[offset:offset + n_obs_b].reshape(T, N_b, C)
+                p_anom = p_bt - p_bt.mean(dim=0, keepdim=True)
+                y_anom = y_bt - y_bt.mean(dim=0, keepdim=True)
+                sse_temporal += ((p_anom - y_anom) ** 2).sum(dim=(0, 1))
+                sst_temporal += (y_anom ** 2).sum(dim=(0, 1))
+
+                # Original space
+                p_bt_o = P_orig[offset:offset + n_obs_b].reshape(T, N_b, C)
+                y_bt_o = Y_orig[offset:offset + n_obs_b].reshape(T, N_b, C)
+                p_anom_o = p_bt_o - p_bt_o.mean(dim=0, keepdim=True)
+                y_anom_o = y_bt_o - y_bt_o.mean(dim=0, keepdim=True)
+                sse_temporal_orig += ((p_anom_o - y_anom_o) ** 2).sum(dim=(0, 1))
+                sst_temporal_orig += (y_anom_o ** 2).sum(dim=(0, 1))
+
+                offset += n_obs_b
+                n_pixels_total += N_b
+
     def _compute_mse_r2(sse_acc, sum_y_acc, sum_y2_acc, n):
         mse_per: Dict[str, float] = {}
         r2_per: Dict[str, float] = {}
@@ -884,6 +932,38 @@ def evaluate_phase_probe(
     spearman_per = _compute_spearman(all_preds_norm, all_targets_norm)
     spearman_per_orig = _compute_spearman(all_preds_orig, all_targets_orig)
 
+    # --- Temporal (within-pixel) R² ---
+    r2_temporal: Dict[str, float] = {}
+    r2_temporal_orig: Dict[str, float] = {}
+    vf_temporal: Dict[str, float] = {}
+    for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+        # Normalized space
+        sst_w = float(sst_temporal[c_idx].item())
+        if sst_w > 1e-8:
+            r2_temporal[ch] = 1.0 - float(sse_temporal[c_idx].item()) / sst_w
+        else:
+            r2_temporal[ch] = 0.0
+
+        # Original space
+        sst_wo = float(sst_temporal_orig[c_idx].item())
+        if sst_wo > 1e-8:
+            r2_temporal_orig[ch] = (
+                1.0 - float(sse_temporal_orig[c_idx].item()) / sst_wo
+            )
+        else:
+            r2_temporal_orig[ch] = 0.0
+
+        # Variance fraction: within-pixel / total (normalized space)
+        sst_total_ch = max(
+            0.0,
+            float(sum_y2[c_idx].item())
+            - float(sum_y[c_idx].item()) ** 2 / n_obs,
+        )
+        if sst_total_ch > 1e-8:
+            vf_temporal[ch] = sst_w / sst_total_ch
+        else:
+            vf_temporal[ch] = 0.0
+
     return PhaseProbeMetrics(
         mse_per_channel=mse_per,
         r2_per_channel=r2_per,
@@ -898,6 +978,13 @@ def evaluate_phase_probe(
         r2_total_original=float(np.mean(list(r2_per_orig.values()))),
         spearman_rho2_total_original=float(np.mean(list(spearman_per_orig.values()))),
         n_observations=n_obs,
+        r2_temporal_per_channel=r2_temporal,
+        r2_temporal_total=float(np.mean(list(r2_temporal.values()))),
+        r2_temporal_per_channel_original=r2_temporal_orig,
+        r2_temporal_total_original=float(np.mean(list(r2_temporal_orig.values()))),
+        variance_fraction_temporal=vf_temporal,
+        variance_fraction_temporal_total=float(np.mean(list(vf_temporal.values()))),
+        n_pixels=n_pixels_total,
     )
 
 
@@ -944,6 +1031,35 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
         f"  {'Average':<30} {metrics.mse_total_original:>12.6f} "
         f"{metrics.r2_total_original:>12.6f} "
         f"{metrics.spearman_rho2_total_original:>12.6f}"
+    )
+
+    # Temporal (within-pixel) decomposition
+    logger.info(f"  [Temporal (within-pixel) R²]")
+    logger.info(
+        f"  Temporal variance = {metrics.variance_fraction_temporal_total:.1%} "
+        f"of total ({metrics.n_pixels:,} pixels)"
+    )
+    logger.info(
+        f"  {'Channel':<30} {'R²_total':>12} {'R²_temporal':>12} "
+        f"{'R²_temp_orig':>12} {'VarFrac':>12}"
+    )
+    logger.info(f"  {'-' * 70}")
+    for ch in PHASE_TARGET_CHANNELS:
+        short = ch.replace("annual.", "")
+        logger.info(
+            f"  {short:<30} "
+            f"{metrics.r2_per_channel[ch]:>12.6f} "
+            f"{metrics.r2_temporal_per_channel[ch]:>12.6f} "
+            f"{metrics.r2_temporal_per_channel_original[ch]:>12.6f} "
+            f"{metrics.variance_fraction_temporal.get(ch, 0.0):>11.1%}"
+        )
+    logger.info(f"  {'-' * 70}")
+    logger.info(
+        f"  {'Average':<30} "
+        f"{metrics.r2_total:>12.6f} "
+        f"{metrics.r2_temporal_total:>12.6f} "
+        f"{metrics.r2_temporal_total_original:>12.6f} "
+        f"{metrics.variance_fraction_temporal_total:>11.1%}"
     )
 
 
@@ -1104,6 +1220,13 @@ def main():
         "val_mse_per_channel_original": val_metrics.mse_per_channel_original,
         "val_r2_per_channel_original": val_metrics.r2_per_channel_original,
         "val_spearman_rho2_per_channel_original": val_metrics.spearman_rho2_per_channel_original,
+        # Temporal (within-pixel) decomposition
+        "val_r2_temporal_total": val_metrics.r2_temporal_total,
+        "val_r2_temporal_per_channel": val_metrics.r2_temporal_per_channel,
+        "val_r2_temporal_total_original": val_metrics.r2_temporal_total_original,
+        "val_r2_temporal_per_channel_original": val_metrics.r2_temporal_per_channel_original,
+        "val_variance_fraction_temporal_total": val_metrics.variance_fraction_temporal_total,
+        "val_variance_fraction_temporal": val_metrics.variance_fraction_temporal,
     }
     save_dict.update(preprocessor.to_dict())
     torch.save(save_dict, out_path)
