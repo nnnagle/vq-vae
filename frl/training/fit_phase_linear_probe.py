@@ -989,6 +989,276 @@ def evaluate_phase_probe(
 
 
 # ---------------------------------------------------------------------------
+# Embedding diagnostics: z_phase variance decomposition + FiLM parameters
+# ---------------------------------------------------------------------------
+
+def compute_embedding_diagnostics(
+    loader: DataLoader,
+    feature_builder: FeatureBuilder,
+    model: RepresentationModel,
+    device: torch.device,
+    halo: int = 16,
+    max_batches: int = 0,
+) -> dict:
+    """Compute z_phase variance decomposition and FiLM parameter diagnostics.
+
+    Measures three things:
+
+    1. **z_phase temporal variance fraction** — does z_phase change across time
+       within a pixel, or is it essentially static?
+    2. **Pre-FiLM TCN output temporal variance fraction** — does the TCN produce
+       temporal variation before FiLM conditioning?
+    3. **Post-FiLM hidden temporal variance fraction** — does FiLM preserve or
+       collapse the TCN's temporal variation?
+    4. **FiLM gamma/beta statistics** — are the FiLM parameters near-identity
+       (gamma ≈ 1, beta ≈ 0), suggesting z_type conditioning is ineffective?
+
+    Together these diagnose whether temporal signal is absent from the start
+    (TCN doesn't produce it), killed by FiLM (FiLM scales it down), or
+    lost in the final 1×1 projection.
+
+    Uses the law of total variance:
+        Var(X) = E[Var(X|pixel)] + Var(E[X|pixel])
+               = within-pixel      + between-pixel
+
+    Returns:
+        dict with per-dimension tensors for within/between/fraction for
+        z_phase (12-d), TCN output (64-d), post-FiLM (64-d), and
+        FiLM gamma/beta summary statistics.
+    """
+    model.eval()
+    D_ZP = 12   # z_phase dim
+    D_H = 64    # TCN / FiLM hidden dim
+
+    # --- Variance decomposition accumulators (on CPU, float64) ---
+    sum_within_zp = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_pixmean_zp = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_pixmean2_zp = torch.zeros(D_ZP, dtype=torch.float64)
+
+    sum_within_tcn = torch.zeros(D_H, dtype=torch.float64)
+    sum_pixmean_tcn = torch.zeros(D_H, dtype=torch.float64)
+    sum_pixmean2_tcn = torch.zeros(D_H, dtype=torch.float64)
+
+    sum_within_post = torch.zeros(D_H, dtype=torch.float64)
+    sum_pixmean_post = torch.zeros(D_H, dtype=torch.float64)
+    sum_pixmean2_post = torch.zeros(D_H, dtype=torch.float64)
+
+    # --- FiLM parameter accumulators ---
+    sum_gamma = torch.zeros(D_H, dtype=torch.float64)
+    sum_gamma2 = torch.zeros(D_H, dtype=torch.float64)
+    sum_beta = torch.zeros(D_H, dtype=torch.float64)
+    sum_beta2 = torch.zeros(D_H, dtype=torch.float64)
+    gamma_min = torch.full((D_H,), float("inf"), dtype=torch.float64)
+    gamma_max = torch.full((D_H,), float("-inf"), dtype=torch.float64)
+    beta_min = torch.full((D_H,), float("inf"), dtype=torch.float64)
+    beta_max = torch.full((D_H,), float("-inf"), dtype=torch.float64)
+    n_film_pixels = 0
+
+    n_pixels = 0
+
+    # Hook to capture TCN output before FiLM
+    tcn_output: dict = {}
+
+    def _tcn_hook(module, input, output):
+        tcn_output["h"] = output
+
+    handle = model.phase_tcn.register_forward_hook(_tcn_hook)
+
+    try:
+        with torch.no_grad():
+            for batch in _iter_batches(loader, max_batches):
+                Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
+                    batch, feature_builder, device,
+                )
+                Bsz, _, H, W_sp = Ximg.shape
+                T = Xphase.shape[2]
+
+                z_type = model(Ximg)
+                z_type_det = z_type.detach()
+                z_phase = model.forward_phase(Xphase, z_type_det)
+                # z_phase: [B, 12, T, H, W]
+
+                # TCN output captured by hook: [B, 64, T, H, W]
+                h_tcn = tcn_output["h"]
+
+                # Compute post-FiLM hidden states (same as inside forward_phase)
+                gamma, beta = model.phase_film(z_type_det)
+                # gamma, beta: [B, 64, H, W]
+                h_post = gamma.unsqueeze(2) * h_tcn + beta.unsqueeze(2)
+                # h_post: [B, 64, T, H, W]
+
+                halo_m = _halo_mask(H, W_sp, halo, device)
+                full_mask = M & halo_m.unsqueeze(0)  # [B, H, W]
+
+                # --- FiLM parameters at valid pixels ---
+                gm = gamma.permute(0, 2, 3, 1)[full_mask]  # [N, 64] on GPU
+                bt = beta.permute(0, 2, 3, 1)[full_mask]
+                N_valid = gm.shape[0]
+                if N_valid == 0:
+                    continue
+
+                gm_cpu = gm.cpu().double()
+                bt_cpu = bt.cpu().double()
+                sum_gamma += gm_cpu.sum(dim=0)
+                sum_gamma2 += (gm_cpu**2).sum(dim=0)
+                gamma_min = torch.minimum(gamma_min, gm_cpu.min(dim=0).values)
+                gamma_max = torch.maximum(gamma_max, gm_cpu.max(dim=0).values)
+                sum_beta += bt_cpu.sum(dim=0)
+                sum_beta2 += (bt_cpu**2).sum(dim=0)
+                beta_min = torch.minimum(beta_min, bt_cpu.min(dim=0).values)
+                beta_max = torch.maximum(beta_max, bt_cpu.max(dim=0).values)
+                n_film_pixels += N_valid
+
+                # --- Variance decomposition (compute on GPU, accumulate on CPU) ---
+                # For each valid pixel, compute mean and variance across T.
+                for tensor, sw, spm, spm2 in [
+                    (
+                        z_phase.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 12, T]
+                        sum_within_zp,
+                        sum_pixmean_zp,
+                        sum_pixmean2_zp,
+                    ),
+                    (
+                        h_tcn.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 64, T]
+                        sum_within_tcn,
+                        sum_pixmean_tcn,
+                        sum_pixmean2_tcn,
+                    ),
+                    (
+                        h_post.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 64, T]
+                        sum_within_post,
+                        sum_pixmean_post,
+                        sum_pixmean2_post,
+                    ),
+                ]:
+                    pix_mean = tensor.mean(dim=2)               # [N, D]
+                    pix_var = tensor.var(dim=2, correction=0)    # [N, D]
+                    sw += pix_var.sum(dim=0).cpu().double()
+                    spm += pix_mean.sum(dim=0).cpu().double()
+                    spm2 += (pix_mean**2).sum(dim=0).cpu().double()
+
+                n_pixels += N_valid
+    finally:
+        handle.remove()
+
+    if n_pixels == 0:
+        raise RuntimeError("No valid pixels for embedding diagnostics.")
+
+    def _var_decomp(sw, spm, spm2, n):
+        within = sw / n                                    # E[Var(X|pixel)]
+        mean_of_means = spm / n
+        between = spm2 / n - mean_of_means**2              # Var(E[X|pixel])
+        total = (within + between).clamp(min=1e-12)
+        frac = within / total
+        return within, between, frac
+
+    w_zp, b_zp, f_zp = _var_decomp(
+        sum_within_zp, sum_pixmean_zp, sum_pixmean2_zp, n_pixels,
+    )
+    w_tcn, b_tcn, f_tcn = _var_decomp(
+        sum_within_tcn, sum_pixmean_tcn, sum_pixmean2_tcn, n_pixels,
+    )
+    w_post, b_post, f_post = _var_decomp(
+        sum_within_post, sum_pixmean_post, sum_pixmean2_post, n_pixels,
+    )
+
+    # FiLM per-channel statistics
+    gamma_mean = sum_gamma / n_film_pixels
+    gamma_var = (sum_gamma2 / n_film_pixels - gamma_mean**2).clamp(min=0)
+    gamma_std = gamma_var.sqrt()
+
+    beta_mean = sum_beta / n_film_pixels
+    beta_var = (sum_beta2 / n_film_pixels - beta_mean**2).clamp(min=0)
+    beta_std = beta_var.sqrt()
+
+    return {
+        "z_phase_within_var": w_zp,
+        "z_phase_between_var": b_zp,
+        "z_phase_temporal_frac": f_zp,
+        "tcn_within_var": w_tcn,
+        "tcn_between_var": b_tcn,
+        "tcn_temporal_frac": f_tcn,
+        "postfilm_within_var": w_post,
+        "postfilm_between_var": b_post,
+        "postfilm_temporal_frac": f_post,
+        "film_gamma_mean": gamma_mean,
+        "film_gamma_std": gamma_std,
+        "film_gamma_min": gamma_min,
+        "film_gamma_max": gamma_max,
+        "film_beta_mean": beta_mean,
+        "film_beta_std": beta_std,
+        "film_beta_min": beta_min,
+        "film_beta_max": beta_max,
+        "n_pixels": n_pixels,
+    }
+
+
+def log_embedding_diagnostics(diag: dict):
+    """Log embedding variance decomposition and FiLM diagnostics."""
+    n = diag["n_pixels"]
+    logger.info(f"  [Embedding diagnostics] ({n:,} pixels)")
+
+    # z_phase
+    f_zp = diag["z_phase_temporal_frac"]
+    w_zp = diag["z_phase_within_var"]
+    b_zp = diag["z_phase_between_var"]
+    logger.info("  z_phase (12-d) temporal variance fraction:")
+    logger.info(
+        f"    mean={f_zp.mean():.2%}  "
+        f"range=[{f_zp.min():.2%}, {f_zp.max():.2%}]"
+    )
+    logger.info(
+        f"    within-pixel var={w_zp.mean():.6f}  "
+        f"between-pixel var={b_zp.mean():.6f}"
+    )
+
+    # Pre-FiLM TCN output
+    f_tcn = diag["tcn_temporal_frac"]
+    w_tcn = diag["tcn_within_var"]
+    b_tcn = diag["tcn_between_var"]
+    logger.info("  Pre-FiLM TCN (64-d) temporal variance fraction:")
+    logger.info(
+        f"    mean={f_tcn.mean():.2%}  "
+        f"range=[{f_tcn.min():.2%}, {f_tcn.max():.2%}]"
+    )
+    logger.info(
+        f"    within-pixel var={w_tcn.mean():.6f}  "
+        f"between-pixel var={b_tcn.mean():.6f}"
+    )
+
+    # Post-FiLM hidden
+    f_post = diag["postfilm_temporal_frac"]
+    w_post = diag["postfilm_within_var"]
+    b_post = diag["postfilm_between_var"]
+    logger.info("  Post-FiLM (64-d) temporal variance fraction:")
+    logger.info(
+        f"    mean={f_post.mean():.2%}  "
+        f"range=[{f_post.min():.2%}, {f_post.max():.2%}]"
+    )
+    logger.info(
+        f"    within-pixel var={w_post.mean():.6f}  "
+        f"between-pixel var={b_post.mean():.6f}"
+    )
+
+    # FiLM parameters
+    gm = diag["film_gamma_mean"]
+    gs = diag["film_gamma_std"]
+    bm = diag["film_beta_mean"]
+    bs = diag["film_beta_std"]
+    logger.info("  FiLM parameters (64 channels):")
+    logger.info(
+        f"    gamma: mean={gm.mean():.4f} +/- {gs.mean():.4f}  "
+        f"[{diag['film_gamma_min'].min():.4f}, "
+        f"{diag['film_gamma_max'].max():.4f}]"
+    )
+    logger.info(
+        f"    beta:  mean={bm.mean():.4f} +/- {bs.mean():.4f}  "
+        f"[{diag['film_beta_min'].min():.4f}, "
+        f"{diag['film_beta_max'].max():.4f}]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -1183,6 +1453,15 @@ def main():
     log_metrics(train_metrics, prefix="TRAIN")
     log_metrics(val_metrics, prefix="VAL")
 
+    # Embedding diagnostics (z_phase variance decomposition + FiLM)
+    logger.info("Computing embedding diagnostics on validation set...")
+    emb_diag = compute_embedding_diagnostics(
+        val_loader, feature_builder, model, device,
+        halo=args.halo,
+        max_batches=args.max_batches_eval,
+    )
+    log_embedding_diagnostics(emb_diag)
+
     # Save
     if args.output:
         out_path = Path(args.output)
@@ -1227,6 +1506,17 @@ def main():
         "val_r2_temporal_per_channel_original": val_metrics.r2_temporal_per_channel_original,
         "val_variance_fraction_temporal_total": val_metrics.variance_fraction_temporal_total,
         "val_variance_fraction_temporal": val_metrics.variance_fraction_temporal,
+        # Embedding diagnostics
+        "emb_diag_z_phase_temporal_frac": emb_diag["z_phase_temporal_frac"],
+        "emb_diag_z_phase_within_var": emb_diag["z_phase_within_var"],
+        "emb_diag_z_phase_between_var": emb_diag["z_phase_between_var"],
+        "emb_diag_tcn_temporal_frac": emb_diag["tcn_temporal_frac"],
+        "emb_diag_postfilm_temporal_frac": emb_diag["postfilm_temporal_frac"],
+        "emb_diag_film_gamma_mean": emb_diag["film_gamma_mean"],
+        "emb_diag_film_gamma_std": emb_diag["film_gamma_std"],
+        "emb_diag_film_beta_mean": emb_diag["film_beta_mean"],
+        "emb_diag_film_beta_std": emb_diag["film_beta_std"],
+        "emb_diag_n_pixels": emb_diag["n_pixels"],
     }
     save_dict.update(preprocessor.to_dict())
     torch.save(save_dict, out_path)
