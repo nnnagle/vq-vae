@@ -50,19 +50,22 @@ class RepresentationModel(nn.Module):
     **Type pathway** (v1):
         ``[B, 16, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, 64, H, W]``
 
-    **Phase pathway** (v2):
-        ``[B, 8, T, H, W]`` → TCN → FiLM(stopgrad z_type) → 1×1 proj → z_phase ``[B, 12, T, H, W]``
+    **Phase pathway** (v2.1):
+        ``[B, 8, T, H, W]`` → TCN → LayerNorm → FiLM(stopgrad z_type) → gated residual
+        → 1×1 proj → z_phase ``[B, 12, T, H, W]``
 
     The FiLM generates gamma/beta once from the spatial z_type and
-    broadcasts them across all timesteps (the type identity modulates
-    temporal features uniformly).
+    broadcasts them across all timesteps.  A LayerNorm normalizes TCN
+    features before FiLM modulation, and a learnable residual gate
+    (initialized to zero) controls the strength of FiLM conditioning,
+    giving the model an identity-start warmup.
 
     Attributes:
         VERSION: Architecture version string. Bump this whenever the forward
             pipeline changes in a checkpoint-incompatible way.
     """
 
-    VERSION = "2"
+    VERSION = "2.1"
 
     def __init__(self) -> None:
         super().__init__()
@@ -95,6 +98,8 @@ class RepresentationModel(nn.Module):
             num_groups=8,
             pooling='none',
         )
+        # LayerNorm prior to FiLM (GroupNorm with 1 group = LayerNorm for conv)
+        self.film_norm = nn.GroupNorm(1, 64)
         # FiLM: generates gamma/beta from z_type [B, 64, H, W]
         # to modulate TCN output (64-dim), broadcast across T
         self.phase_film = FiLMLayer(
@@ -102,6 +107,8 @@ class RepresentationModel(nn.Module):
             target_dim=64,
             hidden_dim=64,
         )
+        # Residual gate: learned scalar, initialized to 0 (FiLM starts as no-op)
+        self.film_gate = nn.Parameter(torch.zeros(1))
         # Project to final phase embedding dimension
         self.phase_head = nn.Conv2d(64, 12, kernel_size=1)
 
@@ -149,11 +156,12 @@ class RepresentationModel(nn.Module):
         # TCN along time: [B, 8, T, H, W] -> [B, 64, T, H, W]
         h = self.phase_tcn(x_phase)
 
-        # FiLM: generate gamma/beta from z_type once, broadcast across T
+        # LayerNorm → FiLM → gated residual
+        h_normed = self.film_norm(h)
         gamma, beta = self.phase_film(z_type)  # each [B, 64, H, W]
         gamma = gamma.unsqueeze(2)  # [B, 64, 1, H, W]
         beta = beta.unsqueeze(2)    # [B, 64, 1, H, W]
-        h = gamma * h + beta        # [B, 64, T, H, W]
+        h = h + self.film_gate * (gamma * h_normed + beta)  # [B, 64, T, H, W]
 
         # Project per-timestep: reshape to [B*T, 64, H, W] for Conv2d
         h = h.permute(0, 2, 1, 3, 4).reshape(B * T, 64, H, W)
@@ -187,13 +195,14 @@ class RepresentationModel(nn.Module):
         # TCN accepts [N, C, T] directly (no spatial reshape needed)
         h = self.phase_tcn(x_phase_pixels)  # [N, 64, T]
 
-        # FiLM: z_type_pixels [N, 64] -> gamma/beta via the same FiLM layer
+        # LayerNorm → FiLM → gated residual
+        h_normed = self.film_norm(h)
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
         z_cond = z_type_pixels.unsqueeze(-1).unsqueeze(-1)  # [N, 64, 1, 1]
         gamma, beta = self.phase_film(z_cond)  # each [N, 64, 1, 1]
         gamma = gamma.squeeze(-1)  # [N, 64, 1]
         beta = beta.squeeze(-1)    # [N, 64, 1]
-        h = gamma * h + beta       # [N, 64, T]
+        h = h + self.film_gate * (gamma * h_normed + beta)  # [N, 64, T]
 
         # Project: phase_head is Conv2d(64, 12, 1×1)
         # Reshape [N, 64, T] -> [N*T, 64, 1, 1] for Conv2d
@@ -202,6 +211,40 @@ class RepresentationModel(nn.Module):
         z = z.reshape(N, T, 12)
 
         return z  # [N, T, 12]
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def film_diagnostics(self) -> dict:
+        """Return parameter-level diagnostics for FiLM conditioning.
+
+        Reports the scale of FiLM gamma (slope), beta (intercept), and
+        the residual gate.  Computed directly from model parameters
+        without requiring a data forward pass.
+
+        Returns:
+            Dict with keys: ``gamma_bias_mean``, ``gamma_bias_std``,
+            ``gamma_weight_rms``, ``beta_bias_mean``, ``beta_bias_std``,
+            ``beta_weight_rms``, ``gate``.
+        """
+        gamma_net = self.phase_film.gamma_network
+        beta_net = self.phase_film.beta_network
+
+        gamma_bias = gamma_net[-1].bias.data   # [target_dim]
+        beta_bias = beta_net[-1].bias.data     # [target_dim]
+        gamma_w = gamma_net[-1].weight.data    # [target_dim, hidden_dim, 1, 1]
+        beta_w = beta_net[-1].weight.data
+
+        return {
+            'gamma_bias_mean': gamma_bias.mean().item(),
+            'gamma_bias_std': gamma_bias.std().item(),
+            'gamma_weight_rms': gamma_w.pow(2).mean().sqrt().item(),
+            'beta_bias_mean': beta_bias.mean().item(),
+            'beta_bias_std': beta_bias.std().item(),
+            'beta_weight_rms': beta_w.pow(2).mean().sqrt().item(),
+            'gate': self.film_gate.item(),
+        }
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
