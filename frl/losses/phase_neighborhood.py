@@ -303,6 +303,16 @@ def build_phase_neighborhood_batch(
     # [N, V, T] @ [N, T, D] -> [N, V, D]
     avg_phase = torch.bmm(indicator, phase_embeddings) / counts_safe
 
+    # --- Demean spectral features per pixel across all ysfc values ---
+    # Removes per-pixel mean spectral signature (type information) so that
+    # distances reflect temporal trajectory shape (phase) only.  The mean is
+    # computed over each pixel's full ysfc range — not just the per-pair
+    # overlap — giving a stable baseline even when overlap is small.
+    presence_f = presence.unsqueeze(-1).float()       # [N, V, 1]
+    n_present = presence_f.sum(dim=1, keepdim=True).clamp(min=1)  # [N, 1, 1]
+    pixel_mean_spec = (avg_spec * presence_f).sum(dim=1, keepdim=True) / n_present  # [N, 1, C]
+    avg_spec = (avg_spec - pixel_mean_spec) * presence_f  # [N, V, C]
+
     # --- Per-pair overlap ---
     idx_i = pair_indices[:, 0]  # [B]
     idx_j = pair_indices[:, 1]  # [B]
