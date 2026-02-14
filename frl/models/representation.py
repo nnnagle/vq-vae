@@ -50,22 +50,20 @@ class RepresentationModel(nn.Module):
     **Type pathway** (v1):
         ``[B, 16, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, 64, H, W]``
 
-    **Phase pathway** (v2.1):
-        ``[B, 8, T, H, W]`` → TCN → LayerNorm → FiLM(stopgrad z_type) → gated residual
+    **Phase pathway** (v2.2):
+        ``[B, 8, T, H, W]`` → TCN → LayerNorm → FiLM(stopgrad z_type)
         → 1×1 proj → z_phase ``[B, 12, T, H, W]``
 
     The FiLM generates gamma/beta once from the spatial z_type and
     broadcasts them across all timesteps.  A LayerNorm normalizes TCN
-    features before FiLM modulation, and a learnable residual gate
-    (initialized to zero) controls the strength of FiLM conditioning,
-    giving the model an identity-start warmup.
+    features before FiLM modulation (gamma * h_normed + beta).
 
     Attributes:
         VERSION: Architecture version string. Bump this whenever the forward
             pipeline changes in a checkpoint-incompatible way.
     """
 
-    VERSION = "2.1"
+    VERSION = "2.2"
 
     def __init__(self) -> None:
         super().__init__()
@@ -107,18 +105,8 @@ class RepresentationModel(nn.Module):
             target_dim=64,
             hidden_dim=64,
         )
-        # Residual gate: sigmoid-bounded [0, 1], initialized to 0.5
-        # Raw param=0 → sigmoid(0)=0.5; caps FiLM contribution to at most
-        # 1× the residual, preventing the aggressive modulation that was
-        # crushing temporal variance (63% → 29%).
-        self._film_gate_raw = nn.Parameter(torch.zeros(1))
         # Project to final phase embedding dimension
         self.phase_head = nn.Conv2d(64, 12, kernel_size=1)
-
-    @property
-    def film_gate(self) -> torch.Tensor:
-        """Sigmoid-bounded FiLM gate in [0, 1]."""
-        return torch.sigmoid(self._film_gate_raw)
 
     def forward(
         self, x: torch.Tensor, return_gate: bool = False
@@ -164,12 +152,12 @@ class RepresentationModel(nn.Module):
         # TCN along time: [B, 8, T, H, W] -> [B, 64, T, H, W]
         h = self.phase_tcn(x_phase)
 
-        # LayerNorm → FiLM → gated residual
+        # LayerNorm → FiLM modulation
         h_normed = self.film_norm(h)
         gamma, beta = self.phase_film(z_type)  # each [B, 64, H, W]
         gamma = gamma.unsqueeze(2)  # [B, 64, 1, H, W]
         beta = beta.unsqueeze(2)    # [B, 64, 1, H, W]
-        h = h + self.film_gate * (gamma * h_normed + beta)  # [B, 64, T, H, W]
+        h = gamma * h_normed + beta  # [B, 64, T, H, W]
 
         # Project per-timestep: reshape to [B*T, 64, H, W] for Conv2d
         h = h.permute(0, 2, 1, 3, 4).reshape(B * T, 64, H, W)
@@ -203,14 +191,14 @@ class RepresentationModel(nn.Module):
         # TCN accepts [N, C, T] directly (no spatial reshape needed)
         h = self.phase_tcn(x_phase_pixels)  # [N, 64, T]
 
-        # LayerNorm → FiLM → gated residual
+        # LayerNorm → FiLM modulation
         h_normed = self.film_norm(h)
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
         z_cond = z_type_pixels.unsqueeze(-1).unsqueeze(-1)  # [N, 64, 1, 1]
         gamma, beta = self.phase_film(z_cond)  # each [N, 64, 1, 1]
         gamma = gamma.squeeze(-1)  # [N, 64, 1]
         beta = beta.squeeze(-1)    # [N, 64, 1]
-        h = h + self.film_gate * (gamma * h_normed + beta)  # [N, 64, T]
+        h = gamma * h_normed + beta  # [N, 64, T]
 
         # Project: phase_head is Conv2d(64, 12, 1×1)
         # Reshape [N, 64, T] -> [N*T, 64, 1, 1] for Conv2d
@@ -227,14 +215,14 @@ class RepresentationModel(nn.Module):
     def film_diagnostics(self) -> dict:
         """Return parameter-level diagnostics for FiLM conditioning.
 
-        Reports the scale of FiLM gamma (slope), beta (intercept), and
-        the residual gate.  Computed directly from model parameters
-        without requiring a data forward pass.
+        Reports the scale of FiLM gamma (slope) and beta (intercept).
+        Computed directly from model parameters without requiring a
+        data forward pass.
 
         Returns:
             Dict with keys: ``gamma_bias_mean``, ``gamma_bias_std``,
             ``gamma_weight_rms``, ``beta_bias_mean``, ``beta_bias_std``,
-            ``beta_weight_rms``, ``gate``.
+            ``beta_weight_rms``.
         """
         gamma_net = self.phase_film.gamma_network
         beta_net = self.phase_film.beta_network
@@ -251,7 +239,6 @@ class RepresentationModel(nn.Module):
             'beta_bias_mean': beta_bias.mean().item(),
             'beta_bias_std': beta_bias.std().item(),
             'beta_weight_rms': beta_w.pow(2).mean().sqrt().item(),
-            'gate': self.film_gate.item(),
         }
 
     # ------------------------------------------------------------------
