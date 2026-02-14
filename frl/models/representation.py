@@ -107,10 +107,18 @@ class RepresentationModel(nn.Module):
             target_dim=64,
             hidden_dim=64,
         )
-        # Residual gate: learned scalar, initialized to 0 (FiLM starts as no-op)
-        self.film_gate = nn.Parameter(torch.zeros(1))
+        # Residual gate: sigmoid-bounded [0, 1], initialized to 0.5
+        # Raw param=0 → sigmoid(0)=0.5; caps FiLM contribution to at most
+        # 1× the residual, preventing the aggressive modulation that was
+        # crushing temporal variance (63% → 29%).
+        self._film_gate_raw = nn.Parameter(torch.zeros(1))
         # Project to final phase embedding dimension
         self.phase_head = nn.Conv2d(64, 12, kernel_size=1)
+
+    @property
+    def film_gate(self) -> torch.Tensor:
+        """Sigmoid-bounded FiLM gate in [0, 1]."""
+        return torch.sigmoid(self._film_gate_raw)
 
     def forward(
         self, x: torch.Tensor, return_gate: bool = False
