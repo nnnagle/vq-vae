@@ -93,15 +93,17 @@ def build_phase_pairs(
         'pairs_per_anchor_mean': 0.0,
         'pairs_per_anchor_min': 0,
         'pairs_per_anchor_max': 0,
-        'weight_mean': 0.0,
-        'weight_std': 0.0,
-        'dist_mean': 0.0,
-        'dist_std': 0.0,
-        'dist_q25': 0.0,
-        'dist_q50': 0.0,
-        'dist_q75': 0.0,
-        'dist_min': 0.0,
-        'dist_max': 0.0,
+        'cand_dist_mean': 0.0, 'cand_dist_std': 0.0,
+        'cand_dist_q25': 0.0, 'cand_dist_q50': 0.0,
+        'cand_dist_q75': 0.0, 'cand_dist_q95': 0.0,
+        'cand_dist_min': 0.0, 'cand_dist_max': 0.0,
+        'retained_dist_mean': 0.0, 'retained_dist_std': 0.0,
+        'retained_dist_q25': 0.0, 'retained_dist_q50': 0.0,
+        'retained_dist_q75': 0.0,
+        'retained_dist_min': 0.0, 'retained_dist_max': 0.0,
+        'weight_mean': 0.0, 'weight_std': 0.0,
+        'weight_q25': 0.0, 'weight_q50': 0.0, 'weight_q75': 0.0,
+        'weight_min': 0.0, 'weight_max': 0.0,
     }
 
     if N < 2:
@@ -132,6 +134,18 @@ def build_phase_pairs(
     # Get distances for candidate pairs
     candidate_dists = spec_dists[candidate_pairs[:, 0], candidate_pairs[:, 1]]
 
+    # --- Pre-threshold candidate distance stats (for tuning threshold) ---
+    cand_dist_stats = {
+        'cand_dist_mean': candidate_dists.mean().item(),
+        'cand_dist_std': candidate_dists.std().item() if n_candidates > 1 else 0.0,
+        'cand_dist_q25': torch.quantile(candidate_dists, 0.25).item(),
+        'cand_dist_q50': torch.quantile(candidate_dists, 0.50).item(),
+        'cand_dist_q75': torch.quantile(candidate_dists, 0.75).item(),
+        'cand_dist_q95': torch.quantile(candidate_dists, 0.95).item(),
+        'cand_dist_min': candidate_dists.min().item(),
+        'cand_dist_max': candidate_dists.max().item(),
+    }
+
     # --- Hard threshold prune ---
     if spectral_threshold is not None:
         threshold_mask = candidate_dists <= spectral_threshold
@@ -145,6 +159,7 @@ def build_phase_pairs(
 
     if n_after_threshold == 0:
         empty_stats['n_candidates'] = n_candidates
+        empty_stats.update(cand_dist_stats)
         return empty_pairs, empty_weights, empty_stats
 
     # --- Compute pair weights from spectral distance ---
@@ -188,15 +203,24 @@ def build_phase_pairs(
         'pairs_per_anchor_mean': counts_nonzero.float().mean().item() if n_anchors_with_pairs > 0 else 0.0,
         'pairs_per_anchor_min': counts_nonzero.min().item() if n_anchors_with_pairs > 0 else 0,
         'pairs_per_anchor_max': counts_nonzero.max().item() if n_anchors_with_pairs > 0 else 0,
+        # Pre-threshold candidate distances (all kNN pairs)
+        **cand_dist_stats,
+        # Post-threshold retained distances
+        'retained_dist_mean': surviving_dists.mean().item(),
+        'retained_dist_std': surviving_dists.std().item() if n_after_threshold > 1 else 0.0,
+        'retained_dist_q25': torch.quantile(surviving_dists, 0.25).item(),
+        'retained_dist_q50': torch.quantile(surviving_dists, 0.50).item(),
+        'retained_dist_q75': torch.quantile(surviving_dists, 0.75).item(),
+        'retained_dist_min': surviving_dists.min().item(),
+        'retained_dist_max': surviving_dists.max().item(),
+        # Retained pair weights
         'weight_mean': cross_weights.mean().item(),
         'weight_std': cross_weights.std().item() if n_after_threshold > 1 else 0.0,
-        'dist_mean': surviving_dists.mean().item(),
-        'dist_std': surviving_dists.std().item() if n_after_threshold > 1 else 0.0,
-        'dist_q25': torch.quantile(surviving_dists, 0.25).item(),
-        'dist_q50': torch.quantile(surviving_dists, 0.50).item(),
-        'dist_q75': torch.quantile(surviving_dists, 0.75).item(),
-        'dist_min': surviving_dists.min().item(),
-        'dist_max': surviving_dists.max().item(),
+        'weight_q25': torch.quantile(cross_weights, 0.25).item(),
+        'weight_q50': torch.quantile(cross_weights, 0.50).item(),
+        'weight_q75': torch.quantile(cross_weights, 0.75).item(),
+        'weight_min': cross_weights.min().item(),
+        'weight_max': cross_weights.max().item(),
     }
 
     return all_pairs, all_weights, stats

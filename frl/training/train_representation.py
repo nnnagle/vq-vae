@@ -457,10 +457,17 @@ def process_batch(
         'n_self_pairs': 0, 'n_total_pairs': 0,
         'pairs_per_anchor_mean': 0.0, 'pairs_per_anchor_min': 0,
         'pairs_per_anchor_max': 0,
+        'cand_dist_mean': 0.0, 'cand_dist_std': 0.0,
+        'cand_dist_q25': 0.0, 'cand_dist_q50': 0.0,
+        'cand_dist_q75': 0.0, 'cand_dist_q95': 0.0,
+        'cand_dist_min': 0.0, 'cand_dist_max': 0.0,
+        'retained_dist_mean': 0.0, 'retained_dist_std': 0.0,
+        'retained_dist_q25': 0.0, 'retained_dist_q50': 0.0,
+        'retained_dist_q75': 0.0,
+        'retained_dist_min': 0.0, 'retained_dist_max': 0.0,
         'weight_mean': 0.0, 'weight_std': 0.0,
-        'dist_mean': 0.0, 'dist_std': 0.0,
-        'dist_q25': 0.0, 'dist_q50': 0.0, 'dist_q75': 0.0,
-        'dist_min': 0.0, 'dist_max': 0.0,
+        'weight_q25': 0.0, 'weight_q50': 0.0, 'weight_q75': 0.0,
+        'weight_min': 0.0, 'weight_max': 0.0,
     }
     empty_phase_loss_stats = {
         'n_pairs': 0, 'n_pairs_active': 0,
@@ -1201,10 +1208,25 @@ def main():
                 f"[{ps['pairs_per_anchor_min']}-{ps['pairs_per_anchor_max']}]"
             )
             logger.info(
-                f"  Phase spec dist: mean={ps['dist_mean']:.2f}\u00b1{ps['dist_std']:.2f}, "
-                f"[q25={ps['dist_q25']:.2f}, q50={ps['dist_q50']:.2f}, q75={ps['dist_q75']:.2f}], "
-                f"range=[{ps['dist_min']:.2f}, {ps['dist_max']:.2f}] | "
-                f"Weights(sigma={phase_config['sigma']}): {ps['weight_mean']:.3f}\u00b1{ps['weight_std']:.3f}"
+                f"  Phase candidate dist (all kNN): "
+                f"mean={ps['cand_dist_mean']:.2f}\u00b1{ps['cand_dist_std']:.2f}, "
+                f"[q25={ps['cand_dist_q25']:.2f}, q50={ps['cand_dist_q50']:.2f}, "
+                f"q75={ps['cand_dist_q75']:.2f}, q95={ps['cand_dist_q95']:.2f}], "
+                f"range=[{ps['cand_dist_min']:.2f}, {ps['cand_dist_max']:.2f}]"
+            )
+            logger.info(
+                f"  Phase retained dist (post-threshold): "
+                f"mean={ps['retained_dist_mean']:.2f}\u00b1{ps['retained_dist_std']:.2f}, "
+                f"[q25={ps['retained_dist_q25']:.2f}, q50={ps['retained_dist_q50']:.2f}, "
+                f"q75={ps['retained_dist_q75']:.2f}], "
+                f"range=[{ps['retained_dist_min']:.2f}, {ps['retained_dist_max']:.2f}]"
+            )
+            logger.info(
+                f"  Phase pair weights (sigma={phase_config['sigma']}): "
+                f"mean={ps['weight_mean']:.3f}\u00b1{ps['weight_std']:.3f}, "
+                f"[q25={ps['weight_q25']:.3f}, q50={ps['weight_q50']:.3f}, "
+                f"q75={ps['weight_q75']:.3f}], "
+                f"range=[{ps['weight_min']:.3f}, {ps['weight_max']:.3f}]"
             )
 
         # Log phase loss stats
