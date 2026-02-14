@@ -38,7 +38,7 @@ from data.sampling.anchor_sampling import AnchorSampler, build_anchor_sampler
 from models import RepresentationModel
 from losses import contrastive_loss, pairs_with_spatial_constraint
 from losses.phase_pairs import build_phase_pairs
-from losses.phase_neighborhood import phase_neighborhood_loss
+from losses.soft_neighborhood import soft_neighborhood_matching_loss
 from utils import (
     compute_spatial_distances,
     extract_at_locations,
@@ -300,23 +300,12 @@ def process_batch(
             )
 
         # --- Phase pair construction + loss ---
-        # Pair construction (kNN + overlap) runs on CPU.
+        # Pair construction (kNN + threshold) runs on CPU.
         # Loss computation runs on GPU (requires gradients through phase encoder).
         phase_loss_val = torch.tensor(0.0, device=device)
         if phase_sampler is not None and phase_config is not None:
-            # Build ysfc feature via FeatureBuilder (returns numpy)
-            ysfc_feature = feature_builder.build_feature('ysfc', sample)
-            ysfc_data = torch.from_numpy(ysfc_feature.data).float()
-            # ysfc_data: [1, T, H, W] (single channel, CPU)
-
-            # Combined mask for phase anchors: encoder mask AND ysfc validity
-            ysfc_mask = torch.from_numpy(ysfc_feature.mask)
-            # ysfc_mask is [T, H, W] for temporal; collapse to [H, W]
-            if ysfc_mask.ndim == 3:
-                ysfc_spatial_mask = ysfc_mask.all(dim=0)  # valid across all timesteps
-            else:
-                ysfc_spatial_mask = ysfc_mask
-            phase_mask = combined_mask.cpu() & ysfc_spatial_mask
+            # Combined mask for phase anchors: use the same mask as spectral
+            phase_mask = combined_mask.cpu()
 
             # Sample separate anchors for phase loss
             phase_anchors = phase_sampler(
@@ -329,20 +318,11 @@ def process_batch(
                     spec_dist_data.cpu(), phase_anchors
                 )  # [N_phase, C]
 
-                # Extract ysfc time series at phase anchors
-                # ysfc_data is [1, T, H, W]; squeeze channel dim for extraction
-                ysfc_at_anchors = extract_temporal_at_locations(
-                    ysfc_data, phase_anchors
-                )  # [N_phase, T, 1]
-                ysfc_at_anchors = ysfc_at_anchors.squeeze(-1)  # [N_phase, T]
-
-                # Build pairs (all CPU)
+                # Build pairs (all CPU): kNN + spectral threshold
                 phase_pairs, phase_weights, phase_stats = build_phase_pairs(
                     spec_features=phase_spec_at_anchors,
-                    ysfc=ysfc_at_anchors,
                     k=phase_config.get('k', 16),
-                    min_overlap=phase_config.get('min_overlap', 3),
-                    min_pairs=phase_config.get('min_pairs', 5),
+                    spectral_threshold=phase_config.get('spectral_threshold'),
                     include_self=phase_config.get('include_self', True),
                     sigma=phase_config.get('sigma', 5.0),
                     self_pair_weight=phase_config.get('self_pair_weight', 1.0),
@@ -363,24 +343,33 @@ def process_batch(
                         curriculum_w = (epoch - start_epoch) / ramp_epochs
 
                     if curriculum_w > 0.0:
-                        # Build phase_ccdc temporal feature
+                        # Build soft_neighborhood_phase_target feature (reference)
+                        target_feature = feature_builder.build_feature(
+                            'soft_neighborhood_phase_target', sample
+                        )
+                        target_data = torch.from_numpy(
+                            target_feature.data
+                        ).float().to(device)
+                        # target_data: [C, T, H, W]
+
+                        # Build phase_ccdc temporal feature (encoder input)
                         phase_ccdc_feature = feature_builder.build_feature('phase_ccdc', sample)
                         phase_ccdc_data = torch.from_numpy(
                             phase_ccdc_feature.data
                         ).float().to(device)
                         # phase_ccdc_data: [C, T, H, W]
 
-                        # Extract only anchor pixel time-series (avoid dense TCN)
                         phase_anchors_dev = phase_anchors.to(device)
+
+                        # Extract target feature at anchors: [N_phase, T, C_target]
+                        target_at_anchors = extract_temporal_at_locations(
+                            target_data, phase_anchors_dev
+                        )
+
+                        # Extract encoder input at anchors
                         phase_ccdc_at_anchors = extract_temporal_at_locations(
                             phase_ccdc_data, phase_anchors_dev
                         )  # [N_phase, T, C]
-                        # Temporal spectral features as loss reference
-                        # (phase_ccdc varies over time, unlike the old
-                        #  static spec_dist_data which was identical at
-                        #  every timestep and collapsed to zero after
-                        #  demeaning)
-                        spec_at_phase_anchors = phase_ccdc_at_anchors  # [N_phase, T, C]
                         phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(
                             0, 2, 1
                         )  # [N_phase, C, T]
@@ -393,29 +382,38 @@ def process_batch(
                         # Run phase encoder on anchor pixels only
                         z_phase_at_anchors = model.forward_phase_at_locations(
                             phase_ccdc_at_anchors, z_type_at_anchors
-                        )  # [N_phase, T, 12]
+                        )  # [N_phase, T, D_phase]
 
-                        # ysfc on GPU for loss
-                        ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
+                        # --- Build T×T distance matrices for each pair ---
+                        pairs_dev = phase_pairs.to(device)
+                        weights_dev = phase_weights.to(device)
 
-                        # Compute phase neighborhood loss
-                        p_loss, p_loss_stats = phase_neighborhood_loss(
-                            spectral_features=spec_at_phase_anchors,
-                            phase_embeddings=z_phase_at_anchors,
-                            ysfc=ysfc_at_anchors_gpu,
-                            pair_indices=phase_pairs.to(device),
-                            pair_weights=phase_weights.to(device),
+                        # Reference distances: [B, T, T]
+                        target_i = target_at_anchors[pairs_dev[:, 0]]  # [B, T, C]
+                        target_j = target_at_anchors[pairs_dev[:, 1]]  # [B, T, C]
+                        d_ref = torch.cdist(target_i, target_j)  # [B, T, T]
+
+                        # Learned distances: [B, T, T]
+                        z_i = z_phase_at_anchors[pairs_dev[:, 0]]  # [B, T, D]
+                        z_j = z_phase_at_anchors[pairs_dev[:, 1]]  # [B, T, D]
+                        d_learned = torch.cdist(z_i, z_j)  # [B, T, T]
+
+                        # Mask: all True for cross-pixel; diagonal False for self-pairs
+                        T = target_at_anchors.shape[1]
+                        is_self = pairs_dev[:, 0] == pairs_dev[:, 1]  # [B]
+                        diag = torch.eye(T, dtype=torch.bool, device=device).unsqueeze(0)
+                        mask = ~(is_self.unsqueeze(1).unsqueeze(2) & diag)  # [B, T, T]
+
+                        # Compute soft neighborhood matching loss
+                        p_loss, p_loss_stats = soft_neighborhood_matching_loss(
+                            d_reference=d_ref,
+                            d_learned=d_learned,
+                            mask=mask,
                             tau_ref=phase_config.get('tau_ref', 0.1),
                             tau_learned=phase_config.get('tau_learned', 0.1),
-                            min_overlap=phase_config.get('min_overlap', 3),
+                            pair_weights=weights_dev,
                             min_valid_per_row=phase_config.get(
                                 'min_valid_per_row', 2
-                            ),
-                            self_similarity_weight=phase_config.get(
-                                'self_similarity_weight', 1.0
-                            ),
-                            cross_pixel_weight=phase_config.get(
-                                'cross_pixel_weight', 1.0
                             ),
                         )
 
@@ -454,18 +452,20 @@ def process_batch(
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
     empty_phase_stats = {
-        'n_anchors': 0, 'n_anchors_surviving': 0,
-        'n_candidates': 0, 'n_after_overlap': 0,
+        'n_anchors': 0, 'n_anchors_with_pairs': 0,
+        'n_candidates': 0, 'n_after_threshold': 0,
         'n_self_pairs': 0, 'n_total_pairs': 0,
-        'overlap_mean': 0.0, 'overlap_min': 0,
+        'pairs_per_anchor_mean': 0.0, 'pairs_per_anchor_min': 0,
+        'pairs_per_anchor_max': 0,
         'weight_mean': 0.0, 'weight_std': 0.0,
         'dist_mean': 0.0, 'dist_std': 0.0,
         'dist_q25': 0.0, 'dist_q50': 0.0, 'dist_q75': 0.0,
         'dist_min': 0.0, 'dist_max': 0.0,
     }
     empty_phase_loss_stats = {
-        'n_pairs_input': 0, 'n_pairs_sufficient_overlap': 0,
-        'loss_self': 0.0, 'loss_cross': 0.0,
+        'n_pairs': 0, 'n_pairs_active': 0,
+        'n_rows_total': 0, 'n_rows_valid': 0,
+        'mean_kl': 0.0, 'mean_overlap': 0.0,
         'curriculum_w': 0.0,
     }
 
@@ -637,14 +637,15 @@ def train_epoch(
                 if ps and ps['n_anchors'] > 0:
                     phase_msg = (
                         f" | Phase: {ps['n_total_pairs']:.0f} pairs "
-                        f"({ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} anchors, "
-                        f"overlap={ps['overlap_mean']:.1f}, "
-                        f"w={ps['weight_mean']:.3f}±{ps['weight_std']:.3f})"
+                        f"({ps['n_anchors_with_pairs']:.0f}/{ps['n_anchors']:.0f} anchors, "
+                        f"per_anchor={ps['pairs_per_anchor_mean']:.1f}"
+                        f"[{ps['pairs_per_anchor_min']}-{ps['pairs_per_anchor_max']}], "
+                        f"w={ps['weight_mean']:.3f}\u00b1{ps['weight_std']:.3f})"
                     )
                 if pls and pls.get('curriculum_w', 0) > 0:
                     phase_msg += (
                         f" | Phase loss: {stats['phase_loss']:.4f} "
-                        f"(self={pls['loss_self']:.4f}, cross={pls['loss_cross']:.4f}, "
+                        f"(kl={pls['mean_kl']:.4f}, "
                         f"cw={pls['curriculum_w']:.2f})"
                     )
 
@@ -1093,8 +1094,7 @@ def main():
         phase_config = {
             # Pair construction
             'k': ps.type_similarity.k if ps and ps.type_similarity else 16,
-            'min_overlap': ps.ysfc_overlap.min_overlap if ps and ps.ysfc_overlap else 3,
-            'min_pairs': ps.min_pairs if ps else 5,
+            'spectral_threshold': ps.spectral_threshold if ps else None,
             'include_self': ps.include_self if ps else True,
             'sigma': pw.sigma if pw else 5.0,
             'self_pair_weight': pw.self_pair_weight if pw else 1.0,
@@ -1103,16 +1103,15 @@ def main():
             'tau_ref': phase_loss_cfg.tau_ref if phase_loss_cfg.tau_ref is not None else 0.1,
             'tau_learned': phase_loss_cfg.tau_learned if phase_loss_cfg.tau_learned is not None else 0.1,
             'min_valid_per_row': phase_loss_cfg.min_valid_per_row if phase_loss_cfg.min_valid_per_row is not None else 2,
-            'self_similarity_weight': phase_loss_cfg.self_similarity_weight if phase_loss_cfg.self_similarity_weight is not None else 1.0,
-            'cross_pixel_weight': phase_loss_cfg.cross_pixel_weight if phase_loss_cfg.cross_pixel_weight is not None else 1.0,
             # Curriculum
             'curriculum_start_epoch': cur.start_epoch if cur else 10,
             'curriculum_ramp_epochs': cur.ramp_epochs if cur else 10,
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "
-            f"k={phase_config['k']}, min_overlap={phase_config['min_overlap']}, "
-            f"min_pairs={phase_config['min_pairs']}, sigma={phase_config['sigma']}, "
+            f"k={phase_config['k']}, "
+            f"spectral_threshold={phase_config['spectral_threshold']}, "
+            f"sigma={phase_config['sigma']}, "
             f"tau_ref={phase_config['tau_ref']}, tau_learned={phase_config['tau_learned']}, "
             f"weight={phase_config['weight']}, "
             f"curriculum=[start={phase_config['curriculum_start_epoch']}, "
@@ -1195,25 +1194,27 @@ def main():
         if ps and ps['n_anchors'] > 0:
             logger.info(
                 f"  Phase pairs: {ps['n_total_pairs']:.0f} total "
-                f"({ps['n_self_pairs']:.0f} self + {ps['n_total_pairs'] - ps['n_self_pairs']:.0f} cross) | "
-                f"Anchors: {ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} surviving | "
-                f"kNN candidates: {ps['n_candidates']:.0f} -> overlap filter: {ps['n_after_overlap']:.0f} | "
-                f"Overlap: mean={ps['overlap_mean']:.1f}, min={ps['overlap_min']}"
+                f"({ps['n_self_pairs']:.0f} self + {ps['n_after_threshold']:.0f} cross) | "
+                f"Anchors: {ps['n_anchors_with_pairs']:.0f}/{ps['n_anchors']:.0f} with pairs | "
+                f"kNN candidates: {ps['n_candidates']:.0f} -> threshold: {ps['n_after_threshold']:.0f} | "
+                f"Per anchor: {ps['pairs_per_anchor_mean']:.1f} "
+                f"[{ps['pairs_per_anchor_min']}-{ps['pairs_per_anchor_max']}]"
             )
             logger.info(
-                f"  Phase spec dist: mean={ps['dist_mean']:.2f}±{ps['dist_std']:.2f}, "
+                f"  Phase spec dist: mean={ps['dist_mean']:.2f}\u00b1{ps['dist_std']:.2f}, "
                 f"[q25={ps['dist_q25']:.2f}, q50={ps['dist_q50']:.2f}, q75={ps['dist_q75']:.2f}], "
                 f"range=[{ps['dist_min']:.2f}, {ps['dist_max']:.2f}] | "
-                f"Weights(sigma={phase_config['sigma']}): {ps['weight_mean']:.3f}±{ps['weight_std']:.3f}"
+                f"Weights(sigma={phase_config['sigma']}): {ps['weight_mean']:.3f}\u00b1{ps['weight_std']:.3f}"
             )
 
         # Log phase loss stats
         pls = train_stats.get('phase_loss_stats')
         if pls and pls.get('curriculum_w', 0) > 0:
             logger.info(
-                f"  Phase loss: self={pls['loss_self']:.4f}, cross={pls['loss_cross']:.4f} | "
-                f"Pairs: {pls['n_pairs_input']:.0f} input, "
-                f"{pls['n_pairs_sufficient_overlap']:.0f} with overlap | "
+                f"  Phase loss: kl={pls['mean_kl']:.4f} | "
+                f"Pairs: {pls['n_pairs']:.0f} total, "
+                f"{pls['n_pairs_active']:.0f} active | "
+                f"Rows: {pls['n_rows_valid']:.0f}/{pls['n_rows_total']:.0f} valid | "
                 f"Curriculum weight: {pls['curriculum_w']:.2f}"
             )
         elif pls:

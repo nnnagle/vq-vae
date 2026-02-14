@@ -1,9 +1,9 @@
 """
 Phase pair construction for soft neighborhood loss.
 
-Two-stage pair selection:
+Simplified pair selection:
   1. kNN in spectral feature space → candidate pairs per anchor
-  2. Filter by ysfc temporal overlap ≥ min_overlap
+  2. Hard threshold prune by spectral distance
 
 Pair weights are computed from spectral distance:
   w_ij = exp(-||spec_i - spec_j||₂ / sigma)
@@ -13,10 +13,8 @@ Usage::
 
     pairs, weights, stats = build_phase_pairs(
         spec_features=spec_at_anchors,   # [N, C]
-        ysfc=ysfc_at_anchors,            # [N, T]
         k=16,
-        min_overlap=3,
-        min_pairs=5,
+        spectral_threshold=10.0,
         include_self=True,
         sigma=5.0,
         self_pair_weight=1.0,
@@ -28,55 +26,10 @@ from __future__ import annotations
 import torch
 
 
-def _vectorized_ysfc_overlap(
-    ysfc: torch.Tensor,
-    candidate_pairs: torch.Tensor,
-) -> torch.Tensor:
-    """Count shared unique ysfc values for each candidate pair.
-
-    Builds a binary presence indicator ``[N, num_classes]`` and computes
-    pairwise overlap via matmul, then indexes into the result for each
-    candidate pair.  Replaces the per-pair Python loop over
-    ``build_ysfc_overlap``.
-
-    Parameters
-    ----------
-    ysfc : Tensor ``[N, T]``
-        Integer-valued ysfc time series per anchor pixel.
-    candidate_pairs : LongTensor ``[P, 2]``
-        Candidate pair indices into the N anchors.
-
-    Returns
-    -------
-    overlaps : LongTensor ``[P]``
-        Number of shared unique ysfc values per pair.
-    """
-    # Build binary presence matrix: presence[i, c] = 1 iff pixel i has
-    # ysfc value c at any timestep.  ysfc values are non-negative ints.
-    ysfc_long = ysfc.long()
-    num_classes = ysfc_long.max().item() + 1
-    N, T = ysfc_long.shape
-    device = ysfc.device
-
-    # Scatter ones into [N, num_classes] for each (pixel, timestep) value
-    presence = torch.zeros(N, num_classes, dtype=torch.float32, device=device)
-    presence.scatter_(1, ysfc_long, 1.0)
-    # presence is now binary: each row has 1s at the ysfc values present
-
-    # Pairwise overlap: overlap_matrix[i, j] = number of shared classes
-    overlap_matrix = presence @ presence.T  # [N, N]
-
-    # Index for candidate pairs
-    overlaps = overlap_matrix[candidate_pairs[:, 0], candidate_pairs[:, 1]]
-    return overlaps.long()
-
-
 def build_phase_pairs(
     spec_features: torch.Tensor,
-    ysfc: torch.Tensor,
     k: int = 16,
-    min_overlap: int = 3,
-    min_pairs: int = 5,
+    spectral_threshold: float | None = None,
     include_self: bool = True,
     sigma: float = 5.0,
     self_pair_weight: float = 1.0,
@@ -88,18 +41,14 @@ def build_phase_pairs(
     spec_features : Tensor ``[N, C]``
         Spectral distance features (Mahalanobis-whitened) at anchor pixels.
         Used for both kNN candidate selection and pair weighting.
-    ysfc : Tensor ``[N, T]``
-        Per-pixel ysfc time series at anchor pixels.  Single channel,
-        integer-valued (e.g. 0..44).
     k : int
-        Number of nearest spectral neighbors per anchor (stage 1).
-    min_overlap : int
-        Minimum shared ysfc values for a pair to survive (stage 2).
-    min_pairs : int
-        Drop an anchor entirely if fewer than this many cross-pixel
-        pairs survive filtering.
+        Number of nearest spectral neighbors per anchor.
+    spectral_threshold : float or None
+        Hard prune pairs with spectral distance above this value.
+        If None, no threshold is applied (all kNN pairs kept).
     include_self : bool
-        If True, add self-pairs ``(i, i)`` for every surviving anchor.
+        If True, add self-pairs ``(i, i)`` for every anchor that has
+        at least one surviving cross-pixel pair.
     sigma : float
         Scale for Gaussian pair weighting:
         ``w = exp(-||spec_i - spec_j||₂ / sigma)``.
@@ -117,15 +66,17 @@ def build_phase_pairs(
         Diagnostics for logging:
 
         - ``n_anchors``: total anchors provided
-        - ``n_anchors_surviving``: anchors with ≥ min_pairs cross pairs
-        - ``n_candidates``: total candidate pairs from kNN (before filter)
-        - ``n_after_overlap``: pairs surviving ysfc overlap filter
+        - ``n_anchors_with_pairs``: anchors with ≥ 1 surviving cross pair
+        - ``n_candidates``: total candidate pairs from kNN
+        - ``n_after_threshold``: pairs surviving spectral threshold
         - ``n_self_pairs``: self-pairs added
         - ``n_total_pairs``: final pair count
-        - ``overlap_mean``: mean ysfc overlap across surviving pairs
-        - ``overlap_min``: min ysfc overlap across surviving pairs
+        - ``pairs_per_anchor_mean``: mean cross pairs per anchor (surviving only)
+        - ``pairs_per_anchor_min``: min cross pairs per anchor
+        - ``pairs_per_anchor_max``: max cross pairs per anchor
         - ``weight_mean``: mean pair weight (cross-pixel only)
         - ``weight_std``: std of pair weights
+        - ``dist_*``: spectral distance distribution stats
     """
     device = spec_features.device
     N = spec_features.shape[0]
@@ -134,26 +85,32 @@ def build_phase_pairs(
     empty_weights = torch.zeros(0, device=device)
     empty_stats = {
         'n_anchors': N,
-        'n_anchors_surviving': 0,
+        'n_anchors_with_pairs': 0,
         'n_candidates': 0,
-        'n_after_overlap': 0,
+        'n_after_threshold': 0,
         'n_self_pairs': 0,
         'n_total_pairs': 0,
-        'overlap_mean': 0.0,
-        'overlap_min': 0,
+        'pairs_per_anchor_mean': 0.0,
+        'pairs_per_anchor_min': 0,
+        'pairs_per_anchor_max': 0,
         'weight_mean': 0.0,
         'weight_std': 0.0,
+        'dist_mean': 0.0,
+        'dist_std': 0.0,
+        'dist_q25': 0.0,
+        'dist_q50': 0.0,
+        'dist_q75': 0.0,
+        'dist_min': 0.0,
+        'dist_max': 0.0,
     }
 
     if N < 2:
         return empty_pairs, empty_weights, empty_stats
 
-    # --- Stage 1: kNN in spectral space ---
-    # Pairwise L2 distances [N, N]
-    spec_dists = torch.cdist(spec_features, spec_features)
+    # --- kNN in spectral space ---
+    spec_dists = torch.cdist(spec_features, spec_features)  # [N, N]
 
-    # For each anchor, find k nearest neighbors (excluding self)
-    # Set diagonal to inf so self isn't selected as a neighbor
+    # Exclude self from kNN candidates
     spec_dists_no_self = spec_dists.clone()
     spec_dists_no_self.fill_diagonal_(float('inf'))
 
@@ -161,7 +118,6 @@ def build_phase_pairs(
     if actual_k == 0:
         return empty_pairs, empty_weights, empty_stats
 
-    # topk on negative distances = k smallest distances
     _, knn_indices = spec_dists_no_self.topk(actual_k, dim=1, largest=False)
     # knn_indices: [N, actual_k]
 
@@ -173,56 +129,48 @@ def build_phase_pairs(
 
     n_candidates = candidate_pairs.shape[0]
 
-    # --- Stage 2: filter by ysfc overlap ---
-    overlaps = _vectorized_ysfc_overlap(ysfc, candidate_pairs)
+    # Get distances for candidate pairs
+    candidate_dists = spec_dists[candidate_pairs[:, 0], candidate_pairs[:, 1]]
 
-    # Keep pairs with sufficient overlap
-    overlap_mask = overlaps >= min_overlap
-    surviving_pairs = candidate_pairs[overlap_mask]
-    surviving_overlaps = overlaps[overlap_mask]
-
-    n_after_overlap = surviving_pairs.shape[0]
-
-    # --- Drop anchors with too few surviving pairs ---
-    if n_after_overlap > 0:
-        # Count surviving cross-pixel pairs per anchor
-        anchor_counts = torch.zeros(N, dtype=torch.long, device=device)
-        anchor_counts.scatter_add_(
-            0,
-            surviving_pairs[:, 0],
-            torch.ones(n_after_overlap, dtype=torch.long, device=device),
-        )
-        anchors_ok = anchor_counts >= min_pairs  # [N] bool
-
-        # Filter pairs to only those from surviving anchors
-        pair_anchor_ok = anchors_ok[surviving_pairs[:, 0]]
-        surviving_pairs = surviving_pairs[pair_anchor_ok]
-        surviving_overlaps = surviving_overlaps[pair_anchor_ok]
+    # --- Hard threshold prune ---
+    if spectral_threshold is not None:
+        threshold_mask = candidate_dists <= spectral_threshold
+        surviving_pairs = candidate_pairs[threshold_mask]
+        surviving_dists = candidate_dists[threshold_mask]
     else:
-        anchors_ok = torch.zeros(N, dtype=torch.bool, device=device)
+        surviving_pairs = candidate_pairs
+        surviving_dists = candidate_dists
 
-    n_surviving_anchors = anchors_ok.sum().item()
-    n_cross_pairs = surviving_pairs.shape[0]
+    n_after_threshold = surviving_pairs.shape[0]
 
-    if n_cross_pairs == 0:
+    if n_after_threshold == 0:
         empty_stats['n_candidates'] = n_candidates
         return empty_pairs, empty_weights, empty_stats
 
     # --- Compute pair weights from spectral distance ---
-    cross_dists = spec_dists[surviving_pairs[:, 0], surviving_pairs[:, 1]]
-    cross_weights = torch.exp(-cross_dists / sigma)
+    cross_weights = torch.exp(-surviving_dists / sigma)
+
+    # --- Per-anchor pair counts (for logging) ---
+    anchor_counts = torch.zeros(N, dtype=torch.long, device=device)
+    anchor_counts.scatter_add_(
+        0,
+        surviving_pairs[:, 0],
+        torch.ones(n_after_threshold, dtype=torch.long, device=device),
+    )
+    anchors_with_pairs = anchor_counts > 0  # [N] bool
+    n_anchors_with_pairs = anchors_with_pairs.sum().item()
+    counts_nonzero = anchor_counts[anchors_with_pairs]
 
     # --- Add self-pairs ---
     n_self = 0
-    if include_self and n_surviving_anchors > 0:
-        self_anchor_indices = anchors_ok.nonzero(as_tuple=False).squeeze(1)
+    if include_self and n_anchors_with_pairs > 0:
+        self_anchor_indices = anchors_with_pairs.nonzero(as_tuple=False).squeeze(1)
         self_pairs = self_anchor_indices.unsqueeze(1).expand(-1, 2)  # [M, 2]
         self_weights = torch.full(
             (self_pairs.shape[0],), self_pair_weight, device=device
         )
         n_self = self_pairs.shape[0]
 
-        # Concatenate
         all_pairs = torch.cat([surviving_pairs, self_pairs], dim=0)
         all_weights = torch.cat([cross_weights, self_weights], dim=0)
     else:
@@ -232,22 +180,23 @@ def build_phase_pairs(
     # --- Stats ---
     stats = {
         'n_anchors': N,
-        'n_anchors_surviving': n_surviving_anchors,
+        'n_anchors_with_pairs': n_anchors_with_pairs,
         'n_candidates': n_candidates,
-        'n_after_overlap': n_after_overlap,
+        'n_after_threshold': n_after_threshold,
         'n_self_pairs': n_self,
         'n_total_pairs': all_pairs.shape[0],
-        'overlap_mean': surviving_overlaps.float().mean().item() if n_cross_pairs > 0 else 0.0,
-        'overlap_min': surviving_overlaps.min().item() if n_cross_pairs > 0 else 0,
-        'weight_mean': cross_weights.mean().item() if n_cross_pairs > 0 else 0.0,
-        'weight_std': cross_weights.std().item() if n_cross_pairs > 1 else 0.0,
-        'dist_mean': cross_dists.mean().item() if n_cross_pairs > 0 else 0.0,
-        'dist_std': cross_dists.std().item() if n_cross_pairs > 1 else 0.0,
-        'dist_q25': torch.quantile(cross_dists, 0.25).item() if n_cross_pairs > 0 else 0.0,
-        'dist_q50': torch.quantile(cross_dists, 0.50).item() if n_cross_pairs > 0 else 0.0,
-        'dist_q75': torch.quantile(cross_dists, 0.75).item() if n_cross_pairs > 0 else 0.0,
-        'dist_min': cross_dists.min().item() if n_cross_pairs > 0 else 0.0,
-        'dist_max': cross_dists.max().item() if n_cross_pairs > 0 else 0.0,
+        'pairs_per_anchor_mean': counts_nonzero.float().mean().item() if n_anchors_with_pairs > 0 else 0.0,
+        'pairs_per_anchor_min': counts_nonzero.min().item() if n_anchors_with_pairs > 0 else 0,
+        'pairs_per_anchor_max': counts_nonzero.max().item() if n_anchors_with_pairs > 0 else 0,
+        'weight_mean': cross_weights.mean().item(),
+        'weight_std': cross_weights.std().item() if n_after_threshold > 1 else 0.0,
+        'dist_mean': surviving_dists.mean().item(),
+        'dist_std': surviving_dists.std().item() if n_after_threshold > 1 else 0.0,
+        'dist_q25': torch.quantile(surviving_dists, 0.25).item(),
+        'dist_q50': torch.quantile(surviving_dists, 0.50).item(),
+        'dist_q75': torch.quantile(surviving_dists, 0.75).item(),
+        'dist_min': surviving_dists.min().item(),
+        'dist_max': surviving_dists.max().item(),
     }
 
     return all_pairs, all_weights, stats

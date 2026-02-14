@@ -385,11 +385,12 @@ class YsfcOverlapConfig:
 @dataclass
 class PairStrategyConfig:
     """Configuration for pair selection in soft neighborhood losses."""
-    type: str  # e.g. 'knn-with-ysfc-overlap'
+    type: str  # e.g. 'knn-with-ysfc-overlap' or 'knn-with-spectral-threshold'
     include_self: bool = True
     type_similarity: Optional[TypeSimilarityConfig] = None
     ysfc_overlap: Optional[YsfcOverlapConfig] = None
     min_pairs: int = 5
+    spectral_threshold: Optional[float] = None  # hard prune pairs above this L2 distance
 
 
 @dataclass

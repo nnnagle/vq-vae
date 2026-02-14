@@ -437,6 +437,11 @@ losses:
   # Phase trajectory matching (soft neighborhood KL)
   # Learns phase embeddings whose distance structure reproduces the
   # spectral distance structure at shared recovery stages (ysfc values).
+  # Phase trajectory matching (soft neighborhood KL)
+  # For each pair of spectrally-similar anchors, compares the full T×T
+  # distance structure between their temporal observations.  Self-pairs
+  # (i==i) teach within-pixel trajectory shape; cross-pixel pairs teach
+  # shared metric space alignment.
   soft_neighborhood_phase:
     weight: 1.0
     type: soft_neighborhood
@@ -445,34 +450,26 @@ losses:
       - static_mask.forest
 
     # Feature whose distance structure the learned embeddings should reproduce.
+    # Reference distances: L2 in Mahalanobis-whitened space (covariance applied by FeatureBuilder).
     # KL(softmax(d_target / tau) || softmax(d_learned / tau)) is minimised.
-    neighborhood_target: features.soft_neighborhood_phase
+    neighborhood_target: features.soft_neighborhood_phase_target
 
     anchor:
       population: grid-plus-supplement-ysfc
 
-    # Two-stage pair selection:
-    #   1. Find type-similar candidates by spectral feature distance
-    #   2. Keep only those with sufficient ysfc temporal overlap
-    # Self-pairs (i==i) are always included and do not count toward k.
-    # Anchors with fewer than min_pairs surviving pairs are dropped.
+    # Pair selection: kNN in spectral space + hard spectral distance threshold.
+    # Self-pairs (i==i) are included for within-pixel trajectory shape learning.
     pair_strategy:
-      type: knn-with-ysfc-overlap
+      type: knn-with-spectral-threshold
       include_self: true
-      # Stage 1: find type-similar candidates
       type_similarity:
         feature: features.infonce_type_spectral
-        k: 16                  # candidates per anchor
-      # Stage 2: keep only those with sufficient temporal overlap
-      ysfc_overlap:
-        channel: annual.ysfc
-        min_overlap: 3
-      # Drop anchor if fewer than this many cross-pixel pairs survive
-      min_pairs: 5
+        k: 16                     # candidates per anchor
+      spectral_threshold: 10.0    # hard prune beyond this Mahalanobis L2 (tune via dist logs)
 
-    # Continuous pair weighting from type encoder similarity
+    # Continuous pair weighting from spectral similarity
     pair_weights:
-      source: features.infonce_type_spectral   # w_ij = exp(-||d_spec_i - d_spec_j||₂ / sigma)
+      source: features.infonce_type_spectral   # w_ij = exp(-||spec_i - spec_j||₂ / sigma)
       sigma: 5.0
       self_pair_weight: 1.0    # self-pairs always weight 1
 
@@ -480,8 +477,6 @@ losses:
     tau_ref: 0.1               # temperature for target (spectral) distribution
     tau_learned: 0.1           # temperature for learned (embedding) distribution
     min_valid_per_row: 2       # minimum neighbors per distribution row
-    self_similarity_weight: 1.0    # trajectory shape matching
-    cross_pixel_weight: 1.0        # shared metric space anchoring
 
     # Curriculum: ramp in after type encoder stabilises
     curriculum:

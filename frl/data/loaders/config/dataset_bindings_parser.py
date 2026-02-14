@@ -656,4 +656,5 @@ class DatasetBindingsParser:
             type_similarity=type_similarity,
             ysfc_overlap=ysfc_overlap,
             min_pairs=spec.get('min_pairs', 5),
+            spectral_threshold=spec.get('spectral_threshold'),
         )
