@@ -375,6 +375,12 @@ def process_batch(
                         phase_ccdc_at_anchors = extract_temporal_at_locations(
                             phase_ccdc_data, phase_anchors_dev
                         )  # [N_phase, T, C]
+                        # Temporal spectral features as loss reference
+                        # (phase_ccdc varies over time, unlike the old
+                        #  static spec_dist_data which was identical at
+                        #  every timestep and collapsed to zero after
+                        #  demeaning)
+                        spec_at_phase_anchors = phase_ccdc_at_anchors  # [N_phase, T, C]
                         phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(
                             0, 2, 1
                         )  # [N_phase, C, T]
@@ -388,15 +394,6 @@ def process_batch(
                         z_phase_at_anchors = model.forward_phase_at_locations(
                             phase_ccdc_at_anchors, z_type_at_anchors
                         )  # [N_phase, T, 12]
-
-                        # Spectral reference: static [C,H,W] expanded to [N,T,C]
-                        T_phase = z_phase_at_anchors.shape[1]
-                        spec_at_phase_anchors = extract_at_locations(
-                            spec_dist_data, phase_anchors_dev
-                        )  # [N_phase, C]
-                        spec_at_phase_anchors = spec_at_phase_anchors.unsqueeze(
-                            1
-                        ).expand(-1, T_phase, -1)
 
                         # ysfc on GPU for loss
                         ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
