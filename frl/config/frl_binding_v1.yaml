@@ -269,7 +269,7 @@ features:
       annual.nir: {norm: zscore}
       annual.nbr: {norm: zscore}
       annual.ndmi: {norm: zscore}
-      annual.spectral_velocity: {norm: zscore}
+      annual.spectral_velocity: {norm: zscore, transform: {name: log, epsilon: 0.001}}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
   ysfc_min:
@@ -289,7 +289,7 @@ features:
       static.mean_nbr: {norm: robust_iqr}
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.variance_ndvi: {norm: robust_iqr}
-  soft_neighborhood_phase:
+  soft_neighborhood_phase_target:
     dim: [C,T,H,W]
     channels:
       annual.red: {norm: zscore}
