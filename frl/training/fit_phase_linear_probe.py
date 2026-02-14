@@ -68,7 +68,7 @@ logging.basicConfig(
 logger = logging.getLogger("phase_linear_probe")
 
 
-PHASE_TARGET_FEATURE = "soft_neighborhood_phase"
+PHASE_TARGET_FEATURE = "soft_neighborhood_phase_target"
 PHASE_INPUT_FEATURE = "phase_ccdc"
 
 PHASE_TARGET_CHANNELS = [
