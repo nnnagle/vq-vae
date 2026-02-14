@@ -68,12 +68,15 @@ class FiLMLayer(nn.Module):
         else:
             self.beta_network = None
 
-        # Initialize gamma to output near 1.0 (start close to identity)
-        nn.init.zeros_(self.gamma_network[-1].weight)
+        # Initialize gamma near 1.0, beta near 0.0, with small nonzero
+        # weights so the networks immediately respond to z_type.
+        # (The sigmoid gate in the representation model bounds the overall
+        # FiLM contribution, so we don't need zero-init for safety.)
+        nn.init.normal_(self.gamma_network[-1].weight, 0.0, 0.01)
         nn.init.ones_(self.gamma_network[-1].bias)
 
         if use_bias:
-            nn.init.zeros_(self.beta_network[-1].weight)
+            nn.init.normal_(self.beta_network[-1].weight, 0.0, 0.01)
             nn.init.zeros_(self.beta_network[-1].bias)
 
     def forward(
