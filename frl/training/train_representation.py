@@ -437,6 +437,22 @@ def process_batch(
                         p_loss_stats['curriculum_w'] = curriculum_w
                         all_phase_loss_stats.append(p_loss_stats)
 
+                        # VCR on phase embeddings (same curriculum gate)
+                        if config.get('vcr_enabled', False):
+                            z_phase_flat = z_phase_at_anchors.reshape(
+                                -1, z_phase_at_anchors.shape[-1]
+                            )  # [N_phase * T, 12]
+                            if z_phase_flat.shape[0] >= 2:
+                                phase_vcr_total, _, _ = variance_covariance_loss(
+                                    z_phase_flat,
+                                    variance_weight=config.get('vcr_variance_weight', 1.0),
+                                    covariance_weight=config.get('vcr_covariance_weight', 1.0),
+                                    variance_target=config.get('vcr_variance_target', 1.0),
+                                )
+                                vcr_loss_val = vcr_loss_val + (
+                                    config.get('vcr_weight', 0.1) * curriculum_w * phase_vcr_total
+                                )
+
         # Combine losses with weights
         spectral_weight = config.get('spectral_loss_weight', 1.0)
         spatial_weight = config.get('spatial_loss_weight', 1.0)
@@ -1098,7 +1114,7 @@ def main():
     }
 
     # Variance-covariance regularization (optional)
-    vcr_cfg = bindings_config.get_loss('variance_covariance_type')
+    vcr_cfg = bindings_config.get_loss('variance_covariance')
     if vcr_cfg is not None:
         loss_config['vcr_enabled'] = True
         loss_config['vcr_weight'] = vcr_cfg.weight if vcr_cfg.weight is not None else 0.1
