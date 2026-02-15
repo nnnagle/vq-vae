@@ -883,9 +883,20 @@ def main():
     logger.info("Creating feature builder...")
     feature_builder = FeatureBuilder(bindings_config)
 
+    # Read feature dimensions from bindings config
+    type_in_channels = len(bindings_config.get_feature('ccdc_history').channels)
+    phase_in_channels = len(bindings_config.get_feature('phase_ccdc').channels)
+    logger.info(
+        f"Feature dimensions from config: "
+        f"ccdc_history={type_in_channels}, phase_ccdc={phase_in_channels}"
+    )
+
     # Create model
     logger.info("Creating representation model...")
-    model = RepresentationModel().to(device)
+    model = RepresentationModel(
+        type_in_channels=type_in_channels,
+        phase_in_channels=phase_in_channels,
+    ).to(device)
     logger.info(f"Model (v{RepresentationModel.VERSION}): {model}")
 
     # Count parameters
@@ -1243,6 +1254,10 @@ def main():
         torch.save({
             'epoch': epoch + 1,
             'model_version': RepresentationModel.VERSION,
+            'model_kwargs': {
+                'type_in_channels': model.type_in_channels,
+                'phase_in_channels': model.phase_in_channels,
+            },
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),

@@ -48,11 +48,17 @@ class RepresentationModel(nn.Module):
     """Full encoder pipeline for type and phase embeddings.
 
     **Type pathway** (v1):
-        ``[B, 16, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, 64, H, W]``
+        ``[B, C_type, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, 64, H, W]``
 
     **Phase pathway** (v2.1):
-        ``[B, 8, T, H, W]`` → TCN → LayerNorm → FiLM(stopgrad z_type) → gated residual
+        ``[B, C_phase, T, H, W]`` → TCN → LayerNorm → FiLM(stopgrad z_type) → gated residual
         → 1×1 proj → z_phase ``[B, 12, T, H, W]``
+
+    Args:
+        type_in_channels: Number of input channels for the type pathway
+            (must match the ``ccdc_history`` feature). Default 16.
+        phase_in_channels: Number of input channels for the phase pathway
+            (must match the ``phase_ccdc`` feature). Default 8.
 
     The FiLM generates gamma/beta once from the spatial z_type and
     broadcasts them across all timesteps.  A LayerNorm normalizes TCN
@@ -67,12 +73,19 @@ class RepresentationModel(nn.Module):
 
     VERSION = "2.1"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        type_in_channels: int = 16,
+        phase_in_channels: int = 8,
+    ) -> None:
         super().__init__()
+
+        self.type_in_channels = type_in_channels
+        self.phase_in_channels = phase_in_channels
 
         # --- Type pathway ---
         self.encoder = Conv2DEncoder(
-            in_channels=16,
+            in_channels=type_in_channels,
             channels=[128, 64],
             kernel_size=1,
             padding=0,
@@ -90,7 +103,7 @@ class RepresentationModel(nn.Module):
 
         # --- Phase pathway ---
         self.phase_tcn = TCNEncoder(
-            in_channels=8,
+            in_channels=phase_in_channels,
             channels=[64, 64, 64],
             kernel_size=3,
             dilations=[1, 2, 4],
@@ -126,7 +139,7 @@ class RepresentationModel(nn.Module):
         """Type pathway forward.
 
         Args:
-            x: Input tensor ``[B, 16, H, W]`` (ccdc_history features).
+            x: Input tensor ``[B, C_type, H, W]`` (ccdc_history features).
             return_gate: If True, also return the spatial gate tensor.
 
         Returns:
@@ -152,7 +165,7 @@ class RepresentationModel(nn.Module):
             is retained for inference when embeddings are needed at every pixel.
 
         Args:
-            x_phase: Temporal input ``[B, 8, T, H, W]`` (phase_ls8 features).
+            x_phase: Temporal input ``[B, C_phase, T, H, W]`` (phase_ccdc features).
             z_type: Type embeddings ``[B, 64, H, W]`` (**caller must
                 stop-grad** before passing in).
 
@@ -290,7 +303,8 @@ class RepresentationModel(nn.Module):
                 f"The architecture has changed since this checkpoint was saved."
             )
 
-        model = cls().to(device)
+        model_kwargs = checkpoint.get("model_kwargs", {})
+        model = cls(**model_kwargs).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
 
         if freeze:
