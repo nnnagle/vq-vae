@@ -447,6 +447,11 @@ class LossConfig:
     cross_pixel_weight: Optional[float] = None
     curriculum: Optional[CurriculumConfig] = None
 
+    # --- variance_covariance-specific ---
+    variance_weight: Optional[float] = None
+    covariance_weight: Optional[float] = None
+    variance_target: Optional[float] = None
+
 
 @dataclass
 class BindingsConfig:
