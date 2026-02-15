@@ -488,3 +488,14 @@ losses:
       start_epoch: 10          # begin contributing to total loss
       ramp_epochs: 10          # linear ramp from 0 to full weight
 
+  # VICReg-style regularization to prevent embedding collapse
+  # Encourages variance across dimensions (anti-collapse) and
+  # decorrelation between dimensions (full use of latent space).
+  # Applied to z_type anchor embeddings [N_anchors, 64].
+  variance_covariance_type:
+    weight: 0.1
+    type: variance_covariance
+    variance_weight: 1.0       # sub-weight for variance (hinge on std)
+    covariance_weight: 1.0     # sub-weight for off-diagonal covariance
+    variance_target: 1.0       # target std per dimension
+

@@ -608,6 +608,9 @@ class DatasetBindingsParser:
             self_similarity_weight=spec.get('self_similarity_weight'),
             cross_pixel_weight=spec.get('cross_pixel_weight'),
             curriculum=curriculum,
+            variance_weight=spec.get('variance_weight'),
+            covariance_weight=spec.get('covariance_weight'),
+            variance_target=spec.get('variance_target'),
         )
 
     def _parse_pair_endpoint_strategy(
