@@ -950,7 +950,6 @@ def main():
     phase_film_params = (
         sum(p.numel() for p in model.phase_film.parameters() if p.requires_grad)
         + sum(p.numel() for p in model.film_norm.parameters() if p.requires_grad)
-        + model.film_gate.numel()
     )
     phase_head_params = sum(p.numel() for p in model.phase_head.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1305,9 +1304,6 @@ def main():
             f"  FiLM beta (intercept): bias={film_diag['beta_bias_mean']:.4f}"
             f"\u00b1{film_diag['beta_bias_std']:.4f}, "
             f"weight_rms={film_diag['beta_weight_rms']:.6f}"
-        )
-        logger.info(
-            f"  FiLM residual gate: {film_diag['gate']:.6f}"
         )
 
         # Save checkpoint
