@@ -226,13 +226,21 @@ features:
   infonce_type_spectral:
     dim: [C,H,W]
     channels:
-      static.mean_red: {norm: zscore}
-      static.mean_nir: {norm: zscore}
-      static.mean_swir1: {norm: zscore}
-      static.mean_swir2: {norm: zscore}
-      static.mean_ndvi: {norm: zscore}
-      static.mean_nbr: {norm: zscore}
-      static.mean_ndmi: {norm: zscore}
+      static.mean_green: {norm: robust_iqr}
+      static.mean_red: {norm: robust_iqr}
+      static.mean_nir: {norm: robust_iqr}
+      static.mean_swir1: {norm: robust_iqr}
+      static.mean_swir2: {norm: robust_iqr}
+      static.mean_ndvi: {norm: robust_iqr}
+      static.mean_nbr: {norm: robust_iqr}
+      static.mean_ndmi: {norm: robust_iqr}
+      static.mean_seasonal_amp_red: {norm: robust_iqr}
+      static.mean_seasonal_amp_nir: {norm: robust_iqr}
+      static.mean_seasonal_amp_swir1: {norm: robust_iqr}
+      static.mean_seasonal_amp_swir2: {norm: robust_iqr}
+      static.spectral_distance_per_decade: {norm: robust_iqr}
+      static.mean_decline_rate: {norm: robust_iqr}
+      static.variance_ndvi: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
     covariance:
       dim: [C,C]
       calculate: true
@@ -258,6 +266,7 @@ features:
       annual.nir: {norm: zscore}
       annual.nbr: {norm: zscore}
       annual.ndmi: {norm: zscore}
+      annual.ndvi: {norm: zscore}
       annual.spectral_velocity: {norm: zscore}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
