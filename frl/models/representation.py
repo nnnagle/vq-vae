@@ -181,7 +181,8 @@ class RepresentationModel(nn.Module):
         self,
         x_phase_pixels: torch.Tensor,
         z_type_pixels: torch.Tensor,
-    ) -> torch.Tensor:
+        return_film: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Phase pathway forward at sampled pixel locations only.
 
         Runs the same TCN → bottleneck → FiLM pipeline but only on the
@@ -193,9 +194,13 @@ class RepresentationModel(nn.Module):
             x_phase_pixels: ``[N, C, T]`` temporal features at N pixels.
             z_type_pixels: ``[N, 64]`` type embeddings at the same N pixels
                 (**caller must stop-grad**).
+            return_film: If True, also return the data-dependent gamma and
+                beta tensors (useful for diagnostics).
 
         Returns:
-            z_phase_pixels: ``[N, T, 12]`` phase embeddings.
+            If *return_film* is False: ``z_phase_pixels [N, T, 12]``.
+            If *return_film* is True: ``(z_phase_pixels, gamma, beta)``
+                where gamma and beta are ``[N, 12]``.
         """
         N, C, T = x_phase_pixels.shape
 
@@ -217,40 +222,11 @@ class RepresentationModel(nn.Module):
         z = gamma * h + beta  # [N, 12, T]
 
         z = z.permute(0, 2, 1)  # [N, T, 12]
+        if return_film:
+            # Return gamma/beta as [N, 12] (squeeze the broadcast time dim)
+            return z, gamma.squeeze(-1), beta.squeeze(-1)
         return z
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def film_diagnostics(self) -> dict:
-        """Return parameter-level diagnostics for FiLM conditioning.
-
-        Reports the scale of FiLM gamma (slope) and beta (intercept).
-        Computed directly from model parameters without requiring a data
-        forward pass.
-
-        Returns:
-            Dict with keys: ``gamma_bias_mean``, ``gamma_bias_std``,
-            ``gamma_weight_rms``, ``beta_bias_mean``, ``beta_bias_std``,
-            ``beta_weight_rms``.
-        """
-        gamma_net = self.phase_film.gamma_network
-        beta_net = self.phase_film.beta_network
-
-        gamma_bias = gamma_net[-1].bias.data   # [target_dim]
-        beta_bias = beta_net[-1].bias.data     # [target_dim]
-        gamma_w = gamma_net[-1].weight.data    # [target_dim, hidden_dim, 1, 1]
-        beta_w = beta_net[-1].weight.data
-
-        return {
-            'gamma_bias_mean': gamma_bias.mean().item(),
-            'gamma_bias_std': gamma_bias.std().item(),
-            'gamma_weight_rms': gamma_w.pow(2).mean().sqrt().item(),
-            'beta_bias_mean': beta_bias.mean().item(),
-            'beta_bias_std': beta_bias.std().item(),
-            'beta_weight_rms': beta_w.pow(2).mean().sqrt().item(),
-        }
 
     # ------------------------------------------------------------------
     # Checkpoint helpers

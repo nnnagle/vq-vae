@@ -121,6 +121,10 @@ def process_batch(
     all_phase_pair_stats = []
     all_phase_loss_stats = []
 
+    # FiLM data-dependent stats accumulators
+    all_film_gamma = []
+    all_film_beta = []
+
     batch_size = len(batch['metadata'])
 
     for i in range(batch_size):
@@ -406,9 +410,12 @@ def process_batch(
                         )  # [N_phase, 64]
 
                         # Run phase encoder on anchor pixels only
-                        z_phase_at_anchors = model.forward_phase_at_locations(
-                            phase_ccdc_at_anchors, z_type_at_anchors
-                        )  # [N_phase, T, 12]
+                        z_phase_at_anchors, film_gamma, film_beta = model.forward_phase_at_locations(
+                            phase_ccdc_at_anchors, z_type_at_anchors,
+                            return_film=True,
+                        )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12]
+                        all_film_gamma.append(film_gamma.detach())
+                        all_film_beta.append(film_beta.detach())
 
                         # Phase VCR: prevent dimensional collapse in z_phase
                         phase_vcr_cfg = config.get('phase_vcr_config')
@@ -602,6 +609,20 @@ def process_batch(
             'q75': torch.quantile(combined, 0.75).item(),
         }
 
+    # Compute data-dependent FiLM stats
+    film_stats = None
+    if all_film_gamma:
+        gamma_cat = torch.cat(all_film_gamma, dim=0)  # [total_pixels, 12]
+        beta_cat = torch.cat(all_film_beta, dim=0)    # [total_pixels, 12]
+        film_stats = {
+            'gamma_mean': gamma_cat.mean().item(),
+            'gamma_std': gamma_cat.std().item(),
+            'gamma_per_dim_std': gamma_cat.std(dim=0).mean().item(),
+            'beta_mean': beta_cat.mean().item(),
+            'beta_std': beta_cat.std().item(),
+            'beta_per_dim_std': beta_cat.std(dim=0).mean().item(),
+        }
+
     return {
         'loss': mean_loss,
         'spectral_loss': mean_spectral_loss,
@@ -619,6 +640,7 @@ def process_batch(
         'neg_weight_stats': compute_stats(all_neg_weights),
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
+        'film_stats': film_stats,
     }
 
 
@@ -653,6 +675,7 @@ def train_epoch(
     last_neg_weight_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
+    last_film_stats = None
 
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
@@ -679,6 +702,8 @@ def train_epoch(
             last_neg_weight_stats = stats['neg_weight_stats']
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
+            if stats.get('film_stats') is not None:
+                last_film_stats = stats['film_stats']
 
             if batch_idx % log_interval == 0:
                 phase_msg = ""
@@ -718,6 +743,7 @@ def train_epoch(
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
+            'film_stats': None,
         }
 
     return {
@@ -733,6 +759,7 @@ def train_epoch(
         'neg_weight_stats': last_neg_weight_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
+        'film_stats': last_film_stats,
     }
 
 def validate_epoch(
@@ -762,6 +789,7 @@ def validate_epoch(
     last_neg_weight_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
+    last_film_stats = None
 
     with torch.no_grad():
         for batch in val_dataloader:
@@ -786,6 +814,8 @@ def validate_epoch(
                 last_neg_weight_stats = stats['neg_weight_stats']
                 last_phase_pair_stats = stats.get('phase_pair_stats')
                 last_phase_loss_stats = stats.get('phase_loss_stats')
+                if stats.get('film_stats') is not None:
+                    last_film_stats = stats['film_stats']
 
     if total_batches == 0:
         return {
@@ -795,6 +825,7 @@ def validate_epoch(
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
+            'film_stats': None,
         }
 
     return {
@@ -810,6 +841,7 @@ def validate_epoch(
         'neg_weight_stats': last_neg_weight_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
+        'film_stats': last_film_stats,
     }
 
 def main():
@@ -1328,18 +1360,21 @@ def main():
                 f"starts epoch {phase_config['curriculum_start_epoch']+1})"
             )
 
-        # Log FiLM diagnostics (parameter-level, no data needed)
-        film_diag = model.film_diagnostics()
-        logger.info(
-            f"  FiLM gamma (slope): bias={film_diag['gamma_bias_mean']:.4f}"
-            f"\u00b1{film_diag['gamma_bias_std']:.4f}, "
-            f"weight_rms={film_diag['gamma_weight_rms']:.6f}"
-        )
-        logger.info(
-            f"  FiLM beta (intercept): bias={film_diag['beta_bias_mean']:.4f}"
-            f"\u00b1{film_diag['beta_bias_std']:.4f}, "
-            f"weight_rms={film_diag['beta_weight_rms']:.6f}"
-        )
+        # Log FiLM diagnostics (data-dependent: actual gamma/beta across pixels)
+        fs = train_stats.get('film_stats')
+        if fs is not None:
+            logger.info(
+                f"  FiLM gamma (data): mean={fs['gamma_mean']:.4f}, "
+                f"std={fs['gamma_std']:.4f}, "
+                f"per_dim_std={fs['gamma_per_dim_std']:.4f}"
+            )
+            logger.info(
+                f"  FiLM beta  (data): mean={fs['beta_mean']:.4f}, "
+                f"std={fs['beta_std']:.4f}, "
+                f"per_dim_std={fs['beta_per_dim_std']:.4f}"
+            )
+        else:
+            logger.info("  FiLM: no data (phase pathway not active yet)")
 
         # Save checkpoint
         ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
