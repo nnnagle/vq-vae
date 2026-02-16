@@ -35,6 +35,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .conv2d_encoder import Conv2DEncoder
 from .conditioning import FiLMLayer
@@ -169,6 +170,9 @@ class RepresentationModel(nn.Module):
         h = self.phase_head(h)  # [B*T, 12, H, W]
         h = h.reshape(B, T, 12, H, W).permute(0, 2, 1, 3, 4)  # [B, 12, T, H, W]
 
+        # L2-normalize along channel dim so TCN controls direction, not magnitude
+        h = F.normalize(h, dim=1)  # [B, 12, T, H, W]
+
         # FiLM conditioning
         gamma, beta = self.phase_film(z_type)  # each [B, 12, H, W]
         gamma = gamma.unsqueeze(2)  # [B, 12, 1, H, W]
@@ -212,6 +216,9 @@ class RepresentationModel(nn.Module):
         h = h.permute(0, 2, 1).reshape(N * T, 64, 1, 1)
         h = self.phase_head(h)  # [N*T, 12, 1, 1]
         h = h.reshape(N, T, 12).permute(0, 2, 1)  # [N, 12, T]
+
+        # L2-normalize along channel dim so TCN controls direction, not magnitude
+        h = F.normalize(h, dim=1)  # [N, 12, T]
 
         # FiLM conditioning
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
