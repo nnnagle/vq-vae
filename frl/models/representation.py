@@ -170,8 +170,10 @@ class RepresentationModel(nn.Module):
         h = self.phase_head(h)  # [B*T, 12, H, W]
         h = h.reshape(B, T, 12, H, W).permute(0, 2, 1, 3, 4)  # [B, 12, T, H, W]
 
-        # L2-normalize along channel dim so TCN controls direction, not magnitude
-        h = F.normalize(h, dim=1)  # [B, 12, T, H, W]
+        # L2-normalize across (channel, time) jointly so the TCN controls
+        # direction & temporal shape, while FiLM gamma owns the per-channel scale.
+        # One norm factor per spatial location — temporal variation is preserved.
+        h = F.normalize(h.flatten(1, 2), dim=1).unflatten(1, (12, T))
 
         # FiLM conditioning
         gamma, beta = self.phase_film(z_type)  # each [B, 12, H, W]
@@ -217,8 +219,8 @@ class RepresentationModel(nn.Module):
         h = self.phase_head(h)  # [N*T, 12, 1, 1]
         h = h.reshape(N, T, 12).permute(0, 2, 1)  # [N, 12, T]
 
-        # L2-normalize along channel dim so TCN controls direction, not magnitude
-        h = F.normalize(h, dim=1)  # [N, 12, T]
+        # L2-normalize across (channel, time) jointly — see forward_phase.
+        h = F.normalize(h.flatten(1, 2), dim=1).unflatten(1, (12, T))
 
         # FiLM conditioning
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
