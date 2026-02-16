@@ -51,6 +51,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # FRL imports
@@ -1023,12 +1024,12 @@ def compute_embedding_diagnostics(
 
     Returns:
         dict with per-dimension tensors for within/between/fraction for
-        z_phase (12-d), TCN output (64-d), post-FiLM (64-d), and
+        z_phase (12-d), TCN output (64-d), post-FiLM (12-d), and
         FiLM gamma/beta summary statistics.
     """
     model.eval()
-    D_ZP = 12   # z_phase dim
-    D_H = 64    # TCN / FiLM hidden dim
+    D_ZP = 12   # z_phase / post-FiLM dim
+    D_H = 64    # TCN hidden dim
 
     # --- Variance decomposition accumulators (on CPU, float64) ---
     sum_within_zp = torch.zeros(D_ZP, dtype=torch.float64)
@@ -1039,19 +1040,19 @@ def compute_embedding_diagnostics(
     sum_pixmean_tcn = torch.zeros(D_H, dtype=torch.float64)
     sum_pixmean2_tcn = torch.zeros(D_H, dtype=torch.float64)
 
-    sum_within_post = torch.zeros(D_H, dtype=torch.float64)
-    sum_pixmean_post = torch.zeros(D_H, dtype=torch.float64)
-    sum_pixmean2_post = torch.zeros(D_H, dtype=torch.float64)
+    sum_within_post = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_pixmean_post = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_pixmean2_post = torch.zeros(D_ZP, dtype=torch.float64)
 
-    # --- FiLM parameter accumulators ---
-    sum_gamma = torch.zeros(D_H, dtype=torch.float64)
-    sum_gamma2 = torch.zeros(D_H, dtype=torch.float64)
-    sum_beta = torch.zeros(D_H, dtype=torch.float64)
-    sum_beta2 = torch.zeros(D_H, dtype=torch.float64)
-    gamma_min = torch.full((D_H,), float("inf"), dtype=torch.float64)
-    gamma_max = torch.full((D_H,), float("-inf"), dtype=torch.float64)
-    beta_min = torch.full((D_H,), float("inf"), dtype=torch.float64)
-    beta_max = torch.full((D_H,), float("-inf"), dtype=torch.float64)
+    # --- FiLM parameter accumulators (FiLM operates in 12-d space) ---
+    sum_gamma = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_gamma2 = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_beta = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_beta2 = torch.zeros(D_ZP, dtype=torch.float64)
+    gamma_min = torch.full((D_ZP,), float("inf"), dtype=torch.float64)
+    gamma_max = torch.full((D_ZP,), float("-inf"), dtype=torch.float64)
+    beta_min = torch.full((D_ZP,), float("inf"), dtype=torch.float64)
+    beta_max = torch.full((D_ZP,), float("-inf"), dtype=torch.float64)
     n_film_pixels = 0
 
     n_pixels = 0
@@ -1081,17 +1082,31 @@ def compute_embedding_diagnostics(
                 # TCN output captured by hook: [B, 64, T, H, W]
                 h_tcn = tcn_output["h"]
 
-                # Compute post-FiLM hidden states (same as inside forward_phase)
+                # Replicate the bottleneck + L2-norm + FiLM pipeline
+                # from forward_phase to compute post-FiLM hidden states.
+                # 1) Bottleneck: Conv2d(64→12) per timestep
+                h_bn = h_tcn.permute(0, 2, 1, 3, 4).reshape(
+                    Bsz * T, 64, H, W_sp
+                )
+                h_bn = model.phase_head(h_bn)  # [B*T, 12, H, W]
+                h_bn = h_bn.reshape(Bsz, T, 12, H, W_sp).permute(
+                    0, 2, 1, 3, 4
+                )  # [B, 12, T, H, W]
+                # 2) L2-normalize across (channel, time) jointly
+                h_bn = F.normalize(
+                    h_bn.flatten(1, 2), dim=1
+                ).unflatten(1, (12, T))
+                # 3) FiLM conditioning
                 gamma, beta = model.phase_film(z_type_det)
-                # gamma, beta: [B, 64, H, W]
-                h_post = gamma.unsqueeze(2) * h_tcn + beta.unsqueeze(2)
-                # h_post: [B, 64, T, H, W]
+                # gamma, beta: [B, 12, H, W]
+                h_post = gamma.unsqueeze(2) * h_bn + beta.unsqueeze(2)
+                # h_post: [B, 12, T, H, W]
 
                 halo_m = _halo_mask(H, W_sp, halo, device)
                 full_mask = M & halo_m.unsqueeze(0)  # [B, H, W]
 
                 # --- FiLM parameters at valid pixels ---
-                gm = gamma.permute(0, 2, 3, 1)[full_mask]  # [N, 64] on GPU
+                gm = gamma.permute(0, 2, 3, 1)[full_mask]  # [N, 12] on GPU
                 bt = beta.permute(0, 2, 3, 1)[full_mask]
                 N_valid = gm.shape[0]
                 if N_valid == 0:
@@ -1125,7 +1140,7 @@ def compute_embedding_diagnostics(
                         sum_pixmean2_tcn,
                     ),
                     (
-                        h_post.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 64, T]
+                        h_post.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 12, T]
                         sum_within_post,
                         sum_pixmean_post,
                         sum_pixmean2_post,
@@ -1230,7 +1245,7 @@ def log_embedding_diagnostics(diag: dict):
     f_post = diag["postfilm_temporal_frac"]
     w_post = diag["postfilm_within_var"]
     b_post = diag["postfilm_between_var"]
-    logger.info("  Post-FiLM (64-d) temporal variance fraction:")
+    logger.info("  Post-FiLM (12-d) temporal variance fraction:")
     logger.info(
         f"    mean={f_post.mean():.2%}  "
         f"range=[{f_post.min():.2%}, {f_post.max():.2%}]"
@@ -1245,7 +1260,7 @@ def log_embedding_diagnostics(diag: dict):
     gs = diag["film_gamma_std"]
     bm = diag["film_beta_mean"]
     bs = diag["film_beta_std"]
-    logger.info("  FiLM parameters (64 channels):")
+    logger.info("  FiLM parameters (12 channels):")
     logger.info(
         f"    gamma: mean={gm.mean():.4f} +/- {gs.mean():.4f}  "
         f"[{diag['film_gamma_min'].min():.4f}, "
