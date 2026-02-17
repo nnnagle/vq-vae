@@ -202,6 +202,13 @@ def collect_phase_diagnostics(
                 pred_norm.reshape(-1, C), inv_whitening, means, transform_specs,
             ).reshape(T, H, W_sp, C).permute(3, 0, 1, 2).numpy()  # [7, T, H, W]
 
+            # Apply variance inflation if factors are in checkpoint
+            if vi_factors is not None and vi_center is not None:
+                for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+                    sf = vi_factors[ch]
+                    ctr = vi_center[ch]
+                    pred_orig[c_idx] = ctr + (pred_orig[c_idx] - ctr) * sf
+
             tgt_orig = _invert_to_original_scale(
                 tgt_norm_thwc.reshape(-1, C),
                 inv_whitening, means, transform_specs,
@@ -645,6 +652,14 @@ def main():
     else:
         preprocessor = None
         logger.info("No preprocessor in probe checkpoint; using raw features.")
+
+    # Load variance inflation factors if present in checkpoint
+    vi_factors = probe_ckpt.get("variance_inflate_factors")
+    vi_center = probe_ckpt.get("variance_inflate_center")
+    if vi_factors is not None:
+        logger.info("Variance inflation enabled from probe checkpoint")
+    else:
+        logger.info("No variance inflation in probe checkpoint")
 
     logger.info(
         f"Probe: design={design}, W shape={list(W.shape)}, "
