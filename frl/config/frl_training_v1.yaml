@@ -33,7 +33,7 @@ hardware:
     
 training:
   epoch:
-    num_epochs: 100
+    num_epochs: 200
     mode: full # full/frac/number - use every batch or take a sample
     sample_frac: .1
     sample_number: 1000

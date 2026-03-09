@@ -105,6 +105,7 @@ def process_batch(
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
+    total_phase_vcr_loss = 0.0
     n_valid = 0
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
@@ -119,6 +120,10 @@ def process_batch(
     # Phase pair stats accumulators
     all_phase_pair_stats = []
     all_phase_loss_stats = []
+
+    # FiLM data-dependent stats accumulators
+    all_film_gamma = []
+    all_film_beta = []
 
     batch_size = len(batch['metadata'])
 
@@ -316,6 +321,7 @@ def process_batch(
         # Pair construction (kNN + overlap) runs on CPU.
         # Loss computation runs on GPU (requires gradients through phase encoder).
         phase_loss_val = torch.tensor(0.0, device=device)
+        phase_vcr_loss_val = torch.tensor(0.0, device=device)
         if phase_sampler is not None and phase_config is not None:
             # Build ysfc feature via FeatureBuilder (returns numpy)
             ysfc_feature = feature_builder.build_feature('ysfc', sample)
@@ -404,9 +410,27 @@ def process_batch(
                         )  # [N_phase, 64]
 
                         # Run phase encoder on anchor pixels only
-                        z_phase_at_anchors = model.forward_phase_at_locations(
-                            phase_ccdc_at_anchors, z_type_at_anchors
-                        )  # [N_phase, T, 12]
+                        z_phase_at_anchors, film_gamma, film_beta = model.forward_phase_at_locations(
+                            phase_ccdc_at_anchors, z_type_at_anchors,
+                            return_film=True,
+                        )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12]
+                        all_film_gamma.append(film_gamma.detach())
+                        all_film_beta.append(film_beta.detach())
+
+                        # Phase VCR: prevent dimensional collapse in z_phase
+                        phase_vcr_cfg = config.get('phase_vcr_config')
+                        if phase_vcr_cfg is not None:
+                            # Flatten [N_phase, T, 12] -> [N_phase*T, 12]
+                            z_phase_flat = z_phase_at_anchors.reshape(-1, 12)
+                            pvcr_total, _, _ = variance_covariance_loss(
+                                z_phase_flat,
+                                variance_weight=phase_vcr_cfg.get('variance_weight', 1.0),
+                                covariance_weight=phase_vcr_cfg.get('covariance_weight', 1.0),
+                                variance_target=phase_vcr_cfg.get('variance_target', 1.0),
+                            )
+                            phase_vcr_loss_val = phase_vcr_cfg.get('weight', 0.1) * curriculum_w * pvcr_total
+                        else:
+                            phase_vcr_loss_val = torch.tensor(0.0, device=device)
 
                         # ysfc on GPU for loss
                         ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
@@ -437,29 +461,14 @@ def process_batch(
                         p_loss_stats['curriculum_w'] = curriculum_w
                         all_phase_loss_stats.append(p_loss_stats)
 
-                        # VCR on phase embeddings (same curriculum gate)
-                        if config.get('vcr_enabled', False):
-                            z_phase_flat = z_phase_at_anchors.reshape(
-                                -1, z_phase_at_anchors.shape[-1]
-                            )  # [N_phase * T, 12]
-                            if z_phase_flat.shape[0] >= 2:
-                                phase_vcr_total, _, _ = variance_covariance_loss(
-                                    z_phase_flat,
-                                    variance_weight=config.get('vcr_variance_weight', 1.0),
-                                    covariance_weight=config.get('vcr_covariance_weight', 1.0),
-                                    variance_target=config.get('vcr_variance_target', 1.0),
-                                )
-                                vcr_loss_val = vcr_loss_val + (
-                                    config.get('vcr_weight', 0.1) * curriculum_w * phase_vcr_total
-                                )
-
         # Combine losses with weights
         spectral_weight = config.get('spectral_loss_weight', 1.0)
         spatial_weight = config.get('spatial_loss_weight', 1.0)
         loss = (spectral_weight * spectral_loss_val
                 + spatial_weight * spatial_loss_val
                 + phase_loss_val
-                + vcr_loss_val)
+                + vcr_loss_val
+                + phase_vcr_loss_val)
 
         # Skip if loss is NaN or Inf (numerical instability)
         if not torch.isfinite(loss):
@@ -473,12 +482,14 @@ def process_batch(
             total_spatial_loss += spatial_loss_val
             total_phase_loss += phase_loss_val
             total_vcr_loss += vcr_loss_val
+            total_phase_vcr_loss += phase_vcr_loss_val
         else:
             total_loss += loss.item()
             total_spectral_loss += spectral_loss_val.item()
             total_spatial_loss += spatial_loss_val.item()
             total_phase_loss += phase_loss_val.item()
             total_vcr_loss += vcr_loss_val.item()
+            total_phase_vcr_loss += phase_vcr_loss_val.item()
         n_valid += 1
         total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
         total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
@@ -528,7 +539,8 @@ def process_batch(
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'vcr_loss': 0.0, 'n_valid': 0,
+            'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -543,6 +555,7 @@ def process_batch(
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = total_phase_loss / n_valid
     mean_vcr_loss = total_vcr_loss / n_valid
+    mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
 
     if training:
         # Final NaN check before backward
@@ -551,7 +564,8 @@ def process_batch(
             return {
                 'loss': float('nan'), 'spectral_loss': float('nan'),
                 'spatial_loss': float('nan'), 'phase_loss': float('nan'),
-                'vcr_loss': float('nan'), 'n_valid': 0,
+                'vcr_loss': float('nan'), 'phase_vcr_loss': float('nan'),
+                'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
                 'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -576,6 +590,7 @@ def process_batch(
         mean_spatial_loss = mean_spatial_loss.item()
         mean_phase_loss = mean_phase_loss.item()
         mean_vcr_loss = mean_vcr_loss.item()
+        mean_phase_vcr_loss = mean_phase_vcr_loss.item()
 
     # Compute distribution statistics for gate values and weights
     def compute_stats(tensors: list[torch.Tensor]) -> dict:
@@ -594,12 +609,27 @@ def process_batch(
             'q75': torch.quantile(combined, 0.75).item(),
         }
 
+    # Compute data-dependent FiLM stats
+    film_stats = None
+    if all_film_gamma:
+        gamma_cat = torch.cat(all_film_gamma, dim=0)  # [total_pixels, 12]
+        beta_cat = torch.cat(all_film_beta, dim=0)    # [total_pixels, 12]
+        film_stats = {
+            'gamma_mean': gamma_cat.mean().item(),
+            'gamma_std': gamma_cat.std().item(),
+            'gamma_per_dim_std': gamma_cat.std(dim=0).mean().item(),
+            'beta_mean': beta_cat.mean().item(),
+            'beta_std': beta_cat.std().item(),
+            'beta_per_dim_std': beta_cat.std(dim=0).mean().item(),
+        }
+
     return {
         'loss': mean_loss,
         'spectral_loss': mean_spectral_loss,
         'spatial_loss': mean_spatial_loss,
         'phase_loss': mean_phase_loss,
         'vcr_loss': mean_vcr_loss,
+        'phase_vcr_loss': mean_phase_vcr_loss,
         'n_valid': n_valid,
         'spectral_pos_pairs': total_spectral_pos_pairs // n_valid if n_valid > 0 else 0,
         'spectral_neg_pairs': total_spectral_neg_pairs // n_valid if n_valid > 0 else 0,
@@ -610,6 +640,7 @@ def process_batch(
         'neg_weight_stats': compute_stats(all_neg_weights),
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
+        'film_stats': film_stats,
     }
 
 
@@ -633,6 +664,7 @@ def train_epoch(
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
+    total_phase_vcr_loss = 0.0
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -643,6 +675,7 @@ def train_epoch(
     last_neg_weight_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
+    last_film_stats = None
 
     for batch_idx, batch in enumerate(train_dataloader):
         stats = process_batch(
@@ -660,6 +693,7 @@ def train_epoch(
             total_spatial_loss += stats['spatial_loss']
             total_phase_loss += stats['phase_loss']
             total_vcr_loss += stats['vcr_loss']
+            total_phase_vcr_loss += stats['phase_vcr_loss']
             total_batches += 1
 
             # Update distribution stats from last valid batch
@@ -668,6 +702,8 @@ def train_epoch(
             last_neg_weight_stats = stats['neg_weight_stats']
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
+            if stats.get('film_stats') is not None:
+                last_film_stats = stats['film_stats']
 
             if batch_idx % log_interval == 0:
                 phase_msg = ""
@@ -692,7 +728,7 @@ def train_epoch(
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
                     f"Loss: {stats['loss']:.4f} (spec: {stats['spectral_loss']:.4f}, "
                     f"spat: {stats['spatial_loss']:.4f}, phase: {stats['phase_loss']:.4f}, "
-                    f"vcr: {stats['vcr_loss']:.4f}) | "
+                    f"vcr: {stats['vcr_loss']:.4f}, pvcr: {stats['phase_vcr_loss']:.4f}) | "
                     f"Pairs(+/-): spec {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']}, "
                     f"spat {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e}"
@@ -702,10 +738,12 @@ def train_epoch(
     if total_batches == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'vcr_loss': 0.0, 'batches': 0,
+            'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
+            'film_stats': None,
         }
 
     return {
@@ -714,12 +752,14 @@ def train_epoch(
         'spatial_loss': total_spatial_loss / total_batches,
         'phase_loss': total_phase_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
+        'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
+        'film_stats': last_film_stats,
     }
 
 def validate_epoch(
@@ -738,6 +778,7 @@ def validate_epoch(
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
+    total_phase_vcr_loss = 0.0
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -748,6 +789,7 @@ def validate_epoch(
     last_neg_weight_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
+    last_film_stats = None
 
     with torch.no_grad():
         for batch in val_dataloader:
@@ -763,6 +805,7 @@ def validate_epoch(
                 total_spatial_loss += stats['spatial_loss']
                 total_phase_loss += stats['phase_loss']
                 total_vcr_loss += stats['vcr_loss']
+                total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_batches += 1
 
                 # Update distribution stats from last valid batch
@@ -771,14 +814,18 @@ def validate_epoch(
                 last_neg_weight_stats = stats['neg_weight_stats']
                 last_phase_pair_stats = stats.get('phase_pair_stats')
                 last_phase_loss_stats = stats.get('phase_loss_stats')
+                if stats.get('film_stats') is not None:
+                    last_film_stats = stats['film_stats']
 
     if total_batches == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'vcr_loss': 0.0, 'batches': 0,
+            'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
+            'film_stats': None,
         }
 
     return {
@@ -787,12 +834,14 @@ def validate_epoch(
         'spatial_loss': total_spatial_loss / total_batches,
         'phase_loss': total_phase_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
+        'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
+        'film_stats': last_film_stats,
     }
 
 def main():
@@ -947,10 +996,7 @@ def main():
     encoder_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     spatial_params = sum(p.numel() for p in model.spatial_conv.parameters() if p.requires_grad)
     phase_tcn_params = sum(p.numel() for p in model.phase_tcn.parameters() if p.requires_grad)
-    phase_film_params = (
-        sum(p.numel() for p in model.phase_film.parameters() if p.requires_grad)
-        + sum(p.numel() for p in model.film_norm.parameters() if p.requires_grad)
-    )
+    phase_film_params = sum(p.numel() for p in model.phase_film.parameters() if p.requires_grad)
     phase_head_params = sum(p.numel() for p in model.phase_head.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
@@ -1113,7 +1159,7 @@ def main():
     }
 
     # Variance-covariance regularization (optional)
-    vcr_cfg = bindings_config.get_loss('variance_covariance')
+    vcr_cfg = bindings_config.get_loss('variance_covariance_type')
     if vcr_cfg is not None:
         loss_config['vcr_enabled'] = True
         loss_config['vcr_weight'] = vcr_cfg.weight if vcr_cfg.weight is not None else 0.1
@@ -1127,7 +1173,26 @@ def main():
             f"var_target={loss_config['vcr_variance_target']}"
         )
     else:
-        logger.info("Variance-covariance loss disabled (not in config)")
+        logger.info("Variance-covariance loss (type) disabled (not in config)")
+
+    # Phase VCR (variance-covariance on z_phase)
+    phase_vcr_cfg = bindings_config.get_loss('variance_covariance_phase')
+    if phase_vcr_cfg is not None:
+        loss_config['phase_vcr_config'] = {
+            'weight': phase_vcr_cfg.weight if phase_vcr_cfg.weight is not None else 0.1,
+            'variance_weight': phase_vcr_cfg.variance_weight if phase_vcr_cfg.variance_weight is not None else 1.0,
+            'covariance_weight': phase_vcr_cfg.covariance_weight if phase_vcr_cfg.covariance_weight is not None else 1.0,
+            'variance_target': phase_vcr_cfg.variance_target if phase_vcr_cfg.variance_target is not None else 1.0,
+        }
+        logger.info(
+            f"Variance-covariance loss (phase) enabled: "
+            f"weight={loss_config['phase_vcr_config']['weight']}, "
+            f"var_w={loss_config['phase_vcr_config']['variance_weight']}, "
+            f"cov_w={loss_config['phase_vcr_config']['covariance_weight']}, "
+            f"var_target={loss_config['phase_vcr_config']['variance_target']}"
+        )
+    else:
+        logger.info("Variance-covariance loss (phase) disabled (not in config)")
 
     logger.info(
         f"Loss config from bindings: "
@@ -1241,10 +1306,12 @@ def main():
             f"Epoch {epoch+1}/{num_epochs} complete | "
             f"Train Loss: {train_stats['loss']:.4f} "
             f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}, "
-            f"phase: {train_stats['phase_loss']:.4f}, vcr: {train_stats['vcr_loss']:.4f}) | "
+            f"phase: {train_stats['phase_loss']:.4f}, vcr: {train_stats['vcr_loss']:.4f}, "
+            f"pvcr: {train_stats['phase_vcr_loss']:.4f}) | "
             f"Val Loss: {val_stats['loss']:.4f} "
             f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}, "
-            f"phase: {val_stats['phase_loss']:.4f}, vcr: {val_stats['vcr_loss']:.4f})"
+            f"phase: {val_stats['phase_loss']:.4f}, vcr: {val_stats['vcr_loss']:.4f}, "
+            f"pvcr: {val_stats['phase_vcr_loss']:.4f})"
         )
 
         # Log distribution statistics
@@ -1293,18 +1360,21 @@ def main():
                 f"starts epoch {phase_config['curriculum_start_epoch']+1})"
             )
 
-        # Log FiLM diagnostics (parameter-level, no data needed)
-        film_diag = model.film_diagnostics()
-        logger.info(
-            f"  FiLM gamma (slope): bias={film_diag['gamma_bias_mean']:.4f}"
-            f"\u00b1{film_diag['gamma_bias_std']:.4f}, "
-            f"weight_rms={film_diag['gamma_weight_rms']:.6f}"
-        )
-        logger.info(
-            f"  FiLM beta (intercept): bias={film_diag['beta_bias_mean']:.4f}"
-            f"\u00b1{film_diag['beta_bias_std']:.4f}, "
-            f"weight_rms={film_diag['beta_weight_rms']:.6f}"
-        )
+        # Log FiLM diagnostics (data-dependent: actual gamma/beta across pixels)
+        fs = train_stats.get('film_stats')
+        if fs is not None:
+            logger.info(
+                f"  FiLM gamma (data): mean={fs['gamma_mean']:.4f}, "
+                f"std={fs['gamma_std']:.4f}, "
+                f"per_dim_std={fs['gamma_per_dim_std']:.4f}"
+            )
+            logger.info(
+                f"  FiLM beta  (data): mean={fs['beta_mean']:.4f}, "
+                f"std={fs['beta_std']:.4f}, "
+                f"per_dim_std={fs['beta_per_dim_std']:.4f}"
+            )
+        else:
+            logger.info("  FiLM: no data (phase pathway not active yet)")
 
         # Save checkpoint
         ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
@@ -1323,11 +1393,13 @@ def main():
             'train_spatial_loss': train_stats['spatial_loss'],
             'train_phase_loss': train_stats['phase_loss'],
             'train_vcr_loss': train_stats['vcr_loss'],
+            'train_phase_vcr_loss': train_stats['phase_vcr_loss'],
             'val_loss': val_stats['loss'],
             'val_spectral_loss': val_stats['spectral_loss'],
             'val_spatial_loss': val_stats['spatial_loss'],
             'val_phase_loss': val_stats['phase_loss'],
             'val_vcr_loss': val_stats['vcr_loss'],
+            'val_phase_vcr_loss': val_stats['phase_vcr_loss'],
         }, ckpt_path)
         logger.info(f"Saved checkpoint to {ckpt_path}")
 

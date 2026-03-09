@@ -508,3 +508,13 @@ losses:
     covariance_weight: 1.0     # sub-weight for off-diagonal covariance
     variance_target: 1.0       # target std per dimension
 
+  # VICReg-style regularization for phase embeddings.
+  # Prevents FiLM from collapsing dimensions in the 12-dim z_phase space.
+  # Applied to z_phase embeddings [N_anchors*T, 12], ramped with phase curriculum.
+  variance_covariance_phase:
+    weight: 0.1
+    type: variance_covariance
+    variance_weight: 1.0
+    covariance_weight: 1.0
+    variance_target: 1.0
+
