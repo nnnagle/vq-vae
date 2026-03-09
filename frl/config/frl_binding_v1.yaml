@@ -501,7 +501,7 @@ losses:
   # Encourages variance across dimensions (anti-collapse) and
   # decorrelation between dimensions (full use of latent space).
   # Applied to z_type [N_anchors, 64] and z_phase [N_phase*T, 12].
-  variance_covariance:
+  variance_covariance_type:
     weight: 0.1
     type: variance_covariance
     variance_weight: 1.0       # sub-weight for variance (hinge on std)
