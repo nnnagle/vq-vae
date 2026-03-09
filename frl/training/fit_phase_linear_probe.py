@@ -45,12 +45,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # FRL imports
@@ -68,7 +70,7 @@ logging.basicConfig(
 logger = logging.getLogger("phase_linear_probe")
 
 
-PHASE_TARGET_FEATURE = "soft_neighborhood_phase"
+PHASE_TARGET_FEATURE = "soft_neighborhood_phase_target"
 PHASE_INPUT_FEATURE = "phase_ccdc"
 
 PHASE_TARGET_CHANNELS = [
@@ -225,6 +227,8 @@ class PhaseProbeMetrics:
     variance_fraction_temporal: Dict[str, float]
     variance_fraction_temporal_total: float
     n_pixels: int
+    # Per-channel means (original scale) — used for variance inflation
+    mean_per_channel_original: Dict[str, float]
 
 
 def _iter_batches(dataloader: DataLoader, max_batches: int):
@@ -748,6 +752,8 @@ def evaluate_phase_probe(
     max_batches_eval: int = 0,
     design: str = "full",
     preprocessor: ProbePreprocessor | None = None,
+    inflation_factors: Dict[str, float] | None = None,
+    inflation_center: Dict[str, float] | None = None,
 ) -> PhaseProbeMetrics:
     """Evaluate MSE and R² in both normalized and original data scales.
 
@@ -757,6 +763,14 @@ def evaluate_phase_probe(
     If *preprocessor* is provided, the design matrix is standardised (and
     optionally PCA-compressed) before prediction.  Otherwise raw features
     are used (legacy behaviour).
+
+    If *inflation_factors* and *inflation_center* are provided, original-scale
+    predictions are variance-inflated before computing original-scale metrics::
+
+        P_inflated(c) = center(c) + (P_orig(c) - center(c)) * sf(c)
+
+    This restores the observed dynamic range at the cost of higher MSE.
+    Normalized-space metrics are unaffected.
     """
     model.eval()
     C = W.shape[1]   # 7
@@ -854,6 +868,13 @@ def evaluate_phase_probe(
             Y_orig = _invert_to_original_scale(
                 Y_norm, inv_whitening, means, transform_specs,
             )
+
+            # Variance inflation: rescale predictions around training mean
+            if inflation_factors is not None and inflation_center is not None:
+                for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+                    sf = inflation_factors[ch]
+                    ctr = inflation_center[ch]
+                    P_orig[:, c_idx] = ctr + (P_orig[:, c_idx] - ctr) * sf
             err_orig = P_orig - Y_orig
             sse_orig += (err_orig * err_orig).sum(dim=0)
             sum_y_orig += Y_orig.sum(dim=0)
@@ -964,6 +985,11 @@ def evaluate_phase_probe(
         else:
             vf_temporal[ch] = 0.0
 
+    # Per-channel means in original scale (for variance inflation centering)
+    mean_orig: Dict[str, float] = {}
+    for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+        mean_orig[ch] = float(sum_y_orig[c_idx].item()) / n_obs if n_obs > 0 else 0.0
+
     return PhaseProbeMetrics(
         mse_per_channel=mse_per,
         r2_per_channel=r2_per,
@@ -985,6 +1011,7 @@ def evaluate_phase_probe(
         variance_fraction_temporal=vf_temporal,
         variance_fraction_temporal_total=float(np.mean(list(vf_temporal.values()))),
         n_pixels=n_pixels_total,
+        mean_per_channel_original=mean_orig,
     )
 
 
@@ -1023,12 +1050,12 @@ def compute_embedding_diagnostics(
 
     Returns:
         dict with per-dimension tensors for within/between/fraction for
-        z_phase (12-d), TCN output (64-d), post-FiLM (64-d), and
+        z_phase (12-d), TCN output (64-d), post-FiLM (12-d), and
         FiLM gamma/beta summary statistics.
     """
     model.eval()
-    D_ZP = 12   # z_phase dim
-    D_H = 64    # TCN / FiLM hidden dim
+    D_ZP = 12   # z_phase / post-FiLM dim
+    D_H = 64    # TCN hidden dim
 
     # --- Variance decomposition accumulators (on CPU, float64) ---
     sum_within_zp = torch.zeros(D_ZP, dtype=torch.float64)
@@ -1039,19 +1066,19 @@ def compute_embedding_diagnostics(
     sum_pixmean_tcn = torch.zeros(D_H, dtype=torch.float64)
     sum_pixmean2_tcn = torch.zeros(D_H, dtype=torch.float64)
 
-    sum_within_post = torch.zeros(D_H, dtype=torch.float64)
-    sum_pixmean_post = torch.zeros(D_H, dtype=torch.float64)
-    sum_pixmean2_post = torch.zeros(D_H, dtype=torch.float64)
+    sum_within_post = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_pixmean_post = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_pixmean2_post = torch.zeros(D_ZP, dtype=torch.float64)
 
-    # --- FiLM parameter accumulators ---
-    sum_gamma = torch.zeros(D_H, dtype=torch.float64)
-    sum_gamma2 = torch.zeros(D_H, dtype=torch.float64)
-    sum_beta = torch.zeros(D_H, dtype=torch.float64)
-    sum_beta2 = torch.zeros(D_H, dtype=torch.float64)
-    gamma_min = torch.full((D_H,), float("inf"), dtype=torch.float64)
-    gamma_max = torch.full((D_H,), float("-inf"), dtype=torch.float64)
-    beta_min = torch.full((D_H,), float("inf"), dtype=torch.float64)
-    beta_max = torch.full((D_H,), float("-inf"), dtype=torch.float64)
+    # --- FiLM parameter accumulators (FiLM operates in 12-d space) ---
+    sum_gamma = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_gamma2 = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_beta = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_beta2 = torch.zeros(D_ZP, dtype=torch.float64)
+    gamma_min = torch.full((D_ZP,), float("inf"), dtype=torch.float64)
+    gamma_max = torch.full((D_ZP,), float("-inf"), dtype=torch.float64)
+    beta_min = torch.full((D_ZP,), float("inf"), dtype=torch.float64)
+    beta_max = torch.full((D_ZP,), float("-inf"), dtype=torch.float64)
     n_film_pixels = 0
 
     n_pixels = 0
@@ -1081,17 +1108,31 @@ def compute_embedding_diagnostics(
                 # TCN output captured by hook: [B, 64, T, H, W]
                 h_tcn = tcn_output["h"]
 
-                # Compute post-FiLM hidden states (same as inside forward_phase)
+                # Replicate the bottleneck + L2-norm + FiLM pipeline
+                # from forward_phase to compute post-FiLM hidden states.
+                # 1) Bottleneck: Conv2d(64→12) per timestep
+                h_bn = h_tcn.permute(0, 2, 1, 3, 4).reshape(
+                    Bsz * T, 64, H, W_sp
+                )
+                h_bn = model.phase_head(h_bn)  # [B*T, 12, H, W]
+                h_bn = h_bn.reshape(Bsz, T, 12, H, W_sp).permute(
+                    0, 2, 1, 3, 4
+                )  # [B, 12, T, H, W]
+                # 2) L2-normalize across (channel, time) jointly
+                h_bn = F.normalize(
+                    h_bn.flatten(1, 2), dim=1
+                ).unflatten(1, (12, T))
+                # 3) FiLM conditioning
                 gamma, beta = model.phase_film(z_type_det)
-                # gamma, beta: [B, 64, H, W]
-                h_post = gamma.unsqueeze(2) * h_tcn + beta.unsqueeze(2)
-                # h_post: [B, 64, T, H, W]
+                # gamma, beta: [B, 12, H, W]
+                h_post = gamma.unsqueeze(2) * h_bn + beta.unsqueeze(2)
+                # h_post: [B, 12, T, H, W]
 
                 halo_m = _halo_mask(H, W_sp, halo, device)
                 full_mask = M & halo_m.unsqueeze(0)  # [B, H, W]
 
                 # --- FiLM parameters at valid pixels ---
-                gm = gamma.permute(0, 2, 3, 1)[full_mask]  # [N, 64] on GPU
+                gm = gamma.permute(0, 2, 3, 1)[full_mask]  # [N, 12] on GPU
                 bt = beta.permute(0, 2, 3, 1)[full_mask]
                 N_valid = gm.shape[0]
                 if N_valid == 0:
@@ -1125,7 +1166,7 @@ def compute_embedding_diagnostics(
                         sum_pixmean2_tcn,
                     ),
                     (
-                        h_post.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 64, T]
+                        h_post.permute(0, 3, 4, 1, 2)[full_mask],  # [N, 12, T]
                         sum_within_post,
                         sum_pixmean_post,
                         sum_pixmean2_post,
@@ -1230,7 +1271,7 @@ def log_embedding_diagnostics(diag: dict):
     f_post = diag["postfilm_temporal_frac"]
     w_post = diag["postfilm_within_var"]
     b_post = diag["postfilm_between_var"]
-    logger.info("  Post-FiLM (64-d) temporal variance fraction:")
+    logger.info("  Post-FiLM (12-d) temporal variance fraction:")
     logger.info(
         f"    mean={f_post.mean():.2%}  "
         f"range=[{f_post.min():.2%}, {f_post.max():.2%}]"
@@ -1245,7 +1286,7 @@ def log_embedding_diagnostics(diag: dict):
     gs = diag["film_gamma_std"]
     bm = diag["film_beta_mean"]
     bs = diag["film_beta_std"]
-    logger.info("  FiLM parameters (64 channels):")
+    logger.info("  FiLM parameters (12 channels):")
     logger.info(
         f"    gamma: mean={gm.mean():.4f} +/- {gs.mean():.4f}  "
         f"[{diag['film_gamma_min'].min():.4f}, "
@@ -1359,6 +1400,11 @@ def main():
         "--interaction-pca-k", type=int, default=20,
         help="Number of PCA components for the interaction block (full design only, 0 = no PCA)",
     )
+    parser.add_argument(
+        "--variance-inflate", action="store_true",
+        help="Apply variance inflation to original-scale predictions "
+             "(rescale per channel to match observed dynamic range)",
+    )
     args = parser.parse_args()
 
     logger.info(f"Loading bindings config from {args.bindings}")
@@ -1442,16 +1488,37 @@ def main():
         design=args.design,
         preprocessor=preprocessor,
     )
+
+    # Compute variance inflation factors from training R² (original scale)
+    vi_factors: Dict[str, float] | None = None
+    vi_center: Dict[str, float] | None = None
+    if args.variance_inflate:
+        vi_factors = {}
+        vi_center = {}
+        logger.info("Variance inflation factors (from training R², original scale):")
+        for ch in PHASE_TARGET_CHANNELS:
+            r2 = train_metrics.r2_per_channel_original[ch]
+            sf = 1.0 / max(math.sqrt(max(r2, 0.0)), 1e-3)
+            vi_factors[ch] = sf
+            vi_center[ch] = train_metrics.mean_per_channel_original[ch]
+            short = ch.replace("annual.", "")
+            logger.info(
+                f"  {short:<30} R²={r2:.4f}  sf={sf:.4f}  "
+                f"center={vi_center[ch]:.6f}"
+            )
+
     val_metrics = evaluate_phase_probe(
         val_loader, feature_builder, model, W, b_bias, device,
         halo=args.halo,
         max_batches_eval=args.max_batches_eval,
         design=args.design,
         preprocessor=preprocessor,
+        inflation_factors=vi_factors,
+        inflation_center=vi_center,
     )
 
     log_metrics(train_metrics, prefix="TRAIN")
-    log_metrics(val_metrics, prefix="VAL")
+    log_metrics(val_metrics, prefix="VAL" + (" [inflated]" if args.variance_inflate else ""))
 
     # Embedding diagnostics (z_phase variance decomposition + FiLM)
     logger.info("Computing embedding diagnostics on validation set...")
@@ -1518,6 +1585,10 @@ def main():
         "emb_diag_film_beta_std": emb_diag["film_beta_std"],
         "emb_diag_n_pixels": emb_diag["n_pixels"],
     }
+    if vi_factors is not None:
+        save_dict["variance_inflate"] = True
+        save_dict["variance_inflate_factors"] = vi_factors
+        save_dict["variance_inflate_center"] = vi_center
     save_dict.update(preprocessor.to_dict())
     torch.save(save_dict, out_path)
     logger.info(f"Saved phase probe to {out_path}")

@@ -35,6 +35,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .conv2d_encoder import Conv2DEncoder
 from .conditioning import FiLMLayer
@@ -50,9 +51,9 @@ class RepresentationModel(nn.Module):
     **Type pathway** (v1):
         ``[B, C_type, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, 64, H, W]``
 
-    **Phase pathway** (v2.2):
-        ``[B, C_phase, T, H, W]`` → TCN → LayerNorm → FiLM(stopgrad z_type)
-        → 1×1 proj → z_phase ``[B, 12, T, H, W]``
+    **Phase pathway** (v3):
+        ``[B, C_phase, T, H, W]`` → TCN → 1×1 bottleneck (64→12)
+        → FiLM(stopgrad z_type) → z_phase ``[B, 12, T, H, W]``
 
     Args:
         type_in_channels: Number of input channels for the type pathway
@@ -60,16 +61,17 @@ class RepresentationModel(nn.Module):
         phase_in_channels: Number of input channels for the phase pathway
             (must match the ``phase_ccdc`` feature). Default 8.
 
-    The FiLM generates gamma/beta once from the spatial z_type and
-    broadcasts them across all timesteps.  A LayerNorm normalizes TCN
-    features before FiLM modulation.
+    The bottleneck projects TCN features to the 12-dim embedding space,
+    then FiLM applies type-conditioned affine modulation directly in
+    that space.  FiLM gamma is initialized near 1 and beta near 0,
+    giving near-identity behavior at the start of training.
 
     Attributes:
         VERSION: Architecture version string. Bump this whenever the forward
             pipeline changes in a checkpoint-incompatible way.
     """
 
-    VERSION = "2.2"
+    VERSION = "3"
 
     def __init__(
         self,
@@ -109,17 +111,15 @@ class RepresentationModel(nn.Module):
             num_groups=8,
             pooling='none',
         )
-        # LayerNorm prior to FiLM (GroupNorm with 1 group = LayerNorm for conv)
-        self.film_norm = nn.GroupNorm(1, 64)
+        # Bottleneck: project TCN output to final embedding dimension
+        self.phase_head = nn.Conv2d(64, 12, kernel_size=1)
         # FiLM: generates gamma/beta from z_type [B, 64, H, W]
-        # to modulate TCN output (64-dim), broadcast across T
+        # to modulate 12-dim bottleneck output, broadcast across T.
+        # Gamma initialized near 1, beta near 0 → near-identity at init.
         self.phase_film = FiLMLayer(
             cond_dim=64,
-            target_dim=64,
-            hidden_dim=64,
+            target_dim=12,
         )
-        # Project to final phase embedding dimension
-        self.phase_head = nn.Conv2d(64, 12, kernel_size=1)
 
     def forward(
         self, x: torch.Tensor, return_gate: bool = False
@@ -162,20 +162,24 @@ class RepresentationModel(nn.Module):
         """
         B, C, T, H, W = x_phase.shape
 
-        # TCN along time: [B, 8, T, H, W] -> [B, 64, T, H, W]
+        # TCN along time: [B, C_phase, T, H, W] -> [B, 64, T, H, W]
         h = self.phase_tcn(x_phase)
 
-        # LayerNorm → FiLM
-        h_normed = self.film_norm(h)
-        gamma, beta = self.phase_film(z_type)  # each [B, 64, H, W]
-        gamma = gamma.unsqueeze(2)  # [B, 64, 1, H, W]
-        beta = beta.unsqueeze(2)    # [B, 64, 1, H, W]
-        h = gamma * h_normed + beta  # [B, 64, T, H, W]
-
-        # Project per-timestep: reshape to [B*T, 64, H, W] for Conv2d
+        # Bottleneck per-timestep: reshape to [B*T, 64, H, W] for Conv2d
         h = h.permute(0, 2, 1, 3, 4).reshape(B * T, 64, H, W)
-        z_phase = self.phase_head(h)  # [B*T, 12, H, W]
-        z_phase = z_phase.reshape(B, T, 12, H, W).permute(0, 2, 1, 3, 4)
+        h = self.phase_head(h)  # [B*T, 12, H, W]
+        h = h.reshape(B, T, 12, H, W).permute(0, 2, 1, 3, 4)  # [B, 12, T, H, W]
+
+        # L2-normalize across (channel, time) jointly so the TCN controls
+        # direction & temporal shape, while FiLM gamma owns the per-channel scale.
+        # One norm factor per spatial location — temporal variation is preserved.
+        h = F.normalize(h.flatten(1, 2), dim=1).unflatten(1, (12, T))
+
+        # FiLM conditioning
+        gamma, beta = self.phase_film(z_type)  # each [B, 12, H, W]
+        gamma = gamma.unsqueeze(2)  # [B, 12, 1, H, W]
+        beta = beta.unsqueeze(2)    # [B, 12, 1, H, W]
+        z_phase = gamma * h + beta  # [B, 12, T, H, W]
 
         return z_phase  # [B, 12, T, H, W]
 
@@ -183,10 +187,11 @@ class RepresentationModel(nn.Module):
         self,
         x_phase_pixels: torch.Tensor,
         z_type_pixels: torch.Tensor,
-    ) -> torch.Tensor:
+        return_film: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Phase pathway forward at sampled pixel locations only.
 
-        Runs the same TCN → FiLM → projection pipeline but only on the
+        Runs the same TCN → bottleneck → FiLM pipeline but only on the
         supplied pixel time-series, avoiding the cost of processing the
         full spatial grid.  Produces identical results to extracting from
         the dense ``forward_phase`` output at the same locations.
@@ -195,64 +200,42 @@ class RepresentationModel(nn.Module):
             x_phase_pixels: ``[N, C, T]`` temporal features at N pixels.
             z_type_pixels: ``[N, 64]`` type embeddings at the same N pixels
                 (**caller must stop-grad**).
+            return_film: If True, also return the data-dependent gamma and
+                beta tensors (useful for diagnostics).
 
         Returns:
-            z_phase_pixels: ``[N, T, 12]`` phase embeddings.
+            If *return_film* is False: ``z_phase_pixels [N, T, 12]``.
+            If *return_film* is True: ``(z_phase_pixels, gamma, beta)``
+                where gamma and beta are ``[N, 12]``.
         """
         N, C, T = x_phase_pixels.shape
 
         # TCN accepts [N, C, T] directly (no spatial reshape needed)
         h = self.phase_tcn(x_phase_pixels)  # [N, 64, T]
 
-        # LayerNorm → FiLM
-        h_normed = self.film_norm(h)
-        # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
-        z_cond = z_type_pixels.unsqueeze(-1).unsqueeze(-1)  # [N, 64, 1, 1]
-        gamma, beta = self.phase_film(z_cond)  # each [N, 64, 1, 1]
-        gamma = gamma.squeeze(-1)  # [N, 64, 1]
-        beta = beta.squeeze(-1)    # [N, 64, 1]
-        h = gamma * h_normed + beta  # [N, 64, T]
-
-        # Project: phase_head is Conv2d(64, 12, 1×1)
+        # Bottleneck: phase_head is Conv2d(64, 12, 1×1)
         # Reshape [N, 64, T] -> [N*T, 64, 1, 1] for Conv2d
         h = h.permute(0, 2, 1).reshape(N * T, 64, 1, 1)
-        z = self.phase_head(h)  # [N*T, 12, 1, 1]
-        z = z.reshape(N, T, 12)
+        h = self.phase_head(h)  # [N*T, 12, 1, 1]
+        h = h.reshape(N, T, 12).permute(0, 2, 1)  # [N, 12, T]
 
-        return z  # [N, T, 12]
+        # L2-normalize across (channel, time) jointly — see forward_phase.
+        h = F.normalize(h.flatten(1, 2), dim=1).unflatten(1, (12, T))
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
+        # FiLM conditioning
+        # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, 64, 1, 1]
+        z_cond = z_type_pixels.unsqueeze(-1).unsqueeze(-1)  # [N, 64, 1, 1]
+        gamma, beta = self.phase_film(z_cond)  # each [N, 12, 1, 1]
+        gamma = gamma.squeeze(-1)  # [N, 12, 1]
+        beta = beta.squeeze(-1)    # [N, 12, 1]
+        z = gamma * h + beta  # [N, 12, T]
 
-    def film_diagnostics(self) -> dict:
-        """Return parameter-level diagnostics for FiLM conditioning.
+        z = z.permute(0, 2, 1)  # [N, T, 12]
+        if return_film:
+            # Return gamma/beta as [N, 12] (squeeze the broadcast time dim)
+            return z, gamma.squeeze(-1), beta.squeeze(-1)
+        return z
 
-        Reports the scale of FiLM gamma (slope) and beta (intercept).
-        Computed directly from model parameters without requiring a
-        data forward pass.
-
-        Returns:
-            Dict with keys: ``gamma_bias_mean``, ``gamma_bias_std``,
-            ``gamma_weight_rms``, ``beta_bias_mean``, ``beta_bias_std``,
-            ``beta_weight_rms``.
-        """
-        gamma_net = self.phase_film.gamma_network
-        beta_net = self.phase_film.beta_network
-
-        gamma_bias = gamma_net[-1].bias.data   # [target_dim]
-        beta_bias = beta_net[-1].bias.data     # [target_dim]
-        gamma_w = gamma_net[-1].weight.data    # [target_dim, hidden_dim, 1, 1]
-        beta_w = beta_net[-1].weight.data
-
-        return {
-            'gamma_bias_mean': gamma_bias.mean().item(),
-            'gamma_bias_std': gamma_bias.std().item(),
-            'gamma_weight_rms': gamma_w.pow(2).mean().sqrt().item(),
-            'beta_bias_mean': beta_bias.mean().item(),
-            'beta_bias_std': beta_bias.std().item(),
-            'beta_weight_rms': beta_w.pow(2).mean().sqrt().item(),
-        }
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
