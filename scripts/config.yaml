@@ -18,7 +18,7 @@ build_zarr:
 
 train_vqvae:
   zarr: out/cube.zarr
-  run_dir: runs/exp_003
+  run_dir: runs/exp_004
 
   # Data/loader
   batch_size: 64
