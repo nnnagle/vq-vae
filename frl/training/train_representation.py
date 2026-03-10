@@ -556,7 +556,9 @@ def process_batch(
         'curriculum_w': 0.0,
         # Entropy of reference (p) and learned (q) distributions
         'self_mean_entropy_p': 0.0, 'self_mean_entropy_q': 0.0,
+        'self_mean_overlap': 0.0,
         'cross_mean_entropy_p': 0.0, 'cross_mean_entropy_q': 0.0,
+        'cross_mean_overlap': 0.0,
         # Distance distributions that tau operates on
         'd_ref_self_mean': 0.0, 'd_ref_self_std': 0.0,
         'd_ref_self_q25': 0.0, 'd_ref_self_q50': 0.0, 'd_ref_self_q75': 0.0,
