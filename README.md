@@ -11,6 +11,12 @@ Also contains associated data for pre-processing the data and building a zarr ar
 
 ---
 
+## Workflow
+- zarr_builder
+- update yaml in frl/config/
+- frl/examples/data/example_compute_stats.py
+- frl/training/train_representation.py
+
 ## Data Layout
 
 ### Input

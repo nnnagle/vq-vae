@@ -87,12 +87,12 @@ dataset: # These exist in the zarr
       - {name: ndvi_summer_p95, source: annual/ls8day/data/NDVI_summer_p95}
       - {name: ndvi_winter_max, source: annual/ls8day/data/NDVI_winter_max}
       - {name: red, source: annual/ccdc_annual/data/red}
-      - {name: nbr, source: annual/ccdc_annual/data/nbr}
-      - {name: ndvi, source: annual/ccdc_annual/data/ndvi}
-      - {name: ndmi, source: annual/ccdc_annual/data/ndmi}
       - {name: nir, source: annual/ccdc_annual/data/nir}
       - {name: swir1, source: annual/ccdc_annual/data/swir1}
       - {name: swir2, source: annual/ccdc_annual/data/swir2}
+      - {name: nbr, source: annual/ccdc_annual/data/nbr}
+      - {name: ndvi, source: annual/ccdc_annual/data/ndvi}
+      - {name: ndmi, source: annual/ccdc_annual/data/ndmi}
       - {name: seas_amp_red, source: annual/ccdc_annual/data/seas_amp_red}
       - {name: seas_amp_nir, source: annual/ccdc_annual/data/seas_amp_nir}
       - {name: seas_amp_swir1, source: annual/ccdc_annual/data/seas_amp_swir1}
@@ -128,9 +128,15 @@ dataset: # These exist in the zarr
       - {name: mean_seasonal_amp_nir,  source: static/ccdc_metrics_history/data/mean_seasonal_amp_nir,  fill_value: -9999}
       - {name: mean_seasonal_amp_swir1, source: static/ccdc_metrics_history/data/mean_seasonal_amp_swir1, fill_value: -9999}
       - {name: mean_seasonal_amp_swir2, source: static/ccdc_metrics_history/data/mean_seasonal_amp_swir2, fill_value: -9999}
+      - {name: variance_seasonal_amp_red, source: static/ccdc_metrics_history/data/variance_seasonal_amp_red, fill_value: -9999}
+      - {name: variance_seasonal_amp_nir, source: static/ccdc_metrics_history/data/variance_seasonal_amp_nir, fill_value: -9999}
       - {name: spectral_distance_per_decade,  source: static/ccdc_metrics_history/data/spectral_distance_per_decade,  fill_value: -9999}
       - {name: mean_decline_rate, source: static/ccdc_metrics_history/data/mean_decline_rate, fill_value: -9999}
+      - {name: net_change_ndvi, source: static/ccdc_metrics_history/data/net_change_ndvi, fill_value: -9999}
       - {name: num_segments, source: static/ccdc_metrics_history/data/num_segments, fill_value: -9999}
+      - {name: mean_segment_duration, source: static/ccdc_metrics_history/data/mean_segment_duration, fill_value: -9999}
+      - {name: mean_break_magnitude, source: static/ccdc_metrics_history/data/mean_break_magnitude, fill_value: -9999}
+      - {name: rapid_loss_mean_magnitude, source: static/ccdc_metrics_history/data/rapid_loss_mean_magnitude, fill_value: -9999}
       - {name: variance_ndvi, source: static/ccdc_metrics_history/data/variance_ndvi, fill_value: -9999}
       - name: ysfc_min
         source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024
@@ -219,10 +225,17 @@ features:
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.mean_seasonal_amp_swir1: {norm: robust_iqr}
       static.mean_seasonal_amp_swir2: {norm: robust_iqr}
+      static.variance_seasonal_amp_red: {norm: robust_iqr}
+      static.variance_seasonal_amp_nir: {norm: robust_iqr}
       static.spectral_distance_per_decade: {norm: robust_iqr}
       static.mean_decline_rate: {norm: robust_iqr}
+      static.net_change_ndvi: {norm: robust_iqr}
       static.num_segments: {norm: robust_iqr}
+      static.mean_segment_duration: {norm: robust_iqr}
+      static.mean_break_magnitude: {norm: robust_iqr}
+      static.rapid_loss_mean_magnitude: {norm: robust_iqr}
       static.variance_ndvi: {norm: robust_iqr}
+
   infonce_type_spectral:
     dim: [C,H,W]
     channels:
@@ -238,8 +251,15 @@ features:
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.mean_seasonal_amp_swir1: {norm: robust_iqr}
       static.mean_seasonal_amp_swir2: {norm: robust_iqr}
-      static.spectral_distance_per_decade: {norm: robust_iqr}
-      static.mean_decline_rate: {norm: robust_iqr}
+      static.variance_seasonal_amp_red: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_seasonal_amp_nir: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.spectral_distance_per_decade: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.mean_decline_rate: {norm: robust_iqr, transform: {name: log, epsilon: 0.0001}}
+      static.net_change_ndvi: {norm: robust_iqr}
+      static.num_segments: {norm: robust_iqr}
+      static.mean_segment_duration: {norm: robust_iqr}
+      static.mean_break_magnitude: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.rapid_loss_mean_magnitude: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
       static.variance_ndvi: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
     covariance:
       dim: [C,C]
@@ -264,10 +284,14 @@ features:
       annual.temporal_position: {norm: identity}
       annual.red: {norm: zscore}
       annual.nir: {norm: zscore}
+      annual.swir1: {norm: zscore}
+      annual.swir2: {norm: zscore}
       annual.nbr: {norm: zscore}
       annual.ndmi: {norm: zscore}
       annual.ndvi: {norm: zscore}
       annual.spectral_velocity: {norm: zscore}
+      annual.seas_amp_red: {norm: zscore}
+      annual.seas_amp_nir: {norm: zscore}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
   ccdc_annual:
@@ -276,9 +300,14 @@ features:
       annual.temporal_position: {norm: identity}
       annual.red: {norm: zscore}
       annual.nir: {norm: zscore}
+      annual.swir1: {norm: zscore}
+      annual.swir2: {norm: zscore}
       annual.nbr: {norm: zscore}
+      annual.ndvi: {norm: zscore}
       annual.ndmi: {norm: zscore}
       annual.spectral_velocity: {norm: zscore, transform: {name: log, epsilon: 0.001}}
+      annual.seas_amp_red: {norm: zscore}
+      annual.seas_amp_nir: {norm: zscore}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
   ysfc_min:
@@ -303,9 +332,14 @@ features:
     channels:
       annual.red: {norm: zscore}
       annual.nir: {norm: zscore}
+      annual.swir1: {norm: zscore}
+      annual.swir2: {norm: zscore}
       annual.nbr: {norm: zscore}
+      annual.ndvi: {norm: zscore}
       annual.ndmi: {norm: zscore}
       annual.spectral_velocity: {norm: zscore, transform: {name: log, epsilon: 0.001}}
+      annual.seas_amp_red: {norm: zscore}
+      annual.seas_amp_nir: {norm: zscore}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
     covariance:

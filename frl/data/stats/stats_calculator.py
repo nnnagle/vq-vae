@@ -291,16 +291,19 @@ class StatsCalculator:
                     # AND with existing mask
                     valid_mask = valid_mask & (mask_data > 0)
 
-        # Mask out NaN pixels in feature data
-        # For temporal data: any NaN across channels invalidates that pixel
+        # Mask out non-finite pixels (NaN or Inf) in feature data.
+        # Inf values can arise when a transform (e.g. log) is applied to
+        # raw fill-values that are themselves +/-Inf.  Both NaN and Inf
+        # corrupt np.mean / np.std, so filter both here.
+        # For temporal data: any non-finite across channels invalidates that pixel
         if feature_data.ndim == 3:
             # [C, H, W]
-            nan_mask = np.any(np.isnan(feature_data), axis=0)  # [H, W]
-            valid_mask = valid_mask & ~nan_mask
+            nonfinite_mask = np.any(~np.isfinite(feature_data), axis=0)  # [H, W]
+            valid_mask = valid_mask & ~nonfinite_mask
         else:
             # [C, T, H, W]
-            nan_mask = np.any(np.isnan(feature_data), axis=0)  # [T, H, W]
-            valid_mask = valid_mask & ~nan_mask
+            nonfinite_mask = np.any(~np.isfinite(feature_data), axis=0)  # [T, H, W]
+            valid_mask = valid_mask & ~nonfinite_mask
 
         return valid_mask
 

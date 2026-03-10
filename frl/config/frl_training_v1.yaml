@@ -5,11 +5,11 @@ version: "1.0"
 name: forest_trajectory_v0
 
 config:
-  bindings_path: config/frl_bindings_v0.yaml
+  bindings_path: config/frl_binding_v1.yaml
   model_path: config/frl_model_v0.yaml
   
 run:
-  experiment_name: frl_v0_exp001
+  experiment_name: frl_v0_exp004
   run_root: runs
   ckpt_dir: checkpoints
   log_dir: logs
