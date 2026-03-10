@@ -891,8 +891,8 @@ def main():
     parser.add_argument(
         '--bindings',
         type=str,
-        default='config/frl_binding_v1.yaml',
-        help='Path to bindings config'
+        default=None,
+        help='Path to bindings config (overrides training config bindings_path)'
     )
     parser.add_argument(
         '--training',
@@ -945,11 +945,14 @@ def main():
     args = parser.parse_args()
 
     # Parse configs first to get defaults
-    logger.info(f"Loading bindings config from {args.bindings}")
-    bindings_config = DatasetBindingsParser(args.bindings).parse()
-
     logger.info(f"Loading training config from {args.training}")
     training_config = TrainingConfigParser(args.training).parse()
+
+    bindings_path = args.bindings or training_config.config_paths.get('bindings_path')
+    if bindings_path is None:
+        raise ValueError("No bindings path found. Set config.bindings_path in the training YAML or pass --bindings.")
+    logger.info(f"Loading bindings config from {bindings_path}")
+    bindings_config = DatasetBindingsParser(bindings_path).parse()
 
     model_config_path = args.model_config or training_config.config_paths.get('model_path')
     if model_config_path is None:
@@ -1335,7 +1338,7 @@ def main():
     logger.info(f"Log dir: {log_dir}")
 
     # Save experiment artifacts for reproducibility
-    shutil.copy2(args.bindings, experiment_dir / Path(args.bindings).name)
+    shutil.copy2(bindings_path, experiment_dir / Path(bindings_path).name)
     shutil.copy2(args.training, experiment_dir / Path(args.training).name)
     shutil.copy2(model_config_path, experiment_dir / Path(model_config_path).name)
     shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
