@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import shutil
 from pathlib import Path
 
@@ -50,6 +51,46 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def compute_input_dropout_rate(
+    schedule_cfg: float | dict,
+    epoch: int,
+    total_epochs: int,
+) -> float:
+    """Return the input dropout rate for the current epoch.
+
+    Args:
+        schedule_cfg: Either a scalar float (constant rate) or a dict with keys:
+            - schedule: 'constant' | 'linear' | 'cosine'
+            - For 'constant': rate (float)
+            - For 'linear' / 'cosine': start, end, epochs (ramp length)
+        epoch: Current epoch index (0-based).
+        total_epochs: Total training epochs (used as ramp length fallback).
+
+    Returns:
+        Dropout probability for this epoch.
+    """
+    if isinstance(schedule_cfg, (int, float)):
+        return float(schedule_cfg)
+
+    schedule = schedule_cfg.get("schedule", "constant")
+
+    if schedule == "constant":
+        return float(schedule_cfg.get("rate", 0.0))
+
+    start = float(schedule_cfg.get("start", 0.0))
+    end = float(schedule_cfg.get("end", 0.1))
+    ramp_epochs = int(schedule_cfg.get("epochs", total_epochs))
+    t = min(epoch / max(ramp_epochs, 1), 1.0)
+
+    if schedule == "linear":
+        return start + t * (end - start)
+    elif schedule == "cosine":
+        return start + (end - start) * (1 - math.cos(math.pi * t)) / 2
+    else:
+        raise ValueError(f"Unknown input_dropout schedule: {schedule!r}")
+
 
 def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
     # a: [N, C], pairs: [P, 2] -> returns [P]
@@ -1297,10 +1338,21 @@ def main():
     shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
     logger.info(f"Saved config and model source to {experiment_dir}")
 
+    # Pre-extract input dropout schedule config (scalar or dict) for the epoch loop.
+    input_dropout_schedule_cfg = model_config.get("type_encoder", {}).get("input_dropout", 0.0)
+
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         train_dataset.on_epoch_start()  # Reshuffle patches
+
+        # Apply scheduled input dropout rate for this epoch.
+        input_dropout_rate = compute_input_dropout_rate(
+            input_dropout_schedule_cfg, epoch, num_epochs
+        )
+        model.set_input_dropout_rate(input_dropout_rate)
+        if input_dropout_rate > 0.0:
+            logger.debug(f"Epoch {epoch}: input_dropout_rate={input_dropout_rate:.4f}")
 
         train_stats = train_epoch(
           train_dataloader, feature_builder, model,

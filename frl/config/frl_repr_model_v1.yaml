@@ -25,6 +25,22 @@ type_encoder:
   dropout: 0.1
   num_groups: 8
 
+  # input_dropout: zeros entire input channel maps before the first conv.
+  # Forces the encoder to learn cross-band structure rather than per-band features.
+  #
+  # Option A — constant rate (scalar):
+  #   input_dropout: 0.05
+  #
+  # Option B — scheduled rate (dict):
+  #   input_dropout:
+  #     schedule: linear    # or: cosine
+  #     start: 0.0          # rate at epoch 0
+  #     end: 0.1            # rate after ramp completes
+  #     epochs: 20          # ramp length; holds at `end` thereafter
+  #
+  # Disabled by default (0.0 = no dropout):
+  input_dropout: 0.0
+
 spatial_conv:
   # channels are inferred from latents.z_type_dim
   num_layers: 2

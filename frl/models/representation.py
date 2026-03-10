@@ -98,6 +98,7 @@ class RepresentationModel(nn.Module):
         type_encoder_padding: int = 0,
         type_encoder_dropout: float = 0.1,
         type_encoder_num_groups: int = 8,
+        type_encoder_input_dropout: float = 0.0,
         # spatial conv (GatedResidualConv2D)
         spatial_conv_num_layers: int = 2,
         spatial_conv_kernel_size: int = 3,
@@ -132,6 +133,7 @@ class RepresentationModel(nn.Module):
             padding=type_encoder_padding,
             dropout_rate=type_encoder_dropout,
             num_groups=type_encoder_num_groups,
+            input_dropout_rate=type_encoder_input_dropout,
         )
         self.spatial_conv = GatedResidualConv2D(
             channels=z_type_dim,
@@ -207,6 +209,18 @@ class RepresentationModel(nn.Module):
         sc = cfg.get("spatial_conv", {})
         pt = cfg.get("phase_tcn", {})
 
+        # input_dropout may be a scalar (constant) or a schedule dict.
+        # At construction time we always use the initial rate:
+        #   scalar  -> that value
+        #   dict    -> "start" (the rate at epoch 0)
+        # The training loop is responsible for calling set_input_dropout_rate()
+        # each epoch when a schedule is active.
+        input_dropout_cfg = te.get("input_dropout", 0.0)
+        if isinstance(input_dropout_cfg, dict):
+            type_encoder_input_dropout = float(input_dropout_cfg.get("start", 0.0))
+        else:
+            type_encoder_input_dropout = float(input_dropout_cfg)
+
         return cls(
             type_in_channels=type_in_channels,
             phase_in_channels=phase_in_channels,
@@ -218,6 +232,7 @@ class RepresentationModel(nn.Module):
             type_encoder_padding=te.get("padding", 0),
             type_encoder_dropout=te.get("dropout", 0.1),
             type_encoder_num_groups=te.get("num_groups", 8),
+            type_encoder_input_dropout=type_encoder_input_dropout,
             # spatial conv
             spatial_conv_num_layers=sc.get("num_layers", 2),
             spatial_conv_kernel_size=sc.get("kernel_size", 3),
@@ -231,6 +246,17 @@ class RepresentationModel(nn.Module):
             phase_tcn_dropout=pt.get("dropout", 0.1),
             phase_tcn_num_groups=pt.get("num_groups", 8),
         )
+
+    def set_input_dropout_rate(self, rate: float) -> None:
+        """Update the type encoder's input dropout rate at runtime.
+
+        Intended for scheduled input dropout: call once per epoch with the
+        epoch-appropriate rate before processing any batches.
+
+        Args:
+            rate: Dropout probability in [0, 1]. 0.0 disables dropout.
+        """
+        self.encoder.set_input_dropout_rate(rate)
 
     # ------------------------------------------------------------------
     # Forward passes

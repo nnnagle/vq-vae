@@ -3,6 +3,7 @@ Conv2D encoder for static [B, C, H, W] tensors.
 
 Features:
 - Multiple convolutional layers with configurable channels
+- Optional input dropout (pre-first-conv, zeros entire input channels)
 - Dropout (postconv placement)
 - GroupNorm (postconv placement)
 - Flexible kernel sizes and padding
@@ -19,18 +20,21 @@ class Conv2DEncoder(nn.Module):
     """
     Stack of 2D convolutional layers for static spatial inputs.
 
-    Architecture per layer:
-        input -> conv -> norm -> activation -> dropout -> output
+    Architecture:
+        input -> [input_dropout] -> (conv -> norm -> activation -> dropout) x N -> output
 
     Args:
         in_channels: Number of input channels
         channels: List of output channels for each layer
         kernel_size: Convolution kernel size (int or list per layer)
         padding: Padding size (int or list per layer, or 'same')
-        dropout_rate: Dropout probability (float or list per layer)
+        dropout_rate: Post-conv dropout probability (float or list per layer)
         num_groups: Number of groups for GroupNorm (int or list per layer)
         activation: Activation function ('relu', 'none')
         out_channels: If specified, adds final conv to this many channels
+        input_dropout_rate: Dropout probability applied to raw input channels
+            before the first conv. Uses Dropout2d (zeros entire channel maps).
+            Supports runtime updates via set_input_dropout_rate().
 
     Example:
         >>> encoder = Conv2DEncoder(
@@ -39,7 +43,8 @@ class Conv2DEncoder(nn.Module):
         ...     kernel_size=1,
         ...     padding=0,
         ...     dropout_rate=0.1,
-        ...     num_groups=[16, 8]
+        ...     num_groups=[16, 8],
+        ...     input_dropout_rate=0.05,
         ... )
         >>> x = torch.randn(2, 47, 32, 32)
         >>> out = encoder(x)  # [2, 64, 32, 32]
@@ -55,6 +60,7 @@ class Conv2DEncoder(nn.Module):
         num_groups: Union[int, List[int]] = 8,
         activation: Literal['relu', 'none'] = 'relu',
         out_channels: Optional[int] = None,
+        input_dropout_rate: float = 0.0,
     ):
         super().__init__()
 
@@ -62,6 +68,10 @@ class Conv2DEncoder(nn.Module):
 
         self.in_channels = in_channels
         self.out_channels = out_channels if out_channels else channels[-1]
+
+        # Input dropout: zeros entire channel maps before the first conv.
+        # p=0.0 is a no-op; rate can be updated at runtime via set_input_dropout_rate().
+        self.input_dropout = nn.Dropout2d(input_dropout_rate)
 
         # Normalize parameters to lists
         num_layers = len(channels)
@@ -128,6 +138,14 @@ class Conv2DEncoder(nn.Module):
 
         self.layers = nn.Sequential(*layers)
 
+    def set_input_dropout_rate(self, rate: float) -> None:
+        """Update the input dropout probability at runtime (e.g. for scheduled dropout).
+
+        Args:
+            rate: New dropout probability in [0, 1]. Set to 0.0 to disable.
+        """
+        self.input_dropout.p = rate
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -136,6 +154,7 @@ class Conv2DEncoder(nn.Module):
         Returns:
             [B, C_out, H, W]
         """
+        x = self.input_dropout(x)
         return self.layers(x)
 
 
