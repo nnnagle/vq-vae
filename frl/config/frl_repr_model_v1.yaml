@@ -38,8 +38,11 @@ type_encoder:
   #     end: 0.1            # rate after ramp completes
   #     epochs: 20          # ramp length; holds at `end` thereafter
   #
-  # Disabled by default (0.0 = no dropout):
-  input_dropout: 0.0
+  input_dropout:
+    schedule: linear
+    start: 0.0    # no dropout at epoch 0 — let the model warm up first
+    end: 0.10     # ramp to 10 % over the first 20 epochs, then hold
+    epochs: 20
 
 spatial_conv:
   # channels are inferred from latents.z_type_dim
