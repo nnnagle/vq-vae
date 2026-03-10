@@ -554,6 +554,14 @@ def process_batch(
         'n_pairs_input': 0, 'n_pairs_sufficient_overlap': 0,
         'loss_self': 0.0, 'loss_cross': 0.0,
         'curriculum_w': 0.0,
+        # Entropy of reference (p) and learned (q) distributions
+        'self_mean_entropy_p': 0.0, 'self_mean_entropy_q': 0.0,
+        'cross_mean_entropy_p': 0.0, 'cross_mean_entropy_q': 0.0,
+        # Distance distributions that tau operates on
+        'd_ref_self_mean': 0.0, 'd_ref_self_std': 0.0,
+        'd_ref_self_q25': 0.0, 'd_ref_self_q50': 0.0, 'd_ref_self_q75': 0.0,
+        'd_ref_cross_mean': 0.0, 'd_ref_cross_std': 0.0,
+        'd_ref_cross_q25': 0.0, 'd_ref_cross_q50': 0.0, 'd_ref_cross_q75': 0.0,
     }
 
     # Aggregate phase pair stats across samples
@@ -1424,6 +1432,23 @@ def main():
                 f"Pairs: {pls['n_pairs_input']:.0f} input, "
                 f"{pls['n_pairs_sufficient_overlap']:.0f} with overlap | "
                 f"Curriculum weight: {pls['curriculum_w']:.2f}"
+            )
+            # Reference distance distributions (what tau_ref operates on)
+            logger.info(
+                f"  Phase d_ref_self:  mean={pls['d_ref_self_mean']:.3f}±{pls['d_ref_self_std']:.3f}, "
+                f"[q25={pls['d_ref_self_q25']:.3f}, q50={pls['d_ref_self_q50']:.3f}, q75={pls['d_ref_self_q75']:.3f}]"
+            )
+            logger.info(
+                f"  Phase d_ref_cross: mean={pls['d_ref_cross_mean']:.3f}±{pls['d_ref_cross_std']:.3f}, "
+                f"[q25={pls['d_ref_cross_q25']:.3f}, q50={pls['d_ref_cross_q50']:.3f}, q75={pls['d_ref_cross_q75']:.3f}]"
+            )
+            # Entropy of softmax distributions (0=one-hot, log(M)=uniform)
+            # With mean_overlap~11.5, log(M) ~ log(10) ~ 2.30 nats
+            logger.info(
+                f"  Phase entropy (nats): "
+                f"self p={pls['self_mean_entropy_p']:.3f}, q={pls['self_mean_entropy_q']:.3f} | "
+                f"cross p={pls['cross_mean_entropy_p']:.3f}, q={pls['cross_mean_entropy_q']:.3f} "
+                f"[max~{pls['self_mean_overlap']:.1f} neighbors -> log(M)~{math.log(max(pls['self_mean_overlap'], 1)):.2f}]"
             )
         elif pls:
             logger.info(

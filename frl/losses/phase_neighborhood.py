@@ -499,6 +499,22 @@ def phase_neighborhood_loss(
     else:
         valid_weights = None
 
+    # --- Distance distribution stats (for tau calibration) -----------------
+    with torch.no_grad():
+        def _dist_stats(d: torch.Tensor, mask: torch.Tensor) -> dict:
+            vals = d[mask]
+            if vals.numel() == 0:
+                return {"mean": 0.0, "std": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0}
+            return {
+                "mean": vals.mean().item(),
+                "std": vals.std().item(),
+                "q25": torch.quantile(vals, 0.25).item(),
+                "q50": torch.quantile(vals, 0.50).item(),
+                "q75": torch.quantile(vals, 0.75).item(),
+            }
+        d_ref_self_stats = _dist_stats(batch["d_ref_self"], batch["mask_self"])
+        d_ref_cross_stats = _dist_stats(batch["d_ref_cross"], batch["mask_cross"])
+
     # --- Self-similarity loss ----------------------------------------------
     loss_self, stats_self = soft_neighborhood_matching_loss(
         d_reference=batch["d_ref_self"],
@@ -535,5 +551,9 @@ def phase_neighborhood_loss(
         stats[f"self_{k}"] = v
     for k, v in stats_cross.items():
         stats[f"cross_{k}"] = v
+    for k, v in d_ref_self_stats.items():
+        stats[f"d_ref_self_{k}"] = v
+    for k, v in d_ref_cross_stats.items():
+        stats[f"d_ref_cross_{k}"] = v
 
     return loss, stats

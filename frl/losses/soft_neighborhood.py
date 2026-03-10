@@ -184,6 +184,16 @@ def soft_neighborhood_matching_loss(
             else 0.0
         )
 
+        # Entropy of reference distribution p per valid row.
+        # H(p) = 0 for 1-hot (tau too small), log(M) for uniform (tau too large).
+        entropy_p = -(p * log_p).sum(dim=2)  # [B, M]
+        mean_entropy_p = entropy_p[row_valid].mean().item() if n_rows_valid > 0 else 0.0
+
+        # Entropy of learned distribution q per valid row.
+        q = logits_learned.softmax(dim=2)  # [B, M, M]
+        entropy_q = -(q * log_q).sum(dim=2)  # [B, M]
+        mean_entropy_q = entropy_q[row_valid].mean().item() if n_rows_valid > 0 else 0.0
+
     stats = {
         "n_pairs": B,
         "n_pairs_active": pair_active.sum().item(),
@@ -191,6 +201,8 @@ def soft_neighborhood_matching_loss(
         "n_rows_valid": n_rows_valid,
         "mean_kl": loss.detach().item(),
         "mean_overlap": mean_overlap,
+        "mean_entropy_p": mean_entropy_p,
+        "mean_entropy_q": mean_entropy_q,
     }
 
     return loss, stats
