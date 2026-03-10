@@ -903,8 +903,8 @@ def main():
     parser.add_argument(
         '--model-config',
         type=str,
-        default='config/frl_repr_model_v1.yaml',
-        help='Path to model architecture config'
+        default=None,
+        help='Path to model architecture config (overrides training config model_path)'
     )
     parser.add_argument(
         '--epochs',
@@ -951,8 +951,11 @@ def main():
     logger.info(f"Loading training config from {args.training}")
     training_config = TrainingConfigParser(args.training).parse()
 
-    logger.info(f"Loading model config from {args.model_config}")
-    with open(args.model_config) as f:
+    model_config_path = args.model_config or training_config.config_paths.get('model_path')
+    if model_config_path is None:
+        raise ValueError("No model config path found. Set config.model_path in the training YAML or pass --model-config.")
+    logger.info(f"Loading model config from {model_config_path}")
+    with open(model_config_path) as f:
         model_config = yaml.safe_load(f)
 
     # Apply config values with command-line overrides
@@ -1334,7 +1337,7 @@ def main():
     # Save experiment artifacts for reproducibility
     shutil.copy2(args.bindings, experiment_dir / Path(args.bindings).name)
     shutil.copy2(args.training, experiment_dir / Path(args.training).name)
-    shutil.copy2(args.model_config, experiment_dir / Path(args.model_config).name)
+    shutil.copy2(model_config_path, experiment_dir / Path(model_config_path).name)
     shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
     logger.info(f"Saved config and model source to {experiment_dir}")
 
