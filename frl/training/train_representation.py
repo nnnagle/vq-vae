@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from torch.utils.data import DataLoader
 
 # FRL imports
@@ -859,6 +860,12 @@ def main():
         help='Path to training config'
     )
     parser.add_argument(
+        '--model-config',
+        type=str,
+        default='config/frl_repr_model_v1.yaml',
+        help='Path to model architecture config'
+    )
+    parser.add_argument(
         '--epochs',
         type=int,
         default=None,
@@ -902,6 +909,10 @@ def main():
 
     logger.info(f"Loading training config from {args.training}")
     training_config = TrainingConfigParser(args.training).parse()
+
+    logger.info(f"Loading model config from {args.model_config}")
+    with open(args.model_config) as f:
+        model_config = yaml.safe_load(f)
 
     # Apply config values with command-line overrides
     num_epochs = args.epochs or training_config.training.num_epochs
@@ -986,7 +997,8 @@ def main():
 
     # Create model
     logger.info("Creating representation model...")
-    model = RepresentationModel(
+    model = RepresentationModel.from_config(
+        model_config,
         type_in_channels=type_in_channels,
         phase_in_channels=phase_in_channels,
     ).to(device)
@@ -1281,6 +1293,7 @@ def main():
     # Save experiment artifacts for reproducibility
     shutil.copy2(args.bindings, experiment_dir / Path(args.bindings).name)
     shutil.copy2(args.training, experiment_dir / Path(args.training).name)
+    shutil.copy2(args.model_config, experiment_dir / Path(args.model_config).name)
     shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
     logger.info(f"Saved config and model source to {experiment_dir}")
 
@@ -1381,10 +1394,9 @@ def main():
         torch.save({
             'epoch': epoch + 1,
             'model_version': RepresentationModel.VERSION,
-            'model_kwargs': {
-                'type_in_channels': model.type_in_channels,
-                'phase_in_channels': model.phase_in_channels,
-            },
+            'model_config': model_config,
+            'type_in_channels': model.type_in_channels,
+            'phase_in_channels': model.phase_in_channels,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),

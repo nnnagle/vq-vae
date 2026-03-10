@@ -1,0 +1,44 @@
+version: "4"
+name: frl_repr_model_v1
+
+# ================================================================
+# Latent dimensions
+# ================================================================
+# z_type_dim ties together: type_encoder output, spatial_conv channels,
+# and FiLM cond_dim. Changing it requires consistent adjustment of
+# type_encoder.channels[-1].
+#
+# z_phase_dim ties together: phase_head output and FiLM target_dim.
+# ================================================================
+latents:
+  z_type_dim: 64
+  z_phase_dim: 12
+
+# ================================================================
+# Type pathway
+# ================================================================
+type_encoder:
+  # channels[-1] must equal latents.z_type_dim
+  channels: [128, 64]
+  kernel_size: 1
+  padding: 0
+  dropout: 0.1
+  num_groups: 8
+
+spatial_conv:
+  # channels are inferred from latents.z_type_dim
+  num_layers: 2
+  kernel_size: 3
+  padding: 1
+  gate_hidden: 64
+  gate_kernel_size: 1
+
+# ================================================================
+# Phase pathway
+# ================================================================
+phase_tcn:
+  channels: [64, 64, 64]
+  kernel_size: 3
+  dilations: [1, 2, 4]
+  dropout: 0.1
+  num_groups: 8
