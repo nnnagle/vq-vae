@@ -770,9 +770,11 @@ def train_epoch(
                 pls = stats.get('phase_loss_stats')
                 cw = pls.get('curriculum_w', 0) if pls else 0
                 cw_str = f" cw={cw:.2f}" if 0 < cw < 1.0 else ""
+                n_batches = len(train_dataloader)
+                batch_width = len(str(n_batches))
                 logger.info(
                     f"Epoch {epoch+1} | "
-                    f"Batch {batch_idx+1}/{len(train_dataloader)} | "
+                    f"Batch {batch_idx+1:{batch_width}d}/{n_batches} | "
                     f"loss={stats['loss']:.4f} "
                     f"spec={stats['spectral_loss']:.4f} "
                     f"spat={stats['spatial_loss']:.4f} "
@@ -1394,16 +1396,18 @@ def main():
           epoch=epoch,
         )
 
+        logger.info(f"Epoch {epoch+1}/{num_epochs} complete")
         logger.info(
-            f"Epoch {epoch+1}/{num_epochs} complete | "
-            f"Train Loss: {train_stats['loss']:.4f} "
-            f"(spec: {train_stats['spectral_loss']:.4f}, spat: {train_stats['spatial_loss']:.4f}, "
-            f"phase: {train_stats['phase_loss']:.4f}, vcr: {train_stats['vcr_loss']:.4f}, "
-            f"pvcr: {train_stats['phase_vcr_loss']:.4f}) | "
-            f"Val Loss: {val_stats['loss']:.4f} "
-            f"(spec: {val_stats['spectral_loss']:.4f}, spat: {val_stats['spatial_loss']:.4f}, "
-            f"phase: {val_stats['phase_loss']:.4f}, vcr: {val_stats['vcr_loss']:.4f}, "
-            f"pvcr: {val_stats['phase_vcr_loss']:.4f})"
+            f"  Train: {train_stats['loss']:.4f} "
+            f"spec={train_stats['spectral_loss']:.4f} spat={train_stats['spatial_loss']:.4f} "
+            f"phase={train_stats['phase_loss']:.4f} vcr={train_stats['vcr_loss']:.4f} "
+            f"pvcr={train_stats['phase_vcr_loss']:.4f}"
+        )
+        logger.info(
+            f"  Val:   {val_stats['loss']:.4f} "
+            f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "
+            f"phase={val_stats['phase_loss']:.4f} vcr={val_stats['vcr_loss']:.4f} "
+            f"pvcr={val_stats['phase_vcr_loss']:.4f}"
         )
 
         # Log distribution statistics
