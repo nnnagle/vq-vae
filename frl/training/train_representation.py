@@ -1531,32 +1531,48 @@ def main():
             )
 
         # Top-k save (evaluated every epoch).
+        # saved_ckpts is sorted best-first (index 0 = rank 1).
         reverse = (ckpt_cfg.mode == "max")
         saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
-        worst_val_in_top_k = saved_ckpts[0][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
+        worst_val_in_top_k = saved_ckpts[-1][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
         is_better = (
             worst_val_in_top_k is None
             or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
             or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
         )
         if is_better:
-            best_path = ckpt_dir / f"encoder_best_epoch_{epoch+1:03d}.pt"
-            torch.save(ckpt_state, best_path)
-            logger.info(
-                f"Saved top-{ckpt_cfg.save_top_k} checkpoint to {best_path} "
-                f"({monitor_key}={monitor_val:.4f})"
-            )
-            saved_ckpts.append((monitor_val, best_path))
+            # Save under a temporary name; will be renamed with rank below.
+            tmp_path = ckpt_dir / f"encoder_best_epoch_{epoch+1:03d}.pt"
+            torch.save(ckpt_state, tmp_path)
+            saved_ckpts.append((monitor_val, tmp_path))
             saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
 
+            # Prune worst entry if over top-k.
             while len(saved_ckpts) > ckpt_cfg.save_top_k:
-                worst_val, worst_path = saved_ckpts.pop(0)
+                worst_val, worst_path = saved_ckpts.pop()
                 if worst_path.exists():
                     worst_path.unlink()
                     logger.info(
                         f"Removed checkpoint {worst_path.name} "
                         f"({monitor_key}={worst_val:.4f}, outside top-{ckpt_cfg.save_top_k})"
                     )
+
+            # Rename all top-k files to reflect current rank (rank 1 = best).
+            # Use temp names first to avoid collisions during rename.
+            tmp_renames = []
+            for rank, (val, old_path) in enumerate(saved_ckpts, 1):
+                ep = old_path.stem.split("_")[-1]  # e.g. '042'
+                new_name = ckpt_dir / f"encoder_best_{rank}_epoch_{ep}.pt"
+                tmp_name = ckpt_dir / f"_tmp_rank_{rank}_{ep}.pt"
+                old_path.rename(tmp_name)
+                tmp_renames.append((rank, val, tmp_name, new_name))
+            saved_ckpts = []
+            for rank, val, tmp_name, new_name in tmp_renames:
+                tmp_name.rename(new_name)
+                saved_ckpts.append((val, new_name))
+            logger.info(f"Updated top-{ckpt_cfg.save_top_k} checkpoints:")
+            for rank, (val, path) in enumerate(saved_ckpts, 1):
+                logger.info(f"  #{rank}: {path.name} ({monitor_key}={val:.4f})")
 
     logger.info("Training complete!")
 
