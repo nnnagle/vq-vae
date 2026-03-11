@@ -1423,7 +1423,7 @@ def main():
         logger.info(f"Saved checkpoint to {ckpt_path}")
 
         # Best-k management: only once all loss schedules have fully ramped up
-        if epoch >= all_losses_active_epoch:
+        if epoch > all_losses_active_epoch:
             best_k_checkpoints.append((val_stats['loss'], str(ckpt_path)))
             if len(best_k_checkpoints) > save_top_k:
                 best_k_checkpoints.sort(key=lambda x: x[0])
