@@ -73,20 +73,10 @@ logger = logging.getLogger("phase_linear_probe")
 PHASE_TARGET_FEATURE = "soft_neighborhood_phase_target"
 PHASE_INPUT_FEATURE = "phase_ccdc"
 
-PHASE_TARGET_CHANNELS = [
-    "annual.red",
-    "annual.nir",
-    "annual.swir1",
-    "annual.swir2",
-    "annual.nbr",
-    "annual.ndvi",
-    "annual.ndmi",
-    "annual.spectral_velocity",
-    "annual.seas_amp_red",
-    "annual.seas_amp_nir",
-    "annual.seas_amp_swir1",
-    "annual.seas_amp_swir2",
-]
+def _get_target_channels(feature_builder: "FeatureBuilder") -> List[str]:
+    """Return ordered channel names for the phase target feature from the binding config."""
+    feature_config = feature_builder.config.get_feature(PHASE_TARGET_FEATURE)
+    return list(feature_config.channels.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -277,24 +267,18 @@ def _build_design_matrix(
     return torch.cat([z_type_flat, z_phase_flat, interaction], dim=1)
 
 
-def _design_dim(design: str) -> int:
+def _design_dim(design: str, d_type: int, d_phase: int) -> int:
     """Return the number of columns produced by *design*."""
     if design == "type-only":
-        return D_TYPE
+        return d_type
     if design == "phase-only":
-        return D_PHASE
+        return d_phase
     if design == "additive":
-        return D_TYPE + D_PHASE
-    return D_TOTAL
+        return d_type + d_phase
+    return d_type + d_phase + d_type * d_phase
 
 
 DESIGN_CHOICES = ("full", "additive", "type-only", "phase-only")
-
-
-D_TYPE = 64
-D_PHASE = 12
-D_INTERACTION = D_TYPE * D_PHASE  # 768
-D_TOTAL = D_TYPE + D_PHASE + D_INTERACTION  # 844
 
 
 # ---------------------------------------------------------------------------
@@ -312,23 +296,25 @@ class ProbePreprocessor:
 
     mean: torch.Tensor           # [D_raw]
     std: torch.Tensor            # [D_raw]
-    pca_components: torch.Tensor | None   # [D_INTERACTION, k] or None
+    pca_components: torch.Tensor | None   # [d_type*d_phase, k] or None
     interaction_pca_k: int       # 0 → no PCA
     design: str                  # "full", "additive", "type-only", "phase-only"
     pca_explained_variance_ratio: torch.Tensor | None  # [k] or None
+    d_type: int = 64             # z_type embedding dim (from model)
+    d_phase: int = 12            # z_phase embedding dim (from model)
 
     @property
     def output_dim(self) -> int:
         if self.design == "type-only":
-            return D_TYPE
+            return self.d_type
         if self.design == "phase-only":
-            return D_PHASE
+            return self.d_phase
         if self.design == "additive":
-            return D_TYPE + D_PHASE
+            return self.d_type + self.d_phase
         # full
         if self.interaction_pca_k > 0 and self.pca_components is not None:
-            return D_TYPE + D_PHASE + self.interaction_pca_k
-        return D_TOTAL
+            return self.d_type + self.d_phase + self.interaction_pca_k
+        return self.d_type + self.d_phase + self.d_type * self.d_phase
 
     def transform(
         self,
@@ -338,8 +324,8 @@ class ProbePreprocessor:
         """Build, standardise, and optionally PCA-compress the design matrix.
 
         Args:
-            z_type_flat:  [N, 64]
-            z_phase_flat: [N, 12]
+            z_type_flat:  [N, d_type]
+            z_phase_flat: [N, d_phase]
 
         Returns:
             [N, D_out]  where D_out = :pyattr:`output_dim`
@@ -347,13 +333,14 @@ class ProbePreprocessor:
         X_raw = _build_design_matrix(z_type_flat, z_phase_flat, self.design)
         X_std = (X_raw.double() - self.mean.double()) / self.std.double()
 
+        d_main = self.d_type + self.d_phase
         if (
             self.design == "full"
             and self.interaction_pca_k > 0
             and self.pca_components is not None
         ):
-            main = X_std[:, : D_TYPE + D_PHASE]
-            interaction_std = X_std[:, D_TYPE + D_PHASE :]
+            main = X_std[:, :d_main]
+            interaction_std = X_std[:, d_main:]
             interaction_pca = interaction_std @ self.pca_components.double()
             return torch.cat([main, interaction_pca], dim=1).float()
 
@@ -378,6 +365,8 @@ class ProbePreprocessor:
                 if self.pca_explained_variance_ratio is not None
                 else None
             ),
+            "preprocessor_d_type": self.d_type,
+            "preprocessor_d_phase": self.d_phase,
         }
 
     @classmethod
@@ -392,6 +381,8 @@ class ProbePreprocessor:
             pca_explained_variance_ratio=d.get(
                 "preprocessor_pca_explained_variance_ratio"
             ),
+            d_type=d.get("preprocessor_d_type", 64),
+            d_phase=d.get("preprocessor_d_phase", 12),
         )
 
 
@@ -413,7 +404,10 @@ def _compute_feature_statistics(
     the full design matrix.
     """
     model.eval()
-    D_raw = _design_dim(design)
+    d_type = model.z_type_dim
+    d_phase = model.z_phase_dim
+    d_interaction = d_type * d_phase
+    D_raw = _design_dim(design, d_type, d_phase)
 
     sum_x = torch.zeros(D_raw, dtype=torch.float64)
     sum_x2 = torch.zeros(D_raw, dtype=torch.float64)
@@ -422,7 +416,7 @@ def _compute_feature_statistics(
     need_pca = design == "full" and interaction_pca_k > 0
     if need_pca:
         sum_xx_int = torch.zeros(
-            D_INTERACTION, D_INTERACTION, dtype=torch.float64,
+            d_interaction, d_interaction, dtype=torch.float64,
         )
 
     with torch.no_grad():
@@ -446,8 +440,8 @@ def _compute_feature_statistics(
             m_flat = m_t.reshape(-1)
 
             zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
-            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat].cpu()
-            zp_flat = zp.reshape(-1, D_PHASE)[m_flat].cpu()
+            zt_flat = zt_t.reshape(-1, d_type)[m_flat].cpu()
+            zp_flat = zp.reshape(-1, d_phase)[m_flat].cpu()
 
             if zt_flat.shape[0] == 0:
                 continue
@@ -461,7 +455,7 @@ def _compute_feature_statistics(
             n_obs += X_raw.shape[0]
 
             if need_pca:
-                X_int = X_raw[:, D_TYPE + D_PHASE :]
+                X_int = X_raw[:, d_type + d_phase:]
                 sum_xx_int += X_int.T @ X_int
 
     if n_obs == 0:
@@ -473,24 +467,24 @@ def _compute_feature_statistics(
 
     # Log scale diagnostics — directly tests the scale-mismatch hypothesis
     if design == "full":
-        type_stds = std[:D_TYPE]
-        phase_stds = std[D_TYPE : D_TYPE + D_PHASE]
-        int_stds = std[D_TYPE + D_PHASE :]
+        type_stds = std[:d_type]
+        phase_stds = std[d_type : d_type + d_phase]
+        int_stds = std[d_type + d_phase:]
         logger.info(
             f"Feature scale diagnostics ({n_obs:,} observations):"
         )
         logger.info(
-            f"  z_type  ({D_TYPE} cols): "
+            f"  z_type  ({d_type} cols): "
             f"mean std = {type_stds.mean():.6f}  "
             f"[{type_stds.min():.6f}, {type_stds.max():.6f}]"
         )
         logger.info(
-            f"  z_phase ({D_PHASE} cols): "
+            f"  z_phase ({d_phase} cols): "
             f"mean std = {phase_stds.mean():.6f}  "
             f"[{phase_stds.min():.6f}, {phase_stds.max():.6f}]"
         )
         logger.info(
-            f"  interaction ({D_INTERACTION} cols): "
+            f"  interaction ({d_interaction} cols): "
             f"mean std = {int_stds.mean():.6f}  "
             f"[{int_stds.min():.6f}, {int_stds.max():.6f}]"
         )
@@ -510,8 +504,8 @@ def _compute_feature_statistics(
     pca_explained_variance_ratio = None
 
     if need_pca:
-        int_mean = mean[D_TYPE + D_PHASE :]
-        int_std = std[D_TYPE + D_PHASE :]
+        int_mean = mean[d_type + d_phase:]
+        int_std = std[d_type + d_phase:]
 
         # Covariance of raw interaction, then convert to standardised cov
         cov_raw = sum_xx_int / n_obs - int_mean.unsqueeze(1) * int_mean.unsqueeze(0)
@@ -520,8 +514,8 @@ def _compute_feature_statistics(
 
         eigvals, eigvecs = torch.linalg.eigh(cov_std)
         # eigh returns ascending order — take the top k
-        k = min(interaction_pca_k, D_INTERACTION)
-        top_eigvecs = eigvecs[:, -k:].flip(dims=[1])      # [768, k]
+        k = min(interaction_pca_k, d_interaction)
+        top_eigvecs = eigvecs[:, -k:].flip(dims=[1])      # [d_interaction, k]
         top_eigvals = eigvals[-k:].flip(dims=[0])          # [k]
 
         # Normalise so that projected columns have unit variance:
@@ -529,7 +523,7 @@ def _compute_feature_statistics(
         top_eigvals_safe = top_eigvals.clamp(min=1e-12)
         pca_components = (
             top_eigvecs / top_eigvals_safe.sqrt().unsqueeze(0)
-        ).to(torch.float32)  # [768, k]
+        ).to(torch.float32)  # [d_interaction, k]
 
         explained_total = eigvals.clamp(min=0.0).sum()
         pca_explained_variance_ratio = (
@@ -550,6 +544,8 @@ def _compute_feature_statistics(
         interaction_pca_k=interaction_pca_k,
         design=design,
         pca_explained_variance_ratio=pca_explained_variance_ratio,
+        d_type=d_type,
+        d_phase=d_phase,
     )
 
 
@@ -596,8 +592,10 @@ def fit_phase_probe(
     # Pass 2 — ridge regression on preprocessed features
     logger.info("Pass 2/2: fitting ridge regression …")
     model.eval()
+    d_type = model.z_type_dim
+    d_phase = model.z_phase_dim
     D = preprocessor.output_dim
-    C = len(PHASE_TARGET_CHANNELS)  # 7
+    C = len(_get_target_channels(feature_builder))
     Da = D + 1
 
     # Accumulate on CPU — the matrices are small, CPU RAM is plentiful
@@ -627,8 +625,8 @@ def fit_phase_probe(
             m_flat = m_t.reshape(-1)
 
             zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
-            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat].cpu()
-            zp_flat = zp.reshape(-1, D_PHASE)[m_flat].cpu()
+            zt_flat = zt_t.reshape(-1, d_type)[m_flat].cpu()
+            zp_flat = zp.reshape(-1, d_phase)[m_flat].cpu()
             Y = y_perm.reshape(-1, C)[m_flat]
 
             if zt_flat.shape[0] == 0:
@@ -678,7 +676,7 @@ def _build_inverse_normalization(
         transform_specs: list of per-channel transform specs (str/dict/None)
     """
     feature_config = feature_builder.config.get_feature(PHASE_TARGET_FEATURE)
-    C = len(PHASE_TARGET_CHANNELS)
+    C = len(feature_config.channels)
 
     # Whitening matrix and its inverse
     whitening = feature_builder._get_whitening_matrix(PHASE_TARGET_FEATURE)
@@ -778,7 +776,10 @@ def evaluate_phase_probe(
     Normalized-space metrics are unaffected.
     """
     model.eval()
-    C = W.shape[1]   # 7
+    d_type = model.z_type_dim
+    d_phase = model.z_phase_dim
+    target_channels = _get_target_channels(feature_builder)
+    C = W.shape[1]
 
     # W and b live on CPU (returned from fit), keep accumulators on CPU too
     W_cpu = W.cpu()
@@ -836,8 +837,8 @@ def evaluate_phase_probe(
             m_flat = m_t.reshape(-1)
 
             zt_t = zt.unsqueeze(1).expand(-1, T, -1, -1, -1)
-            zt_flat = zt_t.reshape(-1, D_TYPE)[m_flat]
-            zp_flat = zp.reshape(-1, D_PHASE)[m_flat]
+            zt_flat = zt_t.reshape(-1, d_type)[m_flat]
+            zp_flat = zp.reshape(-1, d_phase)[m_flat]
             Y_norm = y_perm.reshape(-1, C)[m_flat]
 
             if zt_flat.shape[0] == 0:
@@ -876,7 +877,7 @@ def evaluate_phase_probe(
 
             # Variance inflation: rescale predictions around training mean
             if inflation_factors is not None and inflation_center is not None:
-                for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+                for c_idx, ch in enumerate(target_channels):
                     sf = inflation_factors[ch]
                     ctr = inflation_center[ch]
                     P_orig[:, c_idx] = ctr + (P_orig[:, c_idx] - ctr) * sf
@@ -923,7 +924,7 @@ def evaluate_phase_probe(
     def _compute_mse_r2(sse_acc, sum_y_acc, sum_y2_acc, n):
         mse_per: Dict[str, float] = {}
         r2_per: Dict[str, float] = {}
-        for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+        for c_idx, ch in enumerate(target_channels):
             if n == 0:
                 mse_per[ch] = 0.0
                 r2_per[ch] = 0.0
@@ -942,7 +943,7 @@ def evaluate_phase_probe(
 
     def _compute_spearman(all_p, all_t):
         spearman_per: Dict[str, float] = {}
-        for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+        for c_idx, ch in enumerate(target_channels):
             if all_p[c_idx]:
                 p_cat = torch.cat(all_p[c_idx])
                 t_cat = torch.cat(all_t[c_idx])
@@ -962,7 +963,7 @@ def evaluate_phase_probe(
     r2_temporal: Dict[str, float] = {}
     r2_temporal_orig: Dict[str, float] = {}
     vf_temporal: Dict[str, float] = {}
-    for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+    for c_idx, ch in enumerate(target_channels):
         # Normalized space
         sst_w = float(sst_temporal[c_idx].item())
         if sst_w > 1e-8:
@@ -992,7 +993,7 @@ def evaluate_phase_probe(
 
     # Per-channel means in original scale (for variance inflation centering)
     mean_orig: Dict[str, float] = {}
-    for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+    for c_idx, ch in enumerate(target_channels):
         mean_orig[ch] = float(sum_y_orig[c_idx].item()) / n_obs if n_obs > 0 else 0.0
 
     return PhaseProbeMetrics(
@@ -1059,31 +1060,31 @@ def compute_embedding_diagnostics(
         FiLM gamma/beta summary statistics.
     """
     model.eval()
-    D_ZP = 12   # z_phase / post-FiLM dim
-    D_H = 64    # TCN hidden dim
+    d_zp = model.z_phase_dim   # z_phase / post-FiLM dim
+    d_h = model.phase_head.in_channels  # TCN hidden dim (input to bottleneck)
 
     # --- Variance decomposition accumulators (on CPU, float64) ---
-    sum_within_zp = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_pixmean_zp = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_pixmean2_zp = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_within_zp = torch.zeros(d_zp, dtype=torch.float64)
+    sum_pixmean_zp = torch.zeros(d_zp, dtype=torch.float64)
+    sum_pixmean2_zp = torch.zeros(d_zp, dtype=torch.float64)
 
-    sum_within_tcn = torch.zeros(D_H, dtype=torch.float64)
-    sum_pixmean_tcn = torch.zeros(D_H, dtype=torch.float64)
-    sum_pixmean2_tcn = torch.zeros(D_H, dtype=torch.float64)
+    sum_within_tcn = torch.zeros(d_h, dtype=torch.float64)
+    sum_pixmean_tcn = torch.zeros(d_h, dtype=torch.float64)
+    sum_pixmean2_tcn = torch.zeros(d_h, dtype=torch.float64)
 
-    sum_within_post = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_pixmean_post = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_pixmean2_post = torch.zeros(D_ZP, dtype=torch.float64)
+    sum_within_post = torch.zeros(d_zp, dtype=torch.float64)
+    sum_pixmean_post = torch.zeros(d_zp, dtype=torch.float64)
+    sum_pixmean2_post = torch.zeros(d_zp, dtype=torch.float64)
 
-    # --- FiLM parameter accumulators (FiLM operates in 12-d space) ---
-    sum_gamma = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_gamma2 = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_beta = torch.zeros(D_ZP, dtype=torch.float64)
-    sum_beta2 = torch.zeros(D_ZP, dtype=torch.float64)
-    gamma_min = torch.full((D_ZP,), float("inf"), dtype=torch.float64)
-    gamma_max = torch.full((D_ZP,), float("-inf"), dtype=torch.float64)
-    beta_min = torch.full((D_ZP,), float("inf"), dtype=torch.float64)
-    beta_max = torch.full((D_ZP,), float("-inf"), dtype=torch.float64)
+    # --- FiLM parameter accumulators ---
+    sum_gamma = torch.zeros(d_zp, dtype=torch.float64)
+    sum_gamma2 = torch.zeros(d_zp, dtype=torch.float64)
+    sum_beta = torch.zeros(d_zp, dtype=torch.float64)
+    sum_beta2 = torch.zeros(d_zp, dtype=torch.float64)
+    gamma_min = torch.full((d_zp,), float("inf"), dtype=torch.float64)
+    gamma_max = torch.full((d_zp,), float("-inf"), dtype=torch.float64)
+    beta_min = torch.full((d_zp,), float("inf"), dtype=torch.float64)
+    beta_max = torch.full((d_zp,), float("-inf"), dtype=torch.float64)
     n_film_pixels = 0
 
     n_pixels = 0
@@ -1115,18 +1116,18 @@ def compute_embedding_diagnostics(
 
                 # Replicate the bottleneck + L2-norm + FiLM pipeline
                 # from forward_phase to compute post-FiLM hidden states.
-                # 1) Bottleneck: Conv2d(64→12) per timestep
+                # 1) Bottleneck: Conv2d(d_h → d_zp) per timestep
                 h_bn = h_tcn.permute(0, 2, 1, 3, 4).reshape(
-                    Bsz * T, 64, H, W_sp
+                    Bsz * T, d_h, H, W_sp
                 )
-                h_bn = model.phase_head(h_bn)  # [B*T, 12, H, W]
-                h_bn = h_bn.reshape(Bsz, T, 12, H, W_sp).permute(
+                h_bn = model.phase_head(h_bn)  # [B*T, d_zp, H, W]
+                h_bn = h_bn.reshape(Bsz, T, d_zp, H, W_sp).permute(
                     0, 2, 1, 3, 4
-                )  # [B, 12, T, H, W]
+                )  # [B, d_zp, T, H, W]
                 # 2) L2-normalize across (channel, time) jointly
                 h_bn = F.normalize(
                     h_bn.flatten(1, 2), dim=1
-                ).unflatten(1, (12, T))
+                ).unflatten(1, (d_zp, T))
                 # 3) FiLM conditioning
                 gamma, beta = model.phase_film(z_type_det)
                 # gamma, beta: [B, 12, H, W]
@@ -1248,7 +1249,7 @@ def log_embedding_diagnostics(diag: dict):
     f_zp = diag["z_phase_temporal_frac"]
     w_zp = diag["z_phase_within_var"]
     b_zp = diag["z_phase_between_var"]
-    logger.info("  z_phase (12-d) temporal variance fraction:")
+    logger.info(f"  z_phase ({len(diag['z_phase_temporal_frac'])}-d) temporal variance fraction:")
     logger.info(
         f"    mean={f_zp.mean():.2%}  "
         f"range=[{f_zp.min():.2%}, {f_zp.max():.2%}]"
@@ -1262,7 +1263,7 @@ def log_embedding_diagnostics(diag: dict):
     f_tcn = diag["tcn_temporal_frac"]
     w_tcn = diag["tcn_within_var"]
     b_tcn = diag["tcn_between_var"]
-    logger.info("  Pre-FiLM TCN (64-d) temporal variance fraction:")
+    logger.info(f"  Pre-FiLM TCN ({len(diag['tcn_temporal_frac'])}-d) temporal variance fraction:")
     logger.info(
         f"    mean={f_tcn.mean():.2%}  "
         f"range=[{f_tcn.min():.2%}, {f_tcn.max():.2%}]"
@@ -1276,7 +1277,7 @@ def log_embedding_diagnostics(diag: dict):
     f_post = diag["postfilm_temporal_frac"]
     w_post = diag["postfilm_within_var"]
     b_post = diag["postfilm_between_var"]
-    logger.info("  Post-FiLM (12-d) temporal variance fraction:")
+    logger.info(f"  Post-FiLM ({len(diag['postfilm_temporal_frac'])}-d) temporal variance fraction:")
     logger.info(
         f"    mean={f_post.mean():.2%}  "
         f"range=[{f_post.min():.2%}, {f_post.max():.2%}]"
@@ -1291,7 +1292,7 @@ def log_embedding_diagnostics(diag: dict):
     gs = diag["film_gamma_std"]
     bm = diag["film_beta_mean"]
     bs = diag["film_beta_std"]
-    logger.info("  FiLM parameters (12 channels):")
+    logger.info(f"  FiLM parameters ({len(diag['film_gamma_mean'])} channels):")
     logger.info(
         f"    gamma: mean={gm.mean():.4f} +/- {gs.mean():.4f}  "
         f"[{diag['film_gamma_min'].min():.4f}, "
@@ -1315,7 +1316,7 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
     logger.info(f"  [Normalized space]")
     logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12} {'ρ²':>12}")
     logger.info(f"  {'-' * 70}")
-    for ch in PHASE_TARGET_CHANNELS:
+    for ch in metrics.mse_per_channel:
         short = ch.replace("annual.", "")
         logger.info(
             f"  {short:<30} "
@@ -1334,7 +1335,7 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
     logger.info(f"  [Original scale]")
     logger.info(f"  {'Channel':<30} {'MSE':>12} {'R²':>12} {'ρ²':>12}")
     logger.info(f"  {'-' * 70}")
-    for ch in PHASE_TARGET_CHANNELS:
+    for ch in metrics.mse_per_channel_original:
         short = ch.replace("annual.", "")
         logger.info(
             f"  {short:<30} "
@@ -1360,7 +1361,7 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
         f"{'R²_temp_orig':>12} {'VarFrac':>12}"
     )
     logger.info(f"  {'-' * 70}")
-    for ch in PHASE_TARGET_CHANNELS:
+    for ch in metrics.r2_temporal_per_channel:
         short = ch.replace("annual.", "")
         logger.info(
             f"  {short:<30} "
@@ -1467,8 +1468,12 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
+    d_type = model.z_type_dim
+    d_phase = model.z_phase_dim
     logger.info(
-        f"Design matrix: {args.design} (D_raw={_design_dim(args.design)}, "
+        f"Design matrix: {args.design} "
+        f"(d_type={d_type}, d_phase={d_phase}, "
+        f"D_raw={_design_dim(args.design, d_type, d_phase)}, "
         f"interaction_pca_k={args.interaction_pca_k})"
     )
 
@@ -1501,7 +1506,7 @@ def main():
         vi_factors = {}
         vi_center = {}
         logger.info("Variance inflation factors (from training R², original scale):")
-        for ch in PHASE_TARGET_CHANNELS:
+        for ch in _get_target_channels(feature_builder):
             r2 = train_metrics.r2_per_channel_original[ch]
             sf = 1.0 / max(math.sqrt(max(r2, 0.0)), 1e-3)
             vi_factors[ch] = sf
@@ -1546,7 +1551,7 @@ def main():
         "ridge_lambda": args.ridge_lambda,
         "halo": args.halo,
         "target_feature": PHASE_TARGET_FEATURE,
-        "target_channels": PHASE_TARGET_CHANNELS,
+        "target_channels": _get_target_channels(feature_builder),
         "design": args.design,
         "input_dim": preprocessor.output_dim,
         "interaction_pca_k": args.interaction_pca_k,
