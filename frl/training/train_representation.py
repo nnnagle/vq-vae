@@ -1421,8 +1421,8 @@ def main():
         )
         logger.info(
             f"  Pairs/batch: "
-            f"spec {train_stats.get('spectral_pos_pairs', 0)}+ {train_stats.get('spectral_neg_pairs', 0)}- | "
-            f"spat {train_stats.get('spatial_pos_pairs', 0)}+ {train_stats.get('spatial_neg_pairs', 0)}-"
+            f"spec pos={train_stats.get('spectral_pos_pairs', 0)} neg={train_stats.get('spectral_neg_pairs', 0)} | "
+            f"spat pos={train_stats.get('spatial_pos_pairs', 0)} neg={train_stats.get('spatial_neg_pairs', 0)}"
         )
 
         # Log phase pair construction stats
