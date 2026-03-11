@@ -526,10 +526,12 @@ losses:
     self_similarity_weight: 1.0    # trajectory shape matching
     cross_pixel_weight: 1.0        # shared metric space anchoring
 
-    # Curriculum: ramp in after type encoder stabilises
+    # Curriculum: ramp in after type encoder stabilises.
+    # start_epoch should align with scheduler.phase_warmup so the LR bump
+    # coincides with phase loss entering — keeps the two schedules in sync.
     curriculum:
-      start_epoch: 10          # begin contributing to total loss
-      ramp_epochs: 10          # linear ramp from 0 to full weight
+      start_epoch: 30          # begin contributing to total loss (matches scheduler phase_warmup trigger)
+      ramp_epochs: 10          # linear ramp from 0 to full weight (epochs 30-40)
 
   # VICReg-style regularization to prevent embedding collapse
   # Encourages variance across dimensions (anti-collapse) and

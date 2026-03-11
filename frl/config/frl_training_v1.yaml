@@ -59,11 +59,29 @@ optimizer:
         
 scheduler:
   name: cosine_warmup
+
+  # Phase 1 (epochs 0 → warmup.epochs): linear warmup, LR rises 0 → peak.
+  # Prevents destructively large gradient steps while weights are random.
   warmup:
     enabled: true
-    epochs: 5
-  T_max: 95
-  eta_min: 1.0e-6
+    epochs: 10          # 5% of 200 epochs; ramp is short but avoids early instability
+
+  # Phase 2 (epochs warmup → curriculum_start_epoch): cosine decay from peak.
+  # Spectral/spatial losses train freely while phase loss is silent (weight=0).
+
+  # Phase 3 (curriculum_start_epoch → curriculum_start_epoch + phase_warmup.epochs):
+  # Brief re-warmup when phase loss enters. The optimizer sees a new hard signal
+  # (phase contrastive loss) and benefits from a small LR bump to adapt without
+  # destabilizing the already-learned spectral/spatial representations.
+  # LR ramps linearly from its current cosine value back up to peak_factor × lr.
+  phase_warmup:
+    enabled: true
+    epochs: 5           # short ramp — just enough to absorb new phase gradients
+    peak_factor: 1.0    # ramp back to full peak lr (1.0); reduce if re-warmup is too aggressive
+
+  # Phase 4 (phase_warmup_end → end): cosine decay from peak_factor × lr down to eta_min.
+  # ~165 epochs of smooth decay covering the bulk of training.
+  eta_min: 1.0e-6       # floor ≈ 1% of peak lr; prevents LR from reaching zero
     
 spatial_domain:
   debug_mode: true
