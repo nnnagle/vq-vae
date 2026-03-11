@@ -1424,6 +1424,17 @@ def main():
 
         # Best-k management: only once all loss schedules have fully ramped up
         if epoch >= all_losses_active_epoch:
+            # On first activation, purge pre-curriculum checkpoint files.
+            # Those files have val_loss that excludes phase loss, so they're
+            # incomparable to post-curriculum checkpoints and would appear
+            # artificially "best" to anything scanning the directory by loss.
+            if epoch == all_losses_active_epoch and all_losses_active_epoch > 0:
+                for pre_ckpt in sorted(ckpt_dir.glob("encoder_epoch_*.pt")):
+                    pre_epoch_num = int(pre_ckpt.stem.split('_')[-1])
+                    if pre_epoch_num <= all_losses_active_epoch:
+                        pre_ckpt.unlink(missing_ok=True)
+                        logger.info(f"  Purged pre-curriculum checkpoint: {pre_ckpt.name}")
+
             best_k_checkpoints.append((val_stats['loss'], str(ckpt_path)))
             if len(best_k_checkpoints) > save_top_k:
                 best_k_checkpoints.sort(key=lambda x: x[0])
