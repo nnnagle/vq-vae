@@ -373,6 +373,12 @@ class StatsCalculator:
             if 'sd' in self.stats_config.stats:
                 channel_stats['sd'] = float(np.std(values))
 
+            finite_values = values[np.isfinite(values)]
+            if 'min' in self.stats_config.stats:
+                channel_stats['min'] = float(np.min(finite_values)) if len(finite_values) > 0 else float('nan')
+            if 'max' in self.stats_config.stats:
+                channel_stats['max'] = float(np.max(finite_values)) if len(finite_values) > 0 else float('nan')
+
             # Quantiles
             quantiles_map = {
                 'q02': 2, 'q05': 5, 'q25': 25, 'q50': 50,
