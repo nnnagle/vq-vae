@@ -504,10 +504,13 @@ def phase_neighborhood_loss(
         def _dist_stats(d: torch.Tensor, mask: torch.Tensor) -> dict:
             vals = d[mask]
             if vals.numel() == 0:
-                return {"mean": 0.0, "std": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0}
+                return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0}
+            finite_vals = vals[torch.isfinite(vals)]
             return {
                 "mean": vals.mean().item(),
                 "std": vals.std().item(),
+                "min": finite_vals.min().item() if finite_vals.numel() > 0 else 0.0,
+                "max": finite_vals.max().item() if finite_vals.numel() > 0 else 0.0,
                 "q25": torch.quantile(vals, 0.25).item(),
                 "q50": torch.quantile(vals, 0.50).item(),
                 "q75": torch.quantile(vals, 0.75).item(),
