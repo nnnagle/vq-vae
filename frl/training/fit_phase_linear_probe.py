@@ -76,9 +76,14 @@ PHASE_INPUT_FEATURE = "phase_ccdc"
 PHASE_TARGET_CHANNELS = [
     "annual.red",
     "annual.nir",
+    "annual.swir1",
+    "annual.swir2",
     "annual.nbr",
+    "annual.ndvi",
     "annual.ndmi",
     "annual.spectral_velocity",
+    "annual.seas_amp_red",
+    "annual.seas_amp_nir",
     "annual.seas_amp_swir1",
     "annual.seas_amp_swir2",
 ]
@@ -119,7 +124,7 @@ def extract_phase_batch_tensors(
     Returns:
         Ximg:       [B, 16, H, W]        ccdc_history encoder input
         Xphase:     [B, 8, T, H, W]      phase_ccdc temporal input
-        Yimg:       [B, 7, T, H, W]      soft_neighborhood_phase target (normalized)
+        Yimg:       [B, 12, T, H, W]     soft_neighborhood_phase target (normalized)
         M:          [B, H, W]            boolean mask (True = valid)
     """
     batch_size = len(batch["metadata"])
@@ -142,7 +147,7 @@ def extract_phase_batch_tensors(
 
         enc = torch.from_numpy(enc_f.data).float()        # [16, H, W]
         phase = torch.from_numpy(phase_f.data).float()    # [8, T, H, W]
-        tgt = torch.from_numpy(tgt_f.data).float()        # [7, T, H, W]
+        tgt = torch.from_numpy(tgt_f.data).float()        # [12, T, H, W]
 
         # Combine masks: encoder spatial mask AND target temporal mask
         # enc_f.mask: [H, W], tgt_f.mask: [T, H, W]
