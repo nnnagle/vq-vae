@@ -42,9 +42,7 @@ from models import RepresentationModel
 from training.fit_phase_linear_probe import (
     PHASE_TARGET_FEATURE,
     PHASE_INPUT_FEATURE,
-    PHASE_TARGET_CHANNELS,
-    D_TYPE,
-    D_PHASE,
+    _get_target_channels,
     ProbePreprocessor,
     _build_design_matrix,
     _build_inverse_normalization,
@@ -126,6 +124,7 @@ def collect_phase_diagnostics(
     patch_indices: List[int],
     design: str = "full",
     preprocessor: "ProbePreprocessor | None" = None,
+    target_channels: "List[str] | None" = None,
 ) -> List[Dict[str, np.ndarray]]:
     """Run encoder + phase probe on selected patches.
 
@@ -141,7 +140,9 @@ def collect_phase_diagnostics(
         feature_builder,
     )
 
-    C = len(PHASE_TARGET_CHANNELS)
+    if target_channels is None:
+        target_channels = _get_target_channels(feature_builder)
+    C = len(target_channels)
     W_cpu = W.cpu().float()
     b_cpu = b.cpu().float()
 
@@ -182,8 +183,8 @@ def collect_phase_diagnostics(
             # Predict per-timestep to manage memory
             pred_norm_list = []
             for t in range(T):
-                zt_flat = zt.reshape(-1, D_TYPE)       # [H*W, 64]
-                zp_flat = zp[t].reshape(-1, D_PHASE)   # [H*W, 12]
+                zt_flat = zt.reshape(-1, model.z_type_dim)    # [H*W, d_type]
+                zp_flat = zp[t].reshape(-1, model.z_phase_dim)  # [H*W, d_phase]
                 if preprocessor is not None:
                     X = preprocessor.transform(zt_flat, zp_flat)
                 else:
@@ -240,7 +241,7 @@ def collect_phase_diagnostics(
                 "patch_idx": patch_idx,
                 "T": T,
             }
-            for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+            for c_idx, ch in enumerate(target_channels):
                 record[f"target_{ch}"] = tgt_orig[c_idx]   # [T, H, W]
                 record[f"pred_{ch}"] = pred_orig[c_idx]     # [T, H, W]
 
@@ -267,7 +268,7 @@ def collect_phase_diagnostics(
                 f"    z_phase temporal std (mean over pixels): {zp_temporal_std:.6f}, "
                 f"spatial std (mean over timesteps): {zp_spatial_std:.6f}"
             )
-            for c_idx, ch in enumerate(PHASE_TARGET_CHANNELS):
+            for c_idx, ch in enumerate(target_channels):
                 pred_ch = pred_orig[c_idx][:, mask_np]  # [T, N_valid]
                 tgt_ch = tgt_orig[c_idx][:, mask_np]
                 pred_t_std = pred_ch.std(axis=0).mean()
@@ -646,10 +647,16 @@ def main():
         preprocessor = None
         logger.info("No preprocessor in probe checkpoint; using raw features.")
 
+    # ---- feature builder (needed early for target_channels) ---------------
+    feature_builder = FeatureBuilder(bindings_config)
+
+    target_channels: List[str] = probe_ckpt.get(
+        "target_channels", _get_target_channels(feature_builder)
+    )
+
     logger.info(
         f"Probe: design={design}, W shape={list(W.shape)}, "
-        f"target channels="
-        f"{probe_ckpt.get('target_channels', PHASE_TARGET_CHANNELS)}"
+        f"target channels={target_channels}"
     )
 
     # ---- dataset ----------------------------------------------------------
@@ -673,15 +680,12 @@ def main():
     for idx, count in selected:
         logger.info(f"  Patch {idx}: {count} pixels")
 
-    # ---- feature builder --------------------------------------------------
-    feature_builder = FeatureBuilder(bindings_config)
-
     # ---- collect data -----------------------------------------------------
     logger.info("Running inference on selected patches...")
     records = collect_phase_diagnostics(
         test_dataset, feature_builder, model, W, b,
         device, selected_indices, design=design,
-        preprocessor=preprocessor,
+        preprocessor=preprocessor, target_channels=target_channels,
     )
     logger.info(f"Collected data for {len(records)} patches")
 
@@ -692,7 +696,7 @@ def main():
     plot_ysfc_map(records, output_dir / "forest_diag_ysfc_min.png")
 
     # One sheet per target variable: absolute values and temporal anomalies
-    for ch in PHASE_TARGET_CHANNELS:
+    for ch in target_channels:
         safe_name = ch.replace(".", "_")
         out_path = output_dir / f"forest_diag_{safe_name}.png"
         plot_variable_timeseries(records, ch, out_path, years=years)
