@@ -1530,8 +1530,12 @@ def main():
                 f"({monitor_key}={monitor_val:.4f})"
             )
 
-        # Top-k save (evaluated every epoch).
+        # Top-k save (evaluated only after the phase loss curriculum is fully ramped).
         # saved_ckpts is sorted best-first (index 0 = rank 1).
+        phase_schedule_complete = (
+            phase_config is None
+            or epoch >= phase_config['curriculum_start_epoch'] + phase_config['curriculum_ramp_epochs']
+        )
         reverse = (ckpt_cfg.mode == "max")
         saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
         worst_val_in_top_k = saved_ckpts[-1][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
@@ -1540,7 +1544,7 @@ def main():
             or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
             or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
         )
-        if is_better:
+        if is_better and phase_schedule_complete:
             # Save under a temporary name; will be renamed with rank below.
             tmp_path = ckpt_dir / f"encoder_best_epoch_{epoch+1:03d}.pt"
             torch.save(ckpt_state, tmp_path)
