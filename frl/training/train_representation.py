@@ -1521,20 +1521,32 @@ def main():
             torch.save(ckpt_state, last_path)
             logger.info(f"Saved last checkpoint to {last_path}")
 
-        # Periodic + top-k save.
+        # Periodic save (every nth epoch, never pruned).
         if (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0:
             ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
             torch.save(ckpt_state, ckpt_path)
             logger.info(
-                f"Saved checkpoint to {ckpt_path} "
+                f"Saved periodic checkpoint to {ckpt_path} "
                 f"({monitor_key}={monitor_val:.4f})"
             )
 
-            # Track top-k: saved_ckpts is list of (monitor_val, path).
-            saved_ckpts.append((monitor_val, ckpt_path))
-
-            # Sort so index 0 is the worst to evict (highest val for 'min').
-            reverse = (ckpt_cfg.mode == "max")
+        # Top-k save (evaluated every epoch).
+        reverse = (ckpt_cfg.mode == "max")
+        saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
+        worst_val_in_top_k = saved_ckpts[0][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
+        is_better = (
+            worst_val_in_top_k is None
+            or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
+            or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
+        )
+        if is_better:
+            best_path = ckpt_dir / f"encoder_best_epoch_{epoch+1:03d}.pt"
+            torch.save(ckpt_state, best_path)
+            logger.info(
+                f"Saved top-{ckpt_cfg.save_top_k} checkpoint to {best_path} "
+                f"({monitor_key}={monitor_val:.4f})"
+            )
+            saved_ckpts.append((monitor_val, best_path))
             saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
 
             while len(saved_ckpts) > ckpt_cfg.save_top_k:
