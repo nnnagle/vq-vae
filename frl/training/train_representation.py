@@ -758,34 +758,29 @@ def train_epoch(
                 last_film_stats = stats['film_stats']
 
             if batch_idx % log_interval == 0:
-                phase_msg = ""
                 ps = stats.get('phase_pair_stats')
                 pls = stats.get('phase_loss_stats')
-                if ps and ps['n_anchors'] > 0:
-                    phase_msg = (
-                        f" | Phase: {ps['n_total_pairs']:.0f} pairs "
-                        f"({ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} anchors, "
-                        f"overlap={ps['overlap_mean']:.1f}, "
-                        f"w={ps['weight_mean']:.3f}±{ps['weight_std']:.3f})"
-                    )
-                if pls and pls.get('curriculum_w', 0) > 0:
-                    phase_msg += (
-                        f" | Phase loss: {stats['phase_loss']:.4f} "
-                        f"(self={pls['loss_self']:.4f}, cross={pls['loss_cross']:.4f}, "
-                        f"cw={pls['curriculum_w']:.2f})"
-                    )
-
+                cw = pls.get('curriculum_w', 0) if pls else 0
+                cw_str = f" cw={cw:.2f}" if 0 < cw < 1.0 else ""
                 logger.info(
                     f"Epoch {epoch+1} | "
                     f"Batch {batch_idx+1}/{len(train_dataloader)} | "
-                    f"Loss: {stats['loss']:.4f} (spec: {stats['spectral_loss']:.4f}, "
-                    f"spat: {stats['spatial_loss']:.4f}, phase: {stats['phase_loss']:.4f}, "
-                    f"vcr: {stats['vcr_loss']:.4f}, pvcr: {stats['phase_vcr_loss']:.4f}) | "
-                    f"Pairs(+/-): spec {stats['spectral_pos_pairs']}/{stats['spectral_neg_pairs']}, "
-                    f"spat {stats['spatial_pos_pairs']}/{stats['spatial_neg_pairs']} | "
-                    f"LR: {scheduler.get_last_lr()[0]:.2e}"
-                    f"{phase_msg}"
+                    f"loss={stats['loss']:.4f} "
+                    f"spec={stats['spectral_loss']:.4f} "
+                    f"spat={stats['spatial_loss']:.4f} "
+                    f"phase={stats['phase_loss']:.4f} "
+                    f"vcr={stats['vcr_loss']:.4f} "
+                    f"pvcr={stats['phase_vcr_loss']:.4f} | "
+                    f"LR={scheduler.get_last_lr()[0]:.2e}"
                 )
+                if ps and ps['n_anchors'] > 0 and pls and cw > 0:
+                    logger.info(
+                        f"  phase: {ps['n_total_pairs']:.0f} pairs "
+                        f"({ps['n_anchors_surviving']:.0f}/{ps['n_anchors']:.0f} anchors, "
+                        f"overlap={ps['overlap_mean']:.1f}) "
+                        f"self={pls['loss_self']:.4f} cross={pls['loss_cross']:.4f}"
+                        f"{cw_str}"
+                    )
 
     if total_batches == 0:
         return {
@@ -1334,6 +1329,7 @@ def main():
     # Set up logging to both console and file
     log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     root_logger = logging.getLogger()
+    root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
 
     console_handler = logging.StreamHandler()
