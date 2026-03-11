@@ -1357,6 +1357,9 @@ def main():
     # Pre-extract input dropout schedule config (scalar or dict) for the epoch loop.
     input_dropout_schedule_cfg = model_config.get("type_encoder", {}).get("input_dropout", 0.0)
 
+    # Tracks (monitor_val, path) for top-k checkpoint pruning.
+    saved_ckpts: list = []
+
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
@@ -1474,9 +1477,24 @@ def main():
         else:
             logger.info("  FiLM: no data (phase pathway not active yet)")
 
-        # Save checkpoint
-        ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
-        torch.save({
+        # Flat metrics dict — keys match the monitor strings used in the YAML.
+        epoch_metrics = {
+            "train/loss_total":     train_stats['loss'],
+            "train/loss_spectral":  train_stats['spectral_loss'],
+            "train/loss_spatial":   train_stats['spatial_loss'],
+            "train/loss_phase":     train_stats['phase_loss'],
+            "train/loss_vcr":       train_stats['vcr_loss'],
+            "train/loss_phase_vcr": train_stats['phase_vcr_loss'],
+            "val/loss_total":       val_stats['loss'],
+            "val/loss_spectral":    val_stats['spectral_loss'],
+            "val/loss_spatial":     val_stats['spatial_loss'],
+            "val/loss_phase":       val_stats['phase_loss'],
+            "val/loss_vcr":         val_stats['vcr_loss'],
+            "val/loss_phase_vcr":   val_stats['phase_vcr_loss'],
+        }
+
+        # Checkpoint state dict (shared by periodic and last saves).
+        ckpt_state = {
             'epoch': epoch + 1,
             'model_version': RepresentationModel.VERSION,
             'model_config': model_config,
@@ -1485,20 +1503,48 @@ def main():
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'train_loss': train_stats['loss'],
-            'train_spectral_loss': train_stats['spectral_loss'],
-            'train_spatial_loss': train_stats['spatial_loss'],
-            'train_phase_loss': train_stats['phase_loss'],
-            'train_vcr_loss': train_stats['vcr_loss'],
-            'train_phase_vcr_loss': train_stats['phase_vcr_loss'],
-            'val_loss': val_stats['loss'],
-            'val_spectral_loss': val_stats['spectral_loss'],
-            'val_spatial_loss': val_stats['spatial_loss'],
-            'val_phase_loss': val_stats['phase_loss'],
-            'val_vcr_loss': val_stats['vcr_loss'],
-            'val_phase_vcr_loss': val_stats['phase_vcr_loss'],
-        }, ckpt_path)
-        logger.info(f"Saved checkpoint to {ckpt_path}")
+            **{k: v for k, v in epoch_metrics.items()},
+        }
+
+        ckpt_cfg = training_config.run.checkpoint
+        monitor_key = ckpt_cfg.monitor
+        if monitor_key not in epoch_metrics:
+            raise KeyError(
+                f"Checkpoint monitor '{monitor_key}' not found in epoch_metrics. "
+                f"Available keys: {list(epoch_metrics.keys())}"
+            )
+        monitor_val = epoch_metrics[monitor_key]
+
+        # Always save 'last' checkpoint (overwrites each epoch).
+        if ckpt_cfg.save_last:
+            last_path = ckpt_dir / "encoder_last.pt"
+            torch.save(ckpt_state, last_path)
+            logger.info(f"Saved last checkpoint to {last_path}")
+
+        # Periodic + top-k save.
+        if (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0:
+            ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
+            torch.save(ckpt_state, ckpt_path)
+            logger.info(
+                f"Saved checkpoint to {ckpt_path} "
+                f"({monitor_key}={monitor_val:.4f})"
+            )
+
+            # Track top-k: saved_ckpts is list of (monitor_val, path).
+            saved_ckpts.append((monitor_val, ckpt_path))
+
+            # Sort so index 0 is the worst to evict (highest val for 'min').
+            reverse = (ckpt_cfg.mode == "max")
+            saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
+
+            while len(saved_ckpts) > ckpt_cfg.save_top_k:
+                worst_val, worst_path = saved_ckpts.pop(0)
+                if worst_path.exists():
+                    worst_path.unlink()
+                    logger.info(
+                        f"Removed checkpoint {worst_path.name} "
+                        f"({monitor_key}={worst_val:.4f}, outside top-{ckpt_cfg.save_top_k})"
+                    )
 
     logger.info("Training complete!")
 
