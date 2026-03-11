@@ -1284,6 +1284,25 @@ def main():
     shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
     logger.info(f"Saved config and model source to {experiment_dir}")
 
+    # Best-k checkpoint tracking.  Only active after all loss schedules have
+    # fully ramped up.  The only schedule that gates a loss term is the phase
+    # curriculum, so "fully activated" = curriculum_start_epoch +
+    # curriculum_ramp_epochs.  When no phase loss is configured every loss is
+    # active from epoch 0.
+    save_top_k = training_config.run.checkpoint.save_top_k
+    if phase_config is not None:
+        all_losses_active_epoch = (
+            phase_config['curriculum_start_epoch']
+            + phase_config['curriculum_ramp_epochs']
+        )
+    else:
+        all_losses_active_epoch = 0
+    logger.info(
+        f"Best-{save_top_k} checkpointing active after epoch {all_losses_active_epoch} "
+        f"(all losses fully activated)"
+    )
+    best_k_checkpoints: list[tuple[float, str]] = []  # (val_loss, path)
+
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
@@ -1402,6 +1421,23 @@ def main():
             'val_phase_vcr_loss': val_stats['phase_vcr_loss'],
         }, ckpt_path)
         logger.info(f"Saved checkpoint to {ckpt_path}")
+
+        # Best-k management: only once all loss schedules have fully ramped up
+        if epoch >= all_losses_active_epoch:
+            best_k_checkpoints.append((val_stats['loss'], str(ckpt_path)))
+            if len(best_k_checkpoints) > save_top_k:
+                best_k_checkpoints.sort(key=lambda x: x[0])
+                evicted_loss, evicted_path = best_k_checkpoints.pop()  # worst (highest val loss)
+                Path(evicted_path).unlink(missing_ok=True)
+                logger.info(
+                    f"  Best-{save_top_k}: evicted {Path(evicted_path).name} "
+                    f"(val_loss={evicted_loss:.4f})"
+                )
+            else:
+                logger.info(
+                    f"  Best-{save_top_k}: tracking {len(best_k_checkpoints)}/{save_top_k} "
+                    f"(val_loss={val_stats['loss']:.4f})"
+                )
 
     logger.info("Training complete!")
 
