@@ -717,6 +717,10 @@ def train_epoch(
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
+    total_spectral_pos_pairs = 0
+    total_spectral_neg_pairs = 0
+    total_spatial_pos_pairs = 0
+    total_spatial_neg_pairs = 0
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -746,6 +750,10 @@ def train_epoch(
             total_phase_loss += stats['phase_loss']
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
+            total_spectral_pos_pairs += stats['spectral_pos_pairs']
+            total_spectral_neg_pairs += stats['spectral_neg_pairs']
+            total_spatial_pos_pairs += stats['spatial_pos_pairs']
+            total_spatial_neg_pairs += stats['spatial_neg_pairs']
             total_batches += 1
 
             # Update distribution stats from last valid batch
@@ -800,6 +808,10 @@ def train_epoch(
         'phase_loss': total_phase_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
+        'spectral_pos_pairs': total_spectral_pos_pairs // total_batches,
+        'spectral_neg_pairs': total_spectral_neg_pairs // total_batches,
+        'spatial_pos_pairs': total_spatial_pos_pairs // total_batches,
+        'spatial_neg_pairs': total_spatial_neg_pairs // total_batches,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
@@ -1406,6 +1418,11 @@ def main():
         )
         logger.info(
             f"  Spatial neg weights: {fmt_stats(train_stats['neg_weight_stats'])}"
+        )
+        logger.info(
+            f"  Pairs/batch: "
+            f"spec {train_stats.get('spectral_pos_pairs', 0)}+ {train_stats.get('spectral_neg_pairs', 0)}- | "
+            f"spat {train_stats.get('spatial_pos_pairs', 0)}+ {train_stats.get('spatial_neg_pairs', 0)}-"
         )
 
         # Log phase pair construction stats
