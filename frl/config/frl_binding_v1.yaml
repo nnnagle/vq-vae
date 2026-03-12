@@ -289,7 +289,7 @@ features:
       annual.nbr: {norm: zscore}
       annual.ndmi: {norm: zscore}
       annual.ndvi: {norm: zscore}
-      annual.spectral_velocity: {norm: zscore, transform: {name: log, epsilon: 0.001}}
+      annual.spectral_velocity: {norm: zscore}
       annual.seas_amp_red: {norm: zscore}
       annual.seas_amp_nir: {norm: zscore}
       annual.seas_amp_swir1: {norm: zscore}
