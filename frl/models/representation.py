@@ -111,6 +111,9 @@ class RepresentationModel(nn.Module):
         phase_tcn_dilations: List[int] = (1, 2, 4),
         phase_tcn_dropout: float = 0.1,
         phase_tcn_num_groups: int = 8,
+        # phase input encoder (depthwise pointwise nonlinearity, applied before TCN)
+        phase_input_encoder_num_layers: int = 0,
+        phase_input_encoder_activation: str = "gelu",
     ) -> None:
         super().__init__()
 
@@ -143,6 +146,35 @@ class RepresentationModel(nn.Module):
             gate_hidden=spatial_conv_gate_hidden,
             gate_kernel_size=spatial_conv_gate_kernel_size,
         )
+
+        # --- Phase input encoder (optional per-band nonlinearity before TCN) ---
+        # Each layer is a depthwise Conv1d(C, C, k=1, groups=C) + activation.
+        # groups=in_channels means each band is transformed independently —
+        # no cross-band mixing, no temporal mixing.  Initialized near identity
+        # (weight=1, bias=0) so training starts from the same baseline as having
+        # no pre-encoder.
+        if phase_input_encoder_num_layers > 0:
+            _act_map = {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU}
+            if phase_input_encoder_activation not in _act_map:
+                raise ValueError(
+                    f"phase_input_encoder_activation={phase_input_encoder_activation!r} "
+                    f"must be one of {list(_act_map)}"
+                )
+            act_cls = _act_map[phase_input_encoder_activation]
+            _layers: List[nn.Module] = []
+            for _ in range(phase_input_encoder_num_layers):
+                _layers.append(
+                    nn.Conv1d(phase_in_channels, phase_in_channels, kernel_size=1, groups=phase_in_channels)
+                )
+                _layers.append(act_cls())
+            self.phase_input_encoder: Optional[nn.Sequential] = nn.Sequential(*_layers)
+            # Near-identity init: each depthwise conv starts as w*x+0 with w=1.
+            for m in self.phase_input_encoder.modules():
+                if isinstance(m, nn.Conv1d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
+        else:
+            self.phase_input_encoder = None
 
         # --- Phase pathway ---
         self.phase_tcn = TCNEncoder(
@@ -208,6 +240,7 @@ class RepresentationModel(nn.Module):
         te = cfg.get("type_encoder", {})
         sc = cfg.get("spatial_conv", {})
         pt = cfg.get("phase_tcn", {})
+        pie = cfg.get("phase_input_encoder", {})
 
         # input_dropout may be a scalar (constant) or a schedule dict.
         # At construction time we always use the initial rate:
@@ -245,6 +278,9 @@ class RepresentationModel(nn.Module):
             phase_tcn_dilations=pt.get("dilations", [1, 2, 4]),
             phase_tcn_dropout=pt.get("dropout", 0.1),
             phase_tcn_num_groups=pt.get("num_groups", 8),
+            # phase input encoder
+            phase_input_encoder_num_layers=pie.get("num_layers", 0),
+            phase_input_encoder_activation=pie.get("activation", "gelu"),
         )
 
     def set_input_dropout_rate(self, rate: float) -> None:
@@ -304,6 +340,13 @@ class RepresentationModel(nn.Module):
         B, C, T, H, W = x_phase.shape
         zp = self.z_phase_dim
 
+        # Optional per-band nonlinear pre-encoder (no temporal/cross-band mixing)
+        if self.phase_input_encoder is not None:
+            # Flatten spatial dims so Conv1d sees [B*H*W, C, T]
+            x_flat = x_phase.permute(0, 3, 4, 1, 2).reshape(B * H * W, C, T)
+            x_flat = self.phase_input_encoder(x_flat)
+            x_phase = x_flat.reshape(B, H, W, C, T).permute(0, 3, 4, 1, 2)
+
         # TCN along time: [B, C_phase, T, H, W] -> [B, tcn_out, T, H, W]
         h = self.phase_tcn(x_phase)
 
@@ -353,6 +396,10 @@ class RepresentationModel(nn.Module):
         """
         N, C, T = x_phase_pixels.shape
         zp = self.z_phase_dim
+
+        # Optional per-band nonlinear pre-encoder (no temporal/cross-band mixing)
+        if self.phase_input_encoder is not None:
+            x_phase_pixels = self.phase_input_encoder(x_phase_pixels)
 
         # TCN accepts [N, C, T] directly (no spatial reshape needed)
         h = self.phase_tcn(x_phase_pixels)  # [N, tcn_out, T]

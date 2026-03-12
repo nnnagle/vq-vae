@@ -61,3 +61,22 @@ phase_tcn:
   dilations: [1, 2, 4]
   dropout: 0.1
   num_groups: 8
+
+# ================================================================
+# Phase input encoder (optional, applied before phase_tcn)
+# ================================================================
+# A stack of depthwise Conv1d(C, C, k=1, groups=C) + activation layers.
+# Each band is transformed independently — no cross-band mixing, no
+# temporal mixing.  Useful when phase_ccdc bands are heavily skewed
+# (e.g. most mass above the 95th percentile): the learned per-band
+# nonlinearity can compress the dynamic range before the TCN sees the data.
+#
+# Initialized near identity (weight=1, bias=0) so training starts from
+# the same baseline as num_layers: 0.
+#
+# activation choices: gelu (default), relu, silu
+#
+# To disable entirely, set num_layers: 0 or omit this section.
+phase_input_encoder:
+  num_layers: 0        # set to 2 or 3 to enable
+  activation: gelu
