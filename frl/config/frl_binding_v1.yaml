@@ -104,6 +104,12 @@ dataset: # These exist in the zarr
       - {name: ysfc_censored, source: annual/lcms_ysfc_censored/data/lcms_ysfc_censored_1985_2024}
 
   
+  static_categorical:
+    type: int16
+    dim: [C,H,W]
+    channels:
+      - {name: evt, source: static/evt/data/evt}
+
   static:
     type: float16
     dim: [C,H,W]
@@ -310,6 +316,12 @@ features:
       annual.seas_amp_nir: {norm: zscore}
       annual.seas_amp_swir1: {norm: zscore}
       annual.seas_amp_swir2: {norm: zscore}
+  evt_class:
+    dim: [C,H,W]
+    stats_type: categorical
+    channels:
+      static_categorical.evt: {norm: identity}
+
   ysfc_min:
     dim: [C,H,W]
     channels:

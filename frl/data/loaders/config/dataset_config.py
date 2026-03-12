@@ -272,6 +272,7 @@ class FeatureConfig:
     channels: Dict[str, FeatureChannelConfig]  # channel_ref -> config
     masks: Optional[List[str]] = None  # Feature-level masks
     covariance: Optional[CovarianceConfig] = None
+    stats_type: str = "continuous"  # "continuous" or "categorical"
 
     def get_channel_list(self) -> List[str]:
         """Get ordered list of channel references."""

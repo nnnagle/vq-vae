@@ -175,6 +175,10 @@ class StatsCalculator:
             logger.warning(f"No valid data for feature {feature_name}")
             return {}
 
+        # Branch on stats type
+        if feature_config.stats_type == 'categorical':
+            return self._compute_categorical_stats(patch_data_list, feature_config)
+
         # Compute univariate stats
         channel_stats = self._compute_univariate_stats(
             patch_data_list, feature_config
@@ -395,6 +399,56 @@ class StatsCalculator:
                     channel_stats[name] = float(val)
 
             stats_dict[channel_name] = channel_stats
+
+        return stats_dict
+
+    def _compute_categorical_stats(
+        self,
+        patch_data_list: List[Tuple[np.ndarray, np.ndarray]],
+        feature_config: FeatureConfig,
+    ) -> Dict[str, Any]:
+        """Compute per-class pixel counts and percentages for categorical channels.
+
+        Args:
+            patch_data_list: List of (feature_data, valid_mask) tuples
+            feature_config: Feature configuration (stats_type == 'categorical')
+
+        Returns:
+            Dictionary mapping channel names to {'counts': {...}, 'percent': {...}}
+        """
+        channel_names = list(feature_config.channels.keys())
+        n_channels = len(channel_names)
+
+        # Accumulate integer class values per channel across all patches
+        channel_values: List[List[np.ndarray]] = [[] for _ in range(n_channels)]
+
+        for feature_data, valid_mask in patch_data_list:
+            # feature_data: [C, H, W] (categorical features are always static)
+            for c in range(n_channels):
+                valid_vals = feature_data[c][valid_mask]
+                if len(valid_vals) > 0:
+                    channel_values[c].append(valid_vals)
+
+        stats_dict = {}
+        for channel_name, val_chunks in zip(channel_names, channel_values):
+            if not val_chunks:
+                logger.warning(f"No valid values for categorical channel {channel_name}")
+                continue
+
+            all_vals = np.concatenate(val_chunks).astype(np.int32)
+            classes, counts = np.unique(all_vals, return_counts=True)
+            total = int(counts.sum())
+
+            counts_dict = {str(int(cls)): int(cnt) for cls, cnt in zip(classes, counts)}
+            percent_dict = {
+                str(int(cls)): round(float(cnt) / total * 100.0, 4)
+                for cls, cnt in zip(classes, counts)
+            }
+
+            stats_dict[channel_name] = {
+                'counts': counts_dict,
+                'percent': percent_dict,
+            }
 
         return stats_dict
 

@@ -386,12 +386,15 @@ class DatasetBindingsParser:
                 stat_domain=cov_spec.get('stat_domain', 'patch'),
             )
 
+        stats_type = feature_spec.get('stats_type', 'continuous')
+
         return FeatureConfig(
             name=feature_name,
             dim=dim,
             channels=channels,
             masks=masks,
             covariance=covariance,
+            stats_type=stats_type,
         )
 
     def _parse_feature_channel(
