@@ -1133,7 +1133,11 @@ def main():
             #  Segment 4 — second cosine (phase_warmup_end_step → total_steps):
             #    LR decays from peak_factor × lr down to eta_min over the remainder
             #    of training (~165 epochs for a 200-epoch run).
-            phase_start_epoch = phase_config['curriculum_start_epoch']
+            # curriculum_start_epoch is the epoch where cw is first evaluated, but
+            # cw = (epoch - start_epoch) / ramp = 0 when epoch == start_epoch exactly.
+            # Phase gradients first appear at start_epoch + 1, so that is where the
+            # LR drop must land.
+            phase_start_epoch = phase_config['curriculum_start_epoch'] + 1
             phase_start_step = phase_start_epoch * len(train_dataloader)
             phase_warmup_end_step = (
                 phase_start_step + phase_warmup_cfg.epochs * len(train_dataloader)
