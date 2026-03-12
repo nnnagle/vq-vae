@@ -1121,10 +1121,14 @@ def main():
             #    freely.
             #
             #  Segment 3 — phase re-warmup (phase_start_step → phase_warmup_end_step):
-            #    Phase loss enters and introduces a new, hard gradient signal.
-            #    LR ramps linearly from its current cosine value back up to
-            #    peak_factor × lr so the optimizer can adapt without destabilising
-            #    the already-learned representations.
+            #    Phase loss enters. AdamW's variance estimates (v_t) for phase
+            #    parameters are zero at this point — bias correction makes the first
+            #    update a unit-norm step regardless of gradient magnitude, so a high
+            #    LR here causes overshooting. To counteract this:
+            #      a) LR drops immediately to start_factor × lr at phase_start_step,
+            #         giving low-LR steps to let v_t accumulate accurate estimates.
+            #      b) LR then ramps linearly to peak_factor × lr over phase_warmup.epochs,
+            #         mirroring the initial warmup but scoped to the phase-loss entry.
             #
             #  Segment 4 — second cosine (phase_warmup_end_step → total_steps):
             #    LR decays from peak_factor × lr down to eta_min over the remainder
@@ -1134,35 +1138,33 @@ def main():
             phase_warmup_end_step = (
                 phase_start_step + phase_warmup_cfg.epochs * len(train_dataloader)
             )
-            second_peak = phase_warmup_cfg.peak_factor  # multiplier on peak lr
-
-            # LR value the first cosine reaches at phase_start_step (segment 2 exit).
-            # Used as the starting point for the linear re-warmup ramp.
-            _seg2_progress = (phase_start_step - warmup_steps) / (total_steps - warmup_steps)
-            lr_at_phase_start = _cosine(1.0, eta_min_factor, _seg2_progress)
+            start_factor = phase_warmup_cfg.start_factor  # immediate drop on phase entry
+            second_peak = phase_warmup_cfg.peak_factor    # ramp target, as multiplier on peak lr
 
             logger.info(
                 f"Using two-phase cosine schedule: "
                 f"warmup={scheduler_config.warmup.epochs} epochs, "
                 f"phase re-warmup at epoch {phase_start_epoch} "
                 f"for {phase_warmup_cfg.epochs} epochs "
-                f"(peak_factor={second_peak}, lr_at_entry={lr_at_phase_start * lr:.2e})"
+                f"(start_factor={start_factor}, peak_factor={second_peak})"
             )
 
             def lr_lambda(step):
                 if step < warmup_steps:
-                    # Segment 1: linear warmup
+                    # Segment 1: linear warmup 0 → peak
                     return max(step / warmup_steps, 1e-8)
                 elif step < phase_start_step:
-                    # Segment 2: full-range cosine decay (phase loss is zero)
+                    # Segment 2: cosine decay (full-range) while phase loss is silent
                     progress = (step - warmup_steps) / (total_steps - warmup_steps)
                     return _cosine(1.0, eta_min_factor, progress)
                 elif step < phase_warmup_end_step:
-                    # Segment 3: linear re-warmup as phase loss enters
+                    # Segment 3: immediate drop to start_factor, then linear ramp to
+                    # peak_factor. The low starting LR lets AdamW's v_t accumulate
+                    # before taking large steps with the new phase gradients.
                     ramp_progress = (step - phase_start_step) / (phase_warmup_end_step - phase_start_step)
-                    return lr_at_phase_start + (second_peak - lr_at_phase_start) * ramp_progress
+                    return start_factor + (second_peak - start_factor) * ramp_progress
                 else:
-                    # Segment 4: cosine decay from second_peak to eta_min
+                    # Segment 4: cosine decay from peak_factor to eta_min
                     progress = (step - phase_warmup_end_step) / (total_steps - phase_warmup_end_step)
                     return _cosine(second_peak, eta_min_factor, progress)
 
