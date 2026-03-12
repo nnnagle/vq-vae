@@ -70,14 +70,20 @@ scheduler:
   # Spectral/spatial losses train freely while phase loss is silent (weight=0).
 
   # Phase 3 (curriculum_start_epoch → curriculum_start_epoch + phase_warmup.epochs):
-  # Brief re-warmup when phase loss enters. The optimizer sees a new hard signal
-  # (phase contrastive loss) and benefits from a small LR bump to adapt without
-  # destabilizing the already-learned spectral/spatial representations.
-  # LR ramps linearly from its current cosine value back up to peak_factor × lr.
+  # True re-warmup for phase parameters. When phase loss enters, AdamW's variance
+  # estimates (v_t) for phase-specific parameters are zero — bias correction makes
+  # the first update a unit-norm step at whatever LR is current, which is dangerously
+  # large near peak. To fix this:
+  #   a) LR drops immediately to start_factor × lr at curriculum_start_epoch,
+  #      giving the optimizer low-LR steps to accumulate reliable v_t estimates.
+  #   b) LR then ramps linearly up to peak_factor × lr over phase_warmup.epochs,
+  #      mirroring the initial warmup but scoped to the phase-loss entry point.
   phase_warmup:
     enabled: true
-    epochs: 5           # short ramp — just enough to absorb new phase gradients
-    peak_factor: 1.0    # ramp back to full peak lr (1.0); reduce if re-warmup is too aggressive
+    epochs: 5           # length of the ramp from start_factor → peak_factor
+    start_factor: 0.05  # immediate LR drop on phase entry (5% of peak); low enough
+                        # for AdamW to accumulate v_t before taking large steps
+    peak_factor: 1.0    # LR target at end of re-warmup; 1.0 = back to full peak lr
 
   # Phase 4 (phase_warmup_end → end): cosine decay from peak_factor × lr down to eta_min.
   # ~165 epochs of smooth decay covering the bulk of training.
