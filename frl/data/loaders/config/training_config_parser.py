@@ -235,19 +235,36 @@ class WarmupConfig:
 
 
 @dataclass
+class PhaseWarmupConfig:
+    """Re-warmup config for when the phase loss curriculum activates"""
+    enabled: bool = True
+    epochs: int = 5
+    start_factor: float = 0.05
+    peak_factor: float = 1.0
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'PhaseWarmupConfig':
+        return cls(**{k: v for k, v in d.items() if k in cls.__annotations__})
+
+
+@dataclass
 class SchedulerConfig:
     """Learning rate scheduler configuration"""
     name: str = "cosine_warmup"
     warmup: WarmupConfig = field(default_factory=WarmupConfig)
+    phase_warmup: Optional['PhaseWarmupConfig'] = None
     T_max: int = 95
     eta_min: float = 1e-6
-    
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'SchedulerConfig':
         warmup = WarmupConfig.from_dict(d.get('warmup', {}))
+        phase_warmup_dict = d.get('phase_warmup')
+        phase_warmup = PhaseWarmupConfig.from_dict(phase_warmup_dict) if phase_warmup_dict else None
         return cls(
             name=d.get('name', 'cosine_warmup'),
             warmup=warmup,
+            phase_warmup=phase_warmup,
             T_max=d.get('T_max', 95),
             eta_min=d.get('eta_min', 1e-6)
         )
