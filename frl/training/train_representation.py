@@ -1091,106 +1091,8 @@ def main():
         weight_decay=weight_decay,
     )
 
-    # Create scheduler with optional warmup
-    scheduler_config = training_config.scheduler
-    total_steps = num_epochs * len(train_dataloader)
-    eta_min_factor = scheduler_config.eta_min / lr  # express eta_min as a multiplier on peak lr
-
-    def _cosine(start_val, end_val, progress):
-        """Cosine interpolation from start_val to end_val over [0, 1]."""
-        return end_val + (start_val - end_val) * 0.5 * (1.0 + np.cos(np.pi * progress))
-
-    if scheduler_config.warmup.enabled:
-        warmup_steps = scheduler_config.warmup.epochs * len(train_dataloader)
-        phase_warmup_cfg = getattr(scheduler_config, 'phase_warmup', None)
-
-        if (
-            phase_warmup_cfg is not None
-            and phase_warmup_cfg.enabled
-            and phase_config is not None
-        ):
-            # Two-phase LR schedule to accommodate the phase-loss curriculum:
-            #
-            #  Segment 1 — initial warmup (0 → warmup_steps):
-            #    LR rises linearly 0 → peak. Prevents large updates while weights
-            #    are uninitialized.
-            #
-            #  Segment 2 — first cosine (warmup_steps → phase_start_step):
-            #    LR decays along the full-range cosine (as if running to total_steps).
-            #    Phase loss is zero during this window; spectral/spatial losses train
-            #    freely.
-            #
-            #  Segment 3 — phase re-warmup (phase_start_step → phase_warmup_end_step):
-            #    Phase loss enters. AdamW's variance estimates (v_t) for phase
-            #    parameters are zero at this point — bias correction makes the first
-            #    update a unit-norm step regardless of gradient magnitude, so a high
-            #    LR here causes overshooting. To counteract this:
-            #      a) LR drops immediately to start_factor × lr at phase_start_step,
-            #         giving low-LR steps to let v_t accumulate accurate estimates.
-            #      b) LR then ramps linearly to peak_factor × lr over phase_warmup.epochs,
-            #         mirroring the initial warmup but scoped to the phase-loss entry.
-            #
-            #  Segment 4 — second cosine (phase_warmup_end_step → total_steps):
-            #    LR decays from peak_factor × lr down to eta_min over the remainder
-            #    of training (~165 epochs for a 200-epoch run).
-            # curriculum_start_epoch is the epoch where cw is first evaluated, but
-            # cw = (epoch - start_epoch) / ramp = 0 when epoch == start_epoch exactly.
-            # Phase gradients first appear at start_epoch + 1, so that is where the
-            # LR drop must land.
-            phase_start_epoch = phase_config['curriculum_start_epoch'] + 1
-            phase_start_step = phase_start_epoch * len(train_dataloader)
-            phase_warmup_end_step = (
-                phase_start_step + phase_warmup_cfg.epochs * len(train_dataloader)
-            )
-            start_factor = phase_warmup_cfg.start_factor  # immediate drop on phase entry
-            second_peak = phase_warmup_cfg.peak_factor    # ramp target, as multiplier on peak lr
-
-            logger.info(
-                f"Using two-phase cosine schedule: "
-                f"warmup={scheduler_config.warmup.epochs} epochs, "
-                f"phase re-warmup at epoch {phase_start_epoch} "
-                f"for {phase_warmup_cfg.epochs} epochs "
-                f"(start_factor={start_factor}, peak_factor={second_peak})"
-            )
-
-            def lr_lambda(step):
-                if step < warmup_steps:
-                    # Segment 1: linear warmup 0 → peak
-                    return max(step / warmup_steps, 1e-8)
-                elif step < phase_start_step:
-                    # Segment 2: cosine decay (full-range) while phase loss is silent
-                    progress = (step - warmup_steps) / (total_steps - warmup_steps)
-                    return _cosine(1.0, eta_min_factor, progress)
-                elif step < phase_warmup_end_step:
-                    # Segment 3: immediate drop to start_factor, then linear ramp to
-                    # peak_factor. The low starting LR lets AdamW's v_t accumulate
-                    # before taking large steps with the new phase gradients.
-                    ramp_progress = (step - phase_start_step) / (phase_warmup_end_step - phase_start_step)
-                    return start_factor + (second_peak - start_factor) * ramp_progress
-                else:
-                    # Segment 4: cosine decay from peak_factor to eta_min
-                    progress = (step - phase_warmup_end_step) / (total_steps - phase_warmup_end_step)
-                    return _cosine(second_peak, eta_min_factor, progress)
-
-        else:
-            # Standard single-phase: linear warmup + cosine annealing
-            logger.info(f"Using cosine scheduler with {warmup_steps} warmup steps")
-
-            def lr_lambda(step):
-                if step < warmup_steps:
-                    return max(step / warmup_steps, 1e-8)
-                else:
-                    progress = (step - warmup_steps) / (total_steps - warmup_steps)
-                    return _cosine(1.0, eta_min_factor, progress)
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    else:
-        logger.info(f"Using cosine annealing scheduler: eta_min={scheduler_config.eta_min}")
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps,
-            eta_min=scheduler_config.eta_min,
-        )
+    # Scheduler is created after phase_config below, so it can condition on whether
+    # phase loss is active (needed for the two-phase LR schedule).
 
     # Loss and training config — sourced from parsed bindings YAML.
     spectral_loss_cfg = bindings_config.get_loss('infonce_type_spectral')
@@ -1406,6 +1308,110 @@ def main():
         )
     else:
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
+
+    # Create scheduler with optional warmup.
+    # Must be after phase_config is built so the two-phase branch can read
+    # curriculum_start_epoch from it.
+    scheduler_config = training_config.scheduler
+    total_steps = num_epochs * len(train_dataloader)
+    eta_min_factor = scheduler_config.eta_min / lr  # express eta_min as a multiplier on peak lr
+
+    def _cosine(start_val, end_val, progress):
+        """Cosine interpolation from start_val to end_val over [0, 1]."""
+        return end_val + (start_val - end_val) * 0.5 * (1.0 + np.cos(np.pi * progress))
+
+    if scheduler_config.warmup.enabled:
+        warmup_steps = scheduler_config.warmup.epochs * len(train_dataloader)
+        phase_warmup_cfg = getattr(scheduler_config, 'phase_warmup', None)
+
+        if (
+            phase_warmup_cfg is not None
+            and phase_warmup_cfg.enabled
+            and phase_config is not None
+        ):
+            # Two-phase LR schedule to accommodate the phase-loss curriculum:
+            #
+            #  Segment 1 — initial warmup (0 → warmup_steps):
+            #    LR rises linearly 0 → peak. Prevents large updates while weights
+            #    are uninitialized.
+            #
+            #  Segment 2 — first cosine (warmup_steps → phase_start_step):
+            #    LR decays along the full-range cosine (as if running to total_steps).
+            #    Phase loss is zero during this window; spectral/spatial losses train
+            #    freely.
+            #
+            #  Segment 3 — phase re-warmup (phase_start_step → phase_warmup_end_step):
+            #    Phase loss enters. AdamW's variance estimates (v_t) for phase
+            #    parameters are zero at this point — bias correction makes the first
+            #    update a unit-norm step regardless of gradient magnitude, so a high
+            #    LR here causes overshooting. To counteract this:
+            #      a) LR drops immediately to start_factor × lr at phase_start_step,
+            #         giving low-LR steps to let v_t accumulate accurate estimates.
+            #      b) LR then ramps linearly to peak_factor × lr over phase_warmup.epochs,
+            #         mirroring the initial warmup but scoped to the phase-loss entry.
+            #
+            #  Segment 4 — second cosine (phase_warmup_end_step → total_steps):
+            #    LR decays from peak_factor × lr down to eta_min over the remainder
+            #    of training (~165 epochs for a 200-epoch run).
+            #
+            # curriculum_start_epoch is the epoch where cw is first evaluated, but
+            # cw = (epoch - start_epoch) / ramp = 0 when epoch == start_epoch exactly.
+            # Phase gradients first appear at start_epoch + 1, so that is where the
+            # LR drop must land.
+            phase_start_epoch = phase_config['curriculum_start_epoch'] + 1
+            phase_start_step = phase_start_epoch * len(train_dataloader)
+            phase_warmup_end_step = (
+                phase_start_step + phase_warmup_cfg.epochs * len(train_dataloader)
+            )
+            start_factor = phase_warmup_cfg.start_factor  # immediate drop on phase entry
+            second_peak = phase_warmup_cfg.peak_factor    # ramp target, as multiplier on peak lr
+
+            logger.info(
+                f"Using two-phase cosine schedule: "
+                f"warmup={scheduler_config.warmup.epochs} epochs, "
+                f"phase re-warmup at epoch {phase_start_epoch} "
+                f"for {phase_warmup_cfg.epochs} epochs "
+                f"(start_factor={start_factor}, peak_factor={second_peak})"
+            )
+
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    # Segment 1: linear warmup 0 → peak
+                    return max(step / warmup_steps, 1e-8)
+                elif step < phase_start_step:
+                    # Segment 2: cosine decay (full-range) while phase loss is silent
+                    progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                    return _cosine(1.0, eta_min_factor, progress)
+                elif step < phase_warmup_end_step:
+                    # Segment 3: immediate drop to start_factor, then linear ramp to
+                    # peak_factor. The low starting LR lets AdamW's v_t accumulate
+                    # before taking large steps with the new phase gradients.
+                    ramp_progress = (step - phase_start_step) / (phase_warmup_end_step - phase_start_step)
+                    return start_factor + (second_peak - start_factor) * ramp_progress
+                else:
+                    # Segment 4: cosine decay from peak_factor to eta_min
+                    progress = (step - phase_warmup_end_step) / (total_steps - phase_warmup_end_step)
+                    return _cosine(second_peak, eta_min_factor, progress)
+
+        else:
+            # Standard single-phase: linear warmup + cosine annealing
+            logger.info(f"Using cosine scheduler with {warmup_steps} warmup steps")
+
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return max(step / warmup_steps, 1e-8)
+                else:
+                    progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                    return _cosine(1.0, eta_min_factor, progress)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        logger.info(f"Using cosine annealing scheduler: eta_min={scheduler_config.eta_min}")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=scheduler_config.eta_min,
+        )
 
     # Create output directories
     ckpt_dir = Path(checkpoint_dir)
