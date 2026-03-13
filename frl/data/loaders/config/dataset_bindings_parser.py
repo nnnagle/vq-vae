@@ -32,6 +32,7 @@ from .dataset_config import (
     YsfcOverlapConfig,
     PairStrategyConfig,
     SpectralWeightingConfig,
+    TopoDistanceConfig,
     PairWeightsConfig,
     CurriculumConfig,
     LossConfig,
@@ -567,6 +568,27 @@ class DatasetBindingsParser:
                 min_weight=sw.get('min_weight', 0.01),
             )
 
+        # Topo distance blend for spectral pair selection
+        topo_distance = None
+        if 'topo_distance' in spec:
+            td = spec['topo_distance']
+            topo_distance = TopoDistanceConfig(
+                feature=td['feature'],
+                lambda_max=td.get('lambda_max', 0.3),
+                start_epoch=td.get('start_epoch', 0),
+                ramp_epochs=td.get('ramp_epochs', 0),
+            )
+
+        # Topo weighting for spatial pair positive weights
+        topo_weighting = None
+        if 'topo_weighting' in spec:
+            tw = spec['topo_weighting']
+            topo_weighting = SpectralWeightingConfig(
+                feature=tw['feature'],
+                tau=tw.get('tau', 1.0),
+                min_weight=tw.get('min_weight', 0.01),
+            )
+
         # Soft neighborhood-specific
         neighborhood_target = spec.get('neighborhood_target')
 
@@ -602,6 +624,8 @@ class DatasetBindingsParser:
             positive_strategy=positive_strategy,
             negative_strategy=negative_strategy,
             spectral_weighting=spectral_weighting,
+            topo_distance=topo_distance,
+            topo_weighting=topo_weighting,
             neighborhood_target=neighborhood_target,
             pair_strategy=pair_strategy,
             pair_weights=pair_weights,

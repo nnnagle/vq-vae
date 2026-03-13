@@ -410,6 +410,23 @@ class SpectralWeightingConfig:
 
 
 @dataclass
+class TopoDistanceConfig:
+    """Configuration for topographic distance blended into spectral pair selection.
+
+    The joint distance used for positive/negative selection is:
+        d_joint = d_spectral + topo_lambda(epoch) * d_topo
+
+    topo_lambda ramps linearly from 0 to lambda_max over ramp_epochs starting
+    at start_epoch, giving the spectral encoder time to stabilise before topo
+    influence is introduced.
+    """
+    feature: str          # e.g. 'features.infonce_type_topo'
+    lambda_max: float = 0.3
+    start_epoch: int = 0
+    ramp_epochs: int = 0
+
+
+@dataclass
 class CurriculumConfig:
     """Configuration for loss curriculum (ramp-in schedule)."""
     start_epoch: int = 0
@@ -436,6 +453,8 @@ class LossConfig:
     positive_strategy: Optional[PairEndpointStrategyConfig] = None
     negative_strategy: Optional[PairEndpointStrategyConfig] = None
     spectral_weighting: Optional[SpectralWeightingConfig] = None
+    topo_distance: Optional[TopoDistanceConfig] = None    # blend topo into spectral pair selection
+    topo_weighting: Optional[SpectralWeightingConfig] = None  # multiplicative topo weight for spatial pairs
 
     # --- soft_neighborhood-specific ---
     neighborhood_target: Optional[str] = None  # e.g. 'features.soft_neighborhood_phase'

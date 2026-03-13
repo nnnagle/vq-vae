@@ -272,18 +272,40 @@ features:
       calculate: true
       stat_domain: patch # options are patch stats vs global stats
   infonce_type_topo:
-    dim: [C,H,W]    
+    dim: [C,H,W]
     channels:
-      - static.elevation: {norm: zscore}
-      - static.northness: {norm: zscore}
+      static.elevation: {mask: static_mask.dem_mask,  norm: zscore}
+      static.slope:     {mask: static_mask.dem_mask,  norm: zscore}
+      static.northness: {mask: static_mask.dem_mask,  norm: zscore}
+      static.eastness:  {mask: static_mask.dem_mask,  norm: zscore}
+      static.hand:      {mask: static_mask.hand_mask, norm: zscore}
+      static.twi:       {mask: static_mask.twi_mask,  norm: zscore}
+      static.tpi:       {mask: static_mask.tpi_mask,  norm: robust_iqr}
+      static.ksat:      {mask: static_mask.ksat_mask, norm: robust_iqr}
     masks:
       - static_mask.aoi
       - static_mask.forest
-      - static_mask.dem_mask
-    covariance: 
-      dim: [C,C]      
+    covariance:
+      dim: [C,C]
       calculate: true
       stat_domain: patch
+
+  infonce_type_fine_topo:
+    # Native-30m topo variables only (HAND excluded — coarser resolution).
+    # Used for spatial-loss pair weighting where the positive window is 8px=240m;
+    # at that scale HAND cells are repeated and add no discriminating information.
+    dim: [C,H,W]
+    channels:
+      static.elevation: {mask: static_mask.dem_mask,  norm: zscore}
+      static.slope:     {mask: static_mask.dem_mask,  norm: zscore}
+      static.northness: {mask: static_mask.dem_mask,  norm: zscore}
+      static.eastness:  {mask: static_mask.dem_mask,  norm: zscore}
+      static.twi:       {mask: static_mask.twi_mask,  norm: zscore}
+      static.tpi:       {mask: static_mask.tpi_mask,  norm: robust_iqr}
+      static.ksat:      {mask: static_mask.ksat_mask, norm: robust_iqr}
+    masks:
+      - static_mask.aoi
+      - static_mask.forest
   phase_ccdc:
     dim: [C,T,H,W]
     channels:
@@ -433,6 +455,17 @@ losses:
       metric: l2
       covariance: true  # Mahalanobis (L2 in whitened space)
 
+    # Topographic distance blended into pair selection:
+    #   d_joint = d_spectral + topo_lambda * d_topo
+    # topo_lambda ramps from 0 → lambda_max over ramp_epochs starting at start_epoch.
+    # Keeps the spectral encoder as the primary driver; topo resolves the dry-mesic
+    # axis that spectral features alone cannot separate.
+    topo_distance:
+      feature: features.infonce_type_topo
+      lambda_max: 0.3
+      start_epoch: 10   # Begin after spectral encoder has warmed up
+      ramp_epochs: 10   # Linear ramp epochs 10–20
+
     anchor:
       population: grid-plus-supplement
 
@@ -487,6 +520,16 @@ losses:
     spectral_weighting:
       feature: features.infonce_type_spectral
       tau: 5                # scale for exp(-d/tau)
+      min_weight: 0.03
+
+    # Multiplicative topo weighting for positive pairs only.
+    # Uses native-30m variables (HAND excluded — too coarse for the 8px positive window).
+    # Downweights ridge-crossing pairs where northness/TWI/etc. flip sharply even
+    # though the pixels are spatially adjacent, preventing the spatial loss from
+    # pulling topo-distinct pixels together.
+    topo_weighting:
+      feature: features.infonce_type_fine_topo
+      tau: 2.0              # scale for exp(-d_topo/tau); tune alongside spectral tau
       min_weight: 0.03
 
   # Phase trajectory matching (soft neighborhood KL)

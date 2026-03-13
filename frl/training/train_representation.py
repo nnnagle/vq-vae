@@ -92,6 +92,34 @@ def compute_input_dropout_rate(
         raise ValueError(f"Unknown input_dropout schedule: {schedule!r}")
 
 
+def compute_topo_lambda(config: dict, epoch: int) -> float:
+    """Return the topo_lambda blending weight for the current epoch.
+
+    topo_lambda ramps linearly from 0 to ``topo_lambda_max`` over
+    ``topo_ramp_epochs`` starting at ``topo_start_epoch``.  When
+    ``topo_lambda_max`` is 0 (default) the function short-circuits to 0.0
+    so the topo blending path is skipped entirely.
+
+    Args:
+        config: Loss config dict (must contain topo_lambda_max, topo_start_epoch,
+            topo_ramp_epochs keys; defaults to 0 / disabled).
+        epoch: Current epoch index (0-based).
+
+    Returns:
+        Current topo blending weight in [0, lambda_max].
+    """
+    lambda_max = float(config.get('topo_lambda_max', 0.0))
+    if lambda_max == 0.0:
+        return 0.0
+    start_epoch = int(config.get('topo_start_epoch', 0))
+    ramp_epochs = int(config.get('topo_ramp_epochs', 0))
+    if epoch < start_epoch:
+        return 0.0
+    if ramp_epochs == 0 or epoch >= start_epoch + ramp_epochs:
+        return lambda_max
+    return lambda_max * (epoch - start_epoch) / ramp_epochs
+
+
 def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
     # a: [N, C], pairs: [P, 2] -> returns [P]
     v1 = a[pairs[:, 0]]
@@ -191,6 +219,17 @@ def process_batch(
         spec_dist_mask = torch.from_numpy(spec_dist_feature.mask).to(device)
         combined_mask = mask & spec_dist_mask
 
+        # Topo features for pair selection (built only when topo blending is active)
+        topo_lambda = compute_topo_lambda(config, epoch)
+        topo_dist_data = None
+        fine_topo_data = None
+        if topo_lambda > 0.0 and config.get('topo_lambda_max', 0.0) > 0.0:
+            topo_dist_feature = feature_builder.build_feature('infonce_type_topo', sample)
+            topo_dist_data = torch.from_numpy(topo_dist_feature.data).float().to(device)
+        if config.get('spatial_topo_tau') is not None:
+            fine_topo_feature = feature_builder.build_feature('infonce_type_fine_topo', sample)
+            fine_topo_data = torch.from_numpy(fine_topo_feature.data).float().to(device)
+
         # Sample anchor locations
         anchors = sample_anchors_grid_plus_supplement(
             combined_mask,
@@ -212,9 +251,18 @@ def process_batch(
         spec_feat_distances = torch.cdist(spec_dist_at_anchors, spec_dist_at_anchors)
         spatial_distances = compute_spatial_distances(anchors)
 
+        # Blend topo distance into spectral distance for pair selection.
+        # d_joint = d_spectral + topo_lambda * d_topo
+        # topo_dist_data is None when topo_lambda == 0, so the spectral path is unchanged.
+        pair_selection_distances = spec_feat_distances
+        if topo_dist_data is not None and topo_lambda > 0.0:
+            topo_dist_at_anchors = extract_at_locations(topo_dist_data, anchors)
+            topo_feat_distances = torch.cdist(topo_dist_at_anchors, topo_dist_at_anchors)
+            pair_selection_distances = spec_feat_distances + topo_lambda * topo_feat_distances
+
         # Generate pairs for spectral loss
         spectral_pos_pairs, spectral_neg_pairs = pairs_with_spatial_constraint(
-            spec_feat_distances,
+            pair_selection_distances,
             spatial_distances,
             positive_k=config.get('positive_k', 16),
             positive_min_spatial=config.get('positive_min_spatial', 4.0),
@@ -287,13 +335,29 @@ def process_batch(
 
         tau = config.get("spatial_spectral_tau", 1.0)  # tune this
         min_w = config.get("spatial_min_w", 0.05)
-        
+
+        # Fine-topo data at unique coords for multiplicative topo weighting of positive pairs
+        fine_topo_unique = None
+        spatial_topo_tau = config.get("spatial_topo_tau")
+        spatial_topo_min_w = config.get("spatial_topo_min_w", 0.03)
+        if fine_topo_data is not None and spatial_topo_tau is not None:
+            fine_topo_unique = extract_at_locations(fine_topo_data, unique_coords)  # [Nuniq, C_topo]
+
         pos_weights = None
         neg_weights = None
-        
+
         if spatial_pos_pairs.numel() > 0:
             dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
+            # Multiply by topo similarity weight for positive pairs.
+            # This downweights ridge-crossing pairs (e.g. north-facing vs south-facing
+            # pixels within the 8px window) that the spectral weight alone misses.
+            if fine_topo_unique is not None:
+                dpos_topo = pair_l2(fine_topo_unique, spatial_pos_pairs)
+                topo_w = torch.exp(-dpos_topo / spatial_topo_tau).clamp(
+                    min=spatial_topo_min_w, max=1.0
+                )
+                pos_weights = (pos_weights * topo_w).clamp(min=min_w, max=1.0)
             all_pos_weights.append(pos_weights.detach())
 
         if spatial_neg_pairs.numel() > 0:
@@ -1205,6 +1269,36 @@ def main():
         'spectral_loss_weight': spectral_loss_cfg.weight if spectral_loss_cfg else 1.0,
         'spatial_loss_weight': spatial_loss_cfg.weight if spatial_loss_cfg else 1.0,
 
+        # Topo distance blend for spectral pair selection
+        # (topo_lambda is computed per-epoch inside process_batch via compute_topo_lambda)
+        'topo_lambda_max': (
+            spectral_loss_cfg.topo_distance.lambda_max
+            if spectral_loss_cfg and spectral_loss_cfg.topo_distance
+            else 0.0
+        ),
+        'topo_start_epoch': (
+            spectral_loss_cfg.topo_distance.start_epoch
+            if spectral_loss_cfg and spectral_loss_cfg.topo_distance
+            else 0
+        ),
+        'topo_ramp_epochs': (
+            spectral_loss_cfg.topo_distance.ramp_epochs
+            if spectral_loss_cfg and spectral_loss_cfg.topo_distance
+            else 0
+        ),
+
+        # Topo weighting for spatial loss positive pairs (None → disabled)
+        'spatial_topo_tau': (
+            spatial_loss_cfg.topo_weighting.tau
+            if spatial_loss_cfg and spatial_loss_cfg.topo_weighting
+            else None
+        ),
+        'spatial_topo_min_w': (
+            spatial_loss_cfg.topo_weighting.min_weight
+            if spatial_loss_cfg and spatial_loss_cfg.topo_weighting
+            else 0.03
+        ),
+
         # Training (from training config)
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
         'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
@@ -1253,9 +1347,12 @@ def main():
         f"spectral(k={loss_config['positive_k']}, min_spatial={loss_config['positive_min_spatial']}, "
         f"neg_q=[{loss_config['negative_quantile_low']}, {loss_config['negative_quantile_high']}], "
         f"neg_min_spatial={loss_config['negative_min_spatial']}, temp={loss_config['temperature']}), "
+        f"topo_blend(lambda_max={loss_config['topo_lambda_max']}, "
+        f"start={loss_config['topo_start_epoch']}, ramp={loss_config['topo_ramp_epochs']}), "
         f"spatial(neg_dist=[{loss_config['spatial_negative_min_dist']}, {loss_config['spatial_negative_max_dist']}], "
         f"neg_per_anchor={loss_config['spatial_negatives_per_anchor']}, "
         f"spec_tau={loss_config['spatial_spectral_tau']}, min_w={loss_config['spatial_min_w']}, "
+        f"topo_tau={loss_config['spatial_topo_tau']}, "
         f"temp={loss_config['spatial_temperature']}), "
         f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']})"
     )
