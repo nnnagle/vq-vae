@@ -24,6 +24,15 @@ Usage
         --evt-map    path/to/evt_crosswalk.csv \\
         --top-k-evt  15 \\
         --output-dir runs/gmm_evt_analysis/
+
+    python -m training.compare_gmm_evt \\
+        --checkpoint runs/frl_v0_exp005/checkpoints/encoder_best_1_epoch_197.pt \\
+        --training   runs/frl_v0_exp005/frl_training_v1.yaml \\
+        --bindings   runs/frl_v0_exp005/frl_binding_v1.yaml \\
+        --evt-map    ../data/LANDFIRE_EVT_v1_4_0_classes.csv \\
+        --top-k-evt  15 \\
+        --output-dir runs/frl_v0_exp005/gmm_evt_enalysis \\
+        --gmm        runs/frl_v0_exp005/checkpoints/gmm_k20_diag.pkl
 """
 
 from __future__ import annotations
