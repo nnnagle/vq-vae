@@ -632,11 +632,37 @@ class FeatureBuilder:
         self._transform_cache[cache_key] = whitening_matrix
         return whitening_matrix
 
+    def _get_cluster_channel_std(self, feature_name: str) -> Optional[np.ndarray]:
+        """Get the per-channel std vector used to z-score before applying L.
+
+        Stored by StatsCalculator as 'cluster_channel_std' alongside the matrix.
+        These are the stds computed in transform-space (after log/sqrt etc.).
+
+        Returns:
+            std vector [C] or None if not available
+        """
+        cache_key = f"{feature_name}_cluster_channel_std"
+        if cache_key in self._transform_cache:
+            return self._transform_cache[cache_key]
+
+        if not self.stats or feature_name not in self.stats:
+            return None
+
+        feature_stats = self.stats[feature_name]
+        std_list = feature_stats.get('cluster_channel_std')
+        if std_list is None:
+            return None
+
+        std = np.array(std_list, dtype=np.float64)
+        std[std < 1e-10] = 1.0
+        self._transform_cache[cache_key] = std
+        return std
+
     def _get_cluster_distance_matrix(self, feature_name: str) -> Optional[np.ndarray]:
         """Get or compute the Cholesky factor of the cluster distance matrix A.
 
-        A = sum_k A_k is loaded from the JSON stats file.  We compute L = chol(A)
-        so that L(X-mu) has the property that its L2 norm equals sqrt((X-Y)^T A (X-Y)).
+        A = sum_k A_k uses corr_j^{-1} blocks (pre-whitened), so A operates on
+        z-scored data. L = chol(A) is applied after centering AND dividing by std.
 
         Args:
             feature_name: Name of the feature
@@ -684,9 +710,14 @@ class FeatureBuilder:
     ) -> np.ndarray:
         """Apply cluster-weighted distance transform to feature data.
 
-        Centers data by subtracting per-channel means, then applies L so that
-        Euclidean distance in the output space equals sqrt((X-Y)^T A (X-Y))
-        where A is the cluster-weighted quadratic form matrix.
+        Pipeline:
+          1. Per-channel transform (log, sqrt, …)
+          2. Center (subtract mean)
+          3. Z-score (divide by std) — pre-whitening so A operates on unit-variance data
+          4. Apply L = chol(A) where A uses corr_j^{-1} blocks
+
+        Euclidean distance in the output space = sqrt((X-Y)^T A (X-Y)) where
+        X, Y are already z-scored.
 
         Args:
             data: Feature data [C, H, W] or [C, T, H, W]
@@ -705,7 +736,9 @@ class FeatureBuilder:
             )
             return data
 
-        # Apply pre-normalization transforms (log, sqrt, etc.)
+        channel_std = self._get_cluster_channel_std(feature_name)
+
+        # Apply per-channel transforms (log, sqrt, etc.)
         transformed_data = data.copy()
         channel_names = list(feature_config.channels.keys())
         for c_idx, channel_ref in enumerate(channel_names):
@@ -715,10 +748,15 @@ class FeatureBuilder:
                     transformed_data[c_idx], channel_config.transform
                 )
 
-        # Center by per-channel means
+        # Center
         channel_means = self._get_channel_means(feature_name, feature_config)
         for c_idx, mean in enumerate(channel_means):
             transformed_data[c_idx] -= mean
+
+        # Z-score (pre-whiten): divide by per-channel std so A operates on unit-variance data
+        if channel_std is not None:
+            for c_idx, s in enumerate(channel_std):
+                transformed_data[c_idx] /= s
 
         # Apply L: reshape to [C, N], multiply, reshape back
         original_shape = data.shape

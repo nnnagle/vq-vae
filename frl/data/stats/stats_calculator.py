@@ -590,6 +590,10 @@ class StatsCalculator:
         corr = sigma / np.outer(std, std)
         np.clip(corr, -1.0, 1.0, out=corr)
 
+        # Pre-whiten: A operates on z-scored data (divided by per-channel std),
+        # so the blocks use the correlation sub-matrix inverse, not covariance.
+        # FeatureBuilder divides by the same std vector before applying L=chol(A).
+
         # --- 3. Dissimilarity for clustering: 1 - |R| ---
         dissimilarity = 1.0 - np.abs(corr)
         np.fill_diagonal(dissimilarity, 0.0)
@@ -620,19 +624,21 @@ class StatsCalculator:
                 n_j = len(indices)
                 idx = np.array(indices)
 
-                sigma_j = sigma[np.ix_(idx, idx)]
-                sigma_j_reg = sigma_j + reg * np.eye(n_j)
+                corr_j = corr[np.ix_(idx, idx)]
+                corr_j_reg = corr_j + reg * np.eye(n_j)
 
                 try:
-                    sigma_j_inv = np.linalg.inv(sigma_j_reg)
+                    corr_j_inv = np.linalg.inv(corr_j_reg)
                 except np.linalg.LinAlgError:
                     logger.warning(
-                        f"Singular sub-covariance for cluster {label} at k={k}; using identity block"
+                        f"Singular sub-correlation for cluster {label} at k={k}; using identity block"
                     )
-                    sigma_j_inv = np.eye(n_j)
+                    corr_j_inv = np.eye(n_j)
 
-                # Scale: 1/(k * n_j) ensures equal contribution per cut and per cluster
-                block = sigma_j_inv / (k_actual * n_j)
+                # Scale: 1/(k * n_j) ensures equal contribution per cut and per cluster.
+                # Using corr_j_inv (not sigma_j_inv) keeps all blocks O(1) regardless of
+                # raw feature variance — the per-channel std scaling is handled in FeatureBuilder.
+                block = corr_j_inv / (k_actual * n_j)
                 A_k[np.ix_(idx, idx)] += block
 
                 solution.append({
@@ -645,6 +651,7 @@ class StatsCalculator:
 
         return {
             'cluster_distance_matrix': A.tolist(),
+            'cluster_channel_std': std.tolist(),  # per-channel std in transform space
             'cluster_solutions': cluster_solutions,
         }
 
