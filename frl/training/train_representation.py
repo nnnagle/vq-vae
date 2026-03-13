@@ -92,6 +92,75 @@ def compute_input_dropout_rate(
         raise ValueError(f"Unknown input_dropout schedule: {schedule!r}")
 
 
+def validate_feature_stats(
+    feature_builder: "FeatureBuilder",
+    bindings_config,
+) -> None:
+    """Fail fast if any covariance-enabled feature's cached stats are stale.
+
+    For each feature with ``covariance.calculate: true``, checks that the
+    covariance matrix stored in the stats JSON is square with side length equal
+    to the number of channels currently defined for that feature.
+
+    A mismatch means the feature definition was changed (channels added or
+    removed) after the stats were last computed.  Training would silently
+    produce wrong distances or crash mid-run with a cryptic matmul error.
+
+    Raises:
+        RuntimeError: Listing every stale feature with the expected vs. stored
+            channel count and the command needed to refresh the stats.
+    """
+    if not bindings_config.features:
+        return
+
+    errors = []
+    for feature_name, feature_cfg in bindings_config.features.items():
+        if not (feature_cfg.covariance and feature_cfg.covariance.calculate):
+            continue
+
+        n_channels_cfg = len(feature_cfg.channels)
+
+        # Look up the stored covariance
+        feature_stats = (feature_builder.stats or {}).get(feature_name, {})
+        covariance = feature_stats.get('covariance')
+
+        if covariance is None:
+            errors.append(
+                f"  '{feature_name}': covariance not found in stats "
+                f"(expected {n_channels_cfg}×{n_channels_cfg})"
+            )
+            continue
+
+        import numpy as np
+        cov = np.array(covariance)
+        if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+            errors.append(
+                f"  '{feature_name}': stored covariance is not square "
+                f"(shape {cov.shape})"
+            )
+            continue
+
+        n_channels_stats = cov.shape[0]
+        if n_channels_stats != n_channels_cfg:
+            errors.append(
+                f"  '{feature_name}': config has {n_channels_cfg} channels "
+                f"but stats covariance is {n_channels_stats}×{n_channels_stats} "
+                f"— feature definition changed since stats were computed"
+            )
+
+    if errors:
+        raise RuntimeError(
+            "Stale feature stats detected — rerun the stats script before training:\n"
+            "  python frl/examples/data/example_compute_stats.py\n"
+            "Mismatches:\n" + "\n".join(errors)
+        )
+
+    logger.info(
+        "Feature stats validation passed: all covariance-enabled features "
+        "match their cached stats."
+    )
+
+
 def compute_topo_lambda(config: dict, epoch: int) -> float:
     """Return the topo_lambda blending weight for the current epoch.
 
@@ -1116,6 +1185,11 @@ def main():
     # Create feature builder
     logger.info("Creating feature builder...")
     feature_builder = FeatureBuilder(bindings_config)
+
+    # Validate that cached stats match current feature definitions.
+    # Fails immediately if any covariance-enabled feature has a stale
+    # covariance matrix (e.g. channels were added without rerunning stats).
+    validate_feature_stats(feature_builder, bindings_config)
 
     # Read feature dimensions from bindings config
     type_in_channels = len(bindings_config.get_feature('ccdc_history').channels)
