@@ -31,7 +31,7 @@ Usage
         --bindings   runs/frl_v0_exp005/frl_binding_v1.yaml \\
         --evt-map    ../data/LANDFIRE_EVT_v1_4_0_classes.csv \\
         --top-k-evt  15 \\
-        --output-dir runs/frl_v0_exp005/gmm_evt_enalysis \\
+        --output-dir runs/frl_v0_exp005/gmm_evt_analysis \\
         --gmm        runs/frl_v0_exp005/checkpoints/gmm_k20_diag.pkl
 """
 
