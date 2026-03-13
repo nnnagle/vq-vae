@@ -201,6 +201,7 @@ class StatsCalculator:
                 patch_data_list, feature_config
             )
             result['cluster_distance_matrix'] = cd_result['cluster_distance_matrix']
+            result['cluster_channel_std'] = cd_result['cluster_channel_std']
             result['cluster_solutions'] = cd_result['cluster_solutions']
 
         return result
