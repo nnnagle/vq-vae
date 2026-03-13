@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
 from ..loaders.config.dataset_config import (
     BindingsConfig,
     FeatureConfig,
@@ -191,6 +194,14 @@ class StatsCalculator:
                 patch_data_list, feature_config
             )
             result['covariance'] = cov_matrix.tolist()
+
+        # Compute cluster-weighted distance matrix if requested
+        if feature_config.cluster_distance and feature_config.cluster_distance.calculate:
+            cd_result = self._compute_cluster_distance_matrix(
+                patch_data_list, feature_config
+            )
+            result['cluster_distance_matrix'] = cd_result['cluster_distance_matrix']
+            result['cluster_solutions'] = cd_result['cluster_solutions']
 
         return result
 
@@ -514,6 +525,128 @@ class StatsCalculator:
         else:
             # Global covariance (not implemented yet)
             raise NotImplementedError(f"stat_domain='{stat_domain}' not supported yet")
+
+    def _compute_cluster_distance_matrix(
+        self,
+        patch_data_list: List[Tuple[np.ndarray, np.ndarray]],
+        feature_config,
+    ) -> Dict[str, Any]:
+        """Compute cluster-weighted quadratic form distance matrix.
+
+        For each cut k in config.k_values, builds a block-diagonal matrix A_k
+        where each block corresponding to cluster C_j of size n_j is:
+
+            A_k[I_j, I_j] = (1 / (k * n_j)) * Sigma_j^{-1}
+
+        The (1/k) normalises across cuts so every cut contributes equal expected
+        squared distance regardless of granularity. The (1/n_j) normalises within
+        a cut so every cluster contributes equally regardless of size.
+
+        Returns A = sum_k A_k plus the per-k cluster solutions for inspection.
+
+        Args:
+            patch_data_list: List of (feature_data, valid_mask) tuples
+            feature_config: Feature configuration with cluster_distance settings
+
+        Returns:
+            Dict with:
+                'cluster_distance_matrix': [[...]] C x C matrix A
+                'cluster_solutions': {str(k): [{'indices': [...], 'channel_names': [...]}, ...]}
+        """
+        cd_cfg = feature_config.cluster_distance
+        n_channels = len(feature_config.channels)
+        channel_names = list(feature_config.channels.keys())
+
+        # --- 1. Collect valid observations into a [C, N] matrix ---
+        all_values = [[] for _ in range(n_channels)]
+
+        for feature_data, valid_mask in patch_data_list:
+            if feature_data.ndim == 3:
+                # [C, H, W]
+                for c in range(n_channels):
+                    vals = feature_data[c][valid_mask]
+                    all_values[c].extend(vals.flatten())
+            else:
+                # [C, T, H, W]
+                for c in range(n_channels):
+                    vals = feature_data[c][valid_mask]
+                    all_values[c].extend(vals.flatten())
+
+        if any(len(v) == 0 for v in all_values):
+            logger.warning("Some channels have no valid values; returning identity cluster distance matrix")
+            return {
+                'cluster_distance_matrix': np.eye(n_channels).tolist(),
+                'cluster_solutions': {},
+            }
+
+        min_len = min(len(v) for v in all_values)
+        data_matrix = np.stack([np.array(v[:min_len]) for v in all_values], axis=0)  # [C, N]
+
+        # --- 2. Covariance and correlation ---
+        sigma = np.cov(data_matrix)  # [C, C]
+
+        std = np.sqrt(np.diag(sigma))
+        std[std < 1e-10] = 1.0
+        corr = sigma / np.outer(std, std)
+        np.clip(corr, -1.0, 1.0, out=corr)
+
+        # --- 3. Dissimilarity for clustering: 1 - |R| ---
+        dissimilarity = 1.0 - np.abs(corr)
+        np.fill_diagonal(dissimilarity, 0.0)
+        condensed = squareform(dissimilarity, checks=False)
+
+        # --- 4. Hierarchical clustering ---
+        Z = linkage(condensed, method=cd_cfg.linkage_method)
+
+        # --- 5. Build A = sum_k A_k ---
+        A = np.zeros((n_channels, n_channels), dtype=np.float64)
+        cluster_solutions = {}
+
+        reg = 1e-6
+
+        for k in cd_cfg.k_values:
+            k_actual = min(k, n_channels)
+            labels = fcluster(Z, t=k_actual, criterion='maxclust')  # 1-indexed
+
+            # Group variable indices by cluster label
+            clusters = {}
+            for var_idx, label in enumerate(labels):
+                clusters.setdefault(label, []).append(var_idx)
+
+            A_k = np.zeros((n_channels, n_channels), dtype=np.float64)
+            solution = []
+
+            for label, indices in sorted(clusters.items()):
+                n_j = len(indices)
+                idx = np.array(indices)
+
+                sigma_j = sigma[np.ix_(idx, idx)]
+                sigma_j_reg = sigma_j + reg * np.eye(n_j)
+
+                try:
+                    sigma_j_inv = np.linalg.inv(sigma_j_reg)
+                except np.linalg.LinAlgError:
+                    logger.warning(
+                        f"Singular sub-covariance for cluster {label} at k={k}; using identity block"
+                    )
+                    sigma_j_inv = np.eye(n_j)
+
+                # Scale: 1/(k * n_j) ensures equal contribution per cut and per cluster
+                block = sigma_j_inv / (k_actual * n_j)
+                A_k[np.ix_(idx, idx)] += block
+
+                solution.append({
+                    'indices': idx.tolist(),
+                    'channel_names': [channel_names[i] for i in idx],
+                })
+
+            A += A_k
+            cluster_solutions[str(k)] = solution
+
+        return {
+            'cluster_distance_matrix': A.tolist(),
+            'cluster_solutions': cluster_solutions,
+        }
 
     def _save_stats(self, stats_dict: Dict[str, Any], output_path: Path) -> None:
         """Save statistics to JSON file.

@@ -180,7 +180,7 @@ def process_batch(
 
         # Build features
         encoder_feature = feature_builder.build_feature('ccdc_history', sample)
-        spec_dist_feature = feature_builder.build_feature('infonce_type_spectral', sample)
+        spec_dist_feature = feature_builder.build_feature('infonce_type_spectral_cluster', sample)
 
         # Convert to tensors
         encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)

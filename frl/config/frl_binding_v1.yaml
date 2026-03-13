@@ -271,6 +271,36 @@ features:
       dim: [C,C]
       calculate: true
       stat_domain: patch # options are patch stats vs global stats
+  infonce_type_spectral_cluster:
+    dim: [C,H,W]
+    channels:
+      static.mean_green: {norm: robust_iqr}
+      static.mean_red: {norm: robust_iqr}
+      static.mean_nir: {norm: robust_iqr}
+      static.mean_swir1: {norm: robust_iqr}
+      static.mean_swir2: {norm: robust_iqr}
+      static.mean_ndvi: {norm: robust_iqr}
+      static.mean_nbr: {norm: robust_iqr}
+      static.mean_ndmi: {norm: robust_iqr}
+      static.mean_seasonal_amp_red: {norm: robust_iqr}
+      static.mean_seasonal_amp_nir: {norm: robust_iqr}
+      static.mean_seasonal_amp_swir1: {norm: robust_iqr}
+      static.mean_seasonal_amp_swir2: {norm: robust_iqr}
+      static.variance_seasonal_amp_red: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_seasonal_amp_nir: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.spectral_distance_per_decade: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.mean_decline_rate: {norm: robust_iqr, transform: {name: log, epsilon: 0.0001}}
+      static.net_change_ndvi: {norm: robust_iqr}
+      static.num_segments: {norm: robust_iqr}
+      static.mean_segment_duration: {norm: robust_iqr}
+      static.mean_break_magnitude: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.rapid_loss_mean_magnitude: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_ndvi: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+    cluster_distance:
+      calculate: true
+      stat_domain: patch
+      k_values: [6, 8, 10, 12, 15]
+
   infonce_type_topo:
     dim: [C,H,W]    
     channels:
@@ -429,9 +459,9 @@ losses:
 
     # Distance metric for selecting positives/negatives
     auxiliary_distance:
-      feature: features.infonce_type_spectral
+      feature: features.infonce_type_spectral_cluster
       metric: l2
-      covariance: true  # Mahalanobis (L2 in whitened space)
+      covariance: false  # cluster distance transform applied by FeatureBuilder; plain L2 here
 
     anchor:
       population: grid-plus-supplement
@@ -485,7 +515,7 @@ losses:
     # Weight spatial pairs by spectral similarity so the loss
     # focuses on spatially-close pixels that are also spectrally similar.
     spectral_weighting:
-      feature: features.infonce_type_spectral
+      feature: features.infonce_type_spectral_cluster
       tau: 5                # scale for exp(-d/tau)
       min_weight: 0.03
 
@@ -516,7 +546,7 @@ losses:
       include_self: true
       # Stage 1: find type-similar candidates
       type_similarity:
-        feature: features.infonce_type_spectral
+        feature: features.infonce_type_spectral_cluster
         k: 16                  # candidates per anchor
       # Stage 2: keep only those with sufficient temporal overlap
       ysfc_overlap:
@@ -527,7 +557,7 @@ losses:
 
     # Continuous pair weighting from type encoder similarity
     pair_weights:
-      source: features.infonce_type_spectral   # w_ij = exp(-||d_spec_i - d_spec_j||₂ / sigma)
+      source: features.infonce_type_spectral_cluster   # w_ij = exp(-||d_spec_i - d_spec_j||₂ / sigma)
       sigma: 5.0
       self_pair_weight: 1.0    # self-pairs always weight 1
 

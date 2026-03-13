@@ -265,6 +265,21 @@ class CovarianceConfig:
 
 
 @dataclass
+class ClusterDistanceConfig:
+    """Configuration for cluster-weighted quadratic form distance.
+
+    Computes A = sum_k A_k where each A_k is block-diagonal with blocks
+    (1 / (k * n_j)) * Sigma_j^{-1} for each cluster C_j of size n_j.
+    This ensures every cut k contributes equal expected squared distance,
+    and within each cut every cluster contributes equally regardless of size.
+    """
+    calculate: bool           # Whether to compute
+    stat_domain: str          # 'patch' or 'global'
+    k_values: List[int]       # Cluster counts to try, e.g. [6, 8, 10, 12, 15]
+    linkage_method: str = 'average'  # scipy linkage method
+
+
+@dataclass
 class FeatureConfig:
     """Configuration for a feature (collection of channels with processing)."""
     name: str
@@ -272,7 +287,15 @@ class FeatureConfig:
     channels: Dict[str, FeatureChannelConfig]  # channel_ref -> config
     masks: Optional[List[str]] = None  # Feature-level masks
     covariance: Optional[CovarianceConfig] = None
+    cluster_distance: Optional[ClusterDistanceConfig] = None
     stats_type: str = "continuous"  # "continuous" or "categorical"
+
+    def __post_init__(self):
+        if self.covariance is not None and self.cluster_distance is not None:
+            raise ValueError(
+                f"Feature '{self.name}' cannot have both 'covariance' and "
+                f"'cluster_distance' — choose one weighting type."
+            )
 
     def get_channel_list(self) -> List[str]:
         """Get ordered list of channel references."""

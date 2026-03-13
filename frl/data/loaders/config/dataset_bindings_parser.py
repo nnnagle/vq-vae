@@ -20,6 +20,7 @@ from .dataset_config import (
     FeatureConfig,
     FeatureChannelConfig,
     CovarianceConfig,
+    ClusterDistanceConfig,
     JitterConfig,
     GridConfig,
     WeightByEntry,
@@ -386,6 +387,17 @@ class DatasetBindingsParser:
                 stat_domain=cov_spec.get('stat_domain', 'patch'),
             )
 
+        # Parse optional cluster_distance (mutually exclusive with covariance)
+        cluster_distance = None
+        if 'cluster_distance' in feature_spec:
+            cd_spec = feature_spec['cluster_distance']
+            cluster_distance = ClusterDistanceConfig(
+                calculate=cd_spec.get('calculate', False),
+                stat_domain=cd_spec.get('stat_domain', 'patch'),
+                k_values=cd_spec.get('k_values', [6, 8, 10, 12, 15]),
+                linkage_method=cd_spec.get('linkage_method', 'average'),
+            )
+
         stats_type = feature_spec.get('stats_type', 'continuous')
 
         return FeatureConfig(
@@ -394,6 +406,7 @@ class DatasetBindingsParser:
             channels=channels,
             masks=masks,
             covariance=covariance,
+            cluster_distance=cluster_distance,
             stats_type=stats_type,
         )
 

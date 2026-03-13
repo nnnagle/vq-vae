@@ -148,16 +148,26 @@ class FeatureBuilder:
         # Build combined mask
         mask = self._build_combined_mask(sample, feature_config, channel_data)
 
-        # Apply Mahalanobis transform if feature has covariance.
-        # Mahalanobis subsumes zscore (it centers and whitens), so skip
-        # per-channel normalization when whitening is applied.
+        # Select transform based on the feature's weighting type.
+        # cluster_distance and covariance are mutually exclusive (validated at parse time).
+        # Both subsume per-channel normalization (they center and whiten), so skip
+        # per-channel normalization when either is active.
+        use_cluster_distance = (
+            apply_mahalanobis
+            and feature_config.cluster_distance is not None
+            and feature_config.cluster_distance.calculate
+        )
         use_mahalanobis = (
             apply_mahalanobis
-            and feature_config.covariance
+            and feature_config.covariance is not None
             and feature_config.covariance.calculate
         )
 
-        if use_mahalanobis:
+        if use_cluster_distance:
+            channel_data = self._apply_cluster_distance_transform(
+                channel_data, feature_name, feature_config, mask
+            )
+        elif use_mahalanobis:
             channel_data = self._apply_mahalanobis_transform(
                 channel_data, feature_name, feature_config, mask
             )
@@ -622,6 +632,106 @@ class FeatureBuilder:
         self._transform_cache[cache_key] = whitening_matrix
         return whitening_matrix
 
+    def _get_cluster_distance_matrix(self, feature_name: str) -> Optional[np.ndarray]:
+        """Get or compute the Cholesky factor of the cluster distance matrix A.
+
+        A = sum_k A_k is loaded from the JSON stats file.  We compute L = chol(A)
+        so that L(X-mu) has the property that its L2 norm equals sqrt((X-Y)^T A (X-Y)).
+
+        Args:
+            feature_name: Name of the feature
+
+        Returns:
+            Lower-triangular Cholesky factor L [C, C] or None if not available
+        """
+        cache_key = f"{feature_name}_cluster_distance_cholesky"
+
+        if cache_key in self._transform_cache:
+            return self._transform_cache[cache_key]
+
+        if not self.stats or feature_name not in self.stats:
+            return None
+
+        feature_stats = self.stats[feature_name]
+        A_list = feature_stats.get('cluster_distance_matrix')
+        if A_list is None:
+            return None
+
+        A = np.array(A_list)
+
+        # Regularize for numerical stability
+        n_channels = A.shape[0]
+        A_reg = A + 1e-6 * np.eye(n_channels)
+
+        try:
+            L = np.linalg.cholesky(A_reg)
+        except np.linalg.LinAlgError as e:
+            logger.warning(
+                f"Cholesky decomposition of cluster distance matrix failed for "
+                f"'{feature_name}': {e}. Using identity matrix."
+            )
+            L = np.eye(n_channels)
+
+        self._transform_cache[cache_key] = L
+        return L
+
+    def _apply_cluster_distance_transform(
+        self,
+        data: np.ndarray,
+        feature_name: str,
+        feature_config: FeatureConfig,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        """Apply cluster-weighted distance transform to feature data.
+
+        Centers data by subtracting per-channel means, then applies L so that
+        Euclidean distance in the output space equals sqrt((X-Y)^T A (X-Y))
+        where A is the cluster-weighted quadratic form matrix.
+
+        Args:
+            data: Feature data [C, H, W] or [C, T, H, W]
+            feature_name: Name of the feature
+            feature_config: Feature configuration
+            mask: Validity mask [H, W] or [T, H, W]
+
+        Returns:
+            Transformed data with same shape
+        """
+        L = self._get_cluster_distance_matrix(feature_name)
+        if L is None:
+            logger.warning(
+                f"No cluster_distance_matrix found for feature '{feature_name}', "
+                f"skipping cluster distance transform"
+            )
+            return data
+
+        # Apply pre-normalization transforms (log, sqrt, etc.)
+        transformed_data = data.copy()
+        channel_names = list(feature_config.channels.keys())
+        for c_idx, channel_ref in enumerate(channel_names):
+            channel_config = feature_config.channels[channel_ref]
+            if channel_config.transform:
+                transformed_data[c_idx] = apply_transform(
+                    transformed_data[c_idx], channel_config.transform
+                )
+
+        # Center by per-channel means
+        channel_means = self._get_channel_means(feature_name, feature_config)
+        for c_idx, mean in enumerate(channel_means):
+            transformed_data[c_idx] -= mean
+
+        # Apply L: reshape to [C, N], multiply, reshape back
+        original_shape = data.shape
+        n_channels = original_shape[0]
+        flat = transformed_data.reshape(n_channels, -1)
+        transformed_flat = L @ flat
+        transformed_data = transformed_flat.reshape(original_shape)
+
+        clamp_limit = 5.0
+        np.clip(transformed_data, -clamp_limit, clamp_limit, out=transformed_data)
+
+        return transformed_data
+
     def _get_channel_means(
         self,
         feature_name: str,
@@ -747,6 +857,10 @@ class FeatureBuilder:
             'has_covariance': (
                 feature_config.covariance is not None and
                 feature_config.covariance.calculate
+            ),
+            'has_cluster_distance': (
+                feature_config.cluster_distance is not None and
+                feature_config.cluster_distance.calculate
             ),
         }
 

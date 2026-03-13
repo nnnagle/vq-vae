@@ -9,7 +9,7 @@ config:
   model_path: config/frl_repr_model_v1.yaml
   
 run:
-  experiment_name: frl_v0_exp005
+  experiment_name: frl_v0_exp007
   run_root: runs
   ckpt_dir: checkpoints
   log_dir: logs
