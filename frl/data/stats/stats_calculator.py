@@ -13,6 +13,7 @@ import logging
 
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+from scipy.stats import spearmanr
 
 from ..loaders.config.dataset_config import (
     BindingsConfig,
@@ -583,12 +584,16 @@ class StatsCalculator:
         min_len = min(len(v) for v in all_values)
         data_matrix = np.stack([np.array(v[:min_len]) for v in all_values], axis=0)  # [C, N]
 
-        # --- 2. Covariance and correlation ---
-        sigma = np.cov(data_matrix)  # [C, C]
+        # --- 2. Covariance (for std) and Spearman correlation ---
+        sigma = np.cov(data_matrix)  # [C, C] — used only to extract per-channel std
 
         std = np.sqrt(np.diag(sigma))
         std[std < 1e-10] = 1.0
-        corr = sigma / np.outer(std, std)
+
+        # Spearman correlation on ranks — more robust than Pearson for
+        # skewed/log-transformed channels and nonlinear monotonic relationships.
+        corr_result, _ = spearmanr(data_matrix.T)  # data_matrix is [C, N]; .T gives [N, C]
+        corr = np.atleast_2d(corr_result)
         np.clip(corr, -1.0, 1.0, out=corr)
 
         # Pre-whiten: A operates on z-scored data (divided by per-channel std),
