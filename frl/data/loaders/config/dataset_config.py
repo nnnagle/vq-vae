@@ -276,7 +276,7 @@ class ClusterDistanceConfig:
     calculate: bool           # Whether to compute
     stat_domain: str          # 'patch' or 'global'
     k_values: List[int]       # Cluster counts to try, e.g. [6, 8, 10, 12, 15]
-    linkage_method: str = 'average'  # scipy linkage method
+    linkage_method: str = 'ward'  # scipy linkage method; 'ward' uses ranked data directly
 
 
 @dataclass

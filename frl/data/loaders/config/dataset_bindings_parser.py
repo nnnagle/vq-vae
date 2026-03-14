@@ -395,7 +395,7 @@ class DatasetBindingsParser:
                 calculate=cd_spec.get('calculate', False),
                 stat_domain=cd_spec.get('stat_domain', 'patch'),
                 k_values=cd_spec.get('k_values', [6, 8, 10, 12, 15]),
-                linkage_method=cd_spec.get('linkage_method', 'average'),
+                linkage_method=cd_spec.get('linkage_method', 'ward'),
             )
 
         stats_type = feature_spec.get('stats_type', 'continuous')

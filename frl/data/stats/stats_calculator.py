@@ -13,7 +13,7 @@ import logging
 
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, rankdata
 
 from ..loaders.config.dataset_config import (
     BindingsConfig,
@@ -606,7 +606,15 @@ class StatsCalculator:
         condensed = squareform(dissimilarity, checks=False)
 
         # --- 4. Hierarchical clustering ---
-        Z = linkage(condensed, method=cd_cfg.linkage_method)
+        # Ward linkage requires Euclidean distances and works best on raw
+        # observations. Pass rank-transformed data ([C, N] — each row is a
+        # channel) so Ward operates on the same rank space as Spearman.
+        # Other methods use the precomputed 1-|ρ| condensed distance matrix.
+        if cd_cfg.linkage_method == 'ward':
+            ranked = rankdata(data_matrix, axis=1).astype(np.float64)  # [C, N]
+            Z = linkage(ranked, method='ward')
+        else:
+            Z = linkage(condensed, method=cd_cfg.linkage_method)
 
         # --- 5. Build A = sum_k A_k ---
         A = np.zeros((n_channels, n_channels), dtype=np.float64)
