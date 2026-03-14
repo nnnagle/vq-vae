@@ -93,6 +93,9 @@ dataset: # These exist in the zarr
       - {name: nbr, source: annual/ccdc_annual/data/nbr}
       - {name: ndvi, source: annual/ccdc_annual/data/ndvi}
       - {name: ndmi, source: annual/ccdc_annual/data/ndmi}
+      - {name: tassel_cap_blue, source: annual/ccdc_annual/data/tassel_cap_blue}
+      - {name: tassel_cap_green, source: annual/ccdc_annual/data/tassel_cap_green}
+      - {name: tassel_cap_wet, source: annual/ccdc_annual/data/tassel_cap_wet}
       - {name: seas_amp_red, source: annual/ccdc_annual/data/seas_amp_red}
       - {name: seas_amp_nir, source: annual/ccdc_annual/data/seas_amp_nir}
       - {name: seas_amp_swir1, source: annual/ccdc_annual/data/seas_amp_swir1}
@@ -130,6 +133,15 @@ dataset: # These exist in the zarr
       - {name: mean_ndvi, source: static/ccdc_metrics_history/data/mean_ndvi, fill_value: -9999}
       - {name: mean_nbr,  source: static/ccdc_metrics_history/data/mean_nbr,  fill_value: -9999}
       - {name: mean_ndmi, source: static/ccdc_metrics_history/data/mean_ndmi, fill_value: -9999}
+      - name: mean_tassel_cap_blue
+        source: annual/ccdc_annual/data/tassel_cap_blue
+        reducer: mean
+      - name: mean_tassel_cap_green
+        source: annual/ccdc_annual/data/tassel_cap_green
+        reducer: mean
+      - name: mean_tassel_cap_wet
+        source: annual/ccdc_annual/data/tassel_cap_wet
+        reducer: mean
       - {name: mean_seasonal_amp_red, source: static/ccdc_metrics_history/data/mean_seasonal_amp_red, fill_value: -9999}
       - {name: mean_seasonal_amp_nir,  source: static/ccdc_metrics_history/data/mean_seasonal_amp_nir,  fill_value: -9999}
       - {name: mean_seasonal_amp_swir1, source: static/ccdc_metrics_history/data/mean_seasonal_amp_swir1, fill_value: -9999}
@@ -253,6 +265,9 @@ features:
       static.mean_ndvi: {norm: robust_iqr}
       static.mean_nbr: {norm: robust_iqr}
       static.mean_ndmi: {norm: robust_iqr}
+      static.mean_tassel_cap_blue: {norm: robust_iqr}
+      static.mean_tassel_cap_green: {norm: robust_iqr}
+      static.mean_tassel_cap_wet: {norm: robust_iqr}
       static.mean_seasonal_amp_red: {norm: robust_iqr}
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.mean_seasonal_amp_swir1: {norm: robust_iqr}
@@ -282,6 +297,9 @@ features:
       static.mean_ndvi: {norm: robust_iqr}
       static.mean_nbr: {norm: robust_iqr}
       static.mean_ndmi: {norm: robust_iqr}
+      static.mean_tassel_cap_blue: {norm: robust_iqr}
+      static.mean_tassel_cap_green: {norm: robust_iqr}
+      static.mean_tassel_cap_wet: {norm: robust_iqr}
       static.mean_seasonal_amp_red: {norm: robust_iqr}
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.mean_seasonal_amp_swir1: {norm: robust_iqr}
