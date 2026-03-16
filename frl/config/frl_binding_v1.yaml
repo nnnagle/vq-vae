@@ -239,6 +239,9 @@ features:
       static.mean_ndvi: {norm: robust_iqr}
       static.mean_nbr: {norm: robust_iqr}
       static.mean_ndmi: {norm: robust_iqr}
+      static.mean_tassel_cap_blue: {norm: robust_iqr}
+      static.mean_tassel_cap_green: {norm: robust_iqr}
+      static.mean_tassel_cap_wet: {norm: robust_iqr}
       static.mean_seasonal_amp_red: {norm: robust_iqr}
       static.mean_seasonal_amp_nir: {norm: robust_iqr}
       static.mean_seasonal_amp_swir1: {norm: robust_iqr}
@@ -253,6 +256,8 @@ features:
       static.mean_break_magnitude: {norm: robust_iqr}
       static.rapid_loss_mean_magnitude: {norm: robust_iqr}
       static.variance_ndvi: {norm: robust_iqr}
+      static.elevation: {norm: zscore}
+      static.northness: {norm: zscore}
 
   infonce_type_spectral:
     dim: [C,H,W]
