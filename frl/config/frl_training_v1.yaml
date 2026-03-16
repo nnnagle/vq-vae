@@ -89,6 +89,18 @@ scheduler:
   # ~165 epochs of smooth decay covering the bulk of training.
   eta_min: 1.0e-6       # floor ≈ 1% of peak lr; prevents LR from reaching zero
     
+losses:
+  # Spatial InfoNCE pair weighting.
+  # Weights are computed as exp(-d/tau) for positives and 1-exp(-d/tau) for negatives,
+  # then multiplied across spectral and topo components (when topo is enabled).
+  # Monitor `pos_weight_spec_stats`, `pos_weight_topo_stats`, and `pos_weight_stats`
+  # in the logs to calibrate tau values: a good tau gives mean ≈ 0.3–0.7 for the
+  # positive-pair distances you care about.
+  spatial_spectral_tau: 1.0      # Scale for spectral (Mahalanobis) distance weighting
+  spatial_topo_tau: 1.0          # Scale for topo (Mahalanobis: elevation, northness, TWI) distance weighting
+  spatial_topo_enabled: true     # Set false to revert to spectral-only weighting
+  spatial_min_w: 0.05            # Floor for all spatial pair weights (prevents complete downweighting)
+
 spatial_domain:
   debug_mode: true
   debug_window:

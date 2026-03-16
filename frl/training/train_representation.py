@@ -158,6 +158,10 @@ def process_batch(
     all_gate_values = []
     all_pos_weights = []
     all_neg_weights = []
+    all_pos_weights_spec = []
+    all_neg_weights_spec = []
+    all_pos_weights_topo = []
+    all_neg_weights_topo = []
 
     # Phase pair stats accumulators
     all_phase_pair_stats = []
@@ -181,6 +185,11 @@ def process_batch(
         # Build features
         encoder_feature = feature_builder.build_feature('ccdc_history', sample)
         spec_dist_feature = feature_builder.build_feature('infonce_type_spectral_cluster', sample)
+        try:
+            topo_dist_feature = feature_builder.build_feature('infonce_type_topo', sample)
+            topo_dist_data = torch.from_numpy(topo_dist_feature.data).float().to(device)
+        except Exception:
+            topo_dist_data = None
 
         # Convert to tensors
         encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
@@ -281,24 +290,48 @@ def process_batch(
             neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
             spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
             
-        # --- Spectral weighting for spatial pairs ---
-        # Use spec_dist_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
-        spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
+        # --- Spectral + topo weighting for spatial pairs ---
+        # Both features are in whitened (Mahalanobis) space, so L2 = Mahalanobis distance.
+        spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cspec]
 
-        tau = config.get("spatial_spectral_tau", 1.0)  # tune this
+        tau_spec = config.get("spatial_spectral_tau", 1.0)
+        tau_topo = config.get("spatial_topo_tau", 1.0)
         min_w = config.get("spatial_min_w", 0.05)
-        
+        topo_enabled = config.get("spatial_topo_enabled", True) and topo_dist_data is not None
+
+        topo_dist_unique = (
+            extract_at_locations(topo_dist_data, unique_coords) if topo_enabled else None
+        )  # [Nuniq, Ctopo] or None
+
         pos_weights = None
         neg_weights = None
-        
+
         if spatial_pos_pairs.numel() > 0:
-            dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
-            pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
+            dpos_spec = pair_l2(spec_dist_unique, spatial_pos_pairs)
+            pos_w_spec = torch.exp(-dpos_spec / tau_spec)       # [P], in (0, 1]
+            all_pos_weights_spec.append(pos_w_spec.detach())
+
+            if topo_enabled:
+                dpos_topo = pair_l2(topo_dist_unique, spatial_pos_pairs).nan_to_num(0.0)
+                pos_w_topo = torch.exp(-dpos_topo / tau_topo)  # [P], in (0, 1]
+                all_pos_weights_topo.append(pos_w_topo.detach())
+                pos_weights = (pos_w_spec * pos_w_topo).clamp(min=min_w, max=1.0)
+            else:
+                pos_weights = pos_w_spec.clamp(min=min_w, max=1.0)
             all_pos_weights.append(pos_weights.detach())
 
         if spatial_neg_pairs.numel() > 0:
-            dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
-            neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
+            dneg_spec = pair_l2(spec_dist_unique, spatial_neg_pairs)
+            neg_w_spec = 1.0 - torch.exp(-dneg_spec / tau_spec)  # [M], in [0, 1)
+            all_neg_weights_spec.append(neg_w_spec.detach())
+
+            if topo_enabled:
+                dneg_topo = pair_l2(topo_dist_unique, spatial_neg_pairs).nan_to_num(0.0)
+                neg_w_topo = 1.0 - torch.exp(-dneg_topo / tau_topo)  # [M], in [0, 1)
+                all_neg_weights_topo.append(neg_w_topo.detach())
+                neg_weights = (neg_w_spec * neg_w_topo).clamp(min=min_w, max=1.0)
+            else:
+                neg_weights = neg_w_spec.clamp(min=min_w, max=1.0)
             all_neg_weights.append(neg_weights.detach())
 
         # Check if we have valid pairs for both losses
@@ -595,8 +628,10 @@ def process_batch(
             'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
-            'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
-            'neg_weight_stats': empty_stats,
+            'gate_stats': empty_stats,
+            'pos_weight_stats': empty_stats, 'neg_weight_stats': empty_stats,
+            'pos_weight_spec_stats': empty_stats, 'neg_weight_spec_stats': empty_stats,
+            'pos_weight_topo_stats': empty_stats, 'neg_weight_topo_stats': empty_stats,
             'phase_pair_stats': empty_phase_stats,
             'phase_loss_stats': empty_phase_loss_stats,
         }
@@ -620,8 +655,10 @@ def process_batch(
                 'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
-                'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
-                'neg_weight_stats': empty_stats,
+                'gate_stats': empty_stats,
+                'pos_weight_stats': empty_stats, 'neg_weight_stats': empty_stats,
+                'pos_weight_spec_stats': empty_stats, 'neg_weight_spec_stats': empty_stats,
+                'pos_weight_topo_stats': empty_stats, 'neg_weight_topo_stats': empty_stats,
                 'phase_pair_stats': empty_phase_stats,
                 'phase_loss_stats': empty_phase_loss_stats,
             }
@@ -690,6 +727,10 @@ def process_batch(
         'gate_stats': compute_stats(all_gate_values),
         'pos_weight_stats': compute_stats(all_pos_weights),
         'neg_weight_stats': compute_stats(all_neg_weights),
+        'pos_weight_spec_stats': compute_stats(all_pos_weights_spec),
+        'neg_weight_spec_stats': compute_stats(all_neg_weights_spec),
+        'pos_weight_topo_stats': compute_stats(all_pos_weights_topo),
+        'neg_weight_topo_stats': compute_stats(all_neg_weights_topo),
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
@@ -729,6 +770,10 @@ def train_epoch(
     last_gate_stats = empty_stats
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
+    last_pos_weight_spec_stats = empty_stats
+    last_neg_weight_spec_stats = empty_stats
+    last_pos_weight_topo_stats = empty_stats
+    last_neg_weight_topo_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -760,6 +805,10 @@ def train_epoch(
             last_gate_stats = stats['gate_stats']
             last_pos_weight_stats = stats['pos_weight_stats']
             last_neg_weight_stats = stats['neg_weight_stats']
+            last_pos_weight_spec_stats = stats.get('pos_weight_spec_stats', empty_stats)
+            last_neg_weight_spec_stats = stats.get('neg_weight_spec_stats', empty_stats)
+            last_pos_weight_topo_stats = stats.get('pos_weight_topo_stats', empty_stats)
+            last_neg_weight_topo_stats = stats.get('neg_weight_topo_stats', empty_stats)
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
@@ -797,8 +846,10 @@ def train_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'batches': 0,
-            'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
-            'neg_weight_stats': empty_stats,
+            'gate_stats': empty_stats,
+            'pos_weight_stats': empty_stats, 'neg_weight_stats': empty_stats,
+            'pos_weight_spec_stats': empty_stats, 'neg_weight_spec_stats': empty_stats,
+            'pos_weight_topo_stats': empty_stats, 'neg_weight_topo_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
         }
@@ -818,6 +869,10 @@ def train_epoch(
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
+        'pos_weight_spec_stats': last_pos_weight_spec_stats,
+        'neg_weight_spec_stats': last_neg_weight_spec_stats,
+        'pos_weight_topo_stats': last_pos_weight_topo_stats,
+        'neg_weight_topo_stats': last_neg_weight_topo_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -848,6 +903,10 @@ def validate_epoch(
     last_gate_stats = empty_stats
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
+    last_pos_weight_spec_stats = empty_stats
+    last_neg_weight_spec_stats = empty_stats
+    last_pos_weight_topo_stats = empty_stats
+    last_neg_weight_topo_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -873,6 +932,10 @@ def validate_epoch(
                 last_gate_stats = stats['gate_stats']
                 last_pos_weight_stats = stats['pos_weight_stats']
                 last_neg_weight_stats = stats['neg_weight_stats']
+                last_pos_weight_spec_stats = stats.get('pos_weight_spec_stats', empty_stats)
+                last_neg_weight_spec_stats = stats.get('neg_weight_spec_stats', empty_stats)
+                last_pos_weight_topo_stats = stats.get('pos_weight_topo_stats', empty_stats)
+                last_neg_weight_topo_stats = stats.get('neg_weight_topo_stats', empty_stats)
                 last_phase_pair_stats = stats.get('phase_pair_stats')
                 last_phase_loss_stats = stats.get('phase_loss_stats')
                 if stats.get('film_stats') is not None:
@@ -883,8 +946,10 @@ def validate_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'batches': 0,
-            'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
-            'neg_weight_stats': empty_stats,
+            'gate_stats': empty_stats,
+            'pos_weight_stats': empty_stats, 'neg_weight_stats': empty_stats,
+            'pos_weight_spec_stats': empty_stats, 'neg_weight_spec_stats': empty_stats,
+            'pos_weight_topo_stats': empty_stats, 'neg_weight_topo_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
         }
@@ -900,6 +965,10 @@ def validate_epoch(
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
+        'pos_weight_spec_stats': last_pos_weight_spec_stats,
+        'neg_weight_spec_stats': last_neg_weight_spec_stats,
+        'pos_weight_topo_stats': last_pos_weight_topo_stats,
+        'neg_weight_topo_stats': last_neg_weight_topo_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -1496,10 +1565,22 @@ def main():
             f"  Gate values: {fmt_stats(train_stats['gate_stats'])}"
         )
         logger.info(
-            f"  Spatial pos weights: {fmt_stats(train_stats['pos_weight_stats'])}"
+            f"  Spatial pos weights (combined): {fmt_stats(train_stats['pos_weight_stats'])}"
         )
         logger.info(
-            f"  Spatial neg weights: {fmt_stats(train_stats['neg_weight_stats'])}"
+            f"  Spatial pos weights (spectral): {fmt_stats(train_stats.get('pos_weight_spec_stats', train_stats['pos_weight_stats']))}"
+        )
+        logger.info(
+            f"  Spatial pos weights (topo):     {fmt_stats(train_stats.get('pos_weight_topo_stats', train_stats['pos_weight_stats']))}"
+        )
+        logger.info(
+            f"  Spatial neg weights (combined): {fmt_stats(train_stats['neg_weight_stats'])}"
+        )
+        logger.info(
+            f"  Spatial neg weights (spectral): {fmt_stats(train_stats.get('neg_weight_spec_stats', train_stats['neg_weight_stats']))}"
+        )
+        logger.info(
+            f"  Spatial neg weights (topo):     {fmt_stats(train_stats.get('neg_weight_topo_stats', train_stats['neg_weight_stats']))}"
         )
         logger.info(
             f"  Pairs/batch: "
