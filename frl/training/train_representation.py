@@ -51,6 +51,7 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
+_topo_load_warned = False  # warn once per process if infonce_type_topo fails to load
 
 
 def compute_input_dropout_rate(
@@ -154,8 +155,6 @@ def process_batch(
     total_spatial_pos_pairs = 0
     total_spatial_neg_pairs = 0
 
-    _topo_load_warned = False  # warn once per batch if topo fails
-
     # Collectors for distribution logging (accumulated across samples)
     all_gate_values = []
     all_pos_weights = []
@@ -191,6 +190,7 @@ def process_batch(
             topo_dist_feature = feature_builder.build_feature('infonce_type_topo', sample)
             topo_dist_data = torch.from_numpy(topo_dist_feature.data).float().to(device)
         except Exception as e:
+            global _topo_load_warned
             if not _topo_load_warned:
                 logger.warning(f"Could not load infonce_type_topo (falling back to spectral-only): {e}")
                 _topo_load_warned = True
