@@ -258,8 +258,8 @@ features:
       static.variance_ndvi: {norm: robust_iqr}
       static.elevation: {norm: zscore}
       static.northness: {norm: zscore}
-      static.HAND: {norm: zscore}
-      static.TWI: {norm: zscore}
+      static.hand: {norm: zscore}
+      static.twi: {norm: zscore}
 
   infonce_type_spectral:
     dim: [C,H,W]
