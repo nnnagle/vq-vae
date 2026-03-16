@@ -327,16 +327,17 @@ features:
       k_values: [6, 8, 10, 12, 15]
 
   infonce_type_topo:
-    dim: [C,H,W]    
+    dim: [C,H,W]
     channels:
       - static.elevation: {norm: zscore}
       - static.northness: {norm: zscore}
+      - static.twi: {norm: zscore}
     masks:
       - static_mask.aoi
       - static_mask.forest
       - static_mask.dem_mask
-    covariance: 
-      dim: [C,C]      
+    covariance:
+      dim: [C,C]
       calculate: true
       stat_domain: patch
   phase_ccdc:
