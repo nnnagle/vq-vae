@@ -206,6 +206,56 @@ def collect_patch_data(
 
 
 # ---------------------------------------------------------------------------
+# Variance inflation
+# ---------------------------------------------------------------------------
+
+def inflate_variance_predictions(
+    records: List[Dict[str, np.ndarray]],
+    channel_refs: List[str],
+) -> None:
+    """Rescale per-channel predictions so their std matches the observed std.
+
+    For each target channel, pools all masked pixels across all patches and
+    computes:
+
+        alpha = std(obs_all) / std(pred_all)
+        pred_inflated = mean(pred_all) + alpha * (pred - mean(pred_all))
+
+    Records are updated in-place.  Scale factors are logged.
+    """
+    for cref in channel_refs:
+        obs_vals, pred_vals = [], []
+        for rec in records:
+            mask = rec["combined_mask"]
+            obs_vals.append(rec[f"target_{cref}"][mask])
+            pred_vals.append(rec[f"pred_{cref}"][mask])
+
+        obs_all = np.concatenate(obs_vals) if obs_vals else np.array([])
+        pred_all = np.concatenate(pred_vals) if pred_vals else np.array([])
+
+        if obs_all.size == 0 or pred_all.size == 0:
+            logger.warning(f"  inflate_variance: no valid pixels for {cref}, skipping")
+            continue
+
+        std_obs = float(obs_all.std())
+        std_pred = float(pred_all.std())
+        mean_pred = float(pred_all.mean())
+
+        if std_pred < 1e-8:
+            logger.warning(f"  inflate_variance: pred std ~0 for {cref}, skipping")
+            continue
+
+        alpha = std_obs / std_pred
+        logger.info(
+            f"  inflate_variance [{cref}]: std_obs={std_obs:.4f}  "
+            f"std_pred={std_pred:.4f}  alpha={alpha:.4f}"
+        )
+
+        for rec in records:
+            rec[f"pred_{cref}"] = mean_pred + alpha * (rec[f"pred_{cref}"] - mean_pred)
+
+
+# ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
 
@@ -219,6 +269,7 @@ def plot_variable_sheet(
     channel_ref: str,
     output_path: Path,
     max_cols: int = 4,
+    inflated: bool = False,
 ) -> None:
     """Create a single figure with observed / predicted tiles for one variable.
 
@@ -282,7 +333,8 @@ def plot_variable_sheet(
             if idx >= n_patches:
                 axes[r, c].axis("off")
 
-    fig.suptitle(f"{short_name}  (observed vs predicted, original scale)", fontsize=11)
+    suffix = ", var-inflated" if inflated else ""
+    fig.suptitle(f"{short_name}  (observed vs predicted, original scale{suffix})", fontsize=11)
     fig.tight_layout(rect=[0, 0, 0.92, 0.96])
 
     # Shared colour bar
@@ -445,6 +497,9 @@ def main():
                         help="Device override (e.g. cuda:0 or cpu)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory (default: <experiment>/diagnostics)")
+    parser.add_argument("--inflate-variance", action="store_true", default=False,
+                        help="Rescale predicted values so their std matches the observed std "
+                             "(per channel, pooled across all selected patches)")
     args = parser.parse_args()
 
     # ---- configs ----------------------------------------------------------
@@ -514,6 +569,11 @@ def main():
     )
     logger.info(f"Collected data for {len(records)} patches")
 
+    # ---- optional variance inflation --------------------------------------
+    if args.inflate_variance:
+        logger.info("Inflating prediction variance to match observed variance...")
+        inflate_variance_predictions(records, target_metrics)
+
     # ---- plot -------------------------------------------------------------
     logger.info("Generating diagnostic figures...")
 
@@ -521,7 +581,7 @@ def main():
     for cref in target_metrics:
         safe_name = cref.replace(".", "_")
         out_path = output_dir / f"test_{safe_name}.png"
-        plot_variable_sheet(records, cref, out_path)
+        plot_variable_sheet(records, cref, out_path, inflated=args.inflate_variance)
 
     # Gate sheets — one per representative channel, stratified by variance
     plot_gate_channels(records, output_dir, n_channels=6)
