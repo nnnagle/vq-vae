@@ -1384,13 +1384,22 @@ def log_metrics(metrics: PhaseProbeMetrics, prefix: str):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _find_run_config(checkpoint_path: str, pattern: str):
+    """Return the first YAML matching *pattern* in the run directory (checkpoint's grandparent)."""
+    run_dir = Path(checkpoint_path).parent.parent
+    matches = sorted(run_dir.glob(pattern))
+    return str(matches[0]) if matches else None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Closed-form phase linear probe (streaming ridge regression)",
     )
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to encoder checkpoint (.pt)")
-    parser.add_argument("--bindings", type=str, default="config/frl_binding_v1.yaml", help="Bindings YAML")
-    parser.add_argument("--training", type=str, default="config/frl_training_v1.yaml", help="Training YAML")
+    parser.add_argument("--bindings", type=str, default=None,
+                        help="Bindings YAML (default: auto-detect from run dir)")
+    parser.add_argument("--training", type=str, default=None,
+                        help="Training YAML (default: auto-detect from run dir)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size override")
     parser.add_argument("--device", type=str, default=None, help="Device override, e.g. cuda:0 or cpu")
     parser.add_argument("--ridge-lambda", type=float, default=1e-3, help="Ridge penalty λ (weights only)")
@@ -1413,11 +1422,22 @@ def main():
     )
     args = parser.parse_args()
 
-    logger.info(f"Loading bindings config from {args.bindings}")
-    bindings_config = DatasetBindingsParser(args.bindings).parse()
+    bindings_path = (
+        args.bindings
+        or _find_run_config(args.checkpoint, "*binding*.yaml")
+        or "config/frl_binding_v1.yaml"
+    )
+    training_path = (
+        args.training
+        or _find_run_config(args.checkpoint, "*training*.yaml")
+        or "config/frl_training_v1.yaml"
+    )
 
-    logger.info(f"Loading training config from {args.training}")
-    training_config = TrainingConfigParser(args.training).parse()
+    logger.info(f"Loading bindings config from {bindings_path}")
+    bindings_config = DatasetBindingsParser(bindings_path).parse()
+
+    logger.info(f"Loading training config from {training_path}")
+    training_config = TrainingConfigParser(training_path).parse()
 
     batch_size = args.batch_size or training_config.training.batch_size
     device_str = args.device or training_config.hardware.device

@@ -476,6 +476,13 @@ def plot_gate_channels(
 # Main
 # ---------------------------------------------------------------------------
 
+def _find_run_config(checkpoint_path: str, pattern: str):
+    """Return the first YAML matching *pattern* in the run directory (checkpoint's grandparent)."""
+    run_dir = Path(checkpoint_path).parent.parent
+    matches = sorted(run_dir.glob(pattern))
+    return str(matches[0]) if matches else None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize linear-probe predictions and gate values on test patches."
@@ -485,10 +492,10 @@ def main():
     parser.add_argument("--probe", type=str, default=None,
                         help="Path to saved linear-probe (.pt). "
                              "Defaults to linear_probe_closed_form.pt next to checkpoint.")
-    parser.add_argument("--bindings", type=str, default="config/frl_binding_v1.yaml",
-                        help="Bindings YAML")
-    parser.add_argument("--training", type=str, default="config/frl_training_v1.yaml",
-                        help="Training YAML")
+    parser.add_argument("--bindings", type=str, default=None,
+                        help="Bindings YAML (default: auto-detect from run dir)")
+    parser.add_argument("--training", type=str, default=None,
+                        help="Training YAML (default: auto-detect from run dir)")
     parser.add_argument("--num-patches", type=int, default=16,
                         help="Number of test patches to visualise")
     parser.add_argument("--seed", type=int, default=42,
@@ -503,11 +510,22 @@ def main():
     args = parser.parse_args()
 
     # ---- configs ----------------------------------------------------------
-    logger.info(f"Loading bindings config from {args.bindings}")
-    bindings_config = DatasetBindingsParser(args.bindings).parse()
+    bindings_path = (
+        args.bindings
+        or _find_run_config(args.checkpoint, "*binding*.yaml")
+        or "config/frl_binding_v1.yaml"
+    )
+    training_path = (
+        args.training
+        or _find_run_config(args.checkpoint, "*training*.yaml")
+        or "config/frl_training_v1.yaml"
+    )
 
-    logger.info(f"Loading training config from {args.training}")
-    training_config = TrainingConfigParser(args.training).parse()
+    logger.info(f"Loading bindings config from {bindings_path}")
+    bindings_config = DatasetBindingsParser(bindings_path).parse()
+
+    logger.info(f"Loading training config from {training_path}")
+    training_config = TrainingConfigParser(training_path).parse()
 
     device_str = args.device or training_config.hardware.device
     device = torch.device(device_str)

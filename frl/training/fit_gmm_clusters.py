@@ -172,13 +172,20 @@ def extract_embeddings_from_batch(
 # Main
 # ---------------------------------------------------------------------------
 
+def _find_run_config(checkpoint_path: str, pattern: str):
+    """Return the first YAML matching *pattern* in the run directory (checkpoint's grandparent)."""
+    run_dir = Path(checkpoint_path).parent.parent
+    matches = sorted(run_dir.glob(pattern))
+    return str(matches[0]) if matches else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fit GMM on z_type embeddings from a trained RepresentationModel."
     )
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt)")
-    parser.add_argument("--training", default="config/frl_training_v1.yaml", help="Training config YAML")
-    parser.add_argument("--bindings", default="config/frl_binding_v1.yaml", help="Bindings config YAML")
+    parser.add_argument("--training", default=None, help="Training config YAML (default: auto-detect from run dir)")
+    parser.add_argument("--bindings", default=None, help="Bindings config YAML (default: auto-detect from run dir)")
     parser.add_argument("--n-components", type=int, default=50, help="Number of GMM components (default: 50)")
     parser.add_argument("--covariance-type", default="diag",
                         choices=["diag", "full", "tied", "spherical"],
@@ -197,11 +204,22 @@ def main() -> None:
     args = parser.parse_args()
 
     # --- Config ---
-    logger.info(f"Loading bindings config: {args.bindings}")
-    bindings_config = DatasetBindingsParser(args.bindings).parse()
+    bindings_path = (
+        args.bindings
+        or _find_run_config(args.checkpoint, "*binding*.yaml")
+        or "config/frl_binding_v1.yaml"
+    )
+    training_path = (
+        args.training
+        or _find_run_config(args.checkpoint, "*training*.yaml")
+        or "config/frl_training_v1.yaml"
+    )
 
-    logger.info(f"Loading training config: {args.training}")
-    training_config = TrainingConfigParser(args.training).parse()
+    logger.info(f"Loading bindings config: {bindings_path}")
+    bindings_config = DatasetBindingsParser(bindings_path).parse()
+
+    logger.info(f"Loading training config: {training_path}")
+    training_config = TrainingConfigParser(training_path).parse()
 
     device_str = args.device or training_config.hardware.device
     device = torch.device(device_str)
