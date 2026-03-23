@@ -1464,7 +1464,14 @@ def write_variable_to_zarr(
     log.debug(f"Writing {var_path}")
     if hasattr(da.data, 'compute'):
         log.debug(f"  Writing dask array with shape {da.shape}")
-        dask_array.store(da.data, ds, lock=False, compute=True)
+        # Enable graph fusion to collapse per-chunk operation chains before
+        # sending to the Dask scheduler.  Without this, arrays built from many
+        # stacked lazy ops (open → align → reindex → cast) produce graphs of
+        # tens of thousands of tasks that trigger Dask's "large graph" warning
+        # and add scheduler overhead.
+        import dask
+        with dask.config.set(**{'optimization.fuse.active': True}):
+            dask_array.store(da.data, ds, lock=False, compute=True)
     else:
         ds[:] = da.values
 
