@@ -622,17 +622,17 @@ def load_annual_band(
     global_start, global_end = global_window
     global_years = list(range(global_start, global_end + 1))
     
-    log.debug(f"      Before temporal align: min={da.min().values:.3f}, max={da.max().values:.3f}")
+    log.debug(f"      Before temporal align: shape={da.shape} dtype={da.dtype}")
     da = align_temporal_to_window(da, global_years, group_spec.semantic_type)
-    log.debug(f"      After temporal align: min={da.min().values:.3f}, max={da.max().values:.3f}")
-    
+    log.debug(f"      After temporal align: shape={da.shape}")
+
     # Handle nodata/fill values
     da = handle_fill_values(da, band_spec, group_spec)
-    log.debug(f"      After fill handling: min={da.min().values:.3f}, max={da.max().values:.3f}")
-    
+    log.debug(f"      After fill handling: dtype={da.dtype}")
+
     # Convert dtype
     da = da.astype(target_dtype)
-    log.debug(f"      After dtype convert: min={da.min().values:.3f}, max={da.max().values:.3f}")
+    log.debug(f"      After dtype convert: dtype={da.dtype}")
     
     # Set name
     da.name = band_spec.id
@@ -738,7 +738,7 @@ def load_per_band_annual(
     
     # Open multiband VRT
     da = rioxarray.open_rasterio(file_path, chunks=spatial_chunks)
-    log.debug(f"      After open: shape={da.shape}, min={da.min().values:.3f}, max={da.max().values:.3f}")
+    log.debug(f"      After open: shape={da.shape} dtype={da.dtype}")
     
     # Rename band to time
     if 'band' in da.dims:
@@ -776,11 +776,10 @@ def load_per_band_annual(
             da = da.assign_coords(time=years)
     
     log.debug(f"      Time coords assigned: {da.time.values[:3]}...{da.time.values[-3:]}")
-    log.debug(f"      After time assign: min={da.min().values:.3f}, max={da.max().values:.3f}")
-    
+
     # Align to template
     da = align_to_template(da, template)
-    log.debug(f"      After align: min={da.min().values:.3f}, max={da.max().values:.3f}")
+    log.debug(f"      After align: shape={da.shape} dtype={da.dtype}")
     
     return da
 
@@ -1364,41 +1363,25 @@ def sanitize_attrs(attrs: dict) -> dict:
     return sanitized
 
 
-def write_zarr_hierarchy(
+def open_zarr_store(
     zarr_path: Path,
-    variables: Dict[str, xr.DataArray],
     aoi: Optional[xr.DataArray] = None,
     strata: Optional[xr.DataArray] = None,
     compressor_cfg: Optional[Dict] = None,
     chunks: Optional[Dict[str, int]] = None
-) -> None:
+):
     """
-    Write variables to hierarchical zarr structure.
-    
-    Structure:
-        zarr_path/
-            aoi
-            strata
-            annual/
-                group1/
-                    data/
-                        var1
-                        var2
-                    quality/
-                        var3
-            irregular/
-                ...
-            static/
-                ...
+    Create a zarr store and write aoi/strata.
+
+    Returns ``(root, compressor)`` for subsequent calls to
+    ``write_variable_to_zarr`` and ``zarr.consolidate_metadata``.
     """
     import numcodecs
-    
-    # Create root - force Zarr v2 format for compatibility
+
     p = Path(zarr_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     root = zarr.open_group(str(zarr_path), mode='w', zarr_format=2)
-    
-    # Configure compressor
+
     if compressor_cfg:
         compressor = numcodecs.Blosc(
             cname=compressor_cfg.get('cname', 'lz4'),
@@ -1407,8 +1390,7 @@ def write_zarr_hierarchy(
         )
     else:
         compressor = None
-    
-    # Write AOI and strata at root level
+
     if aoi is not None:
         log.info("Writing aoi to zarr root")
         aoi_array = root.create_array(
@@ -1421,7 +1403,7 @@ def write_zarr_hierarchy(
         )
         aoi_array[:] = aoi.values
         aoi_array.attrs.update(sanitize_attrs(aoi.attrs))
-    
+
     if strata is not None:
         log.info("Writing strata to zarr root")
         strata_array = root.create_array(
@@ -1434,78 +1416,98 @@ def write_zarr_hierarchy(
         )
         strata_array[:] = strata.values
         strata_array.attrs.update(sanitize_attrs(strata.attrs))
-    
-    # Write hierarchical variables
+
+    return root, compressor
+
+
+def write_variable_to_zarr(
+    root,
+    var_path: str,
+    da: xr.DataArray,
+    chunks: Dict[str, int],
+    compressor
+) -> None:
+    """
+    Write a single variable into an already-open zarr store.
+
+    ``var_path`` must have the form ``category/group/subsection/varname``.
+    """
+    import dask.array as dask_array
+
+    parts = var_path.split('/')
+    if len(parts) != 4:
+        log.warning(f"Unexpected path structure: {var_path}")
+        return
+
+    category, group_name, subsection, var_name = parts
+
+    cat_group = root.require_group(category)
+    grp_group = cat_group.require_group(group_name)
+    sub_group = grp_group.require_group(subsection)
+
+    if 'semantic_type' in da.attrs:
+        sub_group.attrs['semantic_type'] = da.attrs['semantic_type']
+
+    var_chunks = tuple(chunks.get(d, s) for d, s in zip(da.dims, da.shape))
+    fill_value = da.attrs.get('_FillValue', None)
+
+    ds = sub_group.create_array(
+        var_name,
+        shape=da.shape,
+        chunks=var_chunks,
+        dtype=da.dtype,
+        compressor=compressor,
+        fill_value=fill_value,
+        overwrite=True
+    )
+
+    log.debug(f"Writing {var_path}")
+    if hasattr(da.data, 'compute'):
+        log.debug(f"  Writing dask array with shape {da.shape}")
+        dask_array.store(da.data, ds, lock=False, compute=True)
+    else:
+        ds[:] = da.values
+
+    ds.attrs.update(sanitize_attrs(da.attrs))
+
+    for dim in da.dims:
+        if dim in da.coords:
+            ds.attrs[f'{dim}_coords'] = da.coords[dim].values.tolist()
+
+
+def write_zarr_hierarchy(
+    zarr_path: Path,
+    variables: Dict[str, xr.DataArray],
+    aoi: Optional[xr.DataArray] = None,
+    strata: Optional[xr.DataArray] = None,
+    compressor_cfg: Optional[Dict] = None,
+    chunks: Optional[Dict[str, int]] = None
+) -> None:
+    """
+    Write all variables to a hierarchical zarr store in one call.
+
+    For large datasets prefer the streaming path in ``main()`` which calls
+    ``open_zarr_store`` / ``write_variable_to_zarr`` one band at a time so
+    memory is released between bands.
+
+    Structure::
+
+        zarr_path/
+            aoi
+            strata
+            annual/group/data|quality/varname
+            irregular/group/data|quality/varname
+            static/group/data|quality/varname
+    """
+    root, compressor = open_zarr_store(zarr_path, aoi, strata, compressor_cfg, chunks)
+
     log.info(f"Writing {len(variables)} variables to zarr")
-    
     iterator = tqdm(variables.items(), desc="Writing zarr") if HAS_TQDM else variables.items()
-    
+
     for var_path, da in iterator:
-        # Parse path: category/group/subsection/varname
-        parts = var_path.split('/')
-        
-        if len(parts) != 4:
-            log.warning(f"Unexpected path structure: {var_path}")
-            continue
-        
-        category, group_name, subsection, var_name = parts
-        
-        # Create group hierarchy
-        cat_group = root.require_group(category)
-        grp_group = cat_group.require_group(group_name)
-        sub_group = grp_group.require_group(subsection)
-        
-        # Store group-level attrs
-        if 'semantic_type' in da.attrs:
-            sub_group.attrs['semantic_type'] = da.attrs['semantic_type']
-        
-        # Determine chunks
-        var_chunks = tuple(
-            chunks.get(d, s) for d, s in zip(da.dims, da.shape)
-        )
-        
-        # Get fill_value from attrs if present
-        fill_value = da.attrs.get('_FillValue', None)
-        
-        # Create array with fill_value
-        ds = sub_group.create_array(
-            var_name,
-            shape=da.shape,
-            chunks=var_chunks,
-            dtype=da.dtype,
-            compressor=compressor,
-            fill_value=fill_value,  # Pass fill_value to Zarr
-            overwrite=True
-        )
-        
-        # Write data (compute if dask)
-        log.debug(f"Writing {var_path}")
-        if hasattr(da.data, 'compute'):
-            # Dask array - write chunk by chunk to avoid loading all to memory
-            import dask.array as dask_array
-            
-            # Use to_zarr for efficient dask writing
-            # But since we're using zarr directly, we need to write chunks manually
-            log.debug(f"  Writing dask array with shape {da.shape}")
-            
-            # Store_chunk writes individual chunks without loading full array
-            dask_array.store(da.data, ds, lock=False, compute=True)
-        else:
-            # Already in memory (small array)
-            ds[:] = da.values
-        
-        # Write attributes (sanitize for JSON serialization)
-        ds.attrs.update(sanitize_attrs(da.attrs))
-        
-        # Write dimension coordinates
-        for dim in da.dims:
-            if dim in da.coords:
-                coord_data = da.coords[dim].values
-                ds.attrs[f'{dim}_coords'] = coord_data.tolist()
-    
-    # Consolidate metadata
+        write_variable_to_zarr(root, var_path, da, chunks, compressor)
+
     zarr.consolidate_metadata(str(zarr_path))
-    
     log.info(f"Successfully wrote zarr to {zarr_path}")
 
 
@@ -2072,48 +2074,84 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         strata = align_to_template(strata, template)
         strata = strata.astype(np.int16)
     
-    # Build variable hierarchy
-    variables = build_variable_hierarchy(
-        group_specs,
-        template,
-        global_window,
-        cfg['dataset'],
-        chunks
+    # =========================================================================
+    # Stream bands to zarr one at a time (avoids holding all arrays in memory)
+    # =========================================================================
+    import time as _time
+
+    root, compressor = open_zarr_store(
+        zarr_path, aoi=aoi, strata=strata,
+        compressor_cfg=compressor_cfg, chunks=chunks
     )
-    
-    # Write to zarr
-    write_zarr_hierarchy(
-        zarr_path,
-        variables,
-        aoi=aoi,
-        strata=strata,
-        compressor_cfg=compressor_cfg,
-        chunks=chunks
-    )
-    
-    # Compute statistics
+
+    dtype_cfg = cfg['dataset'].get('dtype', {})
+    total_bands = sum(len(spec.bands) for spec in group_specs)
+    log.info(f"Streaming {total_bands} variables to zarr")
+
+    band_counter = 0
+    for spec in group_specs:
+        log.info(f"{'─' * 80}")
+        log.info(f"Processing: {spec.category}/{spec.name}/{spec.subsection}  "
+                 f"({len(spec.bands)} bands)")
+
+        target_dtype = get_dtype_for_semantic_type(spec.semantic_type, dtype_cfg)
+        path_prefix = f"{spec.category}/{spec.name}/{spec.subsection}"
+
+        for band in spec.bands:
+            band_counter += 1
+            var_path = f"{path_prefix}/{band.id}"
+            t0 = _time.time()
+            log.info(f"  [{band_counter}/{total_bands}] {band.id}...")
+
+            try:
+                if spec.category == 'static':
+                    da = load_static_band(band, spec, template, target_dtype, chunks)
+                elif spec.category == 'annual':
+                    da = load_annual_band(
+                        band, spec, template, target_dtype, global_window, chunks
+                    )
+                elif spec.category == 'irregular':
+                    da = load_irregular_band(band, spec, template, target_dtype, chunks)
+                else:
+                    raise ValueError(f"Unknown category: {spec.category}")
+
+                da.attrs['semantic_type'] = spec.semantic_type
+                da.attrs['category'] = spec.category
+                da.attrs['group'] = spec.name
+                da.attrs['subsection'] = spec.subsection
+
+                shape_str = ' × '.join(str(s) for s in da.shape)
+                log.info(f"    Loaded: {shape_str} {da.dtype}, writing to zarr...")
+
+                write_variable_to_zarr(root, var_path, da, chunks, compressor)
+
+                elapsed = _time.time() - t0
+                log.info(f"    ✓ Done ({elapsed:.1f}s)")
+
+                del da  # release memory before loading next band
+
+            except Exception as e:
+                elapsed = _time.time() - t0
+                log.error(f"    ✗ Failed {var_path} after {elapsed:.1f}s: {e}")
+                raise
+
+    log.info(f"{'─' * 80}")
+    zarr.consolidate_metadata(str(zarr_path))
+    log.info(f"✓ {band_counter} variables written to {zarr_path}")
+
+    # Compute statistics (always from the written zarr — no in-memory variables dict)
     if not args.no_stats:
-        log.info("Computing statistics")
-        
-        if args.stats_from_zarr:
-            # Compute from written zarr (safer for very large datasets)
-            log.info("Reading from zarr for statistics computation (memory-safe mode)")
-            stats_dict = compute_statistics_from_zarr(zarr_path, aoi)
-        else:
-            # Compute from in-memory variables
-            stats_dict = compute_all_statistics(variables, aoi)
-        
-        # Embed in zarr
+        log.info("Computing statistics from written zarr")
+        stats_dict = compute_statistics_from_zarr(zarr_path, aoi)
+
         stats_cfg = cfg['dataset'].get('statistics', {})
         if stats_cfg.get('embed_in_zarr', True):
             embed_statistics_in_zarr(zarr_path, stats_dict)
-        
-        # Export JSON
+
         if stats_cfg.get('export_json', True):
             json_path = zarr_path.with_suffix('.stats.json')
             export_statistics_json(stats_dict, json_path)
-        
-        # Export CSV
+
         if stats_cfg.get('export_csv', True):
             csv_path = zarr_path.with_suffix('.stats.csv')
             export_statistics_csv(stats_dict, csv_path)
