@@ -2010,7 +2010,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cluster = LocalCluster(
             n_workers=args.ncore,
             threads_per_worker=1,
-            memory_limit='8GB',
+            memory_limit='14GB',
             silence_logs=logging.ERROR,
             # Increase intervals to reduce "unresponsive" warnings during I/O
             heartbeat_interval='60s',  # default is 5s
