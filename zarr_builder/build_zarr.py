@@ -392,6 +392,76 @@ def get_year_list(group_spec: GroupSpec, global_window: Tuple[int, int]) -> List
 # Raster I/O with rioxarray
 # =============================================================================
 
+def _open_single_band_rasterio(
+    file_path: Path,
+    band_index: int,
+    chunks: Optional[Dict[str, int]] = None,
+) -> xr.DataArray:
+    """
+    Open a single band from a (possibly multi-band) raster using rasterio
+    windowed reads.  Each dask chunk opens the file independently and reads
+    only the requested band, so GDAL never caches the full multi-band file.
+    This avoids the large unmanaged-memory footprint that rioxarray incurs
+    when opening a VRT with many bands just to select one.
+    """
+    import dask
+    import dask.array as dsa
+    import rasterio
+
+    chunk_y = (chunks or {}).get('y', 256)
+    chunk_x = (chunks or {}).get('x', 256)
+
+    # Read metadata only — file is closed immediately after this block
+    with rasterio.open(str(file_path)) as src:
+        height, width = src.height, src.width
+        dtype = src.dtypes[band_index - 1]
+        nodata = src.nodata
+        transform = src.transform
+        crs_wkt = src.crs.to_wkt() if src.crs else None
+
+    # Pixel-centre coordinates
+    y_coords = np.array([transform.f + transform.e * (i + 0.5) for i in range(height)])
+    x_coords = np.array([transform.c + transform.a * (j + 0.5) for j in range(width)])
+
+    # Build chunk grid
+    y_slices = [slice(y, min(y + chunk_y, height)) for y in range(0, height, chunk_y)]
+    x_slices = [slice(x, min(x + chunk_x, width))  for x in range(0, width,  chunk_x)]
+
+    file_path_str = str(file_path)  # avoid Path serialisation issues in delayed
+
+    def read_window(y_sl, x_sl):
+        import rasterio
+        from rasterio.windows import Window
+        win = Window(x_sl.start, y_sl.start,
+                     x_sl.stop - x_sl.start, y_sl.stop - y_sl.start)
+        with rasterio.open(file_path_str) as src:
+            return src.read(band_index, window=win)
+
+    delayed_blocks = [
+        [
+            dsa.from_delayed(
+                dask.delayed(read_window)(ys, xs),
+                shape=(ys.stop - ys.start, xs.stop - xs.start),
+                dtype=dtype,
+            )
+            for xs in x_slices
+        ]
+        for ys in y_slices
+    ]
+
+    data = dsa.block(delayed_blocks)
+
+    da = xr.DataArray(data, dims=['y', 'x'],
+                      coords={'y': y_coords, 'x': x_coords})
+    if crs_wkt:
+        da.rio.write_crs(crs_wkt, inplace=True)
+    da.rio.write_transform(transform, inplace=True)
+    if nodata is not None:
+        da.attrs['_FillValue'] = nodata
+
+    return da
+
+
 def open_raster_band(
     file_path: Path,
     band_index: Optional[int] = None,
@@ -399,28 +469,38 @@ def open_raster_band(
     bounds: Optional[Tuple[float, float, float, float]] = None
 ) -> xr.DataArray:
     """
-    Open a single band from a raster file using rioxarray.
-    
+    Open a single band from a raster file.
+
+    When band_index is specified and no spatial subsetting is needed, uses
+    rasterio windowed reads so that only the requested band is ever loaded
+    (avoids GDAL caching the full multi-band file).  Falls back to rioxarray
+    for single-band files and for bounds-clipped reads.
+
     Args:
         file_path: Path to raster file
         band_index: 1-based band index (None for single-band files)
         chunks: Chunk specification for dask (only spatial dims used)
         bounds: Optional (minx, miny, maxx, maxy) to read only a spatial window
-    
+
     Returns:
         DataArray with spatial dimensions (y, x)
     """
+    # Fast path: specific band requested, no spatial subsetting needed.
+    # Use rasterio windowed reads to avoid GDAL caching the full multi-band file.
+    if band_index is not None and bounds is None:
+        return _open_single_band_rasterio(file_path, band_index, chunks)
+
     # Filter chunks to only spatial dimensions that exist in rasters
     spatial_chunks = None
     if chunks:
         spatial_chunks = {k: v for k, v in chunks.items() if k in ('x', 'y', 'band')}
-    
+
     # Open with rioxarray
     # If bounds provided, clip during read (much faster than loading then clipping)
     if bounds:
         minx, miny, maxx, maxy = bounds
         da = rioxarray.open_rasterio(
-            file_path, 
+            file_path,
             chunks=spatial_chunks,
             masked=True
         )
@@ -428,7 +508,7 @@ def open_raster_band(
         da = da.rio.clip_box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
     else:
         da = rioxarray.open_rasterio(file_path, chunks=spatial_chunks)
-    
+
     # Select band if multi-band
     if band_index is not None:
         if 'band' in da.dims:
@@ -437,7 +517,7 @@ def open_raster_band(
         # Single band - drop band dimension
         if 'band' in da.dims and len(da.band) == 1:
             da = da.isel(band=0, drop=True)
-    
+
     return da
 
 
