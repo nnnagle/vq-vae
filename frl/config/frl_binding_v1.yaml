@@ -23,7 +23,8 @@ stats:
     [mean, sd, min, max, q02, q05, q25, q50, q75, q95, q98]
   covariance: true
   samples:
-    n: 16 # number of patches to sample
+    n: 500             # number of patches to sample (~10% of full VA extent)
+    reservoir_size: 500000  # max pixels per channel kept in memory
   mask:
     - static_mask.aoi
     - static_mask.forest

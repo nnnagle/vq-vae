@@ -22,6 +22,55 @@ from ..loaders.transforms import apply_transform
 logger = logging.getLogger(__name__)
 
 
+class _ChannelReservoir:
+    """Fixed-size uniform random reservoir for a single channel.
+
+    Uses Vitter's Algorithm R to maintain a uniform random sample of pixel
+    values seen so far, regardless of how many patches are processed.
+    Memory usage is O(max_size) regardless of the total pixel count.
+    """
+
+    def __init__(self, max_size: int, rng: np.random.RandomState):
+        self.max_size = max_size
+        self.rng = rng
+        self.data = np.empty(max_size, dtype=np.float32)
+        self.n_filled = 0   # slots currently occupied
+        self.n_seen = 0     # total pixels offered so far
+
+    def update(self, values: np.ndarray) -> None:
+        """Offer a batch of pixel values to the reservoir."""
+        values = values.flatten().astype(np.float32)
+        n_new = len(values)
+        if n_new == 0:
+            return
+
+        # Fill empty slots first
+        n_fill = min(self.max_size - self.n_filled, n_new)
+        if n_fill > 0:
+            self.data[self.n_filled:self.n_filled + n_fill] = values[:n_fill]
+            self.n_filled += n_fill
+            values = values[n_fill:]
+            self.n_seen += n_fill
+            n_new -= n_fill
+
+        if n_new == 0:
+            return
+
+        # Reservoir full: vectorised Algorithm R replacement.
+        # For each incoming item at stream index n_seen+i, draw a random
+        # slot in [0, n_seen+i].  Replace if the slot falls inside the
+        # reservoir (< max_size).
+        stream_pos = np.arange(self.n_seen, self.n_seen + n_new)
+        random_slots = self.rng.randint(0, stream_pos + 1)
+        accept = random_slots < self.max_size
+        self.data[random_slots[accept]] = values[accept]
+        self.n_seen += n_new
+
+    def get(self) -> np.ndarray:
+        """Return the reservoir contents (may be smaller than max_size early on)."""
+        return self.data[:self.n_filled]
+
+
 class StatsCalculator:
     """Calculates statistics for features from sampled dataset patches.
 
@@ -316,7 +365,11 @@ class StatsCalculator:
         patch_data_list: List[Tuple[np.ndarray, np.ndarray]],
         feature_config: FeatureConfig,
     ) -> Dict[str, Dict[str, float]]:
-        """Compute univariate statistics for each channel.
+        """Compute univariate statistics for each channel using reservoir sampling.
+
+        Each channel maintains a fixed-size reservoir of uniformly sampled pixel
+        values (default 500 000).  Memory is O(reservoir_size * n_channels)
+        regardless of how many patches or timesteps are processed.
 
         Args:
             patch_data_list: List of (feature_data, valid_mask) tuples
@@ -327,48 +380,46 @@ class StatsCalculator:
         """
         channel_names = list(feature_config.channels.keys())
         n_channels = len(channel_names)
+        reservoir_size = self.stats_config.samples.get('reservoir_size', 500_000)
 
-        # Collect all valid values for each channel
-        channel_values = [[] for _ in range(n_channels)]
+        rng = np.random.RandomState(42)
+        reservoirs = [_ChannelReservoir(reservoir_size, rng) for _ in range(n_channels)]
 
         for feature_data, valid_mask in patch_data_list:
             # feature_data: [C, H, W] or [C, T, H, W]
-            # valid_mask: [H, W] or [T, H, W]
-
+            # valid_mask:   [H, W]    or [T, H, W]
             if feature_data.ndim == 3:
-                # Static data [C, H, W]
                 for c in range(n_channels):
-                    valid_values = feature_data[c][valid_mask]
-                    channel_values[c].extend(valid_values.flatten())
+                    reservoirs[c].update(feature_data[c][valid_mask])
             else:
-                # Temporal data [C, T, H, W] - collect all valid
                 for c in range(n_channels):
-                   channel_temporal = feature_data[c] 
-                   valid_values = channel_temporal[valid_mask]
-                   channel_values[c].extend(valid_values.flatten())
+                    reservoirs[c].update(feature_data[c][valid_mask])
 
+        # Build transform map for self-documenting JSON output
+        channel_transforms = {
+            name: cfg.transform
+            for name, cfg in zip(channel_names, feature_config.channels.values())
+            if cfg.transform is not None
+        }
 
-        # Build a map from channel_name -> transform spec (if any)
-        channel_transforms = {}
-        for channel_name, channel_config in zip(channel_names, feature_config.channels.values()):
-            if channel_config.transform is not None:
-                channel_transforms[channel_name] = channel_config.transform
+        quantiles_map = {
+            'q02': 2, 'q05': 5, 'q25': 25, 'q50': 50,
+            'q75': 75, 'q95': 95, 'q98': 98
+        }
+        quantile_requests = [
+            (name, q) for name, q in quantiles_map.items()
+            if name in self.stats_config.stats
+        ]
 
-        # Compute stats for each channel
         stats_dict = {}
-        for channel_name, values in zip(channel_names, channel_values):
+        for channel_name, reservoir in zip(channel_names, reservoirs):
+            values = reservoir.get()
             if len(values) == 0:
                 logger.warning(f"No valid values for channel {channel_name}")
                 continue
 
-            values = np.array(values)
-
-            # Compute requested stats
             channel_stats = {}
 
-            # Record which transform was applied (if any) so the JSON
-            # is self-documenting about what distribution these stats
-            # describe.
             if channel_name in channel_transforms:
                 channel_stats['transform'] = channel_transforms[channel_name]
 
@@ -379,25 +430,20 @@ class StatsCalculator:
 
             finite_values = values[np.isfinite(values)]
             if 'min' in self.stats_config.stats:
-                channel_stats['min'] = float(np.min(finite_values)) if len(finite_values) > 0 else float('nan')
+                channel_stats['min'] = float(np.min(finite_values)) if len(finite_values) else float('nan')
             if 'max' in self.stats_config.stats:
-                channel_stats['max'] = float(np.max(finite_values)) if len(finite_values) > 0 else float('nan')
+                channel_stats['max'] = float(np.max(finite_values)) if len(finite_values) else float('nan')
 
-            # Quantiles
-            quantiles_map = {
-                'q02': 2, 'q05': 5, 'q25': 25, 'q50': 50,
-                'q75': 75, 'q95': 95, 'q98': 98
-            }
-            quantile_requests = [
-                (name, q) for name, q in quantiles_map.items()
-                if name in self.stats_config.stats
-            ]
             if quantile_requests:
                 percentiles = [q for _, q in quantile_requests]
-                quantile_values = np.percentile(values, percentiles)
+                quantile_values = np.percentile(finite_values, percentiles) if len(finite_values) else [float('nan')] * len(percentiles)
                 for (name, _), val in zip(quantile_requests, quantile_values):
                     channel_stats[name] = float(val)
 
+            logger.info(
+                f"  {channel_name}: {reservoir.n_seen:,} pixels seen, "
+                f"{len(values):,} in reservoir"
+            )
             stats_dict[channel_name] = channel_stats
 
         return stats_dict
