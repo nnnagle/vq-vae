@@ -1967,6 +1967,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Enable debug logging"
     )
     parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Write log output to this file in addition to stderr"
+    )
+    parser.add_argument(
         "--validate-only",
         action='store_true',
         help="Only validate configuration and files, don't build zarr"
@@ -1986,6 +1992,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     
     # Configure logging
+    if args.log_file:
+        fh = logging.FileHandler(args.log_file, mode='a')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(fh)
+
     if args.verbose:
         log.setLevel(logging.DEBUG)
         # Also set root logger
