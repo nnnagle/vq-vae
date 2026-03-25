@@ -2039,11 +2039,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Number of CPU cores for parallel processing"
     )
     parser.add_argument(
-        "--no-stats",
-        action='store_true',
-        help="Skip statistics computation"
-    )
-    parser.add_argument(
         "--verbose", "-v",
         action='store_true',
         help="Enable debug logging"
@@ -2064,11 +2059,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action='store_true',
         help="Only validate configuration and files, don't build zarr"
     )
-    parser.add_argument(
-        "--stats-from-zarr",
-        action='store_true',
-        help="Compute statistics from written zarr (safer for large datasets)"
-    )
+
     
     return parser.parse_args(argv)
 
@@ -2249,23 +2240,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     zarr.consolidate_metadata(str(zarr_path))
     log.info(f"✓ {band_counter} variables written to {zarr_path}")
 
-    # Compute statistics (always from the written zarr — no in-memory variables dict)
-    if not args.no_stats:
-        log.info("Computing statistics from written zarr")
-        stats_dict = compute_statistics_from_zarr(zarr_path, aoi)
-
-        stats_cfg = cfg['dataset'].get('statistics', {})
-        if stats_cfg.get('embed_in_zarr', True):
-            embed_statistics_in_zarr(zarr_path, stats_dict)
-
-        if stats_cfg.get('export_json', True):
-            json_path = zarr_path.with_suffix('.stats.json')
-            export_statistics_json(stats_dict, json_path)
-
-        if stats_cfg.get('export_csv', True):
-            csv_path = zarr_path.with_suffix('.stats.csv')
-            export_statistics_csv(stats_dict, csv_path)
-    
     log.info("✓ Zarr build complete!")
     
     # Clean up dask cluster if running
