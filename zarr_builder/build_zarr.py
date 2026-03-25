@@ -2044,9 +2044,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     spatial_cfg = parse_spatial_config(cfg)
     log.info(f"Spatial grid: {spatial_cfg.shape} pixels at {spatial_cfg.resolution}m resolution")
     
-    # Get global time window
-    global_window = get_global_time_window(cfg)
-    log.info(f"Global time window: {global_window[0]} to {global_window[1]}")
+    # Get global time window (only needed for annual/irregular groups)
+    has_temporal = cfg.get('annual') or cfg.get('irregular')
+    if has_temporal:
+        global_window = get_global_time_window(cfg)
+        log.info(f"Global time window: {global_window[0]} to {global_window[1]}")
+    else:
+        global_window = None
     
     # Determine output path
     zarr_path = args.out or Path(cfg['dataset']['out_zarr']['path'])
