@@ -1368,10 +1368,11 @@ def open_zarr_store(
     aoi: Optional[xr.DataArray] = None,
     strata: Optional[xr.DataArray] = None,
     compressor_cfg: Optional[Dict] = None,
-    chunks: Optional[Dict[str, int]] = None
+    chunks: Optional[Dict[str, int]] = None,
+    append: bool = False
 ):
     """
-    Create a zarr store and write aoi/strata.
+    Create (or append to) a zarr store and write aoi/strata.
 
     Returns ``(root, compressor)`` for subsequent calls to
     ``write_variable_to_zarr`` and ``zarr.consolidate_metadata``.
@@ -1380,7 +1381,8 @@ def open_zarr_store(
 
     p = Path(zarr_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    root = zarr.open_group(str(zarr_path), mode='w', zarr_format=2)
+    mode = 'a' if append else 'w'
+    root = zarr.open_group(str(zarr_path), mode=mode, zarr_format=2)
 
     if compressor_cfg:
         compressor = numcodecs.Blosc(
@@ -1973,6 +1975,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Write log output to this file in addition to stderr"
     )
     parser.add_argument(
+        "--append",
+        action='store_true',
+        help="Open existing zarr in append mode instead of overwriting"
+    )
+    parser.add_argument(
         "--validate-only",
         action='store_true',
         help="Only validate configuration and files, don't build zarr"
@@ -2099,7 +2106,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     root, compressor = open_zarr_store(
         zarr_path, aoi=aoi, strata=strata,
-        compressor_cfg=compressor_cfg, chunks=chunks
+        compressor_cfg=compressor_cfg, chunks=chunks,
+        append=args.append
     )
 
     dtype_cfg = cfg['dataset'].get('dtype', {})
