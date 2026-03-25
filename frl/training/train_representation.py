@@ -1013,11 +1013,19 @@ def main():
     # Create train dataset
     logger.info("Creating train dataset...")
     patch_size = training_config.sampling.patch_size
+    spatial = training_config.spatial_domain
+    debug_window = None
+    if spatial.debug_mode and spatial.debug_window is not None:
+        w = spatial.debug_window
+        debug_window = ((w.origin[0], w.origin[1]), (w.size[0], w.size[1]))
+        logger.info(f"Debug mode: spatial window origin={w.origin} size={w.size}")
+
     train_dataset = ForestDatasetV2(
         bindings_config,
         split='train',
         patch_size=patch_size,
         min_aoi_fraction=0.3,
+        debug_window=debug_window,
     )
     logger.info(f"Train dataset has {len(train_dataset)} patches")
 
@@ -1037,6 +1045,7 @@ def main():
         split='val',
         patch_size=patch_size,
         min_aoi_fraction=0.3,
+        debug_window=debug_window,
     )
     logger.info(f"Validation dataset has {len(val_dataset)} patches")
 
