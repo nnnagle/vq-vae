@@ -1,0 +1,94 @@
+# VA VAE Dataset Configuration - EVT LAYER ONLY
+# Schema version: 1.0.0
+# Use with --append to update the EVT static layer in an existing zarr.
+#
+# Source updated to LF2024 CONUS-wide EVT raster. The VA spatial bounds in
+# this config cause the builder to clip the CONUS file to VA automatically.
+#
+# Example:
+#   python build_zarr.py va_vae_dataset_evt_only.yaml --append --log-file evt_update.log
+
+dataset:
+  name: va_vae_raster_dataset
+  version: "1.0.0"
+
+  out_zarr:
+    path: /data/VA/zarr/va_vae_dataset.zarr
+    structure: hierarchical
+
+  spatial:
+    crs:
+      wkt: |
+        PROJCS["AEA_WGS84",
+          GEOGCS["GCS_WGS_1984",
+            DATUM["WGS_1984",
+              SPHEROID["WGS_84",6378137,298.257223563]],
+            PRIMEM["Greenwich",0],
+            UNIT["Degree",0.0174532925199433]],
+          PROJECTION["Albers_Conic_Equal_Area"],
+          PARAMETER["False_Easting",0],
+          PARAMETER["False_Northing",0],
+          PARAMETER["Central_Meridian",-96],
+          PARAMETER["Standard_Parallel_1",29.5],
+          PARAMETER["Standard_Parallel_2",45.5],
+          PARAMETER["Latitude_Of_Origin",23],
+          UNIT["Meter",1]]
+
+    resolution: 30
+
+    transform: [30, 0, 1089315, 0, -30, 1966485]
+
+    bounds:
+      xmin: 1089315
+      ymin: 1574805
+      xmax: 1795875
+      ymax: 1966485
+      # Dimensions: 23552 x 13056 pixels (706560m x 391680m)
+      # Grid: 92 x 51 tiles of 256 pixels each
+
+  dtype:
+    default: float16
+    continuous: float16
+    categorical: int16
+    mask: uint8
+
+  default_chunk:
+    static: {y: 256, x: 256, bands: all}
+
+  compressor:
+    name: blosc
+    cname: lz4
+    clevel: 3
+    shuffle: 2
+
+  statistics:
+    spatial_mask: aoi
+    continuous: [mean, sd, min, q02, q25, q50, q75, q98, max]
+    categorical: histogram
+    boolean: [true_count, false_count, true_fraction]
+    embed_in_zarr: true
+    export_json: true
+    export_csv: true
+
+  reprojection:
+    enabled: true
+    crs_match_mode: projection
+    resolution_tolerance_m: 1.0
+    interpolation: nearest
+
+aoi:
+  type: static
+  path: /data/VA/main/va_mask.tif
+
+strata:
+  type: static
+  path: /data/VA/main/va_strata.tif
+
+static:
+  - group: evt
+    path: /data/landfire/LF2024_EVT_CONUS/Tif/LF2024_EVT_CONUS.tif
+    data:
+      semantic_type: categorical
+      bands:
+        - id: evt
+          source_band: 1

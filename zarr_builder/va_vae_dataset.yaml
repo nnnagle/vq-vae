@@ -217,7 +217,7 @@ irregular:
           source_band: 7
 static:
   - group: evt
-    path: /data/VA/evt/evt.tif
+    path: /data/landfire/LF2024_EVT_CONUS/Tif/LF2024_EVT_CONUS.tif
     data:
       semantic_type: categorical
       bands:
