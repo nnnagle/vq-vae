@@ -682,7 +682,7 @@ def load_static_band(
         import rasterio as _rio
         with _rio.open(str(file_path)) as _src:
             src_crs = _src.crs
-        if src_crs and template.rio.crs and (src_crs == template.rio.crs):
+        if src_crs and template.rio.crs and _crs_match(src_crs, template.rio.crs):
             open_bounds = template.rio.bounds()
             log.debug(f"        Pre-clipping to template bounds {open_bounds}")
     except Exception as _e:
