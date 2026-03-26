@@ -396,6 +396,7 @@ def _open_single_band_rasterio(
     file_path: Path,
     band_index: int,
     chunks: Optional[Dict[str, int]] = None,
+    bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> xr.DataArray:
     """
     Open a single band from a (possibly multi-band) raster using rasterio
@@ -403,36 +404,65 @@ def _open_single_band_rasterio(
     only the requested band, so GDAL never caches the full multi-band file.
     This avoids the large unmanaged-memory footprint that rioxarray incurs
     when opening a VRT with many bands just to select one.
+
+    When ``bounds`` is provided (in the source file's CRS), the Dask graph is
+    limited to just the tiles that intersect that bounding box.  This is
+    critical for CONUS-wide sources (e.g. LANDFIRE EVT) that would otherwise
+    produce hundreds of thousands of tasks before spatial clipping occurs.
     """
+    import math
+
     import dask
     import dask.array as dsa
     import rasterio
+    import rasterio.windows
 
     chunk_y = (chunks or {}).get('y', 256)
     chunk_x = (chunks or {}).get('x', 256)
 
     # Read metadata only — file is closed immediately after this block
     with rasterio.open(str(file_path)) as src:
-        height, width = src.height, src.width
         dtype = src.dtypes[band_index - 1]
         nodata = src.nodata
         transform = src.transform
         crs_wkt = src.crs.to_wkt() if src.crs else None
 
-    # Pixel-centre coordinates
-    y_coords = np.array([transform.f + transform.e * (i + 0.5) for i in range(height)])
-    x_coords = np.array([transform.c + transform.a * (j + 0.5) for j in range(width)])
+        if bounds is not None:
+            # Convert CRS-space bounds to a pixel window, then clamp to file extent.
+            win = rasterio.windows.from_bounds(*bounds, transform=src.transform)
+            col_off = max(0, math.floor(win.col_off))
+            row_off = max(0, math.floor(win.row_off))
+            col_end = min(src.width,  math.ceil(win.col_off + win.width))
+            row_end = min(src.height, math.ceil(win.row_off + win.height))
+            win_width  = col_end - col_off
+            win_height = row_end - row_off
+            win_transform = rasterio.windows.transform(
+                rasterio.windows.Window(col_off, row_off, win_width, win_height),
+                src.transform,
+            )
+        else:
+            col_off, row_off = 0, 0
+            win_height, win_width = src.height, src.width
+            win_transform = transform
 
-    # Build chunk grid
-    y_slices = [slice(y, min(y + chunk_y, height)) for y in range(0, height, chunk_y)]
-    x_slices = [slice(x, min(x + chunk_x, width))  for x in range(0, width,  chunk_x)]
+    # Pixel-centre coordinates for the (possibly clipped) window
+    y_coords = np.array([win_transform.f + win_transform.e * (i + 0.5) for i in range(win_height)])
+    x_coords = np.array([win_transform.c + win_transform.a * (j + 0.5) for j in range(win_width)])
+
+    # Build chunk grid — only over the window, not the full file
+    y_slices = [slice(y, min(y + chunk_y, win_height)) for y in range(0, win_height, chunk_y)]
+    x_slices = [slice(x, min(x + chunk_x, win_width))  for x in range(0, win_width,  chunk_x)]
 
     file_path_str = str(file_path)  # avoid Path serialisation issues in delayed
+    # Capture offsets explicitly so the closure is self-contained and picklable
+    _col_off = col_off
+    _row_off = row_off
 
     def read_window(y_sl, x_sl):
         import rasterio
         from rasterio.windows import Window
-        win = Window(x_sl.start, y_sl.start,
+        # y_sl / x_sl are window-relative; add file-level offset to get file coords
+        win = Window(_col_off + x_sl.start, _row_off + y_sl.start,
                      x_sl.stop - x_sl.start, y_sl.stop - y_sl.start)
         with rasterio.open(file_path_str) as src:
             return src.read(band_index, window=win)
@@ -455,7 +485,7 @@ def _open_single_band_rasterio(
                       coords={'y': y_coords, 'x': x_coords})
     if crs_wkt:
         da.rio.write_crs(crs_wkt, inplace=True)
-    da.rio.write_transform(transform, inplace=True)
+    da.rio.write_transform(win_transform, inplace=True)
     if nodata is not None:
         da.attrs['_FillValue'] = nodata
 
@@ -485,10 +515,12 @@ def open_raster_band(
     Returns:
         DataArray with spatial dimensions (y, x)
     """
-    # Fast path: specific band requested, no spatial subsetting needed.
-    # Use rasterio windowed reads to avoid GDAL caching the full multi-band file.
-    if band_index is not None and bounds is None:
-        return _open_single_band_rasterio(file_path, band_index, chunks)
+    # When a specific band is requested, always use rasterio windowed reads.
+    # Passing bounds (when available) limits the Dask graph to just the target
+    # area — critical for CONUS-scale sources where a full-extent graph can
+    # reach hundreds of MB and stall the Dask distributed scheduler.
+    if band_index is not None:
+        return _open_single_band_rasterio(file_path, band_index, chunks, bounds)
 
     # Filter chunks to only spatial dimensions that exist in rasters
     spatial_chunks = None
@@ -641,10 +673,25 @@ def load_static_band(
     else:
         raise ValueError(f"No path specified for band {band_spec.id}")
     
-    # Open raster
-    da = open_raster_band(file_path, band_spec.source_band, chunks)
-    
-    # Align to template
+    # Pre-clip bounds when the source CRS matches the template.  This limits
+    # the Dask graph to the target area before it is submitted to the scheduler,
+    # which is essential for CONUS-wide sources (e.g. LANDFIRE EVT) that would
+    # otherwise generate hundreds of thousands of tasks.
+    open_bounds = None
+    try:
+        import rasterio as _rio
+        with _rio.open(str(file_path)) as _src:
+            src_crs = _src.crs
+        if src_crs and template.rio.crs and (src_crs == template.rio.crs):
+            open_bounds = template.rio.bounds()
+            log.debug(f"        Pre-clipping to template bounds {open_bounds}")
+    except Exception as _e:
+        log.debug(f"        Could not pre-clip bounds ({_e}); falling back to post-load clip")
+
+    # Open raster (windowed to target area when CRS matches)
+    da = open_raster_band(file_path, band_spec.source_band, chunks, open_bounds)
+
+    # Align to template (handles residual pixel-alignment or CRS reprojection)
     da = align_to_template(da, template)
     
     # Handle nodata/fill values
