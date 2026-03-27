@@ -1585,13 +1585,13 @@ def main():
             f"  Train: {train_stats['loss']:.4f} "
             f"spec={train_stats['spectral_loss']:.4f} spat={train_stats['spatial_loss']:.4f} "
             f"phase={train_stats['phase_loss']:.4f} vcr={train_stats['vcr_loss']:.4f} "
-            f"pvcr={train_stats['phase_vcr_loss']:.4f}"
+            f"pvcr={train_stats['phase_vcr_loss']:.4f} evt={train_stats['evt_loss']:.4f}"
         )
         logger.info(
             f"  Val:   {val_stats['loss']:.4f} "
             f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "
             f"phase={val_stats['phase_loss']:.4f} vcr={val_stats['vcr_loss']:.4f} "
-            f"pvcr={val_stats['phase_vcr_loss']:.4f}"
+            f"pvcr={val_stats['phase_vcr_loss']:.4f} evt={val_stats['evt_loss']:.4f}"
         )
 
         # Log distribution statistics
