@@ -153,6 +153,7 @@ def process_batch(
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
+    all_evt_diag: list[dict] = []  # accumulate per-sample EVT diagnostics
     n_valid = 0
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
@@ -339,13 +340,14 @@ def process_batch(
             else:
                 z_evt = z_anchors
                 evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)  # [N]
-            evt_raw, _evt_stats = evt_soft_neighborhood_loss(
+            evt_raw, evt_diag = evt_soft_neighborhood_loss(
                 z_evt,
                 evt_at_anchors,
                 evt_metric,
                 tau_ref=config.get('evt_tau_ref', 0.5),
                 tau_learned=config.get('evt_tau_learned', 0.5),
             )
+            all_evt_diag.append(evt_diag)
             evt_loss_val = config.get('evt_weight', 0.0) * evt_raw
 
         # Compute variance-covariance regularization on type embeddings
@@ -618,11 +620,13 @@ def process_batch(
             agg[key] = sum(vals) / len(vals)
         return agg
 
+    _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+                           median_d_learned=0.0, n_anchors_valid=0)
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
-            'evt_loss': 0.0,
+            'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
@@ -649,7 +653,7 @@ def process_batch(
                 'loss': float('nan'), 'spectral_loss': float('nan'),
                 'spatial_loss': float('nan'), 'phase_loss': float('nan'),
                 'vcr_loss': float('nan'), 'phase_vcr_loss': float('nan'),
-                'evt_loss': float('nan'),
+                'evt_loss': float('nan'), 'evt_diag': _empty_evt_diag,
                 'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
@@ -709,6 +713,17 @@ def process_batch(
             'beta_per_dim_std': beta_cat.std(dim=0).mean().item(),
         }
 
+    # Aggregate EVT diagnostics across samples
+    empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+                          median_d_learned=0.0, n_anchors_valid=0)
+    if all_evt_diag:
+        evt_diag_agg = {
+            k: sum(d.get(k, 0.0) for d in all_evt_diag) / len(all_evt_diag)
+            for k in ('mean_entropy_ref', 'mean_entropy_learned', 'median_d_learned', 'n_anchors_valid')
+        }
+    else:
+        evt_diag_agg = empty_evt_diag
+
     return {
         'loss': mean_loss,
         'spectral_loss': mean_spectral_loss,
@@ -717,6 +732,7 @@ def process_batch(
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
+        'evt_diag': evt_diag_agg,
         'n_valid': n_valid,
         'spectral_pos_pairs': total_spectral_pos_pairs // n_valid if n_valid > 0 else 0,
         'spectral_neg_pairs': total_spectral_neg_pairs // n_valid if n_valid > 0 else 0,
@@ -755,6 +771,7 @@ def train_epoch(
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
+    all_epoch_evt_diag: list[dict] = []
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
     total_spatial_pos_pairs = 0
@@ -789,6 +806,8 @@ def train_epoch(
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_evt_loss += stats.get('evt_loss', 0.0)
+            if stats.get('evt_diag'):
+                all_epoch_evt_diag.append(stats['evt_diag'])
             total_spectral_pos_pairs += stats['spectral_pos_pairs']
             total_spectral_neg_pairs += stats['spectral_neg_pairs']
             total_spatial_pos_pairs += stats['spatial_pos_pairs']
@@ -844,6 +863,13 @@ def train_epoch(
             'film_stats': None,
         }
 
+    _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+                           median_d_learned=0.0, n_anchors_valid=0)
+    epoch_evt_diag = (
+        {k: sum(d.get(k, 0.0) for d in all_epoch_evt_diag) / len(all_epoch_evt_diag)
+         for k in _empty_evt_diag}
+        if all_epoch_evt_diag else _empty_evt_diag
+    )
     return {
         'loss': total_loss / total_batches,
         'spectral_loss': total_spectral_loss / total_batches,
@@ -852,6 +878,7 @@ def train_epoch(
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
+        'evt_diag': epoch_evt_diag,
         'spectral_pos_pairs': total_spectral_pos_pairs // total_batches,
         'spectral_neg_pairs': total_spectral_neg_pairs // total_batches,
         'spatial_pos_pairs': total_spatial_pos_pairs // total_batches,
@@ -885,6 +912,7 @@ def validate_epoch(
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
+    all_epoch_evt_diag: list[dict] = []
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -913,6 +941,8 @@ def validate_epoch(
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_evt_loss += stats.get('evt_loss', 0.0)
+                if stats.get('evt_diag'):
+                    all_epoch_evt_diag.append(stats['evt_diag'])
                 total_batches += 1
 
                 # Update distribution stats from last valid batch
@@ -925,10 +955,12 @@ def validate_epoch(
                     last_film_stats = stats['film_stats']
 
     if total_batches == 0:
+        _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+                               median_d_learned=0.0, n_anchors_valid=0)
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
-            'evt_loss': 0.0,
+            'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
@@ -936,6 +968,13 @@ def validate_epoch(
             'film_stats': None,
         }
 
+    _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+                           median_d_learned=0.0, n_anchors_valid=0)
+    epoch_evt_diag = (
+        {k: sum(d.get(k, 0.0) for d in all_epoch_evt_diag) / len(all_epoch_evt_diag)
+         for k in _empty_evt_diag}
+        if all_epoch_evt_diag else _empty_evt_diag
+    )
     return {
         'loss': total_loss / total_batches,
         'spectral_loss': total_spectral_loss / total_batches,
@@ -944,6 +983,7 @@ def validate_epoch(
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
+        'evt_diag': epoch_evt_diag,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
@@ -1593,6 +1633,25 @@ def main():
             f"phase={val_stats['phase_loss']:.4f} vcr={val_stats['vcr_loss']:.4f} "
             f"pvcr={val_stats['phase_vcr_loss']:.4f} evt={val_stats['evt_loss']:.4f}"
         )
+        # EVT tau diagnostics — logged only when the EVT loss is active
+        if evt_metric is not None:
+            td = train_stats.get('evt_diag', {})
+            vd = val_stats.get('evt_diag', {})
+            logger.info(
+                f"  EVT diagnostics (train) | "
+                f"H_ref={td.get('mean_entropy_ref', 0.0):.3f} "
+                f"H_lrn={td.get('mean_entropy_learned', 0.0):.3f} "
+                f"med_d_lrn={td.get('median_d_learned', 0.0):.3f} "
+                f"n_valid={td.get('n_anchors_valid', 0):.0f} | "
+                f"target tau_learned ≈ {td.get('median_d_learned', 0.0):.3f}"
+            )
+            logger.info(
+                f"  EVT diagnostics (val)   | "
+                f"H_ref={vd.get('mean_entropy_ref', 0.0):.3f} "
+                f"H_lrn={vd.get('mean_entropy_learned', 0.0):.3f} "
+                f"med_d_lrn={vd.get('median_d_learned', 0.0):.3f} "
+                f"n_valid={vd.get('n_anchors_valid', 0):.0f}"
+            )
 
         # Log distribution statistics
         def fmt_stats(s: dict) -> str:

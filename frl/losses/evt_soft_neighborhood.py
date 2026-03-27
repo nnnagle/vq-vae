@@ -347,6 +347,10 @@ def evt_soft_neighborhood_loss(
         entropy_lrn = -(q_dist * log_q).sum(dim=1)
         mean_entropy_ref = entropy_ref[active].mean().item() if active.any() else 0.0
         mean_entropy_lrn = entropy_lrn[active].mean().item() if active.any() else 0.0
+        # Median pairwise latent distance — direct guide for tau_learned:
+        # tau_learned should be ~this value for a well-spread distribution
+        off_diag_d = d_learned_v[mask]
+        mean_d_learned = off_diag_d.median().item() if off_diag_d.numel() > 0 else 0.0
 
     stats = dict(
         n_anchors_in=embeddings.shape[0],
@@ -355,5 +359,6 @@ def evt_soft_neighborhood_loss(
         mean_kl=mean_kl,
         mean_entropy_ref=mean_entropy_ref,
         mean_entropy_learned=mean_entropy_lrn,
+        median_d_learned=mean_d_learned,
     )
     return loss, stats
