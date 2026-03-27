@@ -418,6 +418,24 @@ sampling-strategy:
           - channel: static.ysfc_min
             transform: inverse-frequency  # weight ∝ 1/count(value) within masked area
 
+  # Like grid-plus-supplement but supplement is weighted by inverse EVT code
+  # frequency so rare ecological types get proportionally more anchor samples.
+  grid-plus-supplement-evt:
+    grid:
+      stride: 16
+      exclude_border: 16
+      jitter:
+        radius: 4
+    supplement:
+      n: 104
+      sampling:
+        type: weighted
+        weight_by:
+          - static_mask.aoi
+          - static_mask.forest
+          - channel: static_categorical.evt
+            transform: inverse-frequency  # weight ∝ 1/count(evt_code) within masked area
+
 losses:
   # Ecological similarity (context-driven)
   infonce_type_spectral:
@@ -579,4 +597,6 @@ losses:
     diffusion_steps: 2    # k in P^k; 1=direct confusion, 2=two-hop transitivity
     tau_ref: 0.5          # softmax temperature for EVT graph distances
     tau_learned: 0.5      # softmax temperature for latent space distances
+    anchor:
+      population: grid-plus-supplement-evt  # oversamples rare EVT codes
 

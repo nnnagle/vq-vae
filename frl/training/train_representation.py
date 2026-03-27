@@ -112,6 +112,7 @@ def process_batch(
     phase_config: dict | None = None,
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
+    evt_sampler: AnchorSampler | None = None,
 ) -> dict:
     """
     Process a single batch for training or validation.
@@ -128,6 +129,7 @@ def process_batch(
         phase_sampler: Optional anchor sampler for phase loss pair construction
         phase_config: Optional phase loss config dict (k, min_overlap, etc.)
         epoch: Current epoch (0-indexed), used for curriculum weighting
+        evt_sampler: Optional EVT-stratified anchor sampler; oversamples rare EVT codes
 
     Returns:
         Dict with loss values and stats
@@ -329,9 +331,16 @@ def process_batch(
         if evt_metric is not None:
             evt_feature = feature_builder.build_feature('evt_class', sample)
             evt_data = torch.from_numpy(evt_feature.data).long().to(device)  # [1, H, W]
-            evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)  # [N]
+            if evt_sampler is not None:
+                # Draw EVT-stratified anchors (oversamples rare EVT codes)
+                evt_anchors = evt_sampler(combined_mask, training=training, sample=sample)
+                z_evt = extract_at_locations(z_full, evt_anchors)   # [M, D]
+                evt_at_anchors = extract_at_locations(evt_data, evt_anchors).squeeze(1)  # [M]
+            else:
+                z_evt = z_anchors
+                evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)  # [N]
             evt_raw, _evt_stats = evt_soft_neighborhood_loss(
-                z_anchors,
+                z_evt,
                 evt_at_anchors,
                 evt_metric,
                 tau_ref=config.get('evt_tau_ref', 0.5),
@@ -736,6 +745,7 @@ def train_epoch(
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
     evt_metric: EvtDiffusionMetric | None = None,
+    evt_sampler: AnchorSampler | None = None,
 ) -> dict:
     """Run training on entire training set for one epoch."""
     total_loss = 0.0
@@ -766,7 +776,7 @@ def train_epoch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
             phase_sampler=phase_sampler, phase_config=phase_config,
-            epoch=epoch, evt_metric=evt_metric,
+            epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
         scheduler.step()
@@ -865,6 +875,7 @@ def validate_epoch(
     phase_config: dict | None = None,
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
+    evt_sampler: AnchorSampler | None = None,
 ) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
@@ -892,7 +903,7 @@ def validate_epoch(
                 batch, feature_builder, model, device, config,
                 training=False,
                 phase_sampler=phase_sampler, phase_config=phase_config,
-                epoch=epoch, evt_metric=evt_metric,
+                epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
             )
             if stats['n_valid'] > 0:
                 total_loss += stats['loss']
@@ -1382,6 +1393,13 @@ def main():
         loss_config['evt_weight'] = evt_loss_cfg.weight
         loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
         loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
+        # Build EVT-stratified anchor sampler
+        evt_anchor_pop = (
+            evt_loss_cfg.anchor_population
+            if evt_loss_cfg.anchor_population
+            else 'grid-plus-supplement-evt'
+        )
+        evt_sampler = build_anchor_sampler(bindings_config, evt_anchor_pop)
         logger.info(
             f"EVT soft neighbourhood loss enabled: "
             f"{evt_metric.n_codes} codes, "
@@ -1389,9 +1407,11 @@ def main():
             f"min_count={evt_loss_cfg.min_count or 100}, "
             f"weight={loss_config['evt_weight']}, "
             f"tau_ref={loss_config['evt_tau_ref']}, "
-            f"tau_learned={loss_config['evt_tau_learned']}"
+            f"tau_learned={loss_config['evt_tau_learned']}, "
+            f"anchor_population={evt_anchor_pop}"
         )
     else:
+        evt_sampler = None
         logger.info("EVT soft neighbourhood loss disabled (weight=0 or not in bindings config)")
 
     # Create scheduler with optional warmup.
@@ -1550,14 +1570,14 @@ def main():
           train_dataloader, feature_builder, model,
           optimizer, scheduler, device, loss_config, epoch, num_epochs,
           phase_sampler=phase_sampler, phase_config=phase_config,
-          evt_metric=evt_metric,
+          evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
         val_stats = validate_epoch(
           val_dataloader, feature_builder, model,
           device, loss_config,
           phase_sampler=phase_sampler, phase_config=phase_config,
-          epoch=epoch, evt_metric=evt_metric,
+          epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
         logger.info(f"Epoch {epoch+1}/{num_epochs} complete")

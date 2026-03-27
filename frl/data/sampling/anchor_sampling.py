@@ -399,7 +399,7 @@ class AnchorSampler:
                 border=self.border,
                 jitter_radius=jitter,
             )
-        elif self.strategy in ('grid-plus-supplement', 'grid-plus-supplement-ysfc'):
+        elif self.strategy.startswith('grid-plus-supplement'):
             return sample_anchors_grid_plus_supplement(
                 mask,
                 stride=self.stride,
@@ -514,7 +514,7 @@ def build_anchor_sampler(
                 jitter_radius=grid_config.get('jitter', {}).get('radius', 4),
                 supplement_n=0,
             )
-        elif strategy_name in ('grid-plus-supplement', 'grid-plus-supplement-ysfc'):
+        elif strategy_name.startswith('grid-plus-supplement'):
             gps_config = strategies.get(strategy_name, {})
             grid_config = gps_config.get('grid', {})
             supplement_config = gps_config.get('supplement', {})
