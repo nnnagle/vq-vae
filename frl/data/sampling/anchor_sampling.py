@@ -152,7 +152,7 @@ def sample_anchors_grid_plus_supplement(
 
         if weights is not None:
             # Weighted sampling: gather weights at valid pixel locations
-            flat_weights = weights.flatten()[valid_indices].float()
+            flat_weights = weights.to(mask.device).flatten()[valid_indices].float()
             # Clamp negatives and ensure non-zero sum
             flat_weights = flat_weights.clamp(min=0.0)
             total = flat_weights.sum()
