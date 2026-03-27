@@ -1,0 +1,364 @@
+"""
+EVT-guided soft neighbourhood loss.
+
+Encourages the z_type embedding space to mirror the network structure of
+the LANDFIRE EVT confusion graph.  For each anchor pixel, the distribution
+of distances to neighbouring pixels in the learned latent space should match
+the distribution of diffusion distances in the EVT confusion graph.
+
+Design
+------
+1.  **Similarity matrix** — built from the combined NE+SE EVT contingency
+    table.  Codes absent from the regional histogram (below ``min_count``) are
+    excluded so rare / out-of-region types don't dilute the signal.
+
+2.  **Diffusion** — the raw confusion matrix is symmetrised and row-normalised
+    to a stochastic transition matrix P, then raised to the k-th power (P^k).
+    This captures transitive similarity: if A↔B and B↔C are both confused,
+    the diffused matrix assigns nonzero similarity to A↔C even when their
+    direct confusion is zero.  k=1 is direct confusion only; k=2 is the
+    default.
+
+3.  **Soft neighbourhood matching** — per-anchor KL divergence between
+    softmax(−d_ref / τ_ref) and softmax(−d_learned / τ_learned), where
+    d_ref comes from the diffused EVT graph and d_learned from pairwise
+    L2 distances in the embedding.  This matches the full distributional
+    structure, not just binary positive/negative pairs.
+
+4.  **Inverse-frequency weighting** — each anchor's row KL is weighted by
+    median_freq / freq(code), capped at max_weight.  This prevents the loss
+    from being dominated by the few most common EVT codes.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+
+_SUMMARY_COLS = ["Row Totals", "Percent Row Agreement"]
+_SUMMARY_ROWS = ["Column Totals", "Percent Column Agreement"]
+
+
+class EvtDiffusionMetric:
+    """Diffusion-distance metric derived from the EVT confusion table.
+
+    Parameters
+    ----------
+    confusion_csv:
+        Path to the combined EVT contingency table CSV produced by
+        ``data/combine_evt_contingency_tables.py``.  Row and column labels
+        are integer LANDFIRE codes.
+    histogram_csv:
+        Path to a two-column CSV with headers ``code`` and ``count``,
+        giving the per-code pixel count in the training region.  Codes
+        below ``min_count`` are excluded from the metric.
+    min_count:
+        Minimum regional pixel count for a code to be included.
+    diffusion_steps:
+        Number of random-walk steps (k in P^k).  k=1 uses direct confusion
+        only; k=2 (default) captures one level of transitivity.
+    max_weight:
+        Cap on inverse-frequency anchor weights to prevent extreme upweighting
+        of very rare codes that do pass the min_count filter.
+    """
+
+    def __init__(
+        self,
+        confusion_csv: str | Path,
+        histogram_csv: str | Path,
+        min_count: int = 100,
+        diffusion_steps: int = 2,
+        max_weight: float = 10.0,
+    ) -> None:
+        self.max_weight = max_weight
+        self._device = torch.device("cpu")
+
+        # ---- Load and filter the confusion table ----------------------------
+        conf = pd.read_csv(confusion_csv, index_col=0)
+        # Drop summary rows / columns
+        conf = conf.drop(
+            columns=[c for c in _SUMMARY_COLS if c in conf.columns],
+            errors="ignore",
+        )
+        conf = conf.drop(
+            index=[r for r in _SUMMARY_ROWS if r in conf.index],
+            errors="ignore",
+        )
+        conf = conf[conf.index.notna()]
+        conf.index = conf.index.astype(int)
+        conf.columns = conf.columns.astype(int)
+        conf = conf.astype(float)
+
+        # ---- Load regional histogram and filter codes -----------------------
+        hist = pd.read_csv(histogram_csv)
+        hist.columns = hist.columns.str.strip().str.lower()
+        if "code" not in hist.columns or "count" not in hist.columns:
+            raise ValueError(
+                f"histogram_csv must have 'code' and 'count' columns; "
+                f"got {list(hist.columns)}"
+            )
+        hist = hist[hist["count"] >= min_count]
+        valid_codes = set(hist["code"].astype(int).tolist())
+
+        # Keep only codes present in both the confusion table AND the histogram
+        keep = sorted(
+            c for c in conf.index.tolist() if c in valid_codes
+        )
+        if len(keep) < 2:
+            raise ValueError(
+                f"Fewer than 2 EVT codes survive the min_count={min_count} filter. "
+                f"Lower min_count or check that histogram_csv covers your region."
+            )
+
+        conf = conf.reindex(index=keep, columns=keep, fill_value=0.0)
+
+        # ---- Build symmetric confusion matrix and diffuse -------------------
+        C = conf.values  # [K, K]
+        C_sym = (C + C.T) / 2.0
+
+        # Row-normalise → stochastic transition matrix P
+        row_sums = C_sym.sum(axis=1, keepdims=True)
+        # Rows with no confusion at all → uniform distribution
+        uniform = np.full(C_sym.shape, 1.0 / C_sym.shape[0])
+        P = np.where(row_sums > 0, C_sym / np.where(row_sums > 0, row_sums, 1.0), uniform)
+
+        # Raise to the k-th power
+        Pk = np.linalg.matrix_power(P, diffusion_steps)
+
+        # Ensure diagonal = 1 (a code is identical to itself)
+        np.fill_diagonal(Pk, 1.0)
+
+        # S[i,j] ∈ [0, 1]; convert to distances: d = 1 - S
+        self._S = torch.tensor(Pk, dtype=torch.float32)  # [K, K]
+        self._code_to_idx: dict[int, int] = {code: i for i, code in enumerate(keep)}
+
+        # ---- Inverse-frequency weights from histogram -----------------------
+        freq_map = dict(
+            zip(hist["code"].astype(int).tolist(), hist["count"].astype(float).tolist())
+        )
+        counts = np.array([freq_map.get(c, 0.0) for c in keep], dtype=np.float64)
+        # Normalise to [0, 1] range so median is well-defined
+        total = counts.sum()
+        freqs = counts / total if total > 0 else np.ones_like(counts) / len(counts)
+        median_freq = float(np.median(freqs[freqs > 0])) if (freqs > 0).any() else 1.0
+        raw_weights = np.where(freqs > 0, median_freq / freqs, 0.0)
+        raw_weights = np.clip(raw_weights, 0.0, max_weight)
+        self._freq_weights = torch.tensor(raw_weights, dtype=torch.float32)  # [K]
+
+    # ------------------------------------------------------------------
+    def to(self, device: torch.device | str) -> "EvtDiffusionMetric":
+        """Move internal tensors to *device*; returns self."""
+        self._device = torch.device(device)
+        self._S = self._S.to(self._device)
+        self._freq_weights = self._freq_weights.to(self._device)
+        return self
+
+    # ------------------------------------------------------------------
+    def reference_distances(
+        self,
+        codes: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute pairwise diffusion distances for a set of EVT codes.
+
+        Parameters
+        ----------
+        codes:
+            ``[N]`` int tensor of LANDFIRE EVT codes at anchor locations.
+
+        Returns
+        -------
+        d_ref : ``[N, N]`` float tensor
+            Pairwise distances (1 − diffused_similarity).  Unknown-code pairs
+            get distance 1.0.
+        valid : ``[N]`` bool tensor
+            True for anchors whose EVT code is present in the metric.
+        """
+        N = codes.shape[0]
+        valid = torch.tensor(
+            [c.item() in self._code_to_idx for c in codes],
+            dtype=torch.bool,
+            device=self._device,
+        )
+        idx = torch.tensor(
+            [self._code_to_idx.get(c.item(), 0) for c in codes],
+            dtype=torch.long,
+            device=self._device,
+        )
+        # Similarity matrix for these anchors
+        sim = self._S[idx[:, None], idx[None, :]]  # [N, N]
+        # Unknown-code entries: set similarity to 0 (distance = 1)
+        inv_valid = ~valid
+        sim[inv_valid, :] = 0.0
+        sim[:, inv_valid] = 0.0
+        # Self-similarity for unknowns stays 0 (they'll be masked out anyway)
+        d_ref = 1.0 - sim
+        return d_ref, valid
+
+    # ------------------------------------------------------------------
+    def anchor_weights(self, codes: torch.Tensor) -> torch.Tensor:
+        """Return per-anchor inverse-frequency weights.
+
+        Parameters
+        ----------
+        codes:
+            ``[N]`` int tensor of LANDFIRE EVT codes.
+
+        Returns
+        -------
+        weights : ``[N]`` float tensor
+            Inverse-frequency weight for each anchor.  Anchors with unknown
+            codes get weight 0.0 (they are excluded from the loss).
+        """
+        weights = torch.tensor(
+            [
+                self._freq_weights[self._code_to_idx[c.item()]].item()
+                if c.item() in self._code_to_idx
+                else 0.0
+                for c in codes
+            ],
+            dtype=torch.float32,
+            device=self._device,
+        )
+        return weights
+
+    @property
+    def n_codes(self) -> int:
+        """Number of EVT codes in the metric."""
+        return len(self._code_to_idx)
+
+
+# ---------------------------------------------------------------------------
+
+def evt_soft_neighborhood_loss(
+    embeddings: torch.Tensor,
+    evt_codes: torch.Tensor,
+    metric: EvtDiffusionMetric,
+    tau_ref: float = 0.5,
+    tau_learned: float = 0.5,
+    min_valid_anchors: int = 4,
+) -> tuple[torch.Tensor, dict]:
+    """EVT-guided soft neighbourhood loss.
+
+    For each anchor with a known EVT code, minimises the KL divergence
+    between the softmax distribution of diffusion distances in the EVT
+    confusion graph and the softmax distribution of L2 distances in the
+    learned embedding space.
+
+    Anchors with EVT codes absent from the regional histogram are excluded.
+    Remaining anchors are weighted by the inverse frequency of their code,
+    so the loss is not dominated by the most common types.
+
+    Parameters
+    ----------
+    embeddings : ``[N, D]``
+        z_type embeddings at anchor locations.
+    evt_codes : ``[N]``
+        Integer LANDFIRE EVT code for each anchor.
+    metric :
+        Prebuilt :class:`EvtDiffusionMetric`.
+    tau_ref :
+        Temperature for the reference (EVT graph) softmax distribution.
+        Smaller → sharper, focusing on nearest EVT neighbours.
+    tau_learned :
+        Temperature for the learned (embedding) softmax distribution.
+    min_valid_anchors :
+        Minimum number of anchors with known EVT codes required to compute
+        the loss.  Returns 0 if not met.
+
+    Returns
+    -------
+    loss : scalar tensor
+    stats : dict
+        Diagnostic keys: ``n_anchors_in``, ``n_anchors_valid``,
+        ``n_rows_active``, ``mean_kl``, ``mean_entropy_ref``,
+        ``mean_entropy_learned``.
+    """
+    device = embeddings.device
+    zero = torch.tensor(0.0, device=device, dtype=embeddings.dtype,
+                        requires_grad=True)
+    empty_stats = dict(
+        n_anchors_in=embeddings.shape[0],
+        n_anchors_valid=0,
+        n_rows_active=0,
+        mean_kl=0.0,
+        mean_entropy_ref=0.0,
+        mean_entropy_learned=0.0,
+    )
+
+    # ---- Reference distances and per-anchor weights ----------------------
+    d_ref, valid = metric.reference_distances(evt_codes)   # [N,N], [N]
+    weights = metric.anchor_weights(evt_codes)             # [N]
+
+    n_valid = int(valid.sum().item())
+    if n_valid < min_valid_anchors:
+        empty_stats["n_anchors_valid"] = n_valid
+        return zero, empty_stats
+
+    # ---- Filter to valid anchors only ------------------------------------
+    emb_v = embeddings[valid]           # [M, D]
+    d_ref_v = d_ref[valid][:, valid]    # [M, M]
+    w_v = weights[valid]                # [M]  inverse-freq weights
+    M = emb_v.shape[0]
+
+    # ---- Learned distances -----------------------------------------------
+    d_learned_v = torch.cdist(emb_v, emb_v)  # [M, M]
+
+    # ---- Mask: off-diagonal, both anchors valid --------------------------
+    mask = ~torch.eye(M, dtype=torch.bool, device=device)  # [M, M]
+
+    # ---- Softmax distributions -------------------------------------------
+    large_neg = torch.tensor(-1e9, device=device, dtype=embeddings.dtype)
+    logits_ref = torch.where(mask, -d_ref_v / tau_ref, large_neg)        # [M, M]
+    logits_lrn = torch.where(mask, -d_learned_v / tau_learned, large_neg)  # [M, M]
+
+    # Rows with ≥2 valid neighbours (all off-diagonal entries are valid here)
+    valid_per_row = mask.sum(dim=1)   # [M]  — always M-1 for a full matrix
+    row_active = valid_per_row >= 2   # [M]
+
+    n_rows_active = int(row_active.sum().item())
+    if n_rows_active == 0:
+        empty_stats["n_anchors_valid"] = n_valid
+        return zero, empty_stats
+
+    # ---- Per-row KL divergence -------------------------------------------
+    log_p = logits_ref.log_softmax(dim=1)    # [M, M]
+    log_q = logits_lrn.log_softmax(dim=1)    # [M, M]
+    p = logits_ref.softmax(dim=1)            # [M, M]
+
+    kl_per_row = (p * (log_p - log_q)).sum(dim=1)   # [M]
+    kl_per_row = torch.where(row_active, kl_per_row, torch.zeros_like(kl_per_row))
+
+    # ---- Weighted mean (inverse-frequency weights) -----------------------
+    row_weights = w_v * row_active.float()   # [M]
+    total_weight = row_weights.sum()
+
+    if total_weight > 0:
+        loss = (row_weights * kl_per_row).sum() / total_weight
+    else:
+        empty_stats["n_anchors_valid"] = n_valid
+        empty_stats["n_rows_active"] = n_rows_active
+        return zero, empty_stats
+
+    # ---- Diagnostics (no grad) -------------------------------------------
+    with torch.no_grad():
+        active = row_active
+        mean_kl = loss.item()
+        q_dist = logits_lrn.softmax(dim=1)
+        entropy_ref = -(p * log_p).sum(dim=1)
+        entropy_lrn = -(q_dist * log_q).sum(dim=1)
+        mean_entropy_ref = entropy_ref[active].mean().item() if active.any() else 0.0
+        mean_entropy_lrn = entropy_lrn[active].mean().item() if active.any() else 0.0
+
+    stats = dict(
+        n_anchors_in=embeddings.shape[0],
+        n_anchors_valid=n_valid,
+        n_rows_active=n_rows_active,
+        mean_kl=mean_kl,
+        mean_entropy_ref=mean_entropy_ref,
+        mean_entropy_learned=mean_entropy_lrn,
+    )
+    return loss, stats

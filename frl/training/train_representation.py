@@ -42,6 +42,7 @@ from losses import contrastive_loss, pairs_with_spatial_constraint
 from losses.phase_pairs import build_phase_pairs
 from losses.phase_neighborhood import phase_neighborhood_loss
 from losses.variance_covariance import variance_covariance_loss
+from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
 from utils import (
     compute_spatial_distances,
     extract_at_locations,
@@ -110,6 +111,7 @@ def process_batch(
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
     epoch: int = 0,
+    evt_metric: EvtDiffusionMetric | None = None,
 ) -> dict:
     """
     Process a single batch for training or validation.
@@ -148,6 +150,7 @@ def process_batch(
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
+    total_evt_loss = 0.0
     n_valid = 0
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
@@ -320,6 +323,21 @@ def process_batch(
 
         # Extract embeddings at anchor locations for spectral loss
         z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
+
+        # EVT soft neighbourhood loss
+        evt_loss_val = torch.tensor(0.0, device=device)
+        if evt_metric is not None:
+            evt_feature = feature_builder.build_feature('evt_class', sample)
+            evt_data = torch.from_numpy(evt_feature.data).long().to(device)  # [1, H, W]
+            evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)  # [N]
+            evt_raw, _evt_stats = evt_soft_neighborhood_loss(
+                z_anchors,
+                evt_at_anchors,
+                evt_metric,
+                tau_ref=config.get('evt_tau_ref', 0.5),
+                tau_learned=config.get('evt_tau_learned', 0.5),
+            )
+            evt_loss_val = config.get('evt_weight', 0.0) * evt_raw
 
         # Compute variance-covariance regularization on type embeddings
         vcr_loss_val = torch.tensor(0.0, device=device)
@@ -510,7 +528,8 @@ def process_batch(
                 + spatial_weight * spatial_loss_val
                 + phase_loss_val
                 + vcr_loss_val
-                + phase_vcr_loss_val)
+                + phase_vcr_loss_val
+                + evt_loss_val)
 
         # Skip if loss is NaN or Inf (numerical instability)
         if not torch.isfinite(loss):
@@ -525,6 +544,7 @@ def process_batch(
             total_phase_loss += phase_loss_val
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
+            total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
             total_spectral_loss += spectral_loss_val.item()
@@ -532,6 +552,7 @@ def process_batch(
             total_phase_loss += phase_loss_val.item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
+            total_evt_loss += evt_loss_val.item()
         n_valid += 1
         total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
         total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
@@ -592,6 +613,7 @@ def process_batch(
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'evt_loss': 0.0,
             'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
             'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
@@ -608,6 +630,7 @@ def process_batch(
     mean_phase_loss = total_phase_loss / n_valid
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
+    mean_evt_loss = total_evt_loss / n_valid
 
     if training:
         # Final NaN check before backward
@@ -617,6 +640,7 @@ def process_batch(
                 'loss': float('nan'), 'spectral_loss': float('nan'),
                 'spatial_loss': float('nan'), 'phase_loss': float('nan'),
                 'vcr_loss': float('nan'), 'phase_vcr_loss': float('nan'),
+                'evt_loss': float('nan'),
                 'n_valid': 0,
                 'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
                 'spatial_pos_pairs': 0, 'spatial_neg_pairs': 0,
@@ -643,6 +667,7 @@ def process_batch(
         mean_phase_loss = mean_phase_loss.item()
         mean_vcr_loss = mean_vcr_loss.item()
         mean_phase_vcr_loss = mean_phase_vcr_loss.item()
+        mean_evt_loss = mean_evt_loss.item() if hasattr(mean_evt_loss, 'item') else float(mean_evt_loss)
 
     # Compute distribution statistics for gate values and weights
     def compute_stats(tensors: list[torch.Tensor]) -> dict:
@@ -682,6 +707,7 @@ def process_batch(
         'phase_loss': mean_phase_loss,
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
+        'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
         'n_valid': n_valid,
         'spectral_pos_pairs': total_spectral_pos_pairs // n_valid if n_valid > 0 else 0,
         'spectral_neg_pairs': total_spectral_neg_pairs // n_valid if n_valid > 0 else 0,
@@ -709,6 +735,7 @@ def train_epoch(
     log_interval: int = 10,
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
+    evt_metric: EvtDiffusionMetric | None = None,
 ) -> dict:
     """Run training on entire training set for one epoch."""
     total_loss = 0.0
@@ -717,6 +744,7 @@ def train_epoch(
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
+    total_evt_loss = 0.0
     total_spectral_pos_pairs = 0
     total_spectral_neg_pairs = 0
     total_spatial_pos_pairs = 0
@@ -738,7 +766,7 @@ def train_epoch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
             phase_sampler=phase_sampler, phase_config=phase_config,
-            epoch=epoch,
+            epoch=epoch, evt_metric=evt_metric,
         )
 
         scheduler.step()
@@ -750,6 +778,7 @@ def train_epoch(
             total_phase_loss += stats['phase_loss']
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
+            total_evt_loss += stats.get('evt_loss', 0.0)
             total_spectral_pos_pairs += stats['spectral_pos_pairs']
             total_spectral_neg_pairs += stats['spectral_neg_pairs']
             total_spatial_pos_pairs += stats['spatial_pos_pairs']
@@ -780,7 +809,8 @@ def train_epoch(
                     f"spat={stats['spatial_loss']:.4f} "
                     f"phase={stats['phase_loss']:.4f} "
                     f"vcr={stats['vcr_loss']:.4f} "
-                    f"pvcr={stats['phase_vcr_loss']:.4f} | "
+                    f"pvcr={stats['phase_vcr_loss']:.4f} "
+                    f"evt={stats.get('evt_loss', 0.0):.4f} | "
                     f"LR={scheduler.get_last_lr()[0]:.2e}"
                 )
                 if ps and ps['n_anchors'] > 0 and pls and cw > 0:
@@ -796,6 +826,7 @@ def train_epoch(
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'evt_loss': 0.0,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
@@ -810,6 +841,7 @@ def train_epoch(
         'phase_loss': total_phase_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
+        'evt_loss': total_evt_loss / total_batches,
         'spectral_pos_pairs': total_spectral_pos_pairs // total_batches,
         'spectral_neg_pairs': total_spectral_neg_pairs // total_batches,
         'spatial_pos_pairs': total_spatial_pos_pairs // total_batches,
@@ -832,6 +864,7 @@ def validate_epoch(
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
     epoch: int = 0,
+    evt_metric: EvtDiffusionMetric | None = None,
 ) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
@@ -840,6 +873,7 @@ def validate_epoch(
     total_phase_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
+    total_evt_loss = 0.0
     total_batches = 0
 
     # Keep last batch stats for epoch-level distribution logging
@@ -858,7 +892,7 @@ def validate_epoch(
                 batch, feature_builder, model, device, config,
                 training=False,
                 phase_sampler=phase_sampler, phase_config=phase_config,
-                epoch=epoch,
+                epoch=epoch, evt_metric=evt_metric,
             )
             if stats['n_valid'] > 0:
                 total_loss += stats['loss']
@@ -867,6 +901,7 @@ def validate_epoch(
                 total_phase_loss += stats['phase_loss']
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
+                total_evt_loss += stats.get('evt_loss', 0.0)
                 total_batches += 1
 
                 # Update distribution stats from last valid batch
@@ -882,6 +917,7 @@ def validate_epoch(
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'evt_loss': 0.0,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
@@ -896,6 +932,7 @@ def validate_epoch(
         'phase_loss': total_phase_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
+        'evt_loss': total_evt_loss / total_batches,
         'batches': total_batches,
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
@@ -1318,6 +1355,37 @@ def main():
     else:
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
 
+    # --- EVT soft neighbourhood loss setup ---
+    evt_metric = None
+    with open(args.training) as _f:
+        _training_yaml_raw = yaml.safe_load(_f)
+    evt_cfg = _training_yaml_raw.get('evt', {})
+    if evt_cfg.get('enabled', False):
+        confusion_csv = evt_cfg.get('confusion_matrix_path', 'data/combined_evt_contingency_table.csv')
+        histogram_csv = evt_cfg.get('histogram_path')
+        if histogram_csv is None:
+            raise ValueError("evt.histogram_path must be set in training config when evt.enabled is true")
+        evt_metric = EvtDiffusionMetric(
+            confusion_csv=confusion_csv,
+            histogram_csv=histogram_csv,
+            min_count=evt_cfg.get('min_count', 100),
+            diffusion_steps=evt_cfg.get('diffusion_steps', 2),
+        ).to(device)
+        loss_config['evt_weight'] = evt_cfg.get('weight', 0.1)
+        loss_config['evt_tau_ref'] = evt_cfg.get('tau_ref', 0.5)
+        loss_config['evt_tau_learned'] = evt_cfg.get('tau_learned', 0.5)
+        logger.info(
+            f"EVT soft neighbourhood loss enabled: "
+            f"{evt_metric.n_codes} codes, "
+            f"diffusion_steps={evt_cfg.get('diffusion_steps', 2)}, "
+            f"min_count={evt_cfg.get('min_count', 100)}, "
+            f"weight={loss_config['evt_weight']}, "
+            f"tau_ref={loss_config['evt_tau_ref']}, "
+            f"tau_learned={loss_config['evt_tau_learned']}"
+        )
+    else:
+        logger.info("EVT soft neighbourhood loss disabled (evt.enabled not set)")
+
     # Create scheduler with optional warmup.
     # Must be after phase_config is built so the two-phase branch can read
     # curriculum_start_epoch from it.
@@ -1474,13 +1542,14 @@ def main():
           train_dataloader, feature_builder, model,
           optimizer, scheduler, device, loss_config, epoch, num_epochs,
           phase_sampler=phase_sampler, phase_config=phase_config,
+          evt_metric=evt_metric,
         )
 
         val_stats = validate_epoch(
           val_dataloader, feature_builder, model,
           device, loss_config,
           phase_sampler=phase_sampler, phase_config=phase_config,
-          epoch=epoch,
+          epoch=epoch, evt_metric=evt_metric,
         )
 
         logger.info(f"Epoch {epoch+1}/{num_epochs} complete")
