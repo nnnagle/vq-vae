@@ -144,9 +144,6 @@ class EvtDiffusionMetric:
         # Raise to the k-th power
         Pk = np.linalg.matrix_power(P, diffusion_steps)
 
-        # Ensure diagonal = 1 (a code is identical to itself)
-        np.fill_diagonal(Pk, 1.0)
-
         # S[i,j] ∈ [0, 1]; convert to distances: d = 1 - S
         self._S = torch.tensor(Pk, dtype=torch.float32)  # [K, K]
         self._code_to_idx: dict[int, int] = {code: i for i, code in enumerate(keep)}
