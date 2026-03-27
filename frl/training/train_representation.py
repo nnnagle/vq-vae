@@ -1359,13 +1359,23 @@ def main():
     evt_metric = None
     evt_loss_cfg = bindings_config.get_loss('soft_neighborhood_evt')
     if evt_loss_cfg is not None and (evt_loss_cfg.weight or 0.0) > 0.0:
-        if evt_loss_cfg.histogram_path is None:
+        # EVT code counts come from the shared stats file, at the path:
+        #   stats["evt_class"]["static_categorical.evt"]["counts"]
+        # Keys are string codes, values are integer pixel counts.
+        evt_code_counts = (
+            feature_builder.stats
+            .get("evt_class", {})
+            .get("static_categorical.evt", {})
+            .get("counts", {})
+        )
+        if not evt_code_counts:
             raise ValueError(
-                "losses.soft_neighborhood_evt.histogram_path must be set in bindings config"
+                "EVT code counts not found in stats file. "
+                "Run example_compute_stats.py to compute stats first."
             )
         evt_metric = EvtDiffusionMetric(
             confusion_csv=evt_loss_cfg.confusion_matrix_path,
-            histogram_csv=evt_loss_cfg.histogram_path,
+            code_counts=evt_code_counts,
             min_count=evt_loss_cfg.min_count or 100,
             diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
         ).to(device)

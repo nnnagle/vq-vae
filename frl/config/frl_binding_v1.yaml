@@ -575,7 +575,6 @@ losses:
     weight: 0.0
     type: soft_neighborhood_evt
     confusion_matrix_path: data/combined_evt_contingency_table.csv
-    histogram_path: data/evt_histogram.csv   # precompute before training
     min_count: 100        # exclude codes with fewer regional pixels than this
     diffusion_steps: 2    # k in P^k; 1=direct confusion, 2=two-hop transitivity
     tau_ref: 0.5          # softmax temperature for EVT graph distances

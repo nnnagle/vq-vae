@@ -52,10 +52,12 @@ class EvtDiffusionMetric:
         Path to the combined EVT contingency table CSV produced by
         ``data/combine_evt_contingency_tables.py``.  Row and column labels
         are integer LANDFIRE codes.
-    histogram_csv:
-        Path to a two-column CSV with headers ``code`` and ``count``,
-        giving the per-code pixel count in the training region.  Codes
-        below ``min_count`` are excluded from the metric.
+    code_counts:
+        Mapping of integer LANDFIRE EVT code → regional pixel count, as
+        found in the stats file at
+        ``stats["evt_class"]["static_categorical.evt"]["counts"]``
+        (keys may be strings or ints).  Codes below ``min_count`` are
+        excluded from the metric.
     min_count:
         Minimum regional pixel count for a code to be included.
     diffusion_steps:
@@ -69,7 +71,7 @@ class EvtDiffusionMetric:
     def __init__(
         self,
         confusion_csv: str | Path,
-        histogram_csv: str | Path,
+        code_counts: dict,
         min_count: int = 100,
         diffusion_steps: int = 2,
         max_weight: float = 10.0,
@@ -93,16 +95,12 @@ class EvtDiffusionMetric:
         conf.columns = conf.columns.astype(int)
         conf = conf.astype(float)
 
-        # ---- Load regional histogram and filter codes -----------------------
-        hist = pd.read_csv(histogram_csv)
-        hist.columns = hist.columns.str.strip().str.lower()
-        if "code" not in hist.columns or "count" not in hist.columns:
-            raise ValueError(
-                f"histogram_csv must have 'code' and 'count' columns; "
-                f"got {list(hist.columns)}"
-            )
-        hist = hist[hist["count"] >= min_count]
-        valid_codes = set(hist["code"].astype(int).tolist())
+        # ---- Filter codes by regional pixel count ---------------------------
+        # code_counts keys may be strings (from JSON) or ints
+        int_counts: dict[int, float] = {
+            int(k): float(v) for k, v in code_counts.items()
+        }
+        valid_codes = {code for code, cnt in int_counts.items() if cnt >= min_count}
 
         # Keep only codes present in both the confusion table AND the histogram
         keep = sorted(
@@ -111,7 +109,7 @@ class EvtDiffusionMetric:
         if len(keep) < 2:
             raise ValueError(
                 f"Fewer than 2 EVT codes survive the min_count={min_count} filter. "
-                f"Lower min_count or check that histogram_csv covers your region."
+                f"Lower min_count or check that the stats file covers your region."
             )
 
         conf = conf.reindex(index=keep, columns=keep, fill_value=0.0)
@@ -136,11 +134,8 @@ class EvtDiffusionMetric:
         self._S = torch.tensor(Pk, dtype=torch.float32)  # [K, K]
         self._code_to_idx: dict[int, int] = {code: i for i, code in enumerate(keep)}
 
-        # ---- Inverse-frequency weights from histogram -----------------------
-        freq_map = dict(
-            zip(hist["code"].astype(int).tolist(), hist["count"].astype(float).tolist())
-        )
-        counts = np.array([freq_map.get(c, 0.0) for c in keep], dtype=np.float64)
+        # ---- Inverse-frequency weights from pixel counts --------------------
+        counts = np.array([int_counts.get(c, 0.0) for c in keep], dtype=np.float64)
         # Normalise to [0, 1] range so median is well-defined
         total = counts.sum()
         freqs = counts / total if total > 0 else np.ones_like(counts) / len(counts)
