@@ -129,15 +129,11 @@ class EvtDiffusionMetric:
         C = conf.values  # [K, K]
         C_sym = (C + C.T) / 2.0
 
-        # Optional Laplace smoothing — only applied to already non-zero cells
-        # to avoid inflating the many structural zeros in the confusion matrix.
-        # Scale alpha by the mean non-zero value so the prior stays small.
+        # Optional Laplace smoothing — add epsilon uniformly to every cell.
+        # Regularises sparse rows toward uniform; min_confusion_samples already
+        # removes the most extreme cases, so a small value (e.g. 0.1) is enough.
         if laplace_smoothing > 0.0:
-            nonzero_mask = C_sym > 0
-            if nonzero_mask.any():
-                mean_nonzero = C_sym[nonzero_mask].mean()
-                alpha = laplace_smoothing * mean_nonzero
-                C_sym = np.where(nonzero_mask, C_sym + alpha, 0.0)
+            C_sym = C_sym + laplace_smoothing
 
         # Row-normalise → stochastic transition matrix P
         row_sums = C_sym.sum(axis=1, keepdims=True)
