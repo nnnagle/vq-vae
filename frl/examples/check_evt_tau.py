@@ -24,7 +24,7 @@ from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
 
 
 def main():
-    bindings = DatasetBindingsParser.from_yaml('config/frl_binding_v1.yaml')
+    bindings = DatasetBindingsParser('config/frl_binding_v1.yaml').parse()
 
     # --- load stats for code counts ---
     stats_path = bindings.stats.file
