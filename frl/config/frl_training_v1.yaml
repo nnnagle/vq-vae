@@ -130,19 +130,3 @@ visualization:
 reproducibility:
   seed: 42
   benchmark: true
-
-# ================================================================
-# EVT Soft Neighbourhood Loss
-# Encourages z_type to reflect the network structure of the LANDFIRE
-# EVT confusion graph, including transitive (multi-hop) similarity.
-# Requires a precomputed regional EVT histogram CSV (code, count).
-# ================================================================
-evt:
-  enabled: false
-  confusion_matrix_path: data/combined_evt_contingency_table.csv
-  histogram_path: data/evt_histogram.csv   # must be precomputed before training
-  weight: 0.1          # scale factor applied to the KL loss
-  min_count: 100       # exclude codes with fewer pixels than this in the region
-  diffusion_steps: 2   # k in P^k; 1=direct confusion only, 2=two-hop transitivity
-  tau_ref: 0.5         # softmax temperature for EVT graph distances
-  tau_learned: 0.5     # softmax temperature for latent space distances

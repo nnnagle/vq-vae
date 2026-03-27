@@ -614,6 +614,10 @@ class DatasetBindingsParser:
             variance_weight=spec.get('variance_weight'),
             covariance_weight=spec.get('covariance_weight'),
             variance_target=spec.get('variance_target'),
+            confusion_matrix_path=spec.get('confusion_matrix_path'),
+            histogram_path=spec.get('histogram_path'),
+            min_count=spec.get('min_count'),
+            diffusion_steps=spec.get('diffusion_steps'),
         )
 
     def _parse_pair_endpoint_strategy(

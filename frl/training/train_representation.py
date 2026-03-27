@@ -1357,34 +1357,32 @@ def main():
 
     # --- EVT soft neighbourhood loss setup ---
     evt_metric = None
-    with open(args.training) as _f:
-        _training_yaml_raw = yaml.safe_load(_f)
-    evt_cfg = _training_yaml_raw.get('evt', {})
-    if evt_cfg.get('enabled', False):
-        confusion_csv = evt_cfg.get('confusion_matrix_path', 'data/combined_evt_contingency_table.csv')
-        histogram_csv = evt_cfg.get('histogram_path')
-        if histogram_csv is None:
-            raise ValueError("evt.histogram_path must be set in training config when evt.enabled is true")
+    evt_loss_cfg = bindings_config.get_loss('soft_neighborhood_evt')
+    if evt_loss_cfg is not None and (evt_loss_cfg.weight or 0.0) > 0.0:
+        if evt_loss_cfg.histogram_path is None:
+            raise ValueError(
+                "losses.soft_neighborhood_evt.histogram_path must be set in bindings config"
+            )
         evt_metric = EvtDiffusionMetric(
-            confusion_csv=confusion_csv,
-            histogram_csv=histogram_csv,
-            min_count=evt_cfg.get('min_count', 100),
-            diffusion_steps=evt_cfg.get('diffusion_steps', 2),
+            confusion_csv=evt_loss_cfg.confusion_matrix_path,
+            histogram_csv=evt_loss_cfg.histogram_path,
+            min_count=evt_loss_cfg.min_count or 100,
+            diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
         ).to(device)
-        loss_config['evt_weight'] = evt_cfg.get('weight', 0.1)
-        loss_config['evt_tau_ref'] = evt_cfg.get('tau_ref', 0.5)
-        loss_config['evt_tau_learned'] = evt_cfg.get('tau_learned', 0.5)
+        loss_config['evt_weight'] = evt_loss_cfg.weight
+        loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
+        loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
         logger.info(
             f"EVT soft neighbourhood loss enabled: "
             f"{evt_metric.n_codes} codes, "
-            f"diffusion_steps={evt_cfg.get('diffusion_steps', 2)}, "
-            f"min_count={evt_cfg.get('min_count', 100)}, "
+            f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
+            f"min_count={evt_loss_cfg.min_count or 100}, "
             f"weight={loss_config['evt_weight']}, "
             f"tau_ref={loss_config['evt_tau_ref']}, "
             f"tau_learned={loss_config['evt_tau_learned']}"
         )
     else:
-        logger.info("EVT soft neighbourhood loss disabled (evt.enabled not set)")
+        logger.info("EVT soft neighbourhood loss disabled (weight=0 or not in bindings config)")
 
     # Create scheduler with optional warmup.
     # Must be after phase_config is built so the two-phase branch can read

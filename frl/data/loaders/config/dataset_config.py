@@ -453,6 +453,12 @@ class LossConfig:
     covariance_weight: Optional[float] = None
     variance_target: Optional[float] = None
 
+    # --- soft_neighborhood_evt-specific ---
+    confusion_matrix_path: Optional[str] = None  # path to combined EVT contingency CSV
+    histogram_path: Optional[str] = None          # path to regional EVT code-count CSV
+    min_count: Optional[int] = None               # exclude codes below this pixel count
+    diffusion_steps: Optional[int] = None         # k in P^k transition matrix power
+
 
 @dataclass
 class BindingsConfig:

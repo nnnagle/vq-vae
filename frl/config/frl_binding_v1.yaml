@@ -567,3 +567,17 @@ losses:
     covariance_weight: 1.0
     variance_target: 1.0
 
+  # EVT-guided soft neighbourhood loss.
+  # Encourages z_type to mirror the network structure of the LANDFIRE EVT
+  # confusion graph, including transitive (multi-hop) similarity via diffusion.
+  # Disabled by default (weight: 0.0). Set weight > 0 and provide paths to activate.
+  soft_neighborhood_evt:
+    weight: 0.0
+    type: soft_neighborhood_evt
+    confusion_matrix_path: data/combined_evt_contingency_table.csv
+    histogram_path: data/evt_histogram.csv   # precompute before training
+    min_count: 100        # exclude codes with fewer regional pixels than this
+    diffusion_steps: 2    # k in P^k; 1=direct confusion, 2=two-hop transitivity
+    tau_ref: 0.5          # softmax temperature for EVT graph distances
+    tau_learned: 0.5      # softmax temperature for latent space distances
+
