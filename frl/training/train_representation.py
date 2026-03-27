@@ -1428,7 +1428,9 @@ def main():
             confusion_csv=evt_loss_cfg.confusion_matrix_path,
             code_counts=evt_code_counts,
             min_count=evt_loss_cfg.min_count or 100,
+            min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
             diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
+            laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
         ).to(device)
         loss_config['evt_weight'] = evt_loss_cfg.weight
         loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
@@ -1440,6 +1442,11 @@ def main():
             else 'grid-plus-supplement-evt'
         )
         evt_sampler = build_anchor_sampler(bindings_config, evt_anchor_pop)
+        # Tell the inverse-frequency weight spec to ignore excluded EVT codes
+        # so the sampler doesn't waste anchor slots on types not in the metric.
+        for spec in evt_sampler.weight_specs:
+            if spec.transform == 'inverse-frequency':
+                spec.valid_values = evt_metric.valid_codes
         logger.info(
             f"EVT soft neighbourhood loss enabled: "
             f"{evt_metric.n_codes} codes, "

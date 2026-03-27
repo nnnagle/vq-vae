@@ -41,20 +41,57 @@ def main():
         sys.exit("ERROR: EVT counts not found in stats file. Run example_compute_stats.py first.")
 
     evt_loss_cfg = bindings.get_loss('soft_neighborhood_evt')
-    confusion_csv = evt_loss_cfg.confusion_matrix_path
-    min_count     = evt_loss_cfg.min_count or 100
+    confusion_csv          = evt_loss_cfg.confusion_matrix_path
+    min_count              = evt_loss_cfg.min_count or 100
+    min_confusion_samples  = evt_loss_cfg.min_confusion_samples or 30
+    diffusion_steps        = evt_loss_cfg.diffusion_steps or 2
+    laplace_smoothing      = evt_loss_cfg.laplace_smoothing or 0.0
 
-    print(f"Confusion matrix : {confusion_csv}")
-    print(f"min_count        : {min_count}")
+    print(f"Confusion matrix       : {confusion_csv}")
+    print(f"min_count              : {min_count}")
+    print(f"min_confusion_samples  : {min_confusion_samples}")
+    print(f"diffusion_steps        : {diffusion_steps}")
+    print(f"laplace_smoothing      : {laplace_smoothing}")
+
+    # Show how many codes survive each filter independently
+    import pandas as pd
+    conf_raw = pd.read_csv(confusion_csv, index_col=0)
+    for col in ["Row Totals", "Percent Row Agreement"]:
+        if col in conf_raw.columns:
+            conf_raw = conf_raw.drop(columns=[col])
+    for row in ["Column Totals", "Percent Column Agreement"]:
+        if row in conf_raw.index:
+            conf_raw = conf_raw.drop(index=[row])
+    conf_raw = conf_raw[conf_raw.index.notna()]
+    conf_raw.index = conf_raw.index.astype(int)
+    conf_raw.columns = conf_raw.columns.astype(int)
+    conf_raw = conf_raw.astype(float)
+
+    int_counts = {int(k): float(v) for k, v in code_counts.items()}
+    n_in_table = len(conf_raw.index)
+    n_pass_min_count = sum(
+        1 for c in conf_raw.index if int_counts.get(c, 0) >= min_count
+    )
+    row_sums = conf_raw.sum(axis=1)
+    n_pass_confusion = sum(
+        1 for c in conf_raw.index
+        if int_counts.get(c, 0) >= min_count and row_sums.get(c, 0) >= min_confusion_samples
+    )
+    print(f"\nCode survival:")
+    print(f"  In confusion table          : {n_in_table}")
+    print(f"  After min_count filter      : {n_pass_min_count}")
+    print(f"  After min_confusion_samples : {n_pass_confusion}")
 
     metric = EvtDiffusionMetric(
         confusion_csv=confusion_csv,
         code_counts=code_counts,
         min_count=min_count,
-        diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
+        min_confusion_samples=min_confusion_samples,
+        diffusion_steps=diffusion_steps,
+        laplace_smoothing=laplace_smoothing,
     )
     K = metric.n_codes
-    print(f"Valid codes      : {K}")
+    print(f"  In metric (final)           : {K}")
     print()
 
     # Build code-level distance matrix (K x K)

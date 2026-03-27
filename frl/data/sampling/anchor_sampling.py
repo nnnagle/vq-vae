@@ -50,9 +50,12 @@ class WeightSpec:
     Simple mask references (e.g. ``static_mask.aoi``) have only ``channel``
     set.  Continuous channels that need a transform (e.g. inverse of
     ``static.ysfc_min``) additionally carry a ``transform`` string.
+    When ``valid_values`` is set, pixels whose (rounded integer) value is not
+    in the set receive weight 0 — used to exclude EVT codes not in the metric.
     """
     channel: str            # e.g. "static_mask.aoi" or "static.ysfc_min"
-    transform: Optional[str] = None  # e.g. "inverse"
+    transform: Optional[str] = None  # e.g. "inverse-frequency"
+    valid_values: Optional[set] = None  # if set, only these integer values get weight
 
 
 @dataclass
@@ -232,6 +235,7 @@ def _resolve_channel_from_sample(
 def _apply_inverse_frequency(
     data: torch.Tensor,
     valid_mask: torch.Tensor,
+    valid_values: Optional[set] = None,
 ) -> torch.Tensor:
     """Compute inverse-frequency weights over the valid region of a channel.
 
@@ -251,7 +255,15 @@ def _apply_inverse_frequency(
     Returns:
         Weight tensor [H, W] (float32, ≥ 0).
     """
-    eligible = valid_mask & data.isfinite()
+    # Optionally restrict to a whitelist of integer values (e.g. valid EVT codes)
+    if valid_values is not None:
+        codes_int = data.round().to(torch.int32)
+        in_valid = torch.zeros(data.shape, dtype=torch.bool, device=data.device)
+        for v in valid_values:
+            in_valid |= (codes_int == int(v))
+        eligible = valid_mask & in_valid & data.isfinite()
+    else:
+        eligible = valid_mask & data.isfinite()
     vals = data[eligible]
     if vals.numel() == 0:
         return torch.ones_like(data) * valid_mask.float()
@@ -309,7 +321,7 @@ def resolve_supplement_weights(
         data = _resolve_channel_from_sample(sample, spec.channel)
         if spec.transform == 'inverse-frequency':
             valid_mask = (combined > 0) if combined is not None else data.isfinite()
-            w = _apply_inverse_frequency(data, valid_mask)
+            w = _apply_inverse_frequency(data, valid_mask, valid_values=spec.valid_values)
         else:
             raise ValueError(f"Unknown weight transform: '{spec.transform}'")
 

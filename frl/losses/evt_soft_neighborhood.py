@@ -73,7 +73,9 @@ class EvtDiffusionMetric:
         confusion_csv: str | Path,
         code_counts: dict,
         min_count: int = 100,
+        min_confusion_samples: int = 30,
         diffusion_steps: int = 2,
+        laplace_smoothing: float = 0.0,
         max_weight: float = 10.0,
     ) -> None:
         self.max_weight = max_weight
@@ -106,10 +108,19 @@ class EvtDiffusionMetric:
         keep = sorted(
             c for c in conf.index.tolist() if c in valid_codes
         )
+
+        # ---- Filter codes with too few confusion table samples --------------
+        # Row sum (including diagonal) = total field samples predicted as that
+        # code.  Sparse rows produce unreliable transition probabilities.
+        if min_confusion_samples > 0:
+            row_sums_orig = conf.reindex(index=keep, columns=keep, fill_value=0.0).sum(axis=1)
+            keep = sorted(c for c in keep if row_sums_orig.get(c, 0) >= min_confusion_samples)
+
         if len(keep) < 2:
             raise ValueError(
-                f"Fewer than 2 EVT codes survive the min_count={min_count} filter. "
-                f"Lower min_count or check that the stats file covers your region."
+                f"Fewer than 2 EVT codes survive the filters "
+                f"(min_count={min_count}, min_confusion_samples={min_confusion_samples}). "
+                f"Lower the thresholds or check that the stats file covers your region."
             )
 
         conf = conf.reindex(index=keep, columns=keep, fill_value=0.0)
@@ -117,6 +128,16 @@ class EvtDiffusionMetric:
         # ---- Build symmetric confusion matrix and diffuse -------------------
         C = conf.values  # [K, K]
         C_sym = (C + C.T) / 2.0
+
+        # Optional Laplace smoothing — only applied to already non-zero cells
+        # to avoid inflating the many structural zeros in the confusion matrix.
+        # Scale alpha by the mean non-zero value so the prior stays small.
+        if laplace_smoothing > 0.0:
+            nonzero_mask = C_sym > 0
+            if nonzero_mask.any():
+                mean_nonzero = C_sym[nonzero_mask].mean()
+                alpha = laplace_smoothing * mean_nonzero
+                C_sym = np.where(nonzero_mask, C_sym + alpha, 0.0)
 
         # Row-normalise → stochastic transition matrix P
         row_sums = C_sym.sum(axis=1, keepdims=True)
@@ -224,6 +245,11 @@ class EvtDiffusionMetric:
     def n_codes(self) -> int:
         """Number of EVT codes in the metric."""
         return len(self._code_to_idx)
+
+    @property
+    def valid_codes(self) -> set:
+        """Set of integer EVT codes accepted by this metric."""
+        return set(self._code_to_idx.keys())
 
 
 # ---------------------------------------------------------------------------

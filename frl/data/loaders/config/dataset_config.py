@@ -454,9 +454,11 @@ class LossConfig:
     variance_target: Optional[float] = None
 
     # --- soft_neighborhood_evt-specific ---
-    confusion_matrix_path: Optional[str] = None  # path to combined EVT contingency CSV
-    min_count: Optional[int] = None               # exclude codes below this pixel count
-    diffusion_steps: Optional[int] = None         # k in P^k transition matrix power
+    confusion_matrix_path: Optional[str] = None    # path to combined EVT contingency CSV
+    min_count: Optional[int] = None                # exclude codes below this regional pixel count
+    min_confusion_samples: Optional[int] = None    # exclude codes with sparse confusion rows
+    diffusion_steps: Optional[int] = None          # k in P^k transition matrix power
+    laplace_smoothing: Optional[float] = None      # smoothing on non-zero confusion cells only
 
 
 @dataclass

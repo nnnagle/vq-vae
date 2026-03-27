@@ -616,7 +616,9 @@ class DatasetBindingsParser:
             variance_target=spec.get('variance_target'),
             confusion_matrix_path=spec.get('confusion_matrix_path'),
             min_count=spec.get('min_count'),
+            min_confusion_samples=spec.get('min_confusion_samples'),
             diffusion_steps=spec.get('diffusion_steps'),
+            laplace_smoothing=spec.get('laplace_smoothing'),
         )
 
     def _parse_pair_endpoint_strategy(
