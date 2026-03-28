@@ -716,7 +716,7 @@ def process_batch(
     # Aggregate EVT diagnostics across samples
     empty_evt_diag = dict(
         mean_entropy_ref=0.0, mean_entropy_learned=0.0,
-        median_d_learned=0.0, n_anchors_valid=0,
+        median_d_learned=0.0, n_anchors_valid=0, mean_kl=0.0,
         d_lrn_confused=0.0, d_lrn_noncf=0.0,
         n_confused_pairs=0.0, mean_rank_confused=0.5, eff_n_ref=1.0,
     )
