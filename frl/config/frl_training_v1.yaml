@@ -93,7 +93,7 @@ spatial_domain:
   debug_mode: true
   debug_window:
     origin: [6016, 11264] #[row, col] — top-left of old test dataset within full VA extent
-    size: [1024, 1024] # [H,W]
+    size: [4096, 4096] # [H,W]
     block_grid: [1,1]
   full_domain:
     origin: [0, 0] # row, col
