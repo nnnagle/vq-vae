@@ -316,13 +316,19 @@ def evt_soft_neighborhood_loss(
     emb_v = embeddings[valid]           # [M, D]
     d_ref_v = d_ref[valid][:, valid]    # [M, M]
     w_v = weights[valid]                # [M]  inverse-freq weights
+    codes_v = evt_codes[valid]          # [M]  EVT code for each valid anchor
     M = emb_v.shape[0]
 
     # ---- Learned distances -----------------------------------------------
     d_learned_v = torch.cdist(emb_v, emb_v)  # [M, M]
 
-    # ---- Mask: off-diagonal, both anchors valid --------------------------
-    mask = ~torch.eye(M, dtype=torch.bool, device=device)  # [M, M]
+    # ---- Mask: off-diagonal AND different-code pairs only ---------------
+    # Same-code pairs are excluded: they have d_ref = 1 - P^k[c,c] ≈ 0.3,
+    # which would dominate the softmax and reduce the loss to within-class
+    # clustering rather than a cross-type topology constraint.
+    self_mask = torch.eye(M, dtype=torch.bool, device=device)
+    same_code = codes_v.unsqueeze(0) == codes_v.unsqueeze(1)  # [M, M]
+    mask = ~self_mask & ~same_code  # [M, M]
 
     # ---- Softmax distributions -------------------------------------------
     large_neg = torch.tensor(-1e9, device=device, dtype=embeddings.dtype)

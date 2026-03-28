@@ -597,8 +597,12 @@ losses:
     min_confusion_samples: 30   # exclude codes with sparse confusion table rows (incl. diagonal)
     diffusion_steps: 2          # k in P^k; 1=direct confusion, 2=two-hop transitivity
     laplace_smoothing: 0.0      # smoothing on non-zero cells only; 0=disabled
-    tau_ref: 0.5                # softmax temperature for EVT graph distances
-    tau_learned: 0.5            # softmax temperature for latent space distances
+    tau_ref: 0.05               # softmax temperature for EVT graph distances
+                                # same-code pairs are excluded from the softmax, so
+                                # d_ref spans [~0.85, 1.0]; tau=0.05 suppresses
+                                # P=0 pairs while giving weight to P>=0.05 confusion
+    tau_learned: 2.0            # softmax temperature for latent space distances
+                                # calibrated to med_d_lrn / log(eff_n_ref) ~ 7.5/3.7
     anchor:
       population: grid-plus-supplement-evt  # oversamples rare EVT codes
 
