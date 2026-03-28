@@ -391,10 +391,15 @@ def evt_soft_neighborhood_loss(
             n_confused_per_row[active].mean().item() if active.any() else 0.0
         )
 
-        # Normalized rank of each cell (0 = nearest).  double-argsort trick.
-        ranks_norm = (
-            d_learned_v.argsort(dim=1).argsort(dim=1).float() / max(M - 1, 1)
-        )  # [M, M]
+        # Normalized rank within the different-code pool only (mask already
+        # excludes self and same-code pairs).  Setting excluded positions to
+        # inf pushes them to the bottom of the argsort so they don't affect
+        # the ranks of different-code pairs.  Result: 0=nearest, 0.5=random.
+        d_for_rank = d_learned_v.clone()
+        d_for_rank[~mask] = float('inf')
+        raw_ranks = d_for_rank.argsort(dim=1).argsort(dim=1).float()  # [M, M]
+        n_diff = mask.sum(dim=1).float()                               # [M]
+        ranks_norm = raw_ranks / (n_diff.unsqueeze(1) - 1).clamp(min=1)  # [M, M]
         confused_ranks = ranks_norm[confused_mask]
         mean_rank_confused = (
             confused_ranks.mean().item() if confused_ranks.numel() > 0 else 0.5
