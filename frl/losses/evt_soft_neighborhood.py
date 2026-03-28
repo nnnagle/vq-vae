@@ -372,12 +372,6 @@ def evt_soft_neighborhood_loss(
 
         # ---- Retrieval diagnostics ------------------------------------------
         # Confused pairs: P^k[i,j] > 0  ↔  d_ref < 1
-        _dbg = d_ref_v[mask]  # off-diagonal values only
-        print(f"[EVT-DBG] M={M} d_ref dtype={d_ref_v.dtype} "
-              f"min={_dbg.min():.6f} median={_dbg.median():.6f} "
-              f"max={_dbg.max():.6f} "
-              f"n_below_thresh={(_dbg < (1.0 - 1e-6)).sum().item()} "
-              f"mean_kl={mean_kl:.4f}", flush=True)
         confused_mask = (d_ref_v < (1.0 - 1e-6)) & mask   # [M, M]
         noncf_mask    = (d_ref_v >= (1.0 - 1e-6)) & mask  # [M, M]
 

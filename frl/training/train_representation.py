@@ -620,8 +620,12 @@ def process_batch(
             agg[key] = sum(vals) / len(vals)
         return agg
 
-    _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
-                           median_d_learned=0.0, n_anchors_valid=0)
+    _empty_evt_diag = dict(
+        mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+        median_d_learned=0.0, n_anchors_valid=0, mean_kl=0.0,
+        d_lrn_confused=0.0, d_lrn_noncf=0.0,
+        n_confused_pairs=0.0, mean_rank_confused=0.5, eff_n_ref=1.0,
+    )
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
@@ -867,10 +871,14 @@ def train_epoch(
             'film_stats': None,
         }
 
-    _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
-                           median_d_learned=0.0, n_anchors_valid=0)
+    _empty_evt_diag = dict(
+        mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+        median_d_learned=0.0, n_anchors_valid=0, mean_kl=0.0,
+        d_lrn_confused=0.0, d_lrn_noncf=0.0,
+        n_confused_pairs=0.0, mean_rank_confused=0.5, eff_n_ref=1.0,
+    )
     epoch_evt_diag = (
-        {k: sum(d.get(k, 0.0) for d in all_epoch_evt_diag) / len(all_epoch_evt_diag)
+        {k: sum(d.get(k, _empty_evt_diag[k]) for d in all_epoch_evt_diag) / len(all_epoch_evt_diag)
          for k in _empty_evt_diag}
         if all_epoch_evt_diag else _empty_evt_diag
     )
@@ -959,8 +967,12 @@ def validate_epoch(
                     last_film_stats = stats['film_stats']
 
     if total_batches == 0:
-        _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
-                               median_d_learned=0.0, n_anchors_valid=0)
+        _empty_evt_diag = dict(
+            mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+            median_d_learned=0.0, n_anchors_valid=0, mean_kl=0.0,
+            d_lrn_confused=0.0, d_lrn_noncf=0.0,
+            n_confused_pairs=0.0, mean_rank_confused=0.5, eff_n_ref=1.0,
+        )
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
@@ -972,10 +984,14 @@ def validate_epoch(
             'film_stats': None,
         }
 
-    _empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
-                           median_d_learned=0.0, n_anchors_valid=0)
+    _empty_evt_diag = dict(
+        mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+        median_d_learned=0.0, n_anchors_valid=0, mean_kl=0.0,
+        d_lrn_confused=0.0, d_lrn_noncf=0.0,
+        n_confused_pairs=0.0, mean_rank_confused=0.5, eff_n_ref=1.0,
+    )
     epoch_evt_diag = (
-        {k: sum(d.get(k, 0.0) for d in all_epoch_evt_diag) / len(all_epoch_evt_diag)
+        {k: sum(d.get(k, _empty_evt_diag[k]) for d in all_epoch_evt_diag) / len(all_epoch_evt_diag)
          for k in _empty_evt_diag}
         if all_epoch_evt_diag else _empty_evt_diag
     )
