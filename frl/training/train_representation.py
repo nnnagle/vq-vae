@@ -714,12 +714,16 @@ def process_batch(
         }
 
     # Aggregate EVT diagnostics across samples
-    empty_evt_diag = dict(mean_entropy_ref=0.0, mean_entropy_learned=0.0,
-                          median_d_learned=0.0, n_anchors_valid=0)
+    empty_evt_diag = dict(
+        mean_entropy_ref=0.0, mean_entropy_learned=0.0,
+        median_d_learned=0.0, n_anchors_valid=0,
+        d_lrn_confused=0.0, d_lrn_noncf=0.0,
+        n_confused_pairs=0.0, mean_rank_confused=0.5, eff_n_ref=1.0,
+    )
     if all_evt_diag:
         evt_diag_agg = {
-            k: sum(d.get(k, 0.0) for d in all_evt_diag) / len(all_evt_diag)
-            for k in ('mean_entropy_ref', 'mean_entropy_learned', 'median_d_learned', 'n_anchors_valid')
+            k: sum(d.get(k, empty_evt_diag[k]) for d in all_evt_diag) / len(all_evt_diag)
+            for k in empty_evt_diag
         }
     else:
         evt_diag_agg = empty_evt_diag
@@ -1640,24 +1644,41 @@ def main():
             f"phase={val_stats['phase_loss']:.4f} vcr={val_stats['vcr_loss']:.4f} "
             f"pvcr={val_stats['phase_vcr_loss']:.4f} evt={val_stats['evt_loss']:.4f}"
         )
-        # EVT tau diagnostics — logged only when the EVT loss is active
+        # EVT diagnostics — logged only when the EVT loss is active
         if evt_metric is not None:
             td = train_stats.get('evt_diag', {})
             vd = val_stats.get('evt_diag', {})
             logger.info(
-                f"  EVT diagnostics (train) | "
+                f"  EVT train | "
+                f"kl={td.get('mean_kl', 0.0):.3f} "
                 f"H_ref={td.get('mean_entropy_ref', 0.0):.3f} "
                 f"H_lrn={td.get('mean_entropy_learned', 0.0):.3f} "
                 f"med_d_lrn={td.get('median_d_learned', 0.0):.3f} "
-                f"n_valid={td.get('n_anchors_valid', 0):.0f} | "
-                f"target tau_learned ≈ {td.get('median_d_learned', 0.0):.3f}"
+                f"n_valid={td.get('n_anchors_valid', 0):.0f}"
             )
             logger.info(
-                f"  EVT diagnostics (val)   | "
+                f"  EVT train | "
+                f"rank_cf={td.get('mean_rank_confused', 0.5):.3f} "
+                f"d_cf={td.get('d_lrn_confused', 0.0):.3f} "
+                f"d_ncf={td.get('d_lrn_noncf', 0.0):.3f} "
+                f"n_cf={td.get('n_confused_pairs', 0.0):.1f} "
+                f"eff_n={td.get('eff_n_ref', 1.0):.1f}"
+            )
+            logger.info(
+                f"  EVT val   | "
+                f"kl={vd.get('mean_kl', 0.0):.3f} "
                 f"H_ref={vd.get('mean_entropy_ref', 0.0):.3f} "
                 f"H_lrn={vd.get('mean_entropy_learned', 0.0):.3f} "
                 f"med_d_lrn={vd.get('median_d_learned', 0.0):.3f} "
                 f"n_valid={vd.get('n_anchors_valid', 0):.0f}"
+            )
+            logger.info(
+                f"  EVT val   | "
+                f"rank_cf={vd.get('mean_rank_confused', 0.5):.3f} "
+                f"d_cf={vd.get('d_lrn_confused', 0.0):.3f} "
+                f"d_ncf={vd.get('d_lrn_noncf', 0.0):.3f} "
+                f"n_cf={vd.get('n_confused_pairs', 0.0):.1f} "
+                f"eff_n={vd.get('eff_n_ref', 1.0):.1f}"
             )
 
         # Log distribution statistics

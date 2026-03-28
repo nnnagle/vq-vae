@@ -359,6 +359,7 @@ def evt_soft_neighborhood_loss(
 
     # ---- Diagnostics (no grad) -------------------------------------------
     with torch.no_grad():
+        import math
         active = row_active
         mean_kl = loss.item()
         q_dist = logits_lrn.softmax(dim=1)
@@ -366,10 +367,34 @@ def evt_soft_neighborhood_loss(
         entropy_lrn = -(q_dist * log_q).sum(dim=1)
         mean_entropy_ref = entropy_ref[active].mean().item() if active.any() else 0.0
         mean_entropy_lrn = entropy_lrn[active].mean().item() if active.any() else 0.0
-        # Median pairwise latent distance — direct guide for tau_learned:
-        # tau_learned should be ~this value for a well-spread distribution
         off_diag_d = d_learned_v[mask]
         mean_d_learned = off_diag_d.median().item() if off_diag_d.numel() > 0 else 0.0
+
+        # ---- Retrieval diagnostics ------------------------------------------
+        # Confused pairs: P^k[i,j] > 0  ↔  d_ref < 1
+        confused_mask = (d_ref_v < (1.0 - 1e-6)) & mask   # [M, M]
+        noncf_mask    = (d_ref_v >= (1.0 - 1e-6)) & mask  # [M, M]
+
+        confused_d = d_learned_v[confused_mask]
+        noncf_d    = d_learned_v[noncf_mask]
+        d_lrn_confused = confused_d.mean().item() if confused_d.numel() > 0 else 0.0
+        d_lrn_noncf    = noncf_d.mean().item()    if noncf_d.numel()    > 0 else 0.0
+
+        n_confused_per_row = confused_mask.sum(dim=1).float()  # [M]
+        n_confused_pairs = (
+            n_confused_per_row[active].mean().item() if active.any() else 0.0
+        )
+
+        # Normalized rank of each cell (0 = nearest).  double-argsort trick.
+        ranks_norm = (
+            d_learned_v.argsort(dim=1).argsort(dim=1).float() / max(M - 1, 1)
+        )  # [M, M]
+        confused_ranks = ranks_norm[confused_mask]
+        mean_rank_confused = (
+            confused_ranks.mean().item() if confused_ranks.numel() > 0 else 0.5
+        )
+
+        eff_n_ref = math.exp(mean_entropy_ref)
 
     stats = dict(
         n_anchors_in=embeddings.shape[0],
@@ -379,5 +404,10 @@ def evt_soft_neighborhood_loss(
         mean_entropy_ref=mean_entropy_ref,
         mean_entropy_learned=mean_entropy_lrn,
         median_d_learned=mean_d_learned,
+        d_lrn_confused=d_lrn_confused,
+        d_lrn_noncf=d_lrn_noncf,
+        n_confused_pairs=n_confused_pairs,
+        mean_rank_confused=mean_rank_confused,
+        eff_n_ref=eff_n_ref,
     )
     return loss, stats
