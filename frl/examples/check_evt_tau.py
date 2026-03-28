@@ -173,6 +173,33 @@ def main():
     print(f"  P^{diffusion_steps}  non-zero off-diagonal: {len(nzk):5d} / {len(sk_off)} ({pct_nzk:.1f}%)")
     _ascii_hist(nzk, n_bins=8, label="similarity", lo=0.0, hi=1.0)
 
+    # ------------------------------------------------------------------
+    # Histogram 3: non-zero off-diagonal entry count per row
+    # Shows how many distinct codes each code is confused with.
+    # ------------------------------------------------------------------
+    print()
+    print(f"── Non-zero off-diagonal entries per row (final filtered table, K={K}) ──")
+    C_filt = conf_raw.reindex(index=keep_codes, columns=keep_codes, fill_value=0.0).values
+    eye_np = np.eye(K, dtype=bool)
+    offdiag_nz_counts = ((C_filt > 0) & ~eye_np).sum(axis=1).astype(float)
+    _ascii_hist(offdiag_nz_counts, n_bins=min(10, int(offdiag_nz_counts.max()) + 1),
+                label="n_confused_codes", integer=True)
+
+    # ------------------------------------------------------------------
+    # Histogram 4: off-diagonal fraction of row-normalised confusion table
+    # Shows what fraction of field samples are confused to other codes.
+    # A value near 0 means the code is rarely confused; near 1 means
+    # almost all field samples are misclassified.
+    # ------------------------------------------------------------------
+    print()
+    print(f"── Off-diagonal fraction of row-normalised confusion (confusion rate per code) ──")
+    row_totals = C_filt.sum(axis=1, keepdims=True)
+    row_totals_safe = np.where(row_totals > 0, row_totals, 1.0)
+    P1_norm = C_filt / row_totals_safe
+    diag_frac = P1_norm[np.arange(K), np.arange(K)]
+    offdiag_frac = 1.0 - diag_frac
+    _ascii_hist(offdiag_frac, n_bins=10, label="off-diag fraction", lo=0.0, hi=1.0)
+
 
 def _ascii_hist(
     values: np.ndarray,
