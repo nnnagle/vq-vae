@@ -168,10 +168,18 @@ def main():
     pct_nzk = 100.0 * len(nzk) / len(sk_off)
 
     print(f"  P^1  non-zero off-diagonal: {len(nz1):5d} / {len(s1_off)} ({pct_nz1:.1f}%)")
-    _ascii_hist(nz1, n_bins=8, label="similarity", lo=0.0, hi=1.0)
+    nz1_lo = nz1[nz1 <= 0.25]
+    nz1_hi = nz1[nz1 > 0.25]
+    _ascii_hist(nz1_lo, n_bins=10, label="similarity", lo=0.0, hi=0.25)
+    if len(nz1_hi) > 0:
+        print(f"  ... plus {len(nz1_hi)} entries above 0.25 (max={nz1.max():.3f})")
     print()
     print(f"  P^{diffusion_steps}  non-zero off-diagonal: {len(nzk):5d} / {len(sk_off)} ({pct_nzk:.1f}%)")
-    _ascii_hist(nzk, n_bins=8, label="similarity", lo=0.0, hi=1.0)
+    nzk_lo = nzk[nzk <= 0.25]
+    nzk_hi = nzk[nzk > 0.25]
+    _ascii_hist(nzk_lo, n_bins=10, label="similarity", lo=0.0, hi=0.25)
+    if len(nzk_hi) > 0:
+        print(f"  ... plus {len(nzk_hi)} entries above 0.25 (max={nzk.max():.3f})")
 
     # ------------------------------------------------------------------
     # Histogram 3: non-zero off-diagonal entry count per row
