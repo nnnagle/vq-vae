@@ -185,7 +185,7 @@ def process_batch(
         sample['metadata'] = batch['metadata'][i]
 
         # Build features
-        encoder_feature = feature_builder.build_feature('ccdc_history', sample)
+        encoder_feature = feature_builder.build_feature('type_encoder_input', sample)
         spec_dist_feature = feature_builder.build_feature('infonce_type_spectral', sample)
 
         # Convert to tensors
@@ -1171,7 +1171,7 @@ def main():
     feature_builder = FeatureBuilder(bindings_config)
 
     # Read feature dimensions from bindings config
-    type_in_channels = len(bindings_config.get_feature('ccdc_history').channels)
+    type_in_channels = len(bindings_config.get_feature('type_encoder_input').channels)
     phase_in_channels = len(bindings_config.get_feature('phase_ccdc').channels)
     logger.info(
         f"Feature dimensions from config: "

@@ -145,6 +145,10 @@ dataset: # These exist in the zarr
       - {name: mean_break_magnitude, source: static/ccdc_metrics_history/data/mean_break_magnitude, fill_value: -9999}
       - {name: rapid_loss_mean_magnitude, source: static/ccdc_metrics_history/data/rapid_loss_mean_magnitude, fill_value: -9999}
       - {name: variance_ndvi, source: static/ccdc_metrics_history/data/variance_ndvi, fill_value: -9999}
+      - {name: max_seasonal_amp_nir,       source: static/ccdc_metrics_history/data/max_seasonal_amp_nir,       fill_value: -9999}
+      - {name: max_seasonal_amp_swir1,      source: static/ccdc_metrics_history/data/max_seasonal_amp_swir1,      fill_value: -9999}
+      - {name: variance_seasonal_amp_swir1, source: static/ccdc_metrics_history/data/variance_seasonal_amp_swir1, fill_value: -9999}
+      - {name: variance_seasonal_amp_swir2, source: static/ccdc_metrics_history/data/variance_seasonal_amp_swir2, fill_value: -9999}
       - name: ysfc_min
         source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024
         reducer: min
@@ -212,11 +216,55 @@ normalization:
 features:
   topo:
     dim: [C,H,W]
-    channels: 
+    channels:
       static.elevation: {mask: static_mask.dem_mask, quality: none, norm: zscore}
       static.slope: {mask: static_mask.dem_mask, quality: none, norm: zscore}
       static.northness: {mask: static_mask.dem_mask, quality: none, norm: zscore}
       static.eastness: {mask: static_mask.dem_mask, quality: none, norm: zscore}
+
+  # Combined topo + CCDC encoder input.
+  # Topo provides hydrological signal (TWI, HAND) invisible to spectral alone.
+  type_encoder_input:
+    dim: [C,H,W]
+    channels:
+      # Topographic (8 channels)
+      static.elevation:  {mask: static_mask.dem_mask,  norm: zscore}
+      static.slope:      {mask: static_mask.dem_mask,  norm: zscore}
+      static.northness:  {mask: static_mask.dem_mask,  norm: zscore}
+      static.eastness:   {mask: static_mask.dem_mask,  norm: zscore}
+      static.hand:       {mask: static_mask.hand_mask, norm: zscore}
+      static.twi:        {mask: static_mask.twi_mask,  norm: zscore}
+      static.tpi:        {mask: static_mask.tpi_mask,  norm: zscore}
+      static.ksat:       {mask: static_mask.ksat_mask, norm: zscore}
+      # CCDC history (22 existing channels)
+      static.mean_green:                   {norm: robust_iqr}
+      static.mean_red:                     {norm: robust_iqr}
+      static.mean_nir:                     {norm: robust_iqr}
+      static.mean_swir1:                   {norm: robust_iqr}
+      static.mean_swir2:                   {norm: robust_iqr}
+      static.mean_ndvi:                    {norm: robust_iqr}
+      static.mean_nbr:                     {norm: robust_iqr}
+      static.mean_ndmi:                    {norm: robust_iqr}
+      static.mean_seasonal_amp_red:        {norm: robust_iqr}
+      static.mean_seasonal_amp_nir:        {norm: robust_iqr}
+      static.mean_seasonal_amp_swir1:      {norm: robust_iqr}
+      static.mean_seasonal_amp_swir2:      {norm: robust_iqr}
+      static.variance_seasonal_amp_red:    {norm: robust_iqr}
+      static.variance_seasonal_amp_nir:    {norm: robust_iqr}
+      static.spectral_distance_per_decade: {norm: robust_iqr}
+      static.mean_decline_rate:            {norm: robust_iqr}
+      static.net_change_ndvi:              {norm: robust_iqr}
+      static.num_segments:                 {norm: robust_iqr}
+      static.mean_segment_duration:        {norm: robust_iqr}
+      static.mean_break_magnitude:         {norm: robust_iqr}
+      static.rapid_loss_mean_magnitude:    {norm: robust_iqr}
+      static.variance_ndvi:                {norm: robust_iqr}
+      # 4 new CCDC channels
+      static.max_seasonal_amp_nir:         {norm: robust_iqr}
+      static.max_seasonal_amp_swir1:       {norm: robust_iqr}
+      static.variance_seasonal_amp_swir1:  {norm: robust_iqr}
+      static.variance_seasonal_amp_swir2:  {norm: robust_iqr}
+
   ccdc_history:
     dim: [C,H,W]
     channels:
