@@ -3,7 +3,7 @@
 Minimal training script for representation learning.
 
 This script trains a simple encoder using InfoNCE contrastive loss:
-- Input: features.ccdc_history (16 channels)
+- Input: features.type_encoder_input
 - Encoder: Conv2D kernel=1, two layers [128, 64]
 - Output: z_type (64-dim embedding per pixel)
 - Loss: InfoNCE with auxiliary distance-based pair selection
@@ -1183,7 +1183,7 @@ def main():
     phase_in_channels = len(bindings_config.get_feature('phase_ccdc').channels)
     logger.info(
         f"Feature dimensions from config: "
-        f"ccdc_history={type_in_channels}, phase_ccdc={phase_in_channels}"
+        f"type_encoder_input={type_in_channels}, phase_ccdc={phase_in_channels}"
     )
 
     # Create model

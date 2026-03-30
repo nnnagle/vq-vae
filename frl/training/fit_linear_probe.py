@@ -126,7 +126,7 @@ def extract_batch_tensors(
         }
         sample["metadata"] = batch["metadata"][i]
 
-        enc_f = feature_builder.build_feature("ccdc_history", sample)
+        enc_f = feature_builder.build_feature("type_encoder_input", sample)
         tgt_f = feature_builder.build_feature("target_metrics", sample)
 
         enc = torch.from_numpy(enc_f.data).float()
