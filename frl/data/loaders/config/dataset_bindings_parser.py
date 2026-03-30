@@ -619,6 +619,7 @@ class DatasetBindingsParser:
             min_confusion_samples=spec.get('min_confusion_samples'),
             diffusion_steps=spec.get('diffusion_steps'),
             laplace_smoothing=spec.get('laplace_smoothing'),
+            binary_threshold=spec.get('binary_threshold'),
         )
 
     def _parse_pair_endpoint_strategy(

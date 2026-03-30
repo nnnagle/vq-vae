@@ -459,6 +459,7 @@ class LossConfig:
     min_confusion_samples: Optional[int] = None    # exclude codes with sparse confusion rows
     diffusion_steps: Optional[int] = None          # k in P^k transition matrix power
     laplace_smoothing: Optional[float] = None      # smoothing on non-zero confusion cells only
+    binary_threshold: Optional[float] = None       # threshold P^k before row-normalising; 0=disabled
 
 
 @dataclass
