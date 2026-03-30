@@ -1128,14 +1128,22 @@ def main():
         debug_window = ((w.origin[0], w.origin[1]), (w.size[0], w.size[1]))
         logger.info(f"Debug mode: spatial window origin={w.origin} size={w.size}")
 
+    epoch_cfg = training_config.training.epoch
     train_dataset = ForestDatasetV2(
         bindings_config,
         split='train',
         patch_size=patch_size,
         min_aoi_fraction=0.3,
         debug_window=debug_window,
+        epoch_mode=epoch_cfg.mode,
+        sample_frac=epoch_cfg.sample_frac,
+        sample_number=epoch_cfg.sample_number,
     )
-    logger.info(f"Train dataset has {len(train_dataset)} patches")
+    logger.info(
+        f"Train dataset has {len(train_dataset.patches)} total patches "
+        f"(epoch_mode={epoch_cfg.mode}, "
+        f"patches/epoch={len(train_dataset)})"
+    )
 
     train_dataloader = DataLoader(
         train_dataset,
