@@ -475,7 +475,7 @@ sampling-strategy:
       jitter:
         radius: 4
     supplement:
-      n: 104
+      n: 768
       sampling:
         type: weighted
         weight_by:
@@ -638,7 +638,7 @@ losses:
   # confusion graph, including transitive (multi-hop) similarity via diffusion.
   # Disabled by default (weight: 0.0). Set weight > 0 and provide paths to activate.
   soft_neighborhood_evt:
-    weight: 0.0
+    weight: 0.5
     type: soft_neighborhood_evt
     confusion_matrix_path: data/combined_evt_contingency_table.csv
     min_count: 100              # exclude codes with fewer regional pixels than this
