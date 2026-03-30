@@ -1459,6 +1459,7 @@ def main():
             min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
             diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
             laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
+            binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
         ).to(device)
         loss_config['evt_weight'] = evt_loss_cfg.weight
         loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5

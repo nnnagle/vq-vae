@@ -645,6 +645,10 @@ losses:
     min_confusion_samples: 30   # exclude codes with sparse confusion table rows (incl. diagonal)
     diffusion_steps: 2          # k in P^k; 1=direct confusion, 2=two-hop transitivity
     laplace_smoothing: 0.0      # smoothing on non-zero cells only; 0=disabled
+    binary_threshold: 0.05      # threshold P^k before row-normalising; 0=disabled.
+                                # pairs with P^k < threshold are zeroed and the row
+                                # is re-normalised to uniform over surviving pairs,
+                                # reducing eff_n_ref from ~174 to ~3-15.
     tau_ref: 0.02               # softmax temperature for EVT graph distances
                                 # same-code pairs are excluded so d_ref spans [~0.85, 1.0].
                                 # tau=0.02 suppresses 200 unconfused anchors to ~10% of

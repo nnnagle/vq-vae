@@ -46,12 +46,14 @@ def main():
     min_confusion_samples  = evt_loss_cfg.min_confusion_samples or 30
     diffusion_steps        = evt_loss_cfg.diffusion_steps or 2
     laplace_smoothing      = evt_loss_cfg.laplace_smoothing or 0.0
+    binary_threshold       = evt_loss_cfg.binary_threshold or 0.0
 
     print(f"Confusion matrix       : {confusion_csv}")
     print(f"min_count              : {min_count}")
     print(f"min_confusion_samples  : {min_confusion_samples}")
     print(f"diffusion_steps        : {diffusion_steps}")
     print(f"laplace_smoothing      : {laplace_smoothing}")
+    print(f"binary_threshold       : {binary_threshold}")
 
     # Show how many codes survive each filter independently
     import pandas as pd
@@ -89,6 +91,7 @@ def main():
         min_confusion_samples=min_confusion_samples,
         diffusion_steps=diffusion_steps,
         laplace_smoothing=laplace_smoothing,
+        binary_threshold=binary_threshold,
     )
     K = metric.n_codes
     print(f"  In metric (final)           : {K}")

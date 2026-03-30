@@ -76,6 +76,7 @@ class EvtDiffusionMetric:
         min_confusion_samples: int = 30,
         diffusion_steps: int = 2,
         laplace_smoothing: float = 0.0,
+        binary_threshold: float = 0.0,
         max_weight: float = 10.0,
     ) -> None:
         self.max_weight = max_weight
@@ -143,6 +144,21 @@ class EvtDiffusionMetric:
 
         # Raise to the k-th power
         Pk = np.linalg.matrix_power(P, diffusion_steps)
+
+        # Optional dichotomization: threshold P^k → binary, then re-normalize rows.
+        # Eliminates weakly-confused pairs (P^k < threshold) that inflate eff_n_ref.
+        # After thresholding, surviving confused pairs receive equal reference weight
+        # (uniform distribution over the ~3-12 strongly-confused neighbors per code).
+        if binary_threshold > 0.0:
+            Pk_bin = (Pk > binary_threshold).astype(float)
+            np.fill_diagonal(Pk_bin, 0.0)  # diagonal handled by same-code mask in loss
+            row_sums_bin = Pk_bin.sum(axis=1, keepdims=True)
+            uniform_bin = np.full(Pk_bin.shape, 1.0 / Pk_bin.shape[0])
+            Pk = np.where(
+                row_sums_bin > 0,
+                Pk_bin / np.where(row_sums_bin > 0, row_sums_bin, 1.0),
+                uniform_bin,
+            )
 
         # S[i,j] ∈ [0, 1]; convert to distances: d = 1 - S
         self._S = torch.tensor(Pk, dtype=torch.float32)  # [K, K]
