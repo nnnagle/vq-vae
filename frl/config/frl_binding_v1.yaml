@@ -640,7 +640,7 @@ losses:
   soft_neighborhood_evt:
     weight: 0.5
     type: soft_neighborhood_evt
-    confusion_matrix_path: data/combined_evt_contingency_table.csv
+    confusion_matrix_path: ../data/combined_evt_contingency_table.csv
     min_count: 100              # exclude codes with fewer regional pixels than this
     min_confusion_samples: 30   # exclude codes with sparse confusion table rows (incl. diagonal)
     diffusion_steps: 2          # k in P^k; 1=direct confusion, 2=two-hop transitivity
