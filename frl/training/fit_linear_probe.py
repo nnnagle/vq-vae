@@ -439,13 +439,7 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
-    # Resolve which feature to feed the encoder. Prefer 'type_encoder_input' (current
-    # name); fall back to 'ccdc_history' for checkpoints trained before the rename.
-    _ENC_FEATURE_CANDIDATES = ["type_encoder_input", "ccdc_history"]
-    enc_feature_name = next(
-        (f for f in _ENC_FEATURE_CANDIDATES if bindings_config.get_feature(f) is not None),
-        _ENC_FEATURE_CANDIDATES[0],  # will raise a clear error inside build_feature
-    )
+    enc_feature_name = training_config.model_input.type_encoder_feature
     logger.info(f"Using encoder feature: '{enc_feature_name}'")
 
     # Fit closed-form probe

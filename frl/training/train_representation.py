@@ -185,7 +185,7 @@ def process_batch(
         sample['metadata'] = batch['metadata'][i]
 
         # Build features
-        encoder_feature = feature_builder.build_feature('type_encoder_input', sample)
+        encoder_feature = feature_builder.build_feature(config['type_encoder_feature'], sample)
         spec_dist_feature = feature_builder.build_feature('infonce_type_spectral', sample)
 
         # Convert to tensors
@@ -454,7 +454,7 @@ def process_batch(
 
                     if curriculum_w > 0.0:
                         # Build phase_ccdc temporal feature
-                        phase_ccdc_feature = feature_builder.build_feature('phase_ccdc', sample)
+                        phase_ccdc_feature = feature_builder.build_feature(config['phase_encoder_feature'], sample)
                         phase_ccdc_data = torch.from_numpy(
                             phase_ccdc_feature.data
                         ).float().to(device)
@@ -1179,11 +1179,13 @@ def main():
     feature_builder = FeatureBuilder(bindings_config)
 
     # Read feature dimensions from bindings config
-    type_in_channels = len(bindings_config.get_feature('type_encoder_input').channels)
-    phase_in_channels = len(bindings_config.get_feature('phase_ccdc').channels)
+    type_enc_feature = training_config.model_input.type_encoder_feature
+    phase_enc_feature = training_config.model_input.phase_encoder_feature
+    type_in_channels = len(bindings_config.get_feature(type_enc_feature).channels)
+    phase_in_channels = len(bindings_config.get_feature(phase_enc_feature).channels)
     logger.info(
         f"Feature dimensions from config: "
-        f"type_encoder_input={type_in_channels}, phase_ccdc={phase_in_channels}"
+        f"{type_enc_feature}={type_in_channels}, {phase_enc_feature}={phase_in_channels}"
     )
 
     # Create model
@@ -1333,6 +1335,10 @@ def main():
         # Training (from training config)
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
         'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
+
+        # Encoder input feature names (from model section of training config)
+        'type_encoder_feature': training_config.model_input.type_encoder_feature,
+        'phase_encoder_feature': training_config.model_input.phase_encoder_feature,
     }
 
     # Variance-covariance regularization (optional)

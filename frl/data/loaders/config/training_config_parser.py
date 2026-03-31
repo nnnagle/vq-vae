@@ -403,6 +403,20 @@ class MetricsConfig:
 
 
 @dataclass
+class ModelInputConfig:
+    """Names of bindings features that feed each encoder pathway."""
+    type_encoder_feature: str = "type_encoder_input"
+    phase_encoder_feature: str = "phase_ccdc"
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'ModelInputConfig':
+        return cls(
+            type_encoder_feature=d.get('type_encoder_feature', 'type_encoder_input'),
+            phase_encoder_feature=d.get('phase_encoder_feature', 'phase_ccdc'),
+        )
+
+
+@dataclass
 class VisualizationConfig:
     """Visualization configuration"""
     enabled: bool = True
@@ -444,6 +458,7 @@ class TrainingConfiguration:
     metrics: MetricsConfig
     visualization: VisualizationConfig
     reproducibility: ReproducibilityConfig
+    model_input: ModelInputConfig = field(default_factory=ModelInputConfig)
     
     @property
     def is_debug_mode(self) -> bool:
@@ -520,7 +535,8 @@ class TrainingConfigParser:
             masking=MaskingConfig.from_dict(self.raw_config.get('masking', {})),
             metrics=MetricsConfig.from_dict(self.raw_config.get('metrics', {})),
             visualization=VisualizationConfig.from_dict(self.raw_config.get('visualization', {})),
-            reproducibility=ReproducibilityConfig.from_dict(self.raw_config.get('reproducibility', {}))
+            reproducibility=ReproducibilityConfig.from_dict(self.raw_config.get('reproducibility', {})),
+            model_input=ModelInputConfig.from_dict(self.raw_config.get('model', {})),
         )
         
         return self.config

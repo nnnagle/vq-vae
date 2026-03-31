@@ -100,6 +100,10 @@ spatial_domain:
     size: [13056, 23552] # Height, Width
     block_grid: [7, 7] # The val/train/test split using a block size of [y,x] patches
     
+model:
+  type_encoder_feature: type_encoder_input  # bindings feature name fed to the type encoder
+  phase_encoder_feature: phase_ccdc         # bindings feature name fed to the phase encoder
+
 sampling:
   patch_size: 256
   grid_subsample:
