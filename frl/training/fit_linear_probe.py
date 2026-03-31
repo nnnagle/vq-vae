@@ -424,6 +424,16 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
+    # Validate that the checkpoint's expected input channels match the feature builder.
+    enc_feature = bindings_config.get_feature('type_encoder_input')
+    enc_channels = len(enc_feature.channels) if enc_feature is not None else None
+    if enc_channels != model.type_in_channels:
+        raise ValueError(
+            f"Channel mismatch: checkpoint expects {model.type_in_channels} input channels "
+            f"but 'type_encoder_input' in {args.bindings} has {enc_channels} channels. "
+            f"Pass --bindings with the YAML that matches this checkpoint."
+        )
+
     # Fit closed-form probe
     W, b = fit_closed_form_ridge(
         train_loader,
