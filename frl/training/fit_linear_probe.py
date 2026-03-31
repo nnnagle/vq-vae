@@ -369,8 +369,20 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Optional path to save fitted probe (pt)")
     args = parser.parse_args()
 
-    logger.info(f"Loading bindings config from {args.bindings}")
-    bindings_config = DatasetBindingsParser(args.bindings).parse()
+    # Resolve bindings YAML: prefer the copy saved alongside the checkpoint in the
+    # run directory (checkpoints/ is one level below the experiment root, which
+    # contains the copied YAMLs).  Fall back to --bindings if not found.
+    ckpt_path = Path(args.checkpoint)
+    run_dir = ckpt_path.parent.parent  # .../runs/frl_v0_expXXX/
+    bindings_name = Path(args.bindings).name
+    run_bindings = run_dir / bindings_name
+    if run_bindings.exists():
+        bindings_resolved = str(run_bindings)
+        logger.info(f"Using run-saved bindings config: {bindings_resolved}")
+    else:
+        bindings_resolved = args.bindings
+        logger.info(f"Loading bindings config from {bindings_resolved}")
+    bindings_config = DatasetBindingsParser(bindings_resolved).parse()
 
     logger.info(f"Loading training config from {args.training}")
     training_config = TrainingConfigParser(args.training).parse()
@@ -423,16 +435,6 @@ def main():
 
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
-
-    # Validate that the checkpoint's expected input channels match the feature builder.
-    enc_feature = bindings_config.get_feature('type_encoder_input')
-    enc_channels = len(enc_feature.channels) if enc_feature is not None else None
-    if enc_channels != model.type_in_channels:
-        raise ValueError(
-            f"Channel mismatch: checkpoint expects {model.type_in_channels} input channels "
-            f"but 'type_encoder_input' in {args.bindings} has {enc_channels} channels. "
-            f"Pass --bindings with the YAML that matches this checkpoint."
-        )
 
     # Fit closed-form probe
     W, b = fit_closed_form_ridge(

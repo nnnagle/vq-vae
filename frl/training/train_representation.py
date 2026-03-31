@@ -1813,7 +1813,6 @@ def main():
             'model_config': model_config,
             'type_in_channels': model.type_in_channels,
             'phase_in_channels': model.phase_in_channels,
-            'bindings_yaml': str(bindings_path),
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
