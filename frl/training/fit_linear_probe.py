@@ -104,6 +104,7 @@ def extract_batch_tensors(
     batch: dict,
     feature_builder: FeatureBuilder,
     device: torch.device,
+    enc_feature_name: str = "type_encoder_input",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build encoder inputs, targets, and mask for a batch.
@@ -126,7 +127,7 @@ def extract_batch_tensors(
         }
         sample["metadata"] = batch["metadata"][i]
 
-        enc_f = feature_builder.build_feature("type_encoder_input", sample)
+        enc_f = feature_builder.build_feature(enc_feature_name, sample)
         tgt_f = feature_builder.build_feature("target_metrics", sample)
 
         enc = torch.from_numpy(enc_f.data).float()
@@ -170,6 +171,7 @@ def fit_closed_form_ridge(
     device: torch.device,
     ridge_lambda: float = 1e-3,
     max_batches_train: int = 0,
+    enc_feature_name: str = "type_encoder_input",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Streaming ridge regression to fit linear probe:
@@ -192,7 +194,7 @@ def fit_closed_form_ridge(
 
     with torch.no_grad():
         for batch in _iter_batches(train_loader, max_batches_train):
-            Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
+            Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device, enc_feature_name)
             z = model(Ximg)            # [B, D, H, W]
 
             # Flatten pixels
@@ -238,6 +240,7 @@ def evaluate_probe(
     b: torch.Tensor,
     device: torch.device,
     max_batches_eval: int = 0,
+    enc_feature_name: str = "type_encoder_input",
 ) -> ProbeMetrics:
     """
     Evaluate MSE and R² per metric (masked) across an entire split.
@@ -261,7 +264,7 @@ def evaluate_probe(
 
     with torch.no_grad():
         for batch in _iter_batches(loader, max_batches_eval):
-            Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device)
+            Ximg, Yimg, M = extract_batch_tensors(batch, feature_builder, device, enc_feature_name)
             z = model(Ximg)            # [B, D, H, W]
 
             # Predict: [B, T, H, W]
@@ -436,6 +439,15 @@ def main():
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
 
+    # Resolve which feature to feed the encoder. Prefer 'type_encoder_input' (current
+    # name); fall back to 'ccdc_history' for checkpoints trained before the rename.
+    _ENC_FEATURE_CANDIDATES = ["type_encoder_input", "ccdc_history"]
+    enc_feature_name = next(
+        (f for f in _ENC_FEATURE_CANDIDATES if bindings_config.get_feature(f) is not None),
+        _ENC_FEATURE_CANDIDATES[0],  # will raise a clear error inside build_feature
+    )
+    logger.info(f"Using encoder feature: '{enc_feature_name}'")
+
     # Fit closed-form probe
     W, b = fit_closed_form_ridge(
         train_loader,
@@ -444,6 +456,7 @@ def main():
         device,
         ridge_lambda=args.ridge_lambda,
         max_batches_train=args.max_batches_train,
+        enc_feature_name=enc_feature_name,
     )
 
     # Evaluate
@@ -455,6 +468,7 @@ def main():
         b,
         device,
         max_batches_eval=args.max_batches_eval,
+        enc_feature_name=enc_feature_name,
     )
     val_metrics = evaluate_probe(
         val_loader,
@@ -464,6 +478,7 @@ def main():
         b,
         device,
         max_batches_eval=args.max_batches_eval,
+        enc_feature_name=enc_feature_name,
     )
 
     log_metrics(train_metrics, prefix="TRAIN")
