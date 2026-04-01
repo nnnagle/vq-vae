@@ -693,14 +693,21 @@ def process_batch(
             return {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                     'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
         combined = torch.cat(tensors)
+        # torch.quantile requires < 2^24 elements; subsample if needed
+        _MAX_QUANTILE_ELEMS = 2 ** 23
+        q_input = (
+            combined[torch.randperm(len(combined), device=combined.device)[:_MAX_QUANTILE_ELEMS]]
+            if len(combined) > _MAX_QUANTILE_ELEMS
+            else combined
+        )
         return {
             'mean': combined.mean().item(),
-            'std': combined.std().item(),
-            'min': combined.min().item(),
-            'max': combined.max().item(),
-            'q25': torch.quantile(combined, 0.25).item(),
-            'q50': torch.quantile(combined, 0.50).item(),
-            'q75': torch.quantile(combined, 0.75).item(),
+            'std':  combined.std().item(),
+            'min':  combined.min().item(),
+            'max':  combined.max().item(),
+            'q25':  torch.quantile(q_input, 0.25).item(),
+            'q50':  torch.quantile(q_input, 0.50).item(),
+            'q75':  torch.quantile(q_input, 0.75).item(),
         }
 
     # Compute data-dependent FiLM stats
