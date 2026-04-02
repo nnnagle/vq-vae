@@ -261,3 +261,9 @@ The codebase is flexible with no rigid extension conventions.
 model = RepresentationModel.from_checkpoint(path, freeze=True)
 head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 ```
+
+---
+
+## Known Limitations / Future Work
+
+**TODO: Weight cross-patch negatives by spectral distance.** Currently cross-patch negatives are unweighted (uniform), which accepts false negatives — spectrally similar forests from different patches that get incorrectly pushed apart. A principled fix: compute spectral distances between cross-patch pairs and apply `neg_weights = 1 - exp(-d_spec / tau)`, consistent with how spatial InfoNCE negatives are already weighted (`frl/training/train_representation.py`, spatial weighting block). This requires computing spectral distances for sampled cross-patch pairs only (not the full O(N²B²) matrix).
