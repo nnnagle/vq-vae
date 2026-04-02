@@ -173,6 +173,11 @@ def process_batch(
     all_film_gamma = []
     all_film_beta = []
 
+    # Collectors for global spectral loss with cross-patch negatives
+    cross_patch_z_anchors: list[torch.Tensor] = []
+    cross_patch_spec_pos_pairs: list[torch.Tensor] = []
+    cross_patch_spec_neg_pairs: list[torch.Tensor] = []
+
     batch_size = len(batch['metadata'])
 
     for i in range(batch_size):
@@ -361,16 +366,11 @@ def process_batch(
             )
             vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
 
-        # Compute spectral loss
-        spectral_loss_val = torch.tensor(0.0, device=device)
+        # Collect embeddings and pairs for global spectral loss (computed after loop)
         if has_spectral:
-            spectral_loss_val = contrastive_loss(
-                z_anchors,
-                spectral_pos_pairs,
-                spectral_neg_pairs,
-                temperature=config.get('temperature', 0.07),
-                similarity='l2',
-            )
+            cross_patch_z_anchors.append(z_anchors)
+            cross_patch_spec_pos_pairs.append(spectral_pos_pairs)
+            cross_patch_spec_neg_pairs.append(spectral_neg_pairs)
 
         # Compute spatial loss
         spatial_loss_val = torch.tensor(0.0, device=device)
@@ -532,11 +532,9 @@ def process_batch(
                         p_loss_stats['curriculum_w'] = curriculum_w
                         all_phase_loss_stats.append(p_loss_stats)
 
-        # Combine losses with weights
-        spectral_weight = config.get('spectral_loss_weight', 1.0)
+        # Combine losses with weights (spectral loss computed globally after loop)
         spatial_weight = config.get('spatial_loss_weight', 1.0)
-        loss = (spectral_weight * spectral_loss_val
-                + spatial_weight * spatial_loss_val
+        loss = (spatial_weight * spatial_loss_val
                 + phase_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
@@ -550,7 +548,6 @@ def process_batch(
         # Accumulate: keep as tensor for training (backward), use .item() for validation
         if training:
             total_loss += loss
-            total_spectral_loss += spectral_loss_val
             total_spatial_loss += spatial_loss_val
             total_phase_loss += phase_loss_val
             total_vcr_loss += vcr_loss_val
@@ -558,17 +555,64 @@ def process_batch(
             total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
-            total_spectral_loss += spectral_loss_val.item()
             total_spatial_loss += spatial_loss_val.item()
             total_phase_loss += phase_loss_val.item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_evt_loss += evt_loss_val.item()
         n_valid += 1
-        total_spectral_pos_pairs += spectral_pos_pairs.shape[0]
-        total_spectral_neg_pairs += spectral_neg_pairs.shape[0]
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
+
+    # --- Global Spectral InfoNCE with Cross-Patch Negatives ---
+    # Pairs from all samples are pooled into a single embedding matrix.
+    # Within-patch positives/negatives come from pairs_with_spatial_constraint.
+    # Cross-patch negatives: each anchor gets cross_patch_negatives_per_anchor
+    # random anchors from every other sample as negatives (unweighted).
+    spectral_weight = config.get('spectral_loss_weight', 1.0)
+    global_spectral_loss_val = torch.tensor(0.0, device=device)
+    if cross_patch_z_anchors:
+        n_spectral = len(cross_patch_z_anchors)
+        z_all = torch.cat(cross_patch_z_anchors, dim=0)  # [N_total, D]
+
+        # Cumulative offsets into the global embedding pool
+        offsets: list[int] = [0]
+        for z in cross_patch_z_anchors:
+            offsets.append(offsets[-1] + z.shape[0])
+
+        # Offset within-patch pair indices to global pool indices
+        global_pos = torch.cat(
+            [p + offsets[k] for k, p in enumerate(cross_patch_spec_pos_pairs)], dim=0
+        )
+        global_neg_parts: list[torch.Tensor] = [
+            n + offsets[k] for k, n in enumerate(cross_patch_spec_neg_pairs)
+        ]
+
+        # Add cross-patch negatives (anchors from other samples)
+        cross_neg_k = config.get('cross_patch_negatives_per_anchor', 8)
+        if n_spectral > 1 and cross_neg_k > 0:
+            for i in range(n_spectral):
+                i_start, i_end = offsets[i], offsets[i + 1]
+                n_i = i_end - i_start
+                for j in range(n_spectral):
+                    if j == i:
+                        continue
+                    j_start, j_end = offsets[j], offsets[j + 1]
+                    k = min(cross_neg_k, j_end - j_start)
+                    if k == 0:
+                        continue
+                    anchor_ids = torch.arange(i_start, i_end, device=device).repeat_interleave(k)
+                    neg_ids = torch.randint(j_start, j_end, (n_i * k,), device=device)
+                    global_neg_parts.append(torch.stack([anchor_ids, neg_ids], dim=1))
+
+        global_neg = torch.cat(global_neg_parts, dim=0)
+        global_spectral_loss_val = contrastive_loss(
+            z_all, global_pos, global_neg,
+            temperature=config.get('temperature', 0.07),
+            similarity='l2',
+        )
+        total_spectral_pos_pairs = global_pos.shape[0]
+        total_spectral_neg_pairs = global_neg.shape[0]
 
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
@@ -640,9 +684,15 @@ def process_batch(
             'phase_loss_stats': empty_phase_loss_stats,
         }
 
-    # Average losses over valid samples in batch
-    mean_loss = total_loss / n_valid
-    mean_spectral_loss = total_spectral_loss / n_valid
+    # Average losses over valid samples in batch.
+    # Spectral loss is computed globally (cross-patch) and added on top.
+    if training:
+        mean_loss = total_loss / n_valid + spectral_weight * global_spectral_loss_val
+        mean_spectral_loss = global_spectral_loss_val
+    else:
+        spectral_scalar = global_spectral_loss_val.item()
+        mean_loss = total_loss / n_valid + spectral_weight * spectral_scalar
+        mean_spectral_loss = spectral_scalar
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = total_phase_loss / n_valid
     mean_vcr_loss = total_vcr_loss / n_valid
@@ -1395,7 +1445,8 @@ def main():
         f"neg_per_anchor={loss_config['spatial_negatives_per_anchor']}, "
         f"spec_tau={loss_config['spatial_spectral_tau']}, min_w={loss_config['spatial_min_w']}, "
         f"temp={loss_config['spatial_temperature']}), "
-        f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']})"
+        f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']}), "
+        f"cross_patch_neg_k={loss_config.get('cross_patch_negatives_per_anchor', 8)}"
     )
 
     # --- Phase loss pair construction setup ---
