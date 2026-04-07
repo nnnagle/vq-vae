@@ -565,11 +565,30 @@ def process_batch(
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     if cross_patch_z_anchors:
-        z_all = torch.cat(cross_patch_z_anchors, dim=0)       # [N_total, D]
-        spec_all = torch.cat(cross_patch_spec_features, dim=0) # [N_total, C]
+        # Subsample anchors per patch before building the distance matrix to
+        # bound GPU memory: N_total = n_patches × max_anch, so the N²×float32
+        # matrix stays predictable regardless of EVT supplement size or batch size.
+        max_anch = config.get('spectral_knn_max_anchors_per_patch', 256)
+        spec_sub, coord_sub, z_sub = [], [], []
+        for feats, coords, z in zip(
+            cross_patch_spec_features, cross_patch_anchor_coords, cross_patch_z_anchors
+        ):
+            n = feats.shape[0]
+            if n > max_anch:
+                idx = torch.randperm(n, device=device)[:max_anch]
+                spec_sub.append(feats[idx])
+                coord_sub.append(coords[idx])
+                z_sub.append(z[idx])
+            else:
+                spec_sub.append(feats)
+                coord_sub.append(coords)
+                z_sub.append(z)
+
+        z_all = torch.cat(z_sub, dim=0)       # [N_total, D]
+        spec_all = torch.cat(spec_sub, dim=0)  # [N_total, C]
 
         offsets: list[int] = [0]
-        for z in cross_patch_z_anchors:
+        for z in z_sub:
             offsets.append(offsets[-1] + z.shape[0])
 
         # Full cross-batch spectral distance matrix (Mahalanobis L2).
@@ -584,7 +603,7 @@ def process_batch(
 
         spec_dist_for_neg = spec_feat_distances_all.clone()
         spec_dist_for_pos = spec_feat_distances_all.clone()
-        for k, coords_k in enumerate(cross_patch_anchor_coords):
+        for k, coords_k in enumerate(coord_sub):
             s, e = offsets[k], offsets[k + 1]
             within_sp = compute_spatial_distances(coords_k)   # [N_k, N_k]
             neg_block = spec_dist_for_neg[s:e, s:e]
