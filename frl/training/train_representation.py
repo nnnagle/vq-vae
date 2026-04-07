@@ -38,7 +38,7 @@ from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
 from data.sampling.anchor_sampling import AnchorSampler, build_anchor_sampler
 from models import RepresentationModel
-from losses import contrastive_loss, pairs_with_spatial_constraint
+from losses import contrastive_loss, pairs_mutual_knn, pairs_quantile, pairs_with_spatial_constraint
 from losses.phase_pairs import build_phase_pairs
 from losses.phase_neighborhood import phase_neighborhood_loss
 from losses.variance_covariance import variance_covariance_loss
@@ -173,10 +173,10 @@ def process_batch(
     all_film_gamma = []
     all_film_beta = []
 
-    # Collectors for global spectral loss with cross-patch negatives
+    # Collectors for global spectral loss (pairs built cross-batch after loop)
     cross_patch_z_anchors: list[torch.Tensor] = []
-    cross_patch_spec_pos_pairs: list[torch.Tensor] = []
-    cross_patch_spec_neg_pairs: list[torch.Tensor] = []
+    cross_patch_spec_features: list[torch.Tensor] = []
+    cross_patch_anchor_coords: list[torch.Tensor] = []
 
     batch_size = len(batch['metadata'])
 
@@ -202,37 +202,26 @@ def process_batch(
         spec_dist_mask = torch.from_numpy(spec_dist_feature.mask).to(device)
         combined_mask = mask & spec_dist_mask
 
-        # Sample anchor locations
-        anchors = sample_anchors_grid_plus_supplement(
-            combined_mask,
-            stride=config.get('stride', 16),
-            border=config.get('border', 16),
-            jitter_radius=jitter_radius,
-            supplement_n=config.get('supplement_n', 104),
-        )
+        # Sample anchor locations — use EVT-stratified sampler when available so
+        # rare forest types are represented for cross-batch kNN pair construction.
+        if evt_sampler is not None:
+            anchors = evt_sampler(combined_mask, training=training, sample=sample)
+        else:
+            anchors = sample_anchors_grid_plus_supplement(
+                combined_mask,
+                stride=config.get('stride', 16),
+                border=config.get('border', 16),
+                jitter_radius=jitter_radius,
+                supplement_n=config.get('supplement_n', 104),
+            )
 
         if anchors.shape[0] < 10:
             continue
 
-        # Extract features at anchor locations for spectral loss
+        # Extract features at anchor locations
+        # spec_dist_at_anchors collected here; pairs built cross-batch after loop.
         encoder_at_anchors = extract_at_locations(encoder_data, anchors)
         spec_dist_at_anchors = extract_at_locations(spec_dist_data, anchors)
-
-        # Compute distances for spectral loss
-        # Mahalanobis transform already applied by FeatureBuilder, so L2 here = Mahalanobis
-        spec_feat_distances = torch.cdist(spec_dist_at_anchors, spec_dist_at_anchors)
-        spatial_distances = compute_spatial_distances(anchors)
-
-        # Generate pairs for spectral loss
-        spectral_pos_pairs, spectral_neg_pairs = pairs_with_spatial_constraint(
-            spec_feat_distances,
-            spatial_distances,
-            positive_k=config.get('positive_k', 16),
-            positive_min_spatial=config.get('positive_min_spatial', 4.0),
-            negative_quantile_low=config.get('negative_quantile_low', 0.5),
-            negative_quantile_high=config.get('negative_quantile_high', 0.75),
-            negative_min_spatial=config.get('negative_min_spatial', 8.0),
-        )
 
         # --- Spatial InfoNCE Loss ---
         # Use efficient offset-based pair generation (no large distance matrix)
@@ -312,8 +301,9 @@ def process_batch(
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
             all_neg_weights.append(neg_weights.detach())
 
-        # Check if we have valid pairs for both losses
-        has_spectral = spectral_pos_pairs.shape[0] > 0 and spectral_neg_pairs.shape[0] > 0
+        # Check if we have valid pairs for losses
+        # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
+        has_spectral = spec_dist_at_anchors.shape[0] > 0
         has_spatial = spatial_pos_pairs.shape[0] > 0 and spatial_neg_pairs.shape[0] > 0
 
         if not has_spectral and not has_spatial:
@@ -366,11 +356,11 @@ def process_batch(
             )
             vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
 
-        # Collect embeddings and pairs for global spectral loss (computed after loop)
+        # Collect embeddings and spectral features for cross-batch pair construction
         if has_spectral:
             cross_patch_z_anchors.append(z_anchors)
-            cross_patch_spec_pos_pairs.append(spectral_pos_pairs)
-            cross_patch_spec_neg_pairs.append(spectral_neg_pairs)
+            cross_patch_spec_features.append(spec_dist_at_anchors)
+            cross_patch_anchor_coords.append(anchors)
 
         # Compute spatial loss
         spatial_loss_val = torch.tensor(0.0, device=device)
@@ -564,52 +554,69 @@ def process_batch(
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
-    # --- Global Spectral InfoNCE with Cross-Patch Negatives ---
-    # Pairs from all samples are pooled into a single embedding matrix.
-    # Within-patch positives/negatives come from pairs_with_spatial_constraint.
-    # Cross-patch negatives: each anchor gets cross_patch_negatives_per_anchor
-    # random anchors from every other sample as negatives (unweighted).
+    # --- Global Spectral InfoNCE with Cross-Batch kNN ---
+    # All anchors from all samples in the batch are pooled into a single
+    # N_total × N_total spectral distance matrix. Positive pairs are mutual
+    # kNN across the full pool — spectrally similar pixels from *different*
+    # patches can now be positives, teaching location-invariant forest type.
+    # Negatives are sampled from the [q_low, q_high) quantile range of spectral
+    # distances and weighted by 1 - exp(-d/tau) to suppress false negatives
+    # (cross-patch pairs that happen to be spectrally similar).
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     if cross_patch_z_anchors:
-        n_spectral = len(cross_patch_z_anchors)
-        z_all = torch.cat(cross_patch_z_anchors, dim=0)  # [N_total, D]
+        z_all = torch.cat(cross_patch_z_anchors, dim=0)       # [N_total, D]
+        spec_all = torch.cat(cross_patch_spec_features, dim=0) # [N_total, C]
 
-        # Cumulative offsets into the global embedding pool
         offsets: list[int] = [0]
         for z in cross_patch_z_anchors:
             offsets.append(offsets[-1] + z.shape[0])
 
-        # Offset within-patch pair indices to global pool indices
-        global_pos = torch.cat(
-            [p + offsets[k] for k, p in enumerate(cross_patch_spec_pos_pairs)], dim=0
+        # Full cross-batch spectral distance matrix (Mahalanobis L2).
+        # Kept for neg_weights lookup after pair selection.
+        spec_feat_distances_all = torch.cdist(spec_all, spec_all)  # [N_total, N_total]
+
+        # Apply within-patch spatial constraints directly on the spectral distance
+        # matrix. Cross-patch pairs are always spatially far apart, so they need
+        # no spatial masking — only within-patch diagonal blocks are touched.
+        pos_min_sp = config.get('positive_min_spatial', 4.0)
+        neg_min_sp = config.get('negative_min_spatial', 8.0)
+
+        spec_dist_for_neg = spec_feat_distances_all.clone()
+        spec_dist_for_pos = spec_feat_distances_all.clone()
+        for k, coords_k in enumerate(cross_patch_anchor_coords):
+            s, e = offsets[k], offsets[k + 1]
+            within_sp = compute_spatial_distances(coords_k)   # [N_k, N_k]
+            neg_block = spec_dist_for_neg[s:e, s:e]
+            neg_block[within_sp < neg_min_sp] = float('inf')
+            spec_dist_for_neg[s:e, s:e] = neg_block
+            pos_block = spec_dist_for_pos[s:e, s:e]
+            pos_block[within_sp < pos_min_sp] = float('inf')
+            spec_dist_for_pos[s:e, s:e] = pos_block
+
+        global_pos = pairs_mutual_knn(
+            spec_dist_for_pos,
+            k=config.get('positive_k', 16),
         )
-        global_neg_parts: list[torch.Tensor] = [
-            n + offsets[k] for k, n in enumerate(cross_patch_spec_neg_pairs)
-        ]
+        global_neg = pairs_quantile(
+            spec_dist_for_neg,
+            low=config.get('negative_quantile_low', 0.5),
+            high=config.get('negative_quantile_high', 0.75),
+            max_pairs=config.get('spectral_max_neg_pairs', 32_000),
+        )
 
-        # Add cross-patch negatives (anchors from other samples)
-        cross_neg_k = config.get('cross_patch_negatives_per_anchor', 8)
-        if n_spectral > 1 and cross_neg_k > 0:
-            for i in range(n_spectral):
-                i_start, i_end = offsets[i], offsets[i + 1]
-                n_i = i_end - i_start
-                for j in range(n_spectral):
-                    if j == i:
-                        continue
-                    j_start, j_end = offsets[j], offsets[j + 1]
-                    k = min(cross_neg_k, j_end - j_start)
-                    if k == 0:
-                        continue
-                    anchor_ids = torch.arange(i_start, i_end, device=device).repeat_interleave(k)
-                    neg_ids = torch.randint(j_start, j_end, (n_i * k,), device=device)
-                    global_neg_parts.append(torch.stack([anchor_ids, neg_ids], dim=1))
+        # Weight negatives by spectral distance — softly suppresses false negatives
+        # (cross-patch pairs that are spectrally similar but sampled as negatives).
+        tau_neg = config.get('spectral_neg_tau', 1.0)
+        min_w = config.get('spectral_neg_min_weight', 0.05)
+        neg_spec_dist = spec_feat_distances_all[global_neg[:, 0], global_neg[:, 1]]
+        neg_weights = (1.0 - torch.exp(-neg_spec_dist / tau_neg)).clamp(min=min_w, max=1.0)
 
-        global_neg = torch.cat(global_neg_parts, dim=0)
         global_spectral_loss_val = contrastive_loss(
             z_all, global_pos, global_neg,
             temperature=config.get('temperature', 0.07),
             similarity='l2',
+            neg_weights=neg_weights,
         )
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
@@ -1521,60 +1528,68 @@ def main():
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
 
     # --- EVT soft neighbourhood loss setup ---
+    # The EVT-stratified anchor sampler is built whenever the EVT loss config
+    # exists, regardless of loss weight. This allows EVT-stratified anchor
+    # sampling for the spectral kNN even when the EVT loss itself is disabled.
     evt_metric = None
+    evt_sampler = None
     evt_loss_cfg = bindings_config.get_loss('soft_neighborhood_evt')
-    if evt_loss_cfg is not None and (evt_loss_cfg.weight or 0.0) > 0.0:
-        # EVT code counts come from the shared stats file, at the path:
-        #   stats["evt_class"]["static_categorical.evt"]["counts"]
-        # Keys are string codes, values are integer pixel counts.
-        evt_code_counts = (
-            feature_builder.stats
-            .get("evt_class", {})
-            .get("static_categorical.evt", {})
-            .get("counts", {})
-        )
-        if not evt_code_counts:
-            raise ValueError(
-                "EVT code counts not found in stats file. "
-                "Run example_compute_stats.py to compute stats first."
-            )
-        evt_metric = EvtDiffusionMetric(
-            confusion_csv=evt_loss_cfg.confusion_matrix_path,
-            code_counts=evt_code_counts,
-            min_count=evt_loss_cfg.min_count or 100,
-            min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
-            diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
-            laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
-            binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
-        ).to(device)
-        loss_config['evt_weight'] = evt_loss_cfg.weight
-        loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
-        loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
-        # Build EVT-stratified anchor sampler
+    if evt_loss_cfg is not None:
         evt_anchor_pop = (
             evt_loss_cfg.anchor_population
             if evt_loss_cfg.anchor_population
             else 'grid-plus-supplement-evt'
         )
         evt_sampler = build_anchor_sampler(bindings_config, evt_anchor_pop)
-        # Tell the inverse-frequency weight spec to ignore excluded EVT codes
-        # so the sampler doesn't waste anchor slots on types not in the metric.
-        for spec in evt_sampler.weight_specs:
-            if spec.transform == 'inverse-frequency':
-                spec.valid_values = evt_metric.valid_codes
-        logger.info(
-            f"EVT soft neighbourhood loss enabled: "
-            f"{evt_metric.n_codes} codes, "
-            f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
-            f"min_count={evt_loss_cfg.min_count or 100}, "
-            f"weight={loss_config['evt_weight']}, "
-            f"tau_ref={loss_config['evt_tau_ref']}, "
-            f"tau_learned={loss_config['evt_tau_learned']}, "
-            f"anchor_population={evt_anchor_pop}"
-        )
+
+        if (evt_loss_cfg.weight or 0.0) > 0.0:
+            # EVT code counts come from the shared stats file, at the path:
+            #   stats["evt_class"]["static_categorical.evt"]["counts"]
+            # Keys are string codes, values are integer pixel counts.
+            evt_code_counts = (
+                feature_builder.stats
+                .get("evt_class", {})
+                .get("static_categorical.evt", {})
+                .get("counts", {})
+            )
+            if not evt_code_counts:
+                raise ValueError(
+                    "EVT code counts not found in stats file. "
+                    "Run example_compute_stats.py to compute stats first."
+                )
+            evt_metric = EvtDiffusionMetric(
+                confusion_csv=evt_loss_cfg.confusion_matrix_path,
+                code_counts=evt_code_counts,
+                min_count=evt_loss_cfg.min_count or 100,
+                min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
+                diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
+                laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
+                binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
+            ).to(device)
+            loss_config['evt_weight'] = evt_loss_cfg.weight
+            loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
+            loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
+            # Restrict inverse-frequency weighting to valid EVT codes only.
+            for spec in evt_sampler.weight_specs:
+                if spec.transform == 'inverse-frequency':
+                    spec.valid_values = evt_metric.valid_codes
+            logger.info(
+                f"EVT soft neighbourhood loss enabled: "
+                f"{evt_metric.n_codes} codes, "
+                f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
+                f"min_count={evt_loss_cfg.min_count or 100}, "
+                f"weight={loss_config['evt_weight']}, "
+                f"tau_ref={loss_config['evt_tau_ref']}, "
+                f"tau_learned={loss_config['evt_tau_learned']}, "
+                f"anchor_population={evt_anchor_pop}"
+            )
+        else:
+            logger.info(
+                f"EVT loss disabled (weight=0) but EVT-stratified anchor sampler "
+                f"active for spectral kNN (population={evt_anchor_pop})"
+            )
     else:
-        evt_sampler = None
-        logger.info("EVT soft neighbourhood loss disabled (weight=0 or not in bindings config)")
+        logger.info("EVT soft neighbourhood loss disabled (not in bindings config)")
 
     # Create scheduler with optional warmup.
     # Must be after phase_config is built so the two-phase branch can read
