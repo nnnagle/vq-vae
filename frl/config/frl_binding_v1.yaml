@@ -519,6 +519,11 @@ losses:
         range: [0.5, 0.75]
         min_distance: 8
 
+    # Cross-batch kNN settings (applied in train_representation.py)
+    spectral_neg_tau: 1.0        # neg weight = 1 - exp(-d/tau); tune if train/val gap persists
+    spectral_neg_min_weight: 0.05
+    spectral_max_neg_pairs: 32000
+
   # Spatial smoothness (coordinate-driven)
   infonce_type_spatial:
     weight: 1.0
@@ -636,9 +641,9 @@ losses:
   # EVT-guided soft neighbourhood loss.
   # Encourages z_type to mirror the network structure of the LANDFIRE EVT
   # confusion graph, including transitive (multi-hop) similarity via diffusion.
-  # Disabled by default (weight: 0.0). Set weight > 0 and provide paths to activate.
+  # EVT loss disabled; sampler still built for EVT-stratified anchor sampling.
   soft_neighborhood_evt:
-    weight: 0.5
+    weight: 0.0
     type: soft_neighborhood_evt
     confusion_matrix_path: ../data/combined_evt_contingency_table.csv
     min_count: 100              # exclude codes with fewer regional pixels than this
