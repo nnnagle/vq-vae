@@ -526,3 +526,85 @@ def pairs_with_spatial_constraint(
         raise ValueError(f"Unknown negative strategy: {negative_strategy}")
 
     return pos_pairs, neg_pairs
+
+
+def pairs_mutual_knn_chunked(
+    features: torch.Tensor,
+    coord_list: list[torch.Tensor],
+    offsets: list[int],
+    k: int,
+    pos_min_spatial: float = 4.0,
+    chunk_size: int = 128,
+) -> torch.Tensor:
+    """
+    Mutual kNN pairs without materialising the full N×N distance matrix.
+
+    Processes ``chunk_size`` query points at a time against all N targets,
+    keeping only the top-k neighbours per query. The within-patch spatial
+    constraint (``pos_min_spatial``) is applied per diagonal block; cross-patch
+    pairs are always spatially distant and need no masking.
+
+    Memory: O(chunk_size × N) per step instead of O(N²).
+
+    Args:
+        features: [N, C] feature matrix in Mahalanobis (whitened) space.
+        coord_list: list of [N_k, 2] anchor (row, col) coordinates, one entry
+            per patch, in the same order as ``offsets``.
+        offsets: cumulative anchor counts; ``offsets[p]:offsets[p+1]`` are the
+            global indices of patch p's anchors. Length = n_patches + 1.
+        k: number of nearest neighbours to consider for each point.
+        pos_min_spatial: minimum pixel distance for within-patch positive pairs.
+            Pairs closer than this are masked to inf (excluded from kNN).
+        chunk_size: number of query points per cdist call.
+
+    Returns:
+        [P, 2] tensor of (anchor, target) pairs. Both (i, j) and (j, i) are
+        returned for each mutual pair, consistent with ``pairs_mutual_knn``.
+    """
+    N = features.shape[0]
+    device = features.device
+    knn_idx = torch.full((N, k), -1, dtype=torch.long, device=device)
+
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        dists = torch.cdist(features[start:end], features)  # [cs, N]
+
+        # Self-distance → inf so each point is never its own neighbour
+        local = torch.arange(end - start, device=device)
+        dists[local, start + local] = float('inf')
+
+        # Within-patch spatial constraint: mask pairs that are too close spatially.
+        # Only diagonal blocks need this — cross-patch pairs are always far apart.
+        for p, coords_p in enumerate(coord_list):
+            ps, pe = offsets[p], offsets[p + 1]
+            qs, qe = max(start, ps), min(end, pe)
+            if qs >= qe:
+                continue
+            q_coords = coords_p[qs - ps: qe - ps]                    # [n_q, 2]
+            sp = torch.cdist(q_coords.float(), coords_p.float())      # [n_q, N_k]
+            block = dists[qs - start: qe - start, ps:pe]
+            block[sp < pos_min_spatial] = float('inf')
+            dists[qs - start: qe - start, ps:pe] = block
+
+        # Top-k (inf entries stay at the end and are marked invalid below)
+        actual_k = min(k, N - 1)
+        topk_vals, topk_idx = dists.topk(actual_k, dim=1, largest=False)
+        topk_idx[torch.isinf(topk_vals)] = -1
+        knn_idx[start:end, :actual_k] = topk_idx
+
+    # Vectorised mutual check.
+    # Candidate pairs: every (i, j) where j is in kNN of i.
+    i_idx = torch.arange(N, device=device).repeat_interleave(k)  # [N*k]
+    j_idx = knn_idx.reshape(-1)                                    # [N*k]
+
+    valid = j_idx >= 0
+    i_idx = i_idx[valid]
+    j_idx = j_idx[valid]
+
+    # Mutual if i also appears in knn_idx[j].
+    # knn_idx[j_idx]: [M, k] — invalid slots are -1, so they never match i_idx >= 0.
+    mutual = (knn_idx[j_idx] == i_idx.unsqueeze(1)).any(dim=1)
+
+    if not mutual.any():
+        return torch.empty((0, 2), dtype=torch.long, device=device)
+    return torch.stack([i_idx[mutual], j_idx[mutual]], dim=1)
