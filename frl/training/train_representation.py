@@ -1126,6 +1126,15 @@ def main():
         default=False,
         help='Overwrite existing experiment directory if it exists'
     )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        metavar='CKPT',
+        help='Path to a checkpoint to resume training from. Loads model weights and '
+             'optimizer state; the scheduler is reinitialized as a fresh cosine decay '
+             'from the checkpoint LR over the remaining epochs (num_epochs - start_epoch).'
+    )
     args = parser.parse_args()
 
     # Parse configs first to get defaults
@@ -1274,6 +1283,19 @@ def main():
         lr=lr,
         weight_decay=weight_decay,
     )
+
+    # Load checkpoint for resume (model weights + optimizer state).
+    # The scheduler is NOT restored — it is rebuilt as a fresh cosine from the
+    # checkpoint LR over the remaining epochs so the full LR range is used.
+    start_epoch = 0
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt['epoch']  # saved as epoch+1 (the next epoch to run)
+        resume_lr = optimizer.param_groups[0]['lr']
+        logger.info(f"Resumed: start_epoch={start_epoch}, resume_lr={resume_lr:.3e}")
 
     # Scheduler is created after phase_config below, so it can condition on whether
     # phase loss is active (needed for the two-phase LR schedule).
@@ -1565,7 +1587,24 @@ def main():
         """Cosine interpolation from start_val to end_val over [0, 1]."""
         return end_val + (start_val - end_val) * 0.5 * (1.0 + np.cos(np.pi * progress))
 
-    if scheduler_config.warmup.enabled:
+    if start_epoch > 0:
+        # Resumed run: fresh cosine from resume_lr → eta_min over remaining epochs.
+        # No warmup or phase re-warmup needed — the model is already well-trained.
+        remaining_steps = (num_epochs - start_epoch) * len(train_dataloader)
+        eta_min_factor_resume = scheduler_config.eta_min / resume_lr
+        logger.info(
+            f"Resume scheduler: cosine from lr={resume_lr:.3e} to "
+            f"eta_min={scheduler_config.eta_min:.1e} over "
+            f"{num_epochs - start_epoch} epochs ({remaining_steps} steps)"
+        )
+
+        def lr_lambda(step):
+            progress = step / max(remaining_steps, 1)
+            return _cosine(1.0, eta_min_factor_resume, min(progress, 1.0))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    elif scheduler_config.warmup.enabled:
         warmup_steps = scheduler_config.warmup.epochs * len(train_dataloader)
         phase_warmup_cfg = getattr(scheduler_config, 'phase_warmup', None)
 
@@ -1694,8 +1733,8 @@ def main():
     saved_ckpts: list = []
 
     # Training loop
-    logger.info(f"Starting training for {num_epochs} epochs...")
-    for epoch in range(num_epochs):
+    logger.info(f"Starting training for {num_epochs} epochs (from epoch {start_epoch})...")
+    for epoch in range(start_epoch, num_epochs):
         train_dataset.on_epoch_start()  # Reshuffle patches
 
         # Apply scheduled input dropout rate for this epoch.
