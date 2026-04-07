@@ -523,6 +523,7 @@ losses:
     spectral_neg_tau: 1.0        # neg weight = 1 - exp(-d/tau); tune if train/val gap persists
     spectral_neg_min_weight: 0.05
     spectral_max_neg_pairs: 32000
+    spectral_knn_max_anchors_per_patch: 256  # subsample before distance matrix to bound GPU memory
 
   # Spatial smoothness (coordinate-driven)
   infonce_type_spatial:
