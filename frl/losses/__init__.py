@@ -28,6 +28,7 @@ from losses.count import count_loss
 from losses.pairs import (
     pairs_knn,
     pairs_mutual_knn,
+    pairs_mutual_knn_chunked,
     pairs_quantile,
     pairs_radius,
     pairs_with_spatial_constraint,
@@ -65,6 +66,7 @@ __all__ = [
     "covariance_loss",
     "pairs_knn",
     "pairs_mutual_knn",
+    "pairs_mutual_knn_chunked",
     "pairs_quantile",
     "pairs_radius",
     "pairs_with_spatial_constraint",

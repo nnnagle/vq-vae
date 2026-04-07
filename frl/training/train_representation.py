@@ -38,7 +38,7 @@ from data.loaders.builders.feature_builder import FeatureBuilder
 from data.sampling import sample_anchors_grid_plus_supplement
 from data.sampling.anchor_sampling import AnchorSampler, build_anchor_sampler
 from models import RepresentationModel
-from losses import contrastive_loss, pairs_mutual_knn, pairs_quantile, pairs_with_spatial_constraint
+from losses import contrastive_loss, pairs_mutual_knn, pairs_mutual_knn_chunked, pairs_quantile, pairs_with_spatial_constraint
 from losses.phase_pairs import build_phase_pairs
 from losses.phase_neighborhood import phase_neighborhood_loss
 from losses.variance_covariance import variance_covariance_loss
@@ -565,70 +565,52 @@ def process_batch(
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     if cross_patch_z_anchors:
-        # Subsample anchors per patch before building the distance matrix to
-        # bound GPU memory: N_total = n_patches × max_anch, so the N²×float32
-        # matrix stays predictable regardless of EVT supplement size or batch size.
-        max_anch = config.get('spectral_knn_max_anchors_per_patch', 256)
-        spec_sub, coord_sub, z_sub = [], [], []
-        for feats, coords, z in zip(
-            cross_patch_spec_features, cross_patch_anchor_coords, cross_patch_z_anchors
-        ):
-            n = feats.shape[0]
-            if n > max_anch:
-                idx = torch.randperm(n, device=device)[:max_anch]
-                spec_sub.append(feats[idx])
-                coord_sub.append(coords[idx])
-                z_sub.append(z[idx])
-            else:
-                spec_sub.append(feats)
-                coord_sub.append(coords)
-                z_sub.append(z)
-
-        z_all = torch.cat(z_sub, dim=0)       # [N_total, D]
-        spec_all = torch.cat(spec_sub, dim=0)  # [N_total, C]
+        n_patches = len(cross_patch_z_anchors)
+        z_all = torch.cat(cross_patch_z_anchors, dim=0)        # [N_total, D]
+        spec_all = torch.cat(cross_patch_spec_features, dim=0) # [N_total, C]
 
         offsets: list[int] = [0]
-        for z in z_sub:
+        for z in cross_patch_z_anchors:
             offsets.append(offsets[-1] + z.shape[0])
 
-        # Full cross-batch spectral distance matrix (Mahalanobis L2).
-        # Kept for neg_weights lookup after pair selection.
-        spec_feat_distances_all = torch.cdist(spec_all, spec_all)  # [N_total, N_total]
-
-        # Apply within-patch spatial constraints directly on the spectral distance
-        # matrix. Cross-patch pairs are always spatially far apart, so they need
-        # no spatial masking — only within-patch diagonal blocks are touched.
-        pos_min_sp = config.get('positive_min_spatial', 4.0)
-        neg_min_sp = config.get('negative_min_spatial', 8.0)
-
-        spec_dist_for_neg = spec_feat_distances_all.clone()
-        spec_dist_for_pos = spec_feat_distances_all.clone()
-        for k, coords_k in enumerate(coord_sub):
-            s, e = offsets[k], offsets[k + 1]
-            within_sp = compute_spatial_distances(coords_k)   # [N_k, N_k]
-            neg_block = spec_dist_for_neg[s:e, s:e]
-            neg_block[within_sp < neg_min_sp] = float('inf')
-            spec_dist_for_neg[s:e, s:e] = neg_block
-            pos_block = spec_dist_for_pos[s:e, s:e]
-            pos_block[within_sp < pos_min_sp] = float('inf')
-            spec_dist_for_pos[s:e, s:e] = pos_block
-
-        global_pos = pairs_mutual_knn(
-            spec_dist_for_pos,
+        # --- Positive pairs: chunked mutual kNN ---
+        # Processes chunk_size queries at a time — peak memory O(chunk × N_total).
+        # Keeps all anchors; no subsampling needed.
+        global_pos = pairs_mutual_knn_chunked(
+            spec_all,
+            cross_patch_anchor_coords,
+            offsets,
             k=config.get('positive_k', 16),
-        )
-        global_neg = pairs_quantile(
-            spec_dist_for_neg,
-            low=config.get('negative_quantile_low', 0.5),
-            high=config.get('negative_quantile_high', 0.75),
-            max_pairs=config.get('spectral_max_neg_pairs', 32_000),
+            pos_min_spatial=config.get('positive_min_spatial', 4.0),
+            chunk_size=config.get('spectral_knn_chunk_size', 128),
         )
 
-        # Weight negatives by spectral distance — softly suppresses false negatives
-        # (cross-patch pairs that are spectrally similar but sampled as negatives).
+        # --- Negative pairs: random cross-patch sampling ---
+        # Cross-patch pairs automatically satisfy the spatial distance constraint.
+        # We sample randomly rather than computing the full distance matrix;
+        # spectral weights handle false negatives (low weight ≈ spectrally similar).
         tau_neg = config.get('spectral_neg_tau', 1.0)
         min_w = config.get('spectral_neg_min_weight', 0.05)
-        neg_spec_dist = spec_feat_distances_all[global_neg[:, 0], global_neg[:, 1]]
+        n_neg = config.get('spectral_max_neg_pairs', 32_000)
+        n_patch_pairs = n_patches * (n_patches - 1)
+        n_per = max(1, n_neg // n_patch_pairs) if n_patch_pairs > 0 else 0
+
+        neg_i_parts, neg_j_parts = [], []
+        for pi in range(n_patches):
+            for pj in range(n_patches):
+                if pi == pj:
+                    continue
+                is_s, is_e = offsets[pi], offsets[pi + 1]
+                js_s, js_e = offsets[pj], offsets[pj + 1]
+                neg_i_parts.append(torch.randint(is_s, is_e, (n_per,), device=device))
+                neg_j_parts.append(torch.randint(js_s, js_e, (n_per,), device=device))
+
+        global_neg_i = torch.cat(neg_i_parts)
+        global_neg_j = torch.cat(neg_j_parts)
+        global_neg = torch.stack([global_neg_i, global_neg_j], dim=1)
+
+        # Distances computed only for sampled pairs — O(n_neg × C), not O(N²)
+        neg_spec_dist = torch.norm(spec_all[global_neg_i] - spec_all[global_neg_j], dim=1)
         neg_weights = (1.0 - torch.exp(-neg_spec_dist / tau_neg)).clamp(min=min_w, max=1.0)
 
         global_spectral_loss_val = contrastive_loss(
