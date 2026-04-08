@@ -100,6 +100,7 @@ def extract_phase_batch_tensors(
     batch: dict,
     feature_builder: FeatureBuilder,
     device: torch.device,
+    enc_feature_name: str = "type_encoder_input",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build encoder inputs, phase inputs, targets, and mask for a batch.
 
@@ -112,7 +113,7 @@ def extract_phase_batch_tensors(
       - valid across all features and timesteps
 
     Returns:
-        Ximg:       [B, 16, H, W]        ccdc_history encoder input
+        Ximg:       [B, C, H, W]         type encoder input (enc_feature_name)
         Xphase:     [B, 8, T, H, W]      phase_ccdc temporal input
         Yimg:       [B, 12, T, H, W]     soft_neighborhood_phase target (normalized)
         M:          [B, H, W]            boolean mask (True = valid)
@@ -131,7 +132,7 @@ def extract_phase_batch_tensors(
         }
         sample["metadata"] = batch["metadata"][i]
 
-        enc_f = feature_builder.build_feature("ccdc_history", sample)
+        enc_f = feature_builder.build_feature(enc_feature_name, sample)
         phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
         tgt_f = feature_builder.build_feature(PHASE_TARGET_FEATURE, sample)
 
@@ -422,7 +423,7 @@ def _compute_feature_statistics(
     with torch.no_grad():
         for batch in _iter_batches(train_loader, max_batches_train):
             Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
-                batch, feature_builder, device,
+                batch, feature_builder, device, enc_feature_name,
             )
             Bsz, _, H, W_sp = Ximg.shape
             T = Xphase.shape[2]
@@ -606,7 +607,7 @@ def fit_phase_probe(
     with torch.no_grad():
         for batch in _iter_batches(train_loader, max_batches_train):
             Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
-                batch, feature_builder, device,
+                batch, feature_builder, device, enc_feature_name,
             )
             Bsz, _, H, W_sp = Ximg.shape
             T = Xphase.shape[2]
@@ -818,7 +819,7 @@ def evaluate_phase_probe(
     with torch.no_grad():
         for batch in _iter_batches(loader, max_batches_eval):
             Ximg, Xphase, Yimg, M = extract_phase_batch_tensors(
-                batch, feature_builder, device,
+                batch, feature_builder, device, enc_feature_name,
             )
             Bsz, _, H, W_sp = Ximg.shape
             T = Xphase.shape[2]
@@ -1467,6 +1468,9 @@ def main():
 
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
+
+    enc_feature_name = training_config.model_input.type_encoder_feature
+    logger.info(f"Using encoder feature: '{enc_feature_name}'")
 
     d_type = model.z_type_dim
     d_phase = model.z_phase_dim
