@@ -591,7 +591,11 @@ def process_batch(
         # spectral weights handle false negatives (low weight ≈ spectrally similar).
         tau_neg = config.get('spectral_neg_tau', 1.0)
         min_w = config.get('spectral_neg_min_weight', 0.05)
-        n_neg = config.get('spectral_max_neg_pairs', 32_000)
+        # Scale neg count by N_total so each anchor gets ~neg_per_anchor negatives on average.
+        # (Analogous to spatial InfoNCE which uses spatial_negatives_per_anchor * N.)
+        N_total = z_all.shape[0]
+        neg_per_anchor = config.get('spectral_neg_per_anchor', 20)
+        n_neg = neg_per_anchor * N_total
         n_patch_pairs = n_patches * (n_patches - 1)
         n_per = max(1, n_neg // n_patch_pairs) if n_patch_pairs > 0 else 0
 
@@ -807,8 +811,9 @@ def process_batch(
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
         'evt_diag': evt_diag_agg,
         'n_valid': n_valid,
-        'spectral_pos_pairs': total_spectral_pos_pairs // n_valid if n_valid > 0 else 0,
-        'spectral_neg_pairs': total_spectral_neg_pairs // n_valid if n_valid > 0 else 0,
+        # Spectral pairs are cross-batch totals (not per-sample); report raw counts.
+        'spectral_pos_pairs': total_spectral_pos_pairs,
+        'spectral_neg_pairs': total_spectral_neg_pairs,
         'spatial_pos_pairs': total_spatial_pos_pairs // n_valid if n_valid > 0 else 0,
         'spatial_neg_pairs': total_spatial_neg_pairs // n_valid if n_valid > 0 else 0,
         'gate_stats': compute_stats(all_gate_values),
@@ -1419,6 +1424,10 @@ def main():
         'spectral_loss_weight': spectral_loss_cfg.weight if spectral_loss_cfg else 1.0,
         'spatial_loss_weight': spatial_loss_cfg.weight if spatial_loss_cfg else 1.0,
 
+        # Cross-batch spectral neg sampling: target this many negatives per anchor.
+        # With N_total anchors, n_neg = spectral_neg_per_anchor * N_total pairs are sampled.
+        'spectral_neg_per_anchor': 20,
+
         # Training (from training config)
         'gradient_clip_enabled': training_config.training.gradient_clip.enabled,
         'gradient_clip_max_norm': training_config.training.gradient_clip.max_norm,
@@ -1840,8 +1849,8 @@ def main():
         )
         logger.info(
             f"  Pairs/batch: "
-            f"spec pos={train_stats.get('spectral_pos_pairs', 0)} neg={train_stats.get('spectral_neg_pairs', 0)} | "
-            f"spat pos={train_stats.get('spatial_pos_pairs', 0)} neg={train_stats.get('spatial_neg_pairs', 0)}"
+            f"spec(batch total) pos={train_stats.get('spectral_pos_pairs', 0)} neg={train_stats.get('spectral_neg_pairs', 0)} | "
+            f"spat(per sample) pos={train_stats.get('spatial_pos_pairs', 0)} neg={train_stats.get('spatial_neg_pairs', 0)}"
         )
 
         # Log phase pair construction stats
