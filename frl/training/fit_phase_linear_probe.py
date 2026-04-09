@@ -396,6 +396,7 @@ def _compute_feature_statistics(
     max_batches_train: int,
     design: str,
     interaction_pca_k: int,
+    enc_feature_name: str = "type_encoder_input",
 ) -> ProbePreprocessor:
     """Pass 1: compute per-column mean/std and interaction PCA components.
 
@@ -560,6 +561,7 @@ def fit_phase_probe(
     max_batches_train: int = 0,
     design: str = "full",
     interaction_pca_k: int = 20,
+    enc_feature_name: str = "type_encoder_input",
 ) -> Tuple[torch.Tensor, torch.Tensor, ProbePreprocessor]:
     """Two-pass streaming ridge regression for the phase linear probe.
 
@@ -587,7 +589,7 @@ def fit_phase_probe(
     logger.info("Pass 1/2: computing feature statistics …")
     preprocessor = _compute_feature_statistics(
         train_loader, feature_builder, model, device,
-        halo, max_batches_train, design, interaction_pca_k,
+        halo, max_batches_train, design, interaction_pca_k, enc_feature_name,
     )
 
     # Pass 2 — ridge regression on preprocessed features
@@ -758,6 +760,7 @@ def evaluate_phase_probe(
     preprocessor: ProbePreprocessor | None = None,
     inflation_factors: Dict[str, float] | None = None,
     inflation_center: Dict[str, float] | None = None,
+    enc_feature_name: str = "type_encoder_input",
 ) -> PhaseProbeMetrics:
     """Evaluate MSE and R² in both normalized and original data scales.
 
@@ -1033,6 +1036,7 @@ def compute_embedding_diagnostics(
     device: torch.device,
     halo: int = 16,
     max_batches: int = 0,
+    enc_feature_name: str = "type_encoder_input",
 ) -> dict:
     """Compute z_phase variance decomposition and FiLM parameter diagnostics.
 
@@ -1492,6 +1496,7 @@ def main():
         max_batches_train=args.max_batches_train,
         design=args.design,
         interaction_pca_k=args.interaction_pca_k,
+        enc_feature_name=enc_feature_name,
     )
 
     # Evaluate
@@ -1501,6 +1506,7 @@ def main():
         max_batches_eval=args.max_batches_eval,
         design=args.design,
         preprocessor=preprocessor,
+        enc_feature_name=enc_feature_name,
     )
 
     # Compute variance inflation factors from training R² (original scale)
@@ -1529,6 +1535,7 @@ def main():
         preprocessor=preprocessor,
         inflation_factors=vi_factors,
         inflation_center=vi_center,
+        enc_feature_name=enc_feature_name,
     )
 
     log_metrics(train_metrics, prefix="TRAIN")
@@ -1540,6 +1547,7 @@ def main():
         val_loader, feature_builder, model, device,
         halo=args.halo,
         max_batches=args.max_batches_eval,
+        enc_feature_name=enc_feature_name,
     )
     log_embedding_diagnostics(emb_diag)
 
