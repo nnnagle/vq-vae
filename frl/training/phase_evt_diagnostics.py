@@ -405,6 +405,48 @@ def _evt_row_label(code: int, name: str) -> str:
     return f"{code}: {short}"
 
 
+def _plot_gamma_ranking(
+    accumulators: EvtAccumulators,
+    evt_code_to_label: Dict[int, str],
+    out_path: Path,
+) -> None:
+    """Horizontal bar chart of mean FiLM gamma (averaged over all z_phase channels),
+    sorted highest to lowest, for all observed EVT classes."""
+    rows = []
+    for e in accumulators.all_evt_codes():
+        mean_g, _ = accumulators.gamma_stats(e)
+        rows.append((e, float(mean_g.mean()), accumulators.n_pixels[e]))
+    if not rows:
+        return
+
+    rows.sort(key=lambda x: x[1])  # ascending so top of chart = highest gamma
+    codes, values, counts = zip(*rows)
+    labels = [
+        f"{_evt_row_label(e, evt_code_to_label.get(e, f'EVT_{e}'))}  (n={n:,})"
+        for e, n in zip(codes, counts)
+    ]
+
+    global_mean = float(np.mean(values))
+    colors = ["#d73027" if v >= global_mean else "#4575b4" for v in values]
+
+    fig_h = max(5, len(rows) * 0.28)
+    fig, ax = plt.subplots(figsize=(10, fig_h))
+    ax.barh(range(len(rows)), values, color=colors, edgecolor="white", linewidth=0.4)
+    ax.axvline(global_mean, color="black", linewidth=1.0, linestyle="--", label=f"mean={global_mean:.3f}")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Mean FiLM gamma (averaged over z_phase channels 0–11)")
+    ax.set_title(
+        "FiLM Gamma ranking by EVT class\n"
+        "red = above mean  |  blue = below mean  |  dashed = global mean"
+    )
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved gamma ranking: {out_path}")
+
+
 def save_outputs(
     accumulators: EvtAccumulators,
     top_evt_codes: List[int],
@@ -506,6 +548,9 @@ def save_outputs(
         cmap="RdBu_r",
         center=0.0,
     )
+
+    # gamma ranking bar chart — mean gamma across channels, all observed EVT classes
+    _plot_gamma_ranking(accumulators, evt_code_to_label, out_dir / "gamma_ranking.png")
 
     # temporal fraction heatmap [top_k × d_phase]
     tfrac_matrix = np.array(
