@@ -48,14 +48,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-# Ensure frl/ is on sys.path regardless of the working directory
-# (allows running as ./phase_evt_diagnostics.py or python training/phase_evt_diagnostics.py)
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
 matplotlib.use("Agg")
