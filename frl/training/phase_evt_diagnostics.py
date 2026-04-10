@@ -485,23 +485,26 @@ def save_outputs(
         for e in top_evt_codes
     ]
 
-    # gamma heatmap [top_k × d_phase]
+    # gamma heatmap [top_k × d_phase] — column-wise z-scores
     gamma_matrix = np.array(
         [[float(accumulators.gamma_stats(e)[0][ch]) for ch in range(d_phase)]
          for e in top_evt_codes],
         dtype=np.float32,
     )
+    col_mean = gamma_matrix.mean(axis=0, keepdims=True)
+    col_std  = gamma_matrix.std(axis=0, keepdims=True).clip(min=1e-6)
+    gamma_zscore = (gamma_matrix - col_mean) / col_std
     plot_heatmap(
-        gamma_matrix,
+        gamma_zscore,
         row_labels=top_labels,
         col_labels=phase_ch_names,
         title=(
-            f"Mean FiLM Gamma by EVT class (top {len(top_evt_codes)})\n"
-            "Columns = z_phase channels 0\u201311  |  center = 1.0 (init value)"
+            f"FiLM Gamma by EVT class — column z-scores (top {len(top_evt_codes)})\n"
+            "Columns = z_phase channels 0\u201311  |  positive = above-average gamma for that channel"
         ),
         out_path=out_dir / "gamma_heatmap.png",
         cmap="RdBu_r",
-        center=1.0,
+        center=0.0,
     )
 
     # temporal fraction heatmap [top_k × d_phase]
