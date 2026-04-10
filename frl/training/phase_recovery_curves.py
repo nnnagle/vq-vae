@@ -151,7 +151,8 @@ def process_batch(
     probe_W: torch.Tensor,        # [D, C] float64 CPU
     probe_b: torch.Tensor,        # [C]    float64 CPU
     preprocessor: ProbePreprocessor,
-    nbr_ch_idx: int,
+    probe_nbr_idx: int,           # NBR column in probe output (probe's channel order)
+    feat_nbr_idx: int,            # NBR channel in target feature tensor (config order)
     max_ysfc: float,
 ) -> None:
     """Forward pass per sample; accumulate (ysfc, pred_nbr, obs_nbr) per EVT."""
@@ -197,7 +198,7 @@ def process_batch(
         ysfc_spatial = torch.from_numpy(ysfc_f.mask[0]).bool()    # [T, H, W]
 
         # target NBR: [12, T, H, W]
-        tgt_nbr_grid  = tgt_f.data[nbr_ch_idx]                    # [T, H, W]
+        tgt_nbr_grid  = tgt_f.data[feat_nbr_idx]                  # [T, H, W]
         tgt_mask_spatial = torch.from_numpy(tgt_f.mask).all(dim=0) # [T, H, W]
 
         # Forward pass (single sample to avoid OOM)
@@ -238,7 +239,7 @@ def process_batch(
 
             X_t     = preprocessor.transform(zt_px, zp_px)           # [N, D]
             pred_t  = (X_t.double() @ probe_W) + probe_b             # [N, n_ch]
-            pred_nbr_px = pred_t[:, nbr_ch_idx].float().numpy()      # [N]
+            pred_nbr_px = pred_t[:, probe_nbr_idx].float().numpy()   # [N]
 
             reservoir.add_batch(evt_px, ysfc_px, pred_nbr_px, obs_px)
 
@@ -518,14 +519,25 @@ def main() -> None:
     probe_b     = probe_ckpt["b"].to(torch.float64)
     preprocessor = ProbePreprocessor.from_dict(probe_ckpt)
 
-    target_channels = _get_target_channels(feature_builder)
+    # Use the probe's stored channel list for the probe output index.
+    # Use the feature_builder's current list for the target feature tensor index.
+    # These will usually agree, but diverge if the config changes after probe training.
+    probe_target_channels = probe_ckpt.get("target_channels", _get_target_channels(feature_builder))
+    feat_target_channels  = _get_target_channels(feature_builder)
     try:
-        nbr_ch_idx = target_channels.index("annual.nbr")
-    except ValueError:
+        probe_nbr_idx = probe_target_channels.index("annual.nbr")
+        feat_nbr_idx  = feat_target_channels.index("annual.nbr")
+    except ValueError as exc:
         raise RuntimeError(
-            f"'annual.nbr' not found in target channels: {target_channels}"
-        )
-    logger.info(f"NBR channel index: {nbr_ch_idx}  (of {len(target_channels)} targets)")
+            f"'annual.nbr' not found in target channels.\n"
+            f"  probe channels: {probe_target_channels}\n"
+            f"  feat  channels: {feat_target_channels}"
+        ) from exc
+    logger.info(
+        f"NBR channel: probe output col {probe_nbr_idx}, "
+        f"target feature ch {feat_nbr_idx}  "
+        f"(probe has {len(probe_target_channels)} channels)"
+    )
 
     # --- Reservoir ---
     reservoir = EvtReservoir(max_per_evt=args.max_samples_per_evt, seed=args.seed)
@@ -546,7 +558,8 @@ def main() -> None:
             probe_W=probe_W,
             probe_b=probe_b,
             preprocessor=preprocessor,
-            nbr_ch_idx=nbr_ch_idx,
+            probe_nbr_idx=probe_nbr_idx,
+            feat_nbr_idx=feat_nbr_idx,
             max_ysfc=args.max_ysfc,
         )
 
