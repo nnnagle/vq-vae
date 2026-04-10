@@ -436,7 +436,7 @@ def save_outputs(
     gamma_rows = []
     for e in all_codes:
         mean_g, std_g = accumulators.gamma_stats(e)
-        name = evt_code_to_label.get(e, "unknown")
+        name = evt_code_to_label.get(e, f"EVT_{e}")
         row: dict = {
             "evt_code": e,
             "evt_name": name,
@@ -455,7 +455,7 @@ def save_outputs(
     tfrac_rows = []
     for e in all_codes:
         tf = accumulators.temporal_frac(e)
-        name = evt_code_to_label.get(e, "unknown")
+        name = evt_code_to_label.get(e, f"EVT_{e}")
         row = {
             "evt_code": e,
             "evt_name": name,
@@ -478,7 +478,7 @@ def save_outputs(
             r2 = accumulators.probe_r2(e)
             if r2 is None:
                 continue
-            name = evt_code_to_label.get(e, "unknown")
+            name = evt_code_to_label.get(e, f"EVT_{e}")
             row = {
                 "evt_code": e,
                 "evt_name": name,
@@ -496,7 +496,7 @@ def save_outputs(
 
     # ----- heatmaps for top-K EVTs -----
     top_labels = [
-        _evt_row_label(e, evt_code_to_label.get(e, "unknown"))
+        _evt_row_label(e, evt_code_to_label.get(e, f"EVT_{e}"))
         for e in top_evt_codes
     ]
 
@@ -575,7 +575,7 @@ def save_outputs(
         tf = accumulators.temporal_frac(e)
         entry: dict = {
             "evt_code": e,
-            "evt_name": evt_code_to_label.get(e, "unknown"),
+            "evt_name": evt_code_to_label.get(e, f"EVT_{e}"),
             "n_pixels": accumulators.n_pixels[e],
             "gamma_mean_avg": float(mean_g.mean()),
             "gamma_std_avg": float(std_g.mean()),
@@ -766,7 +766,7 @@ def main() -> None:
 
     logger.info(f"\nTop {top_k} EVT classes by pixel count:")
     for code, n in sorted_by_count[:top_k]:
-        label = evt_code_to_label.get(code, "unknown")
+        label = evt_code_to_label.get(code, f"EVT_{code}")
         mean_g, _ = accumulators.gamma_stats(code)
         tf = accumulators.temporal_frac(code)
         r2 = accumulators.probe_r2(code)
