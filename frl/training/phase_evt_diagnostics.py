@@ -238,9 +238,18 @@ def process_batch(
     probe_b: Optional[torch.Tensor] = None,      # [C]    float64 CPU
     preprocessor: Optional[ProbePreprocessor] = None,
 ) -> None:
-    """Run encoder forward pass for one batch and accumulate per-EVT stats."""
+    """Run a single batched forward pass for all samples, then accumulate per-EVT stats."""
     d_phase = accumulators.d_phase
     batch_size = len(batch["metadata"])
+    H = W = T = None
+
+    # --- Collect per-sample features and masks (CPU) ---
+    enc_list: List[torch.Tensor] = []
+    phase_list: List[torch.Tensor] = []
+    mask_list: List[torch.Tensor] = []
+    evt_grids: List[np.ndarray] = []
+    probe_mask_list: List[torch.Tensor] = []
+    tgt_list: List[torch.Tensor] = []
 
     for i in range(batch_size):
         sample = {
@@ -250,15 +259,14 @@ def process_batch(
         }
         sample["metadata"] = batch["metadata"][i]
 
-        # --- features ---
         enc_f = feature_builder.build_feature(enc_feature_name, sample)
         phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
         evt_f = feature_builder.build_feature("evt_class", sample)
 
-        H, W = enc_f.data.shape[-2], enc_f.data.shape[-1]
-        T = phase_f.data.shape[1]
+        if H is None:
+            H, W = enc_f.data.shape[-2], enc_f.data.shape[-1]
+            T = phase_f.data.shape[1]
 
-        # --- spatial masks ---
         sm_names = sample["metadata"]["channel_names"]["static_mask"]
         sm_data = sample["static_mask"]
         aoi_mask = torch.from_numpy(sm_data[sm_names.index("aoi")]).bool()
@@ -266,44 +274,61 @@ def process_batch(
         enc_mask = torch.from_numpy(enc_f.mask).bool()
         phase_mask_spatial = torch.from_numpy(phase_f.mask).all(dim=0)
 
-        evt_grid = evt_f.data[0].astype(np.float32)  # [H, W], float-encoded int codes
+        evt_grid = evt_f.data[0].astype(np.float32)
         evt_valid = torch.from_numpy(np.isfinite(evt_grid) & (evt_grid > 0))
 
         halo_m = _halo_mask(H, W, halo, torch.device("cpu"))
         combined_mask = (
             enc_mask & aoi_mask & forest_mask & phase_mask_spatial & evt_valid & halo_m
         )
+
+        enc_list.append(torch.from_numpy(enc_f.data).float())
+        phase_list.append(torch.from_numpy(phase_f.data).float())
+        mask_list.append(combined_mask)
+        evt_grids.append(evt_grid)
+
+        if probe_W is not None and preprocessor is not None:
+            tgt_f = feature_builder.build_feature(PHASE_TARGET_FEATURE, sample)
+            tgt_mask_spatial = torch.from_numpy(tgt_f.mask).all(dim=0)
+            probe_mask_list.append(combined_mask & tgt_mask_spatial)
+            tgt_list.append(torch.from_numpy(tgt_f.data).float())  # [C_tgt, T, H, W]
+        else:
+            probe_mask_list.append(combined_mask)
+            tgt_list.append(torch.empty(0))
+
+    if not any(m.any() for m in mask_list):
+        return
+
+    # --- Single batched forward pass ---
+    Ximg = torch.stack(enc_list).to(device)      # [B, C, H, W]
+    Xphase = torch.stack(phase_list).to(device)  # [B, C_phase, T, H, W]
+
+    with torch.no_grad():
+        z_type = model(Ximg)                               # [B, 64, H, W]
+        z_type_det = z_type.detach()
+        z_phase = model.forward_phase(Xphase, z_type_det)  # [B, 12, T, H, W]
+        gamma_b, _ = model.phase_film(z_type_det)           # [B, 12, H, W]
+
+    # Move everything to CPU once
+    z_type_cpu = z_type.cpu()    # [B, 64, H, W]
+    z_phase_cpu = z_phase.cpu()  # [B, 12, T, H, W]
+    gamma_cpu = gamma_b.cpu()    # [B, 12, H, W]
+
+    # --- Per-sample accumulation ---
+    for i in range(batch_size):
+        combined_mask = mask_list[i]
         if not combined_mask.any():
             continue
 
-        # --- forward pass ---
-        enc_tensor = torch.from_numpy(enc_f.data).float().unsqueeze(0).to(device)
-        phase_tensor = torch.from_numpy(phase_f.data).float().unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            z_type = model(enc_tensor)                           # [1, 64, H, W]
-            z_type_det = z_type.detach()
-            z_phase = model.forward_phase(phase_tensor, z_type_det)  # [1, 12, T, H, W]
-            gamma, _ = model.phase_film(z_type_det)              # [1, 12, H, W]
-
-        # Move to CPU once for all subsequent operations
-        # [H*W, 12]
-        gm_all = gamma.squeeze(0).permute(1, 2, 0).reshape(-1, d_phase).cpu()
-        # [H*W, 12, T]
-        zp_all = z_phase.squeeze(0).permute(2, 3, 0, 1).reshape(-1, d_phase, T).cpu()
-        # [H*W, 64]
-        zt_all = (
-            z_type.squeeze(0).permute(1, 2, 0).reshape(-1, model.z_type_dim).cpu()
-        )
-
-        mask_flat = combined_mask.reshape(-1)  # [H*W] bool
-
-        gm_valid = gm_all[mask_flat].double()   # [N, 12]
-        zp_valid = zp_all[mask_flat].double()   # [N, 12, T]
+        mask_flat = combined_mask.reshape(-1)
+        evt_grid = evt_grids[i]
         evt_codes_valid = evt_grid.reshape(-1)[mask_flat.numpy()].astype(np.int32)
 
-        N = gm_valid.shape[0]
-        if N == 0:
+        # [N, 12] and [N, 12, T]
+        gm_valid = gamma_cpu[i].permute(1, 2, 0).reshape(-1, d_phase)[mask_flat].double()
+        zp_valid = z_phase_cpu[i].permute(2, 3, 0, 1).reshape(-1, d_phase, T)[mask_flat].double()
+
+        if gm_valid.shape[0] == 0:
             continue
 
         accumulators.add_pixels(evt_codes_valid, gm_valid, zp_valid)
@@ -312,44 +337,37 @@ def process_batch(
         if probe_W is None or preprocessor is None:
             continue
 
-        tgt_f = feature_builder.build_feature(PHASE_TARGET_FEATURE, sample)
-        tgt_mask_spatial = torch.from_numpy(tgt_f.mask).all(dim=0)
-        probe_mask = combined_mask & tgt_mask_spatial
+        probe_mask = probe_mask_list[i]
         if not probe_mask.any():
             continue
 
-        probe_mask_flat = probe_mask.reshape(-1)  # [H*W] bool
-
-        # [N2, 64], [N2, 12, T]
-        zt_flat_px = zt_all[probe_mask_flat]         # [N2, 64]
-        zp_flat_px = zp_all[probe_mask_flat]         # [N2, 12, T]
-
-        # target: [C_tgt, T, H, W] → [H*W, T, C_tgt]
-        tgt_tensor = torch.from_numpy(tgt_f.data).float()
-        C_tgt = tgt_tensor.shape[0]
-        tgt_hwt = tgt_tensor.permute(2, 3, 1, 0).reshape(-1, T, C_tgt)  # [H*W, T, C_tgt]
-        tgt_valid = tgt_hwt[probe_mask_flat]  # [N2, T, C_tgt]
-
+        probe_mask_flat = probe_mask.reshape(-1)
         evt_codes_probe = evt_grid.reshape(-1)[probe_mask_flat.numpy()].astype(np.int32)
 
-        # Accumulate one (pixel×timestep) block per timestep
-        pred_list: list[torch.Tensor] = []
-        tgt_list: list[torch.Tensor] = []
-        evt_list: list[np.ndarray] = []
+        zt_flat_px = z_type_cpu[i].permute(1, 2, 0).reshape(-1, model.z_type_dim)[probe_mask_flat]
+        zp_flat_px = z_phase_cpu[i].permute(2, 3, 0, 1).reshape(-1, d_phase, T)[probe_mask_flat]
+
+        tgt_tensor = tgt_list[i]  # [C_tgt, T, H, W]
+        C_tgt = tgt_tensor.shape[0]
+        tgt_hwt = tgt_tensor.permute(2, 3, 1, 0).reshape(-1, T, C_tgt)
+        tgt_valid = tgt_hwt[probe_mask_flat]  # [N2, T, C_tgt]
+
+        pred_parts: List[torch.Tensor] = []
+        tgt_parts: List[torch.Tensor] = []
+        evt_parts: List[np.ndarray] = []
 
         for t in range(T):
-            zp_t = zp_flat_px[:, :, t]                         # [N2, 12]
-            X_t = preprocessor.transform(zt_flat_px, zp_t)     # [N2, D]
-            pred_t = (X_t.double() @ probe_W) + probe_b        # [N2, C_tgt]
-            tgt_t = tgt_valid[:, t, :].double()                 # [N2, C_tgt]
-            pred_list.append(pred_t)
-            tgt_list.append(tgt_t)
-            evt_list.append(evt_codes_probe)
+            zp_t = zp_flat_px[:, :, t]
+            X_t = preprocessor.transform(zt_flat_px, zp_t)
+            pred_t = (X_t.double() @ probe_W) + probe_b
+            pred_parts.append(pred_t)
+            tgt_parts.append(tgt_valid[:, t, :].double())
+            evt_parts.append(evt_codes_probe)
 
         accumulators.add_probe(
-            np.concatenate(evt_list),
-            torch.cat(pred_list, dim=0),
-            torch.cat(tgt_list, dim=0),
+            np.concatenate(evt_parts),
+            torch.cat(pred_parts, dim=0),
+            torch.cat(tgt_parts, dim=0),
         )
 
 
@@ -740,7 +758,7 @@ def main() -> None:
             preprocessor=preprocessor,
         )
 
-        if batch_idx % 25 == 0:
+        if batch_idx % 5 == 0:
             total_px = sum(accumulators.n_pixels.values())
             logger.info(
                 f"  Batch {batch_idx:4d}/{n_batches}  |  "
