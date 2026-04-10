@@ -752,7 +752,11 @@ def main() -> None:
         probe_W = probe_ckpt["W"].to(torch.float64)
         probe_b = probe_ckpt["b"].to(torch.float64)
         preprocessor = ProbePreprocessor.from_dict(probe_ckpt)
-        target_channel_names = _get_target_channels(feature_builder)
+        # Use the probe's stored channel list so column order is correct even if
+        # the config changes after probe training.
+        target_channel_names = probe_ckpt.get(
+            "target_channels", _get_target_channels(feature_builder)
+        )
         n_target_ch = len(target_channel_names)
         logger.info(
             f"Probe: design={preprocessor.design}  "
