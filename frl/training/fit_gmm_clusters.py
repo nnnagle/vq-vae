@@ -48,60 +48,13 @@ from data.loaders.config.training_config_parser import TrainingConfigParser
 from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
 from models import RepresentationModel
+from utils.sampling import ReservoirSampler  # noqa: F401 (re-exported for back-compat)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("fit_gmm_clusters")
-
-
-# ---------------------------------------------------------------------------
-# Reservoir sampling (Algorithm R — Vitter 1985)
-# Maintains a uniform random sample of exactly `capacity` items from a stream
-# of unknown length without storing the full stream.
-# ---------------------------------------------------------------------------
-
-class ReservoirSampler:
-    """Fixed-capacity uniform random sample from a stream.
-
-    Args:
-        capacity: Maximum number of items to keep.
-        dim: Feature dimension of each item.
-        seed: Random seed for reproducibility.
-    """
-
-    def __init__(self, capacity: int, dim: int, seed: int = 0) -> None:
-        self.capacity = capacity
-        self.dim = dim
-        self.rng = np.random.default_rng(seed)
-        self.buffer = np.empty((capacity, dim), dtype=np.float32)
-        self.n_seen = 0  # total items offered so far
-
-    def add(self, vectors: np.ndarray) -> None:
-        """Add a batch of vectors to the reservoir.
-
-        Args:
-            vectors: [N, dim] float32 array.
-        """
-        n = vectors.shape[0]
-        for i in range(n):
-            self.n_seen += 1
-            if self.n_seen <= self.capacity:
-                self.buffer[self.n_seen - 1] = vectors[i]
-            else:
-                j = self.rng.integers(0, self.n_seen)
-                if j < self.capacity:
-                    self.buffer[j] = vectors[i]
-
-    @property
-    def filled(self) -> int:
-        """Number of valid rows currently in the buffer."""
-        return min(self.n_seen, self.capacity)
-
-    def get(self) -> np.ndarray:
-        """Return the sampled buffer as [filled, dim]."""
-        return self.buffer[: self.filled]
 
 
 # ---------------------------------------------------------------------------
