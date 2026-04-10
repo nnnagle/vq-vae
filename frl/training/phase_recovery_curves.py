@@ -53,7 +53,7 @@ from training.fit_phase_linear_probe import (
     _get_target_channels,
     _halo_mask,
 )
-from training.fit_gmm_clusters import ReservoirSampler
+from utils.sampling import ReservoirSampler
 
 logging.basicConfig(
     level=logging.INFO,
