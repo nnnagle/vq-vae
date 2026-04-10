@@ -107,6 +107,7 @@ def process_batch(
     model: RepresentationModel,
     gmm,
     device: torch.device,
+    enc_feature_name: str = "type_encoder_input",
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Run encoder + GMM on one batch; return (cluster_labels, evt_codes) for
     valid pixels, or None if the batch contains no valid pixels."""
@@ -123,7 +124,7 @@ def process_batch(
         sample["metadata"] = batch["metadata"][i]
 
         # --- encoder inputs ---
-        enc_f = feature_builder.build_feature("ccdc_history", sample)
+        enc_f = feature_builder.build_feature(enc_feature_name, sample)
         enc = torch.from_numpy(enc_f.data).float().unsqueeze(0).to(device)  # [1, C, H, W]
 
         # --- spatial masks: aoi ∩ forest ∩ encoder validity ---
@@ -348,6 +349,8 @@ def main() -> None:
     logger.info(f"Loading checkpoint: {args.checkpoint}")
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
     logger.info(f"z_type_dim = {model.z_type_dim}")
+    enc_feature_name = training_config.model_input.type_encoder_feature
+    logger.info(f"Using encoder feature: '{enc_feature_name}'")
 
     # --- GMM ---
     logger.info(f"Loading GMM: {args.gmm}")
@@ -365,7 +368,7 @@ def main() -> None:
     total_pixels = 0
 
     for batch_idx, batch in enumerate(loader):
-        result = process_batch(batch, feature_builder, model, gmm, device)
+        result = process_batch(batch, feature_builder, model, gmm, device, enc_feature_name)
         if result is None:
             continue
         cluster_labels, evt_codes = result
