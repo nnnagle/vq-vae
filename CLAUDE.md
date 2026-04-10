@@ -71,6 +71,7 @@ PHASE PATHWAY (temporal):
 - **L2 normalization before FiLM** — controls embedding scale; FiLM gamma owns the scaling.
 - **Sparse forward pass** — `forward_phase_at_locations()` runs the phase encoder only at sampled anchor pixel locations (not the full spatial grid) for training efficiency.
 - **FiLM initialized near identity** — gamma≈1, beta≈0 at initialization for stable early training.
+- **FiLM gamma amplification observed** — after training, FiLM gamma converges to ~3.5 (from init=1.0). The TCN produces ~78% temporal variance in pre-FiLM z; post-FiLM z_phase retains ~32%. This suppression appears appropriate for stable forest types but warrants monitoring for dynamic forest types.
 
 ### Model Entry Points
 
@@ -130,8 +131,10 @@ The bindings YAML defines dataset groups:
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
 
 **Pair construction:**
-- Positive pairs: high spectral similarity + spatially nearby
-- Negative pairs: spectral dissimilarity (quantile threshold) + beyond distance threshold
+- Spectral positive pairs: cross-batch mutual kNN in whitened feature space (not within-patch)
+- Spectral negative pairs: cross-batch random sampling, scaled to `spectral_neg_per_anchor × N_total` pixels (default: 20 per anchor)
+- Spatial positive pairs: within-patch spatial kNN
+- Spatial negative pairs: beyond distance threshold, weighted by spectral dissimilarity
 
 ---
 
@@ -139,7 +142,7 @@ The bindings YAML defines dataset groups:
 
 The training loop applies four loss components:
 
-1. **Spectral InfoNCE** — contrastive loss on `z_type` using feature-distance pairs
+1. **Spectral InfoNCE** — contrastive loss on `z_type` using cross-batch mutual kNN positives and cross-batch random negatives (scaled by `spectral_neg_per_anchor`, default 20)
 2. **Spatial InfoNCE** — contrastive loss on `z_type` using spatial kNN pairs
 3. **VICReg** — variance + covariance regularization on `z_type`
 4. **Phase loss** — temporal consistency on `z_phase`
@@ -165,7 +168,7 @@ Three YAML files control everything:
 |------|----------|----------------|
 | `frl_repr_model_v1.yaml` | Architecture: encoder channels `[128→64]`, TCN dilations `[1,2,4]`, z_type_dim=64, z_phase_dim=12, dropout schedule | Changing model capacity or structure |
 | `frl_binding_v1.yaml` | Zarr path, time window (2010-2024), dataset groups, channel definitions, formulas, thresholding, normalization presets | Adding/removing input features or data sources |
-| `frl_training_v1.yaml` | Optimizer, scheduler, loss weights, batch size=4, epochs=200, checkpointing, validation | Tuning training hyperparameters |
+| `frl_training_v1.yaml` | Optimizer, scheduler, loss weights, batch size=12, epochs=200, checkpointing, validation | Tuning training hyperparameters |
 
 The training config references the bindings config internally — you typically only need to pass `--training` on the CLI.
 
@@ -193,6 +196,19 @@ python frl/training/train_representation.py \
 python frl/training/fit_linear_probe.py \
     --checkpoint runs/checkpoints/model.pt
 ```
+
+### Important: Encoder Feature Name
+
+All inference and evaluation scripts must read the encoder feature name from the
+training config rather than hardcoding it:
+
+```python
+enc_feature_name = training_config.model_input.type_encoder_feature
+# e.g. "type_encoder_input"  (34 channels)
+```
+
+The old name `"ccdc_history"` (22 channels) is stale and will cause a channel mismatch
+error. All scripts in `frl/training/` follow this pattern.
 
 ### Upstream Preprocessing (rarely needed)
 
@@ -227,8 +243,13 @@ frl/losses/phase_neighborhood.py         Phase temporal loss
 frl/losses/phase_triplet.py              Phase triplet loss
 frl/losses/reconstruction.py             Reconstruction loss
 
-frl/training/train_representation.py     Main training script
-frl/training/fit_linear_probe.py         Downstream linear probe evaluation
+frl/training/train_representation.py          Main training script
+frl/training/fit_linear_probe.py              Downstream type embedding linear probe (z_type → FIA targets)
+frl/training/fit_phase_linear_probe.py        Phase embedding linear probe (temporal R²)
+frl/training/fit_gmm_clusters.py              Fit GMM on z_type embeddings
+frl/training/compare_gmm_evt.py               Compare GMM clusters vs EVT forest types
+frl/training/visualize_test_patches.py        Visualize model output on test patches
+frl/training/visualize_forest_diagnostics.py  Forest-wide embedding diagnostics
 
 frl/config/frl_repr_model_v1.yaml        Architecture config
 frl/config/frl_binding_v1.yaml           Dataset bindings config
@@ -266,4 +287,16 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 
 ## Known Limitations / Future Work
 
-**TODO: Weight cross-patch negatives by spectral distance.** Currently cross-patch negatives are unweighted (uniform), which accepts false negatives — spectrally similar forests from different patches that get incorrectly pushed apart. A principled fix: compute spectral distances between cross-patch pairs and apply `neg_weights = 1 - exp(-d_spec / tau)`, consistent with how spatial InfoNCE negatives are already weighted (`frl/training/train_representation.py`, spatial weighting block). This requires computing spectral distances for sampled cross-patch pairs only (not the full O(N²B²) matrix).
+~~**TODO: Weight cross-patch negatives by spectral distance.** Currently cross-patch negatives are unweighted (uniform), which accepts false negatives — spectrally similar forests from different patches that get incorrectly pushed apart. A principled fix: compute spectral distances between cross-patch pairs and apply `neg_weights = 1 - exp(-d_spec / tau)`, consistent with how spatial InfoNCE negatives are already weighted (`frl/training/train_representation.py`, spatial weighting block). This requires computing spectral distances for sampled cross-patch pairs only (not the full O(N²B²) matrix).~~ *(implemented)*
+
+**TODO: Improve encoding of temporal variance and variance-like measures (variance_ndvi, spectral_velocity).** These targets have weak linear probe R² (~0.25–0.63). The cause is not clearly an architecture issue — it may be a loss issue: after whitening, these features contribute only ~1/22 of the InfoNCE pair-selection signal, so gradient pressure is weak. Alternatively, low R² may be appropriate for stable forest types and only problematic for dynamic types. Options to investigate:
+- Upweight variance-like features in the spectral distance computation
+- Add an auxiliary reconstruction loss targeting these specific channels
+- Stratify probe diagnostics by EVT forest type before concluding the signal is missing
+
+**TODO: Compute EVT-forest-type-stratified diagnostics for phase signal strength.** The prior expectation is that most forest types have weak phase signal but a few (e.g., deciduous, early-successional) have strong phase. Key diagnostics to compute per EVT type:
+- Distribution of FiLM gamma values (do dynamic types receive higher gamma?)
+- Temporal R² of z_phase vs. static between-pixel R² (is temporal variance type-conditional?)
+- Phase linear probe accuracy stratified by EVT type
+
+See `frl/training/visualize_forest_diagnostics.py` and `frl/training/compare_gmm_evt.py` as starting points.
