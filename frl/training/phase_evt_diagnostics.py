@@ -645,7 +645,7 @@ def main() -> None:
     parser.add_argument("--training", default="config/frl_training_v1.yaml")
     parser.add_argument("--bindings", default="config/frl_binding_v1.yaml")
     parser.add_argument(
-        "--evt-map", default=None,
+        "--evt-map", default="../data/LF2024_EVT.csv",
         help="CSV crosswalk with columns Value,Color,Description (LANDFIRE format)",
     )
     parser.add_argument(
@@ -688,10 +688,17 @@ def main() -> None:
     # --- EVT crosswalk ---
     evt_code_to_label: Dict[int, str] = {}
     if args.evt_map:
-        xwalk = pd.read_csv(args.evt_map, dtype={"Value": int})
+        xwalk = pd.read_csv(args.evt_map)
+        # Support both column name conventions:
+        #   LF2024 format:  VALUE / EVT_NAME
+        #   LANDFIRE legacy: Value / Description
+        cols = xwalk.columns.tolist()
+        code_col = "VALUE" if "VALUE" in cols else "Value"
+        name_col = "EVT_NAME" if "EVT_NAME" in cols else "Description"
         evt_code_to_label = {
-            int(row["Value"]): str(row["Description"])
+            int(row[code_col]): str(row[name_col])
             for _, row in xwalk.iterrows()
+            if pd.notna(row[code_col]) and int(row[code_col]) > 0
         }
         logger.info(f"Loaded {len(evt_code_to_label)} EVT codes from {args.evt_map}")
 
