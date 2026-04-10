@@ -113,6 +113,7 @@ def extract_embeddings_from_batch(
     feature_builder: FeatureBuilder,
     model: RepresentationModel,
     device: torch.device,
+    enc_feature_name: str = "type_encoder_input",
 ) -> np.ndarray | None:
     """Run the type pathway on one batch and return valid masked pixels.
 
@@ -138,7 +139,7 @@ def extract_embeddings_from_batch(
         }
         sample["metadata"] = batch["metadata"][i]
 
-        enc_f = feature_builder.build_feature("ccdc_history", sample)
+        enc_f = feature_builder.build_feature(enc_feature_name, sample)
         enc = torch.from_numpy(enc_f.data).float()
 
         sm_names = sample["metadata"]["channel_names"]["static_mask"]
@@ -236,13 +237,15 @@ def main() -> None:
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
     z_dim = model.z_type_dim
     logger.info(f"z_type_dim = {z_dim}")
+    enc_feature_name = training_config.model_input.type_encoder_feature
+    logger.info(f"Using encoder feature: '{enc_feature_name}'")
 
     # --- Reservoir sampling pass ---
     logger.info(f"Reservoir sampling up to {args.max_pixels:,} valid pixels...")
     sampler = ReservoirSampler(capacity=args.max_pixels, dim=z_dim, seed=args.seed)
 
     for batch_idx, batch in enumerate(train_loader):
-        valid_pixels = extract_embeddings_from_batch(batch, feature_builder, model, device)
+        valid_pixels = extract_embeddings_from_batch(batch, feature_builder, model, device, enc_feature_name)
         if valid_pixels is not None:
             sampler.add(valid_pixels)
 

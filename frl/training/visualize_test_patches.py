@@ -116,6 +116,7 @@ def collect_patch_data(
     device: torch.device,
     target_metrics: List[str],
     patch_indices: List[int],
+    enc_feature_name: str = "type_encoder_input",
 ) -> List[Dict[str, np.ndarray]]:
     """Run the encoder + linear probe on selected test patches.
 
@@ -151,7 +152,7 @@ def collect_patch_data(
             dataset._current_indices = saved
 
             # Build features
-            enc_f = feature_builder.build_feature("ccdc_history", sample)
+            enc_f = feature_builder.build_feature(enc_feature_name, sample)
             tgt_f = feature_builder.build_feature("target_metrics", sample)
 
             enc_tensor = torch.from_numpy(enc_f.data).float().unsqueeze(0).to(device)
@@ -503,6 +504,9 @@ def main():
 
     # ---- collect data -----------------------------------------------------
     logger.info("Running inference on selected test patches...")
+    enc_feature_name = training_config.model_input.type_encoder_feature
+    logger.info(f"Using encoder feature: '{enc_feature_name}'")
+
     records = collect_patch_data(
         test_dataset,
         feature_builder,
@@ -511,6 +515,7 @@ def main():
         device,
         target_metrics,
         selected_indices,
+        enc_feature_name=enc_feature_name,
     )
     logger.info(f"Collected data for {len(records)} patches")
 

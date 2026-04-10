@@ -125,6 +125,7 @@ def collect_phase_diagnostics(
     design: str = "full",
     preprocessor: "ProbePreprocessor | None" = None,
     target_channels: "List[str] | None" = None,
+    enc_feature_name: str = "type_encoder_input",
 ) -> List[Dict[str, np.ndarray]]:
     """Run encoder + phase probe on selected patches.
 
@@ -153,7 +154,7 @@ def collect_phase_diagnostics(
             sample = _load_patch(dataset, patch_idx)
 
             # Build features
-            enc_f = feature_builder.build_feature("ccdc_history", sample)
+            enc_f = feature_builder.build_feature(enc_feature_name, sample)
             phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
             tgt_f = feature_builder.build_feature(PHASE_TARGET_FEATURE, sample)
 
@@ -625,6 +626,8 @@ def main():
     model = RepresentationModel.from_checkpoint(
         args.checkpoint, device=device, freeze=True,
     )
+    enc_feature_name = training_config.model_input.type_encoder_feature
+    logger.info(f"Using encoder feature: '{enc_feature_name}'")
 
     probe_path = args.probe or str(
         Path(args.checkpoint).parent / "phase_linear_probe.pt"
@@ -686,6 +689,7 @@ def main():
         test_dataset, feature_builder, model, W, b,
         device, selected_indices, design=design,
         preprocessor=preprocessor, target_channels=target_channels,
+        enc_feature_name=enc_feature_name,
     )
     logger.info(f"Collected data for {len(records)} patches")
 
