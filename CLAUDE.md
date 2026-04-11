@@ -71,7 +71,7 @@ PHASE PATHWAY (temporal):
 - **L2 normalization before FiLM** — controls embedding scale; FiLM gamma owns the scaling.
 - **Sparse forward pass** — `forward_phase_at_locations()` runs the phase encoder only at sampled anchor pixel locations (not the full spatial grid) for training efficiency.
 - **FiLM initialized near identity** — gamma≈1, beta≈0 at initialization for stable early training.
-- **FiLM gamma amplification observed** — after training, FiLM gamma converges to ~3.5 (from init=1.0). The TCN produces ~78% temporal variance in pre-FiLM z; post-FiLM z_phase retains ~32%. This suppression appears appropriate for stable forest types but warrants monitoring for dynamic forest types.
+- **FiLM gamma amplification observed** — after training, FiLM gamma converges to ~3.5 (from init=1.0). The TCN produces ~78% temporal variance in pre-FiLM z; post-FiLM z_phase retains ~32%. EVT-stratified diagnostics (`phase_evt_diagnostics.py`) confirm gamma is type-conditional: plantation/pine types (e.g. EVT 9322, 7368) receive above-average gamma especially in channel 4 (NBR-sensitive); stable oak types receive below-average gamma. Channels 8–10 have near-zero temporal variance fraction (largely redundant with z_type); channel 11 is most temporally active. Recovery curve analysis (`phase_recovery_curves.py`) shows the phase embedding mostly encodes pixel identity rather than recovery stage — post-disturbance NBR does not rise clearly with ysfc across most EVT types.
 
 ### Model Entry Points
 
@@ -235,6 +235,7 @@ frl/data/loaders/config/dataset_bindings_parser.py  YAML bindings parser
 frl/data/loaders/config/training_config_parser.py   Training YAML parser
 frl/data/sampling/anchor_sampling.py                Anchor pixel sampling
 frl/utils/spatial.py                                Spatial distance + kNN utilities
+frl/utils/sampling.py                               ReservoirSampler (Algorithm R streaming sampler)
 
 frl/losses/contrastive.py                InfoNCE loss
 frl/losses/pairs.py                      Pair generation strategies
@@ -250,6 +251,8 @@ frl/training/fit_gmm_clusters.py              Fit GMM on z_type embeddings
 frl/training/compare_gmm_evt.py               Compare GMM clusters vs EVT forest types
 frl/training/visualize_test_patches.py        Visualize model output on test patches
 frl/training/visualize_forest_diagnostics.py  Forest-wide embedding diagnostics
+frl/training/phase_evt_diagnostics.py         EVT-stratified FiLM gamma + z_phase temporal variance
+frl/training/phase_recovery_curves.py         Per-EVT NBR recovery curves vs. ysfc (requires probe)
 
 frl/config/frl_repr_model_v1.yaml        Architecture config
 frl/config/frl_binding_v1.yaml           Dataset bindings config
@@ -292,11 +295,6 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 **TODO: Improve encoding of temporal variance and variance-like measures (variance_ndvi, spectral_velocity).** These targets have weak linear probe R² (~0.25–0.63). The cause is not clearly an architecture issue — it may be a loss issue: after whitening, these features contribute only ~1/22 of the InfoNCE pair-selection signal, so gradient pressure is weak. Alternatively, low R² may be appropriate for stable forest types and only problematic for dynamic types. Options to investigate:
 - Upweight variance-like features in the spectral distance computation
 - Add an auxiliary reconstruction loss targeting these specific channels
-- Stratify probe diagnostics by EVT forest type before concluding the signal is missing
+- ~~Stratify probe diagnostics by EVT forest type before concluding the signal is missing~~ *(done — EVT stratification shows weak phase signal is broadly true across types, not just a stable-forest artifact)*
 
-**TODO: Compute EVT-forest-type-stratified diagnostics for phase signal strength.** The prior expectation is that most forest types have weak phase signal but a few (e.g., deciduous, early-successional) have strong phase. Key diagnostics to compute per EVT type:
-- Distribution of FiLM gamma values (do dynamic types receive higher gamma?)
-- Temporal R² of z_phase vs. static between-pixel R² (is temporal variance type-conditional?)
-- Phase linear probe accuracy stratified by EVT type
-
-See `frl/training/visualize_forest_diagnostics.py` and `frl/training/compare_gmm_evt.py` as starting points.
+~~**TODO: Compute EVT-forest-type-stratified diagnostics for phase signal strength.**~~ *(implemented — see `phase_evt_diagnostics.py` and `phase_recovery_curves.py`; key findings recorded in the FiLM gamma bullet above)*
