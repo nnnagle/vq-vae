@@ -171,17 +171,20 @@ def save_csv(
             if lo >= max_ysfc:
                 break
             count = int(((vals >= lo) & (vals < hi)).sum())
+            width = hi - lo
             rows.append({
-                "evt_code":    code,
-                "evt_name":    name,
-                "bin_label":   label,
-                "bin_lo":      lo,
-                "bin_hi":      hi,
-                "count":       count,
-                "total_count": total,
-                "fraction":    count / total if total > 0 else 0.0,
-                "mean_ysfc":   float(vals.mean()),
-                "median_ysfc": float(np.median(vals)),
+                "evt_code":        code,
+                "evt_name":        name,
+                "bin_label":       label,
+                "bin_lo":          lo,
+                "bin_hi":          hi,
+                "bin_width":       width,
+                "count":           count,
+                "density_per_year": count / width,
+                "total_count":     total,
+                "fraction":        count / total if total > 0 else 0.0,
+                "mean_ysfc":       float(vals.mean()),
+                "median_ysfc":     float(np.median(vals)),
             })
     df = pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
@@ -225,8 +228,10 @@ def plot_histograms(
             int(((vals >= lo) & (vals < hi)).sum())
             for lo, hi in active_bins
         ], dtype=np.float64)
+        widths = np.array([hi - lo for lo, hi in active_bins], dtype=np.float64)
+        density = counts / widths  # counts per year
 
-        ax.bar(x, counts, color="steelblue", edgecolor="white", linewidth=0.4)
+        ax.bar(x, density, color="steelblue", edgecolor="white", linewidth=0.4)
         ax.set_xticks(x)
         ax.set_xticklabels(active_labels, rotation=45, ha="right", fontsize=6)
         ax.tick_params(axis="y", labelsize=6)
@@ -235,14 +240,14 @@ def plot_histograms(
             fontsize=7, pad=2,
         )
         ax.set_xlabel("ysfc (years)", fontsize=6)
-        ax.set_ylabel("Count (sampled)", fontsize=6)
+        ax.set_ylabel("Count per year (sampled)", fontsize=6)
 
     for ax in axes_list[len(top_evt_codes):]:
         ax.axis("off")
 
     fig.suptitle(
         "ysfc distribution by EVT class  |  Top-20 EVT classes by observation count\n"
-        f"(reservoir-sampled; y-axis = sampled counts, not totals)",
+        "(reservoir-sampled; y-axis = sampled count ÷ bin width, comparable across bins)",
         fontsize=9, y=1.01,
     )
     plt.tight_layout()
