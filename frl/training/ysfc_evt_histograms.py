@@ -33,6 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.stats
 import torch
 from torch.utils.data import DataLoader
 
@@ -208,9 +209,7 @@ def plot_histograms(
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 10))
     axes_list = axes.flatten().tolist()
 
-    active_bins = [(lo, hi) for lo, hi in YSFC_BINS if lo < max_ysfc]
-    active_labels = YSFC_BIN_LABELS[: len(active_bins)]
-    x = np.arange(len(active_bins))
+    x_grid = np.linspace(0, max_ysfc, 500)
 
     for idx, code in enumerate(top_evt_codes):
         ax   = axes_list[idx]
@@ -224,30 +223,27 @@ def plot_histograms(
         vals = sampler.get()[:, 0]  # [N] ysfc values
         n_total = n_seen[code]
 
-        counts = np.array([
-            int(((vals >= lo) & (vals < hi)).sum())
-            for lo, hi in active_bins
-        ], dtype=np.float64)
-        widths = np.array([hi - lo for lo, hi in active_bins], dtype=np.float64)
-        density = counts / widths  # counts per year
+        kde = scipy.stats.gaussian_kde(vals)
+        density = kde(x_grid)
 
-        ax.bar(x, density, color="steelblue", edgecolor="white", linewidth=0.4)
-        ax.set_xticks(x)
-        ax.set_xticklabels(active_labels, rotation=45, ha="right", fontsize=6)
-        ax.tick_params(axis="y", labelsize=6)
+        ax.fill_between(x_grid, density, alpha=0.6, color="steelblue")
+        ax.plot(x_grid, density, color="steelblue", linewidth=0.8)
+        ax.set_xlim(0, max_ysfc)
+        ax.set_ylim(bottom=0)
+        ax.tick_params(axis="both", labelsize=6)
         ax.set_title(
             f"{code}: {name[:30]}\n(n={n_total:,} obs)",
             fontsize=7, pad=2,
         )
         ax.set_xlabel("ysfc (years)", fontsize=6)
-        ax.set_ylabel("Count per year (sampled)", fontsize=6)
+        ax.set_ylabel("Density", fontsize=6)
 
     for ax in axes_list[len(top_evt_codes):]:
         ax.axis("off")
 
     fig.suptitle(
         "ysfc distribution by EVT class  |  Top-20 EVT classes by observation count\n"
-        "(reservoir-sampled; y-axis = sampled count ÷ bin width, comparable across bins)",
+        "(KDE of reservoir-sampled ysfc values)",
         fontsize=9, y=1.01,
     )
     plt.tight_layout()
