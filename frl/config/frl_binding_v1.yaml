@@ -149,12 +149,7 @@ dataset: # These exist in the zarr
       - {name: max_seasonal_amp_swir1,      source: static/ccdc_metrics_history/data/max_seasonal_amp_swir1,      fill_value: -9999}
       - {name: variance_seasonal_amp_swir1, source: static/ccdc_metrics_history/data/variance_seasonal_amp_swir1, fill_value: -9999}
       - {name: variance_seasonal_amp_swir2, source: static/ccdc_metrics_history/data/variance_seasonal_amp_swir2, fill_value: -9999}
-      - {name: variance_nbr,   source: static/ccdc_metrics_history/data/variance_nbr,   fill_value: -9999}
-      - {name: variance_ndmi,  source: static/ccdc_metrics_history/data/variance_ndmi,  fill_value: -9999}
-      - {name: variance_red,   source: static/ccdc_metrics_history/data/variance_red,   fill_value: -9999}
       - {name: variance_nir,   source: static/ccdc_metrics_history/data/variance_nir,   fill_value: -9999}
-      - {name: variance_swir1, source: static/ccdc_metrics_history/data/variance_swir1, fill_value: -9999}
-      - {name: variance_swir2, source: static/ccdc_metrics_history/data/variance_swir2, fill_value: -9999}
       - name: ysfc_min
         source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024
         reducer: min
@@ -386,12 +381,7 @@ features:
     dim: [C,H,W]
     channels:
       static.variance_ndvi:               {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
-      static.variance_nbr:                {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
-      static.variance_ndmi:               {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
-      static.variance_red:                {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
       static.variance_nir:                {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
-      static.variance_swir1:              {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
-      static.variance_swir2:              {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
       static.variance_seasonal_amp_red:   {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
       static.variance_seasonal_amp_nir:   {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
       static.variance_seasonal_amp_swir1: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
