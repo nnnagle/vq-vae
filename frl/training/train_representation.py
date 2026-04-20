@@ -748,7 +748,8 @@ def process_batch(
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'phase_loss': 0.0, 'phase_spread_loss': 0.0,
+            'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'n_valid': 0,
             'spectral_pos_pairs': 0, 'spectral_neg_pairs': 0,
@@ -782,6 +783,7 @@ def process_batch(
             return {
                 'loss': float('nan'), 'spectral_loss': float('nan'),
                 'spatial_loss': float('nan'), 'phase_loss': float('nan'),
+                'phase_spread_loss': float('nan'),
                 'vcr_loss': float('nan'), 'phase_vcr_loss': float('nan'),
                 'evt_loss': float('nan'), 'evt_diag': _empty_evt_diag,
                 'n_valid': 0,
@@ -983,6 +985,7 @@ def train_epoch(
                     f"spec={stats['spectral_loss']:.4f} "
                     f"spat={stats['spatial_loss']:.4f} "
                     f"phase={stats['phase_loss']:.4f} "
+                    f"spr={stats.get('phase_spread_loss', 0.0):.4f} "
                     f"vcr={stats['vcr_loss']:.4f} "
                     f"pvcr={stats['phase_vcr_loss']:.4f} "
                     f"evt={stats.get('evt_loss', 0.0):.4f} | "
@@ -1000,7 +1003,8 @@ def train_epoch(
     if total_batches == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'phase_loss': 0.0, 'phase_spread_loss': 0.0,
+            'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'evt_loss': 0.0,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -1116,7 +1120,8 @@ def validate_epoch(
         )
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'phase_loss': 0.0, 'phase_spread_loss': 0.0,
+            'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -1879,13 +1884,15 @@ def main():
         logger.info(
             f"  Train: {train_stats['loss']:.4f} "
             f"spec={train_stats['spectral_loss']:.4f} spat={train_stats['spatial_loss']:.4f} "
-            f"phase={train_stats['phase_loss']:.4f} vcr={train_stats['vcr_loss']:.4f} "
+            f"phase={train_stats['phase_loss']:.4f} spr={train_stats.get('phase_spread_loss', 0.0):.4f} "
+            f"vcr={train_stats['vcr_loss']:.4f} "
             f"pvcr={train_stats['phase_vcr_loss']:.4f} evt={train_stats['evt_loss']:.4f}"
         )
         logger.info(
             f"  Val:   {val_stats['loss']:.4f} "
             f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "
-            f"phase={val_stats['phase_loss']:.4f} vcr={val_stats['vcr_loss']:.4f} "
+            f"phase={val_stats['phase_loss']:.4f} spr={val_stats.get('phase_spread_loss', 0.0):.4f} "
+            f"vcr={val_stats['vcr_loss']:.4f} "
             f"pvcr={val_stats['phase_vcr_loss']:.4f} evt={val_stats['evt_loss']:.4f}"
         )
         # EVT diagnostics — logged only when the EVT loss is active
@@ -2011,18 +2018,20 @@ def main():
 
         # Flat metrics dict — keys match the monitor strings used in the YAML.
         epoch_metrics = {
-            "train/loss_total":     train_stats['loss'],
-            "train/loss_spectral":  train_stats['spectral_loss'],
-            "train/loss_spatial":   train_stats['spatial_loss'],
-            "train/loss_phase":     train_stats['phase_loss'],
-            "train/loss_vcr":       train_stats['vcr_loss'],
-            "train/loss_phase_vcr": train_stats['phase_vcr_loss'],
-            "val/loss_total":       val_stats['loss'],
-            "val/loss_spectral":    val_stats['spectral_loss'],
-            "val/loss_spatial":     val_stats['spatial_loss'],
-            "val/loss_phase":       val_stats['phase_loss'],
-            "val/loss_vcr":         val_stats['vcr_loss'],
-            "val/loss_phase_vcr":   val_stats['phase_vcr_loss'],
+            "train/loss_total":         train_stats['loss'],
+            "train/loss_spectral":      train_stats['spectral_loss'],
+            "train/loss_spatial":       train_stats['spatial_loss'],
+            "train/loss_phase":         train_stats['phase_loss'],
+            "train/loss_phase_spread":  train_stats.get('phase_spread_loss', 0.0),
+            "train/loss_vcr":           train_stats['vcr_loss'],
+            "train/loss_phase_vcr":     train_stats['phase_vcr_loss'],
+            "val/loss_total":           val_stats['loss'],
+            "val/loss_spectral":        val_stats['spectral_loss'],
+            "val/loss_spatial":         val_stats['spatial_loss'],
+            "val/loss_phase":           val_stats['phase_loss'],
+            "val/loss_phase_spread":    val_stats.get('phase_spread_loss', 0.0),
+            "val/loss_vcr":             val_stats['vcr_loss'],
+            "val/loss_phase_vcr":       val_stats['phase_vcr_loss'],
         }
 
         # Checkpoint state dict (shared by periodic and last saves).
