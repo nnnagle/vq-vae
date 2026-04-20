@@ -40,7 +40,11 @@ from data.sampling.anchor_sampling import AnchorSampler, build_anchor_sampler
 from models import RepresentationModel
 from losses import contrastive_loss, pairs_mutual_knn, pairs_mutual_knn_chunked, pairs_quantile, pairs_with_spatial_constraint
 from losses.phase_pairs import build_phase_pairs
-from losses.phase_neighborhood import phase_neighborhood_loss
+from losses.phase_neighborhood import (
+    build_phase_neighborhood_batch,
+    compute_phase_spread_ranking,
+    phase_neighborhood_loss,
+)
 from losses.variance_covariance import variance_covariance_loss
 from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
 from utils import (
@@ -150,6 +154,7 @@ def process_batch(
     total_spectral_loss = 0.0
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
+    total_phase_spread_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -382,6 +387,7 @@ def process_batch(
         # Pair construction (kNN + overlap) runs on CPU.
         # Loss computation runs on GPU (requires gradients through phase encoder).
         phase_loss_val = torch.tensor(0.0, device=device)
+        phase_spread_loss_val = torch.tensor(0.0, device=device)
         phase_vcr_loss_val = torch.tensor(0.0, device=device)
         if phase_sampler is not None and phase_config is not None:
             # Build ysfc feature via FeatureBuilder (returns numpy)
@@ -495,13 +501,23 @@ def process_batch(
 
                         # ysfc on GPU for loss
                         ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
+                        phase_pairs_gpu = phase_pairs.to(device)
+
+                        # Build aligned batch once; reuse for both losses.
+                        phase_batch = build_phase_neighborhood_batch(
+                            spectral_features=spec_at_phase_anchors,
+                            phase_embeddings=z_phase_at_anchors,
+                            ysfc=ysfc_at_anchors_gpu,
+                            pair_indices=phase_pairs_gpu,
+                            min_overlap=phase_config.get('min_overlap', 3),
+                        )
 
                         # Compute phase neighborhood loss
                         p_loss, p_loss_stats = phase_neighborhood_loss(
                             spectral_features=spec_at_phase_anchors,
                             phase_embeddings=z_phase_at_anchors,
                             ysfc=ysfc_at_anchors_gpu,
-                            pair_indices=phase_pairs.to(device),
+                            pair_indices=phase_pairs_gpu,
                             pair_weights=phase_weights.to(device),
                             tau_ref=phase_config.get('tau_ref', 0.1),
                             tau_learned=phase_config.get('tau_learned', 0.1),
@@ -515,6 +531,7 @@ def process_batch(
                             cross_pixel_weight=phase_config.get(
                                 'cross_pixel_weight', 1.0
                             ),
+                            _batch=phase_batch,
                         )
 
                         phase_loss_weight = phase_config.get('weight', 1.0)
@@ -522,10 +539,54 @@ def process_batch(
                         p_loss_stats['curriculum_w'] = curriculum_w
                         all_phase_loss_stats.append(p_loss_stats)
 
+                        # --- Phase spread ranking loss (reuses same batch) ---
+                        if spread_config is not None and phase_batch['valid_pair_mask'].any():
+                            # Extract dynamism feature at phase anchors.
+                            # feature_builder applies Mahalanobis whitening (covariance configured).
+                            dynamism_data = torch.from_numpy(
+                                feature_builder.build_feature(
+                                    'phase_dynamism_supervision', sample
+                                ).data
+                            ).float()
+                            dynamism_at_anchors = extract_at_locations(
+                                dynamism_data, phase_anchors
+                            )  # [N_phase, C]
+                            # Mean of whitened channels → per-anchor dynamism scalar.
+                            # Larger positive = more dynamic; near zero = typical; negative = static.
+                            dynamism_ref = dynamism_at_anchors.mean(dim=1).to(device)  # [N_phase]
+
+                            valid_mask = phase_batch['valid_pair_mask']
+                            idx_i_v = phase_pairs_gpu[valid_mask, 0]
+                            idx_j_v = phase_pairs_gpu[valid_mask, 1]
+
+                            # Compute spread ranking curriculum weight (same schedule as phase loss).
+                            s_start = spread_config['curriculum_start_epoch']
+                            s_ramp = spread_config['curriculum_ramp_epochs']
+                            if epoch < s_start:
+                                spread_w = 0.0
+                            elif epoch >= s_start + s_ramp:
+                                spread_w = 1.0
+                            else:
+                                spread_w = (epoch - s_start) / s_ramp
+
+                            if spread_w > 0.0:
+                                spread_loss, spread_stats = compute_phase_spread_ranking(
+                                    batch_result=phase_batch,
+                                    idx_i_valid=idx_i_v,
+                                    idx_j_valid=idx_j_v,
+                                    dynamism_ref=dynamism_ref,
+                                    margin=spread_config['margin'],
+                                    delta=spread_config['delta'],
+                                )
+                                phase_spread_loss_val = (
+                                    spread_config['weight'] * spread_w * spread_loss
+                                )
+
         # Combine losses with weights (spectral loss computed globally after loop)
         spatial_weight = config.get('spatial_loss_weight', 1.0)
         loss = (spatial_weight * spatial_loss_val
                 + phase_loss_val
+                + phase_spread_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
                 + evt_loss_val)
@@ -540,6 +601,7 @@ def process_batch(
             total_loss += loss
             total_spatial_loss += spatial_loss_val
             total_phase_loss += phase_loss_val
+            total_phase_spread_loss += phase_spread_loss_val
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
             total_evt_loss += evt_loss_val
@@ -547,6 +609,7 @@ def process_batch(
             total_loss += loss.item()
             total_spatial_loss += spatial_loss_val.item()
             total_phase_loss += phase_loss_val.item()
+            total_phase_spread_loss += phase_spread_loss_val.item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_evt_loss += evt_loss_val.item()
@@ -707,6 +770,7 @@ def process_batch(
         mean_spectral_loss = spectral_scalar
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = total_phase_loss / n_valid
+    mean_phase_spread_loss = total_phase_spread_loss / n_valid
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
     mean_evt_loss = total_evt_loss / n_valid
@@ -744,6 +808,7 @@ def process_batch(
         mean_spectral_loss = mean_spectral_loss.item()
         mean_spatial_loss = mean_spatial_loss.item()
         mean_phase_loss = mean_phase_loss.item()
+        mean_phase_spread_loss = mean_phase_spread_loss.item()
         mean_vcr_loss = mean_vcr_loss.item()
         mean_phase_vcr_loss = mean_phase_vcr_loss.item()
         mean_evt_loss = mean_evt_loss.item() if hasattr(mean_evt_loss, 'item') else float(mean_evt_loss)
@@ -806,6 +871,7 @@ def process_batch(
         'spectral_loss': mean_spectral_loss,
         'spatial_loss': mean_spatial_loss,
         'phase_loss': mean_phase_loss,
+        'phase_spread_loss': mean_phase_spread_loss,
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
@@ -846,6 +912,7 @@ def train_epoch(
     total_spectral_loss = 0.0
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
+    total_phase_spread_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -881,6 +948,7 @@ def train_epoch(
             total_spectral_loss += stats['spectral_loss']
             total_spatial_loss += stats['spatial_loss']
             total_phase_loss += stats['phase_loss']
+            total_phase_spread_loss += stats.get('phase_spread_loss', 0.0)
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_evt_loss += stats.get('evt_loss', 0.0)
@@ -957,6 +1025,7 @@ def train_epoch(
         'spectral_loss': total_spectral_loss / total_batches,
         'spatial_loss': total_spatial_loss / total_batches,
         'phase_loss': total_phase_loss / total_batches,
+        'phase_spread_loss': total_phase_spread_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
@@ -991,6 +1060,7 @@ def validate_epoch(
     total_spectral_loss = 0.0
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
+    total_phase_spread_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -1020,6 +1090,7 @@ def validate_epoch(
                 total_spectral_loss += stats['spectral_loss']
                 total_spatial_loss += stats['spatial_loss']
                 total_phase_loss += stats['phase_loss']
+                total_phase_spread_loss += stats.get('phase_spread_loss', 0.0)
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_evt_loss += stats.get('evt_loss', 0.0)
@@ -1070,6 +1141,7 @@ def validate_epoch(
         'spectral_loss': total_spectral_loss / total_batches,
         'spatial_loss': total_spatial_loss / total_batches,
         'phase_loss': total_phase_loss / total_batches,
+        'phase_spread_loss': total_phase_spread_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
@@ -1536,6 +1608,25 @@ def main():
         )
     else:
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
+
+    # --- Phase spread ranking loss setup ---
+    spread_loss_cfg = bindings_config.get_loss('phase_spread_ranking')
+    spread_config = None
+    if spread_loss_cfg is not None:
+        cur_s = spread_loss_cfg.curriculum
+        spread_config = {
+            'weight': spread_loss_cfg.weight if spread_loss_cfg.weight is not None else 0.5,
+            'margin': spread_loss_cfg.margin if spread_loss_cfg.margin is not None else 0.1,
+            'delta': spread_loss_cfg.delta if spread_loss_cfg.delta is not None else 0.5,
+            'curriculum_start_epoch': cur_s.start_epoch if cur_s else 30,
+            'curriculum_ramp_epochs': cur_s.ramp_epochs if cur_s else 10,
+        }
+        logger.info(
+            f"Phase spread ranking loss enabled: weight={spread_config['weight']}, "
+            f"margin={spread_config['margin']}, delta={spread_config['delta']}, "
+            f"curriculum=[start={spread_config['curriculum_start_epoch']}, "
+            f"ramp={spread_config['curriculum_ramp_epochs']}]"
+        )
 
     # --- EVT soft neighbourhood loss setup ---
     # The EVT-stratified anchor sampler is built whenever the EVT loss config

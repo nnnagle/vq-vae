@@ -48,6 +48,7 @@ Usage
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from losses.soft_neighborhood import soft_neighborhood_matching_loss
 
@@ -303,16 +304,6 @@ def build_phase_neighborhood_batch(
     # [N, V, T] @ [N, T, D] -> [N, V, D]
     avg_phase = torch.bmm(indicator, phase_embeddings) / counts_safe
 
-    # --- Demean spectral features per pixel across all ysfc values ---
-    # Removes per-pixel mean spectral signature (type information) so that
-    # distances reflect temporal trajectory shape (phase) only.  The mean is
-    # computed over each pixel's full ysfc range — not just the per-pair
-    # overlap — giving a stable baseline even when overlap is small.
-    presence_f = presence.unsqueeze(-1).float()       # [N, V, 1]
-    n_present = presence_f.sum(dim=1, keepdim=True).clamp(min=1)  # [N, 1, 1]
-    pixel_mean_spec = (avg_spec * presence_f).sum(dim=1, keepdim=True) / n_present  # [N, 1, C]
-    avg_spec = (avg_spec - pixel_mean_spec) * presence_f  # [N, V, C]
-
     # --- Per-pair overlap ---
     idx_i = pair_indices[:, 0]  # [B]
     idx_j = pair_indices[:, 1]  # [B]
@@ -325,6 +316,7 @@ def build_phase_neighborhood_batch(
     empty_result = {
         "d_ref_self": torch.zeros(0, T, T, device=device, dtype=dtype),
         "d_learned_self": torch.zeros(0, T, T, device=device, dtype=dtype),
+        "d_learned_self_j": torch.zeros(0, T, T, device=device, dtype=dtype),
         "mask_self": torch.zeros(0, T, T, device=device, dtype=torch.bool),
         "d_ref_cross": torch.zeros(0, T, T, device=device, dtype=dtype),
         "d_learned_cross": torch.zeros(0, T, T, device=device, dtype=dtype),
@@ -367,10 +359,22 @@ def build_phase_neighborhood_batch(
     aligned_i_phase = torch.bmm(mapping, avg_phase_i)  # [B_valid, M, D]
     aligned_j_phase = torch.bmm(mapping, avg_phase_j)  # [B_valid, M, D]
 
+    # --- Per-pair demeaning over shared ysfc values ---
+    # Removing the per-pair mean removes the static spectral signature so
+    # that distances reflect temporal trajectory shape only.  Demeaning
+    # here (after alignment to shared ysfc positions) ensures both pixels
+    # are centred on the same set of recovery stages, avoiding baseline
+    # contamination from pre-disturbance values not shared by the pair.
+    shared_mean_i = aligned_i_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
+    shared_mean_j = aligned_j_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
+    aligned_i_spec = aligned_i_spec - shared_mean_i
+    aligned_j_spec = aligned_j_spec - shared_mean_j
+
     # --- Batched distance matrices ---
-    d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)        # [B_valid, M, M]
+    d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)         # [B_valid, M, M]
     d_learned_self = torch.cdist(aligned_i_phase, aligned_i_phase)   # [B_valid, M, M]
-    d_ref_cross = torch.cdist(aligned_i_spec, aligned_j_spec)       # [B_valid, M, M]
+    d_learned_self_j = torch.cdist(aligned_j_phase, aligned_j_phase) # [B_valid, M, M]
+    d_ref_cross = torch.cdist(aligned_i_spec, aligned_j_spec)        # [B_valid, M, M]
     d_learned_cross = torch.cdist(aligned_i_phase, aligned_j_phase)  # [B_valid, M, M]
 
     # --- Masks ---
@@ -383,6 +387,7 @@ def build_phase_neighborhood_batch(
     return {
         "d_ref_self": d_ref_self,
         "d_learned_self": d_learned_self,
+        "d_learned_self_j": d_learned_self_j,
         "mask_self": mask_self_batch,
         "d_ref_cross": d_ref_cross,
         "d_learned_cross": d_learned_cross,
@@ -408,6 +413,7 @@ def phase_neighborhood_loss(
     min_valid_per_row: int = 2,
     self_similarity_weight: float = 1.0,
     cross_pixel_weight: float = 1.0,
+    _batch: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Phase neighborhood matching loss for forest recovery trajectories.
 
@@ -467,14 +473,17 @@ def phase_neighborhood_loss(
     device = spectral_features.device
     dtype = spectral_features.dtype
 
-    # --- Build aligned batch -----------------------------------------------
-    batch = build_phase_neighborhood_batch(
-        spectral_features=spectral_features,
-        phase_embeddings=phase_embeddings,
-        ysfc=ysfc,
-        pair_indices=pair_indices,
-        min_overlap=min_overlap,
-    )
+    # --- Build aligned batch (or use pre-built) ----------------------------
+    if _batch is not None:
+        batch = _batch
+    else:
+        batch = build_phase_neighborhood_batch(
+            spectral_features=spectral_features,
+            phase_embeddings=phase_embeddings,
+            ysfc=ysfc,
+            pair_indices=pair_indices,
+            min_overlap=min_overlap,
+        )
 
     n_input = pair_indices.shape[0]
     valid_pair_mask = batch["valid_pair_mask"]
@@ -560,3 +569,113 @@ def phase_neighborhood_loss(
         stats[f"d_ref_cross_{k}"] = v
 
     return loss, stats
+
+
+# ---------------------------------------------------------------------------
+# Phase spread ranking loss
+# ---------------------------------------------------------------------------
+
+def compute_phase_spread_ranking(
+    batch_result: dict,
+    idx_i_valid: torch.Tensor,
+    idx_j_valid: torch.Tensor,
+    dynamism_ref: torch.Tensor,
+    margin: float = 0.1,
+    delta: float = 0.5,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Ranking loss that orders phase spread by inter-annual spectral dynamism.
+
+    For each valid pair (i, j), computes the spread of each pixel's phase
+    embeddings across shared ysfc stages (mean off-diagonal distance in the
+    ysfc-aligned self-distance matrix).  Applies a soft-margin ranking
+    constraint: the more-dynamic pixel (higher ``dynamism_ref``) should have
+    greater spread in phase space.
+
+    Parameters
+    ----------
+    batch_result : dict
+        Output of :func:`build_phase_neighborhood_batch`.  Must contain
+        ``d_learned_self`` ``[B_valid, M, M]``, ``d_learned_self_j``
+        ``[B_valid, M, M]``, and ``mask_self`` ``[B_valid, M, M]``.
+    idx_i_valid : LongTensor ``[B_valid]``
+        Pixel indices for the i-side of each valid pair.
+    idx_j_valid : LongTensor ``[B_valid]``
+        Pixel indices for the j-side of each valid pair.
+    dynamism_ref : Tensor ``[N]``
+        Per-anchor scalar dynamism score (e.g. mean of Mahalanobis-whitened
+        variance channels).  Larger = more dynamic.
+    margin : float
+        Softplus margin.  Constraint fires when
+        ``spread_less_dynamic >= spread_more_dynamic - margin``.
+    delta : float
+        Minimum dynamism difference to trigger the constraint.  Pairs
+        with ``|dynamism_ref[i] - dynamism_ref[j]| <= delta`` are skipped.
+
+    Returns
+    -------
+    loss : scalar Tensor
+    stats : dict
+        - ``n_pairs``: valid pairs considered
+        - ``n_constrained_i``: pairs where i is more dynamic (constraint active)
+        - ``n_constrained_j``: pairs where j is more dynamic (constraint active)
+        - ``frac_satisfied``: fraction of constrained pairs already satisfied
+        - ``mean_spread_i``: mean phase spread for i across all valid pairs
+        - ``mean_spread_j``: mean phase spread for j across all valid pairs
+        - ``mean_ref_diff``: mean |dynamism_ref[i] - dynamism_ref[j]|
+    """
+    device = batch_result["d_learned_self"].device
+    dtype = batch_result["d_learned_self"].dtype
+
+    d_self_i = batch_result["d_learned_self"]    # [B_valid, M, M]
+    d_self_j = batch_result["d_learned_self_j"]  # [B_valid, M, M]
+    mask_self = batch_result["mask_self"]         # [B_valid, M, M] off-diag valid
+
+    B_valid = d_self_i.shape[0]
+
+    if B_valid == 0:
+        zero = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+        return zero, {
+            "n_pairs": 0, "n_constrained_i": 0, "n_constrained_j": 0,
+            "frac_satisfied": 1.0, "mean_spread_i": 0.0,
+            "mean_spread_j": 0.0, "mean_ref_diff": 0.0,
+        }
+
+    # Spread = mean off-diagonal valid distance per pair.
+    n_valid = mask_self.float().sum(dim=(1, 2)).clamp(min=1)  # [B_valid]
+    spread_i = (d_self_i * mask_self).sum(dim=(1, 2)) / n_valid  # [B_valid]
+    spread_j = (d_self_j * mask_self).sum(dim=(1, 2)) / n_valid  # [B_valid]
+
+    # Signed dynamism difference: positive means i is more dynamic.
+    ref_diff = dynamism_ref[idx_i_valid] - dynamism_ref[idx_j_valid]  # [B_valid]
+
+    i_more_dynamic = (ref_diff >  delta).float()   # [B_valid]
+    j_more_dynamic = (ref_diff < -delta).float()   # [B_valid]
+
+    # Softplus ranking constraint (follows triplet_phase.py pattern).
+    # When i is more dynamic: enforce spread_i > spread_j + margin.
+    # When j is more dynamic: enforce spread_j > spread_i + margin.
+    loss_i = F.softplus(spread_j - spread_i + margin) * i_more_dynamic
+    loss_j = F.softplus(spread_i - spread_j + margin) * j_more_dynamic
+    loss = (loss_i + loss_j).mean()
+
+    with torch.no_grad():
+        n_ci = int(i_more_dynamic.sum().item())
+        n_cj = int(j_more_dynamic.sum().item())
+        n_constrained = n_ci + n_cj
+
+        if n_constrained > 0:
+            satisfied_i = ((spread_i - spread_j) > margin) * i_more_dynamic
+            satisfied_j = ((spread_j - spread_i) > margin) * j_more_dynamic
+            frac_sat = (satisfied_i + satisfied_j).sum().item() / n_constrained
+        else:
+            frac_sat = 1.0
+
+    return loss, {
+        "n_pairs": B_valid,
+        "n_constrained_i": n_ci,
+        "n_constrained_j": n_cj,
+        "frac_satisfied": frac_sat,
+        "mean_spread_i": spread_i.mean().item(),
+        "mean_spread_j": spread_j.mean().item(),
+        "mean_ref_diff": ref_diff.abs().mean().item(),
+    }

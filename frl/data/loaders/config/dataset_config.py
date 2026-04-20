@@ -461,6 +461,10 @@ class LossConfig:
     laplace_smoothing: Optional[float] = None      # smoothing on non-zero confusion cells only
     binary_threshold: Optional[float] = None       # threshold P^k before row-normalising; 0=disabled
 
+    # --- phase_spread_ranking-specific ---
+    margin: Optional[float] = None   # softplus ranking margin
+    delta: Optional[float] = None    # min dynamism difference to trigger constraint
+
 
 @dataclass
 class BindingsConfig:
