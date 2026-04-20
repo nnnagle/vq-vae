@@ -149,6 +149,12 @@ dataset: # These exist in the zarr
       - {name: max_seasonal_amp_swir1,      source: static/ccdc_metrics_history/data/max_seasonal_amp_swir1,      fill_value: -9999}
       - {name: variance_seasonal_amp_swir1, source: static/ccdc_metrics_history/data/variance_seasonal_amp_swir1, fill_value: -9999}
       - {name: variance_seasonal_amp_swir2, source: static/ccdc_metrics_history/data/variance_seasonal_amp_swir2, fill_value: -9999}
+      - {name: variance_nbr,   source: static/ccdc_metrics_history/data/variance_nbr,   fill_value: -9999}
+      - {name: variance_ndmi,  source: static/ccdc_metrics_history/data/variance_ndmi,  fill_value: -9999}
+      - {name: variance_red,   source: static/ccdc_metrics_history/data/variance_red,   fill_value: -9999}
+      - {name: variance_nir,   source: static/ccdc_metrics_history/data/variance_nir,   fill_value: -9999}
+      - {name: variance_swir1, source: static/ccdc_metrics_history/data/variance_swir1, fill_value: -9999}
+      - {name: variance_swir2, source: static/ccdc_metrics_history/data/variance_swir2, fill_value: -9999}
       - name: ysfc_min
         source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024
         reducer: min
@@ -376,6 +382,25 @@ features:
     channels:
       static.ysfc_min: {norm: identity}
       static.ysfc_censored_min: {norm: identity}
+  phase_dynamism_supervision:
+    dim: [C,H,W]
+    channels:
+      static.variance_ndvi:               {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_nbr:                {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_ndmi:               {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_red:                {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_nir:                {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_swir1:              {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_swir2:              {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_seasonal_amp_red:   {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_seasonal_amp_nir:   {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_seasonal_amp_swir1: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.variance_seasonal_amp_swir2: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+      static.spectral_distance_per_decade: {norm: robust_iqr, transform: {name: log, epsilon: 0.001}}
+    covariance:
+      dim: [C,C]
+      calculate: true
+      stat_domain: patch
   ysfc:
     dim: [C,T,H,W]
     channels:
@@ -643,6 +668,21 @@ losses:
   # Encourages z_type to mirror the network structure of the LANDFIRE EVT
   # confusion graph, including transitive (multi-hop) similarity via diffusion.
   # EVT loss disabled; sampler still built for EVT-stratified anchor sampling.
+  # Phase spread ranking loss.
+  # Enforces that pixels with higher inter-annual spectral variance (more dynamic)
+  # also have more spread-out phase embeddings across shared recovery stages.
+  # Uses the same pairs as soft_neighborhood_phase (no separate pair sampling).
+  phase_spread_ranking:
+    weight: 0.5
+    type: phase_spread_ranking
+
+    margin: 0.1       # softplus margin for ranking constraint
+    delta: 0.5        # min dynamism difference (in whitened feature units) to trigger constraint
+
+    curriculum:
+      start_epoch: 30   # same as soft_neighborhood_phase
+      ramp_epochs: 10
+
   soft_neighborhood_evt:
     weight: 0.0
     type: soft_neighborhood_evt

@@ -620,6 +620,8 @@ class DatasetBindingsParser:
             diffusion_steps=spec.get('diffusion_steps'),
             laplace_smoothing=spec.get('laplace_smoothing'),
             binary_threshold=spec.get('binary_threshold'),
+            margin=spec.get('margin'),
+            delta=spec.get('delta'),
         )
 
     def _parse_pair_endpoint_strategy(
