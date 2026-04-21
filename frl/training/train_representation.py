@@ -114,6 +114,7 @@ def process_batch(
     optimizer: torch.optim.Optimizer | None = None,
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
+    spread_config: dict | None = None,
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
@@ -906,6 +907,7 @@ def train_epoch(
     log_interval: int = 10,
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
+    spread_config: dict | None = None,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
 ) -> dict:
@@ -940,6 +942,7 @@ def train_epoch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
             phase_sampler=phase_sampler, phase_config=phase_config,
+            spread_config=spread_config,
             epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
@@ -1055,6 +1058,7 @@ def validate_epoch(
     config: dict,
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
+    spread_config: dict | None = None,
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
@@ -1087,6 +1091,7 @@ def validate_epoch(
                 batch, feature_builder, model, device, config,
                 training=False,
                 phase_sampler=phase_sampler, phase_config=phase_config,
+                spread_config=spread_config,
                 epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
             )
             if stats['n_valid'] > 0:
@@ -1870,6 +1875,7 @@ def main():
           train_dataloader, feature_builder, model,
           optimizer, scheduler, device, loss_config, epoch, num_epochs,
           phase_sampler=phase_sampler, phase_config=phase_config,
+          spread_config=spread_config,
           evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
@@ -1877,6 +1883,7 @@ def main():
           val_dataloader, feature_builder, model,
           device, loss_config,
           phase_sampler=phase_sampler, phase_config=phase_config,
+          spread_config=spread_config,
           epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
