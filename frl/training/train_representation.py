@@ -594,7 +594,22 @@ def process_batch(
 
         # Skip if loss is NaN or Inf (numerical instability)
         if not torch.isfinite(loss):
-            logger.warning(f"Skipping sample with non-finite loss: {loss.item()}")
+            md = sample['metadata']
+            sw = md.get('spatial_window')
+            origin = (sw.row_start, sw.col_start) if sw is not None else '?'
+            patch_idx = md.get('patch_idx', '?')
+            def _fmt(t):
+                v = t.item() if hasattr(t, 'item') else float(t)
+                return f"{v:.4f}"
+            logger.warning(
+                f"Skipping sample with non-finite loss: {loss.item()} | "
+                f"patch_idx={patch_idx} origin={origin} | "
+                f"spat={_fmt(spatial_loss_val)} "
+                f"phase={_fmt(phase_loss_val)} "
+                f"spr={_fmt(phase_spread_loss_val)} "
+                f"vcr={_fmt(vcr_loss_val)} "
+                f"pvcr={_fmt(phase_vcr_loss_val)}"
+            )
             continue
 
         # Accumulate: keep as tensor for training (backward), use .item() for validation
