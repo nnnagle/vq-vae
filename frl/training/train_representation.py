@@ -511,6 +511,7 @@ def process_batch(
                             ysfc=ysfc_at_anchors_gpu,
                             pair_indices=phase_pairs_gpu,
                             min_overlap=phase_config.get('min_overlap', 3),
+                            ysfc_stable_min=phase_config.get('ysfc_stable_min', 5),
                         )
 
                         # Compute phase neighborhood loss

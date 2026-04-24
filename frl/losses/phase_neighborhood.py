@@ -227,6 +227,7 @@ def build_phase_neighborhood_batch(
     ysfc: torch.Tensor,
     pair_indices: torch.Tensor,
     min_overlap: int = 3,
+    ysfc_stable_min: int = 5,
 ) -> dict[str, torch.Tensor | int]:
     """Prepare aligned distance matrices for a batch of pixel pairs.
 
@@ -359,16 +360,45 @@ def build_phase_neighborhood_batch(
     aligned_i_phase = torch.bmm(mapping, avg_phase_i)  # [B_valid, M, D]
     aligned_j_phase = torch.bmm(mapping, avg_phase_j)  # [B_valid, M, D]
 
-    # --- Per-pair demeaning over shared ysfc values ---
-    # Removing the per-pair mean removes the static spectral signature so
-    # that distances reflect temporal trajectory shape only.  Demeaning
-    # here (after alignment to shared ysfc positions) ensures both pixels
-    # are centred on the same set of recovery stages, avoiding baseline
-    # contamination from pre-disturbance values not shared by the pair.
-    shared_mean_i = aligned_i_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    shared_mean_j = aligned_j_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    aligned_i_spec = aligned_i_spec - shared_mean_i
-    aligned_j_spec = aligned_j_spec - shared_mean_j
+    # --- Per-pair demeaning over STABLE shared ysfc values ---
+    # Using the mean over all shared ysfc values (including ysfc=0) contaminates
+    # the baseline: pixels with more severe disturbances get lower means, creating
+    # artificial cross-pixel reference distances at pre-disturbance stages even
+    # when two same-type pixels were observed in the same calendar year.
+    # Fix: demean using only shared ysfc values >= ysfc_stable_min.  If no stable
+    # values are shared, fall back to the full mean.
+    #
+    # valid_pos[b, m] = True iff position m is within the K shared values for pair b.
+    range_M_dm = torch.arange(M, device=device)
+    valid_pos_dm = range_M_dm.unsqueeze(0) < K_valid.unsqueeze(1)  # [B_valid, M]
+
+    # Actual ysfc value at each aligned position: mapping[b,m,v]=1 for exactly one v.
+    aligned_ysfc_vals = (mapping @ unique_vals.float().unsqueeze(-1)).squeeze(-1)  # [B_valid, M]
+
+    stable_pos = (aligned_ysfc_vals >= ysfc_stable_min) & valid_pos_dm  # [B_valid, M]
+    has_stable = stable_pos.any(dim=1, keepdim=True)  # [B_valid, 1]
+
+    n_stable = stable_pos.float().sum(dim=1, keepdim=True).clamp(min=1)      # [B_valid, 1]
+    n_valid_all = valid_pos_dm.float().sum(dim=1, keepdim=True).clamp(min=1) # [B_valid, 1]
+
+    # Compute both means; select stable where available.
+    def _masked_mean(feat: torch.Tensor, mask: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        # feat [B_valid, M, C], mask [B_valid, M], n [B_valid, 1] → [B_valid, 1, C]
+        return (feat * mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / n.unsqueeze(-1)
+
+    mean_i = torch.where(
+        has_stable.unsqueeze(-1),
+        _masked_mean(aligned_i_spec, stable_pos, n_stable),
+        _masked_mean(aligned_i_spec, valid_pos_dm, n_valid_all),
+    )  # [B_valid, 1, C]
+    mean_j = torch.where(
+        has_stable.unsqueeze(-1),
+        _masked_mean(aligned_j_spec, stable_pos, n_stable),
+        _masked_mean(aligned_j_spec, valid_pos_dm, n_valid_all),
+    )
+
+    aligned_i_spec = aligned_i_spec - mean_i
+    aligned_j_spec = aligned_j_spec - mean_j
 
     # --- Batched distance matrices ---
     d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)         # [B_valid, M, M]
@@ -378,9 +408,7 @@ def build_phase_neighborhood_batch(
     d_learned_cross = torch.cdist(aligned_i_phase, aligned_j_phase)  # [B_valid, M, M]
 
     # --- Masks ---
-    range_M = torch.arange(M, device=device)
-    valid_pos = range_M.unsqueeze(0) < K_valid.unsqueeze(1)  # [B_valid, M]
-    mask_cross_batch = valid_pos.unsqueeze(2) & valid_pos.unsqueeze(1)  # [B_valid, M, M]
+    mask_cross_batch = valid_pos_dm.unsqueeze(2) & valid_pos_dm.unsqueeze(1)  # [B_valid, M, M]
     diag = torch.eye(M, device=device, dtype=torch.bool).unsqueeze(0)
     mask_self_batch = mask_cross_batch & ~diag
 
@@ -413,6 +441,7 @@ def phase_neighborhood_loss(
     min_valid_per_row: int = 2,
     self_similarity_weight: float = 1.0,
     cross_pixel_weight: float = 1.0,
+    ysfc_stable_min: int = 5,
     _batch: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Phase neighborhood matching loss for forest recovery trajectories.
@@ -483,6 +512,7 @@ def phase_neighborhood_loss(
             ysfc=ysfc,
             pair_indices=pair_indices,
             min_overlap=min_overlap,
+            ysfc_stable_min=ysfc_stable_min,
         )
 
     n_input = pair_indices.shape[0]
