@@ -330,11 +330,12 @@ class TestBuildBatch:
         assert not batch["valid_pair_mask"][0].item()
         assert batch["d_ref_self"].shape[0] == 0
 
-    def test_no_averaging_of_repeated_ysfc(self):
-        """Repeated ysfc values are kept as separate timesteps, not averaged.
+    def test_duplicate_ysfc_pair_excluded(self):
+        """Pairs where either pixel has a duplicate ysfc in the selected region
+        are excluded by the duplicate filter.
 
-        ysfc=[0,0,1,2,3] has 5 timesteps in the selected region [0,1,2,3].
-        M should be 5 (one slot per timestep), not 4 (one slot per unique value).
+        ysfc=[0,0,1,2,3] has ysfc=0 appearing twice (two disturbances).
+        The pair is filtered out: valid_pair_mask[0] should be False.
         """
         N, T, C, D = 1, 5, 2, 2
         # ysfc=0 at t=0 and t=1; ysfc=1,2,3 at t=2,3,4.
@@ -345,9 +346,8 @@ class TestBuildBatch:
         pairs = torch.tensor([[0, 0]])
         batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
 
-        assert batch["valid_pair_mask"][0].item()
-        # 5 timesteps in region (two ysfc=0 occurrences kept separately).
-        assert batch["M"] == 5
+        # Duplicate ysfc=0 triggers the filter → pair excluded.
+        assert not batch["valid_pair_mask"][0].item()
 
     def test_both_distance_types_computed(self):
         """Both self-similarity and cross-pixel matrices should be non-zero."""
