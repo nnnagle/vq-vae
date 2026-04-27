@@ -4,24 +4,32 @@ Forest phase neighborhood matching.
 Wrapper around :func:`soft_neighborhood_matching_loss` that handles the
 domain-specific logic for comparing forest pixel trajectories:
 
-1.  **ysfc-based temporal alignment** — two pixels are compared at
-    recovery stages (ysfc values) that both have observed.  When a ysfc
-    value appears at multiple time steps (e.g. two disturbances), the
-    spectral features and embeddings are averaged across those time steps
-    to produce one representative per ysfc value.
+1.  **ysfc-based temporal alignment** — two pixels are compared within
+    their best shared consecutive recovery region.  Shared ysfc values
+    are split into consecutive runs (values differing by 1); the run with
+    the lowest starting value is selected (tie: longest run).  This
+    avoids mixing post-disturbance recovery stages with pre-disturbance
+    years in the same distance matrix.
 
-2.  **Self-similarity and cross-pixel matching** — for each pair the
+2.  **No averaging of repeated ysfc values** — if a pixel has ysfc=0 at
+    two separate time steps (e.g. two disturbances), both are kept as
+    distinct data points rather than averaged into one representative.
+
+3.  **Self-similarity and cross-pixel matching** — for each pair the
     wrapper computes both:
 
     * *Self-similarity* distances: ``d(r_j(y), r_j(y'))`` and
-      ``d(z_i(y), z_i(y'))`` — teaches trajectory shape.
+      ``d(z_i(y), z_i(y'))`` — teaches trajectory shape.  Restricted to
+      ysfc values where each pixel has exactly one occurrence so positions
+      align unambiguously.
     * *Cross-pixel* distances: ``d(r_i(y), r_j(y'))`` and
       ``d(z_i(y), z_j(y'))`` — anchors embeddings in a shared space.
+      Uses all timesteps in the selected region (K_i × K_j).
 
-3.  **Overlap masking** — entries outside the overlap set (or on the
+4.  **Overlap masking** — entries outside the selected region (or on the
     diagonal for self-similarity) are masked.
 
-4.  **Type-similarity weighting** — each pixel pair's loss contribution
+5.  **Type-similarity weighting** — each pixel pair's loss contribution
     is weighted by how similar their type embeddings are.
 
 Usage
@@ -54,6 +62,61 @@ from losses.soft_neighborhood import soft_neighborhood_matching_loss
 
 
 # ---------------------------------------------------------------------------
+# Consecutive-region utilities
+# ---------------------------------------------------------------------------
+
+def _split_consecutive_regions(sorted_vals: list[int]) -> list[list[int]]:
+    """Split a sorted list of integers into maximal consecutive runs.
+
+    Two adjacent values belong to the same run iff they differ by exactly 1.
+
+    Parameters
+    ----------
+    sorted_vals : list of int
+        Sorted unique integer ysfc values.
+
+    Returns
+    -------
+    list of list of int
+        Each sub-list is one consecutive run, also sorted.
+    """
+    if not sorted_vals:
+        return []
+    regions: list[list[int]] = []
+    cur: list[int] = [sorted_vals[0]]
+    for v in sorted_vals[1:]:
+        if v == cur[-1] + 1:
+            cur.append(v)
+        else:
+            regions.append(cur)
+            cur = [v]
+    regions.append(cur)
+    return regions
+
+
+def _select_best_region(regions: list[list[int]]) -> list[int]:
+    """Pick the region with the lowest starting value; tie → longest.
+
+    Parameters
+    ----------
+    regions : list of list of int
+        Non-empty list of consecutive runs from :func:`_split_consecutive_regions`.
+
+    Returns
+    -------
+    list of int
+        The selected run.
+    """
+    if not regions:
+        return []
+    best = regions[0]
+    for r in regions[1:]:
+        if r[0] < best[0] or (r[0] == best[0] and len(r) > len(best)):
+            best = r
+    return best
+
+
+# ---------------------------------------------------------------------------
 # ysfc overlap utilities
 # ---------------------------------------------------------------------------
 
@@ -61,7 +124,12 @@ def build_ysfc_overlap(
     ysfc_i: torch.Tensor,
     ysfc_j: torch.Tensor,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
-    """Find shared ysfc values and the time indices for each.
+    """Find the best consecutive ysfc region shared by two pixels.
+
+    Shared unique ysfc values are split into consecutive runs; the run
+    with the lowest starting value is selected (tie: longest run).  This
+    avoids mixing pre-disturbance and post-disturbance stages when both
+    pixels share values from two disconnected recovery epochs.
 
     Parameters
     ----------
@@ -70,11 +138,11 @@ def build_ysfc_overlap(
 
     Returns
     -------
-    shared_values : Tensor ``[K]``
-        Sorted unique ysfc values present at both pixels.
+    region_values : Tensor ``[K]``
+        Sorted ysfc values in the selected consecutive region.
     groups_i : list of K LongTensors
-        ``groups_i[k]`` contains the time indices at pixel *i* where
-        ``ysfc_i == shared_values[k]``.
+        ``groups_i[k]`` contains all time indices at pixel *i* where
+        ``ysfc_i == region_values[k]``.
     groups_j : list of K LongTensors
         Same for pixel *j*.
     """
@@ -82,25 +150,26 @@ def build_ysfc_overlap(
 
     unique_i = ysfc_i.unique()
     unique_j = ysfc_j.unique()
-    shared_values = unique_i[torch.isin(unique_i, unique_j)]
+    shared_all = unique_i[torch.isin(unique_i, unique_j)]
 
-    if shared_values.numel() == 0:
+    if shared_all.numel() == 0:
         return (
             torch.empty(0, dtype=ysfc_i.dtype, device=device),
             [],
             [],
         )
 
-    # Sort for deterministic ordering.
-    shared_values = shared_values.sort().values
+    shared_sorted = shared_all.sort().values
 
-    groups_i = []
-    groups_j = []
-    for val in shared_values:
-        groups_i.append((ysfc_i == val).nonzero(as_tuple=False).squeeze(1))
-        groups_j.append((ysfc_j == val).nonzero(as_tuple=False).squeeze(1))
+    # Select the best consecutive region.
+    regions = _split_consecutive_regions(shared_sorted.tolist())
+    region = _select_best_region(regions)
+    region_vals = torch.tensor(region, dtype=ysfc_i.dtype, device=device)
 
-    return shared_values, groups_i, groups_j
+    groups_i = [(ysfc_i == v).nonzero(as_tuple=False).squeeze(1) for v in region_vals]
+    groups_j = [(ysfc_j == v).nonzero(as_tuple=False).squeeze(1) for v in region_vals]
+
+    return region_vals, groups_i, groups_j
 
 
 def average_features_by_ysfc(
@@ -230,15 +299,26 @@ def build_phase_neighborhood_batch(
 ) -> dict[str, torch.Tensor | int]:
     """Prepare aligned distance matrices for a batch of pixel pairs.
 
-    Vectorized implementation — no Python loops over pairs.  The strategy:
+    For each pair (i, j):
 
-    1. Build per-pixel indicator matrices ``[N, V, T]`` mapping each ysfc
-       value to its timestep(s).
-    2. Average features per ysfc value via batched matmul.
-    3. Compute per-pair overlap from presence vectors.
-    4. Align shared ysfc values to padded positions via a mapping matrix
-       and batched matmul (autograd-safe).
-    5. Compute all distance matrices with four batched ``cdist`` calls.
+    1. Find the shared unique ysfc values; split into consecutive runs;
+       select the run with the lowest starting value (tie: longest).
+       This isolates one recovery trajectory and avoids mixing
+       pre-disturbance years with post-disturbance recovery.
+
+    2. Collect **all** time indices from each pixel whose ysfc falls in
+       the selected region, sorted by ysfc value then by time.  Repeated
+       ysfc values (e.g. two disturbances producing two ysfc=0 timesteps)
+       are kept as separate entries — not averaged.
+
+    3. Compute four distance matrices:
+
+       * ``d_ref_self`` / ``d_learned_self`` — self-similarity at pixel
+         j (spectral) and pixel i (embedding).  Restricted to ysfc values
+         where each pixel has exactly one occurrence so positions align
+         unambiguously.  K_self × K_self.
+       * ``d_ref_cross`` / ``d_learned_cross`` — cross-pixel spectral and
+         embedding distances using all K_i × K_j timesteps.
 
     Parameters
     ----------
@@ -251,28 +331,32 @@ def build_phase_neighborhood_batch(
     pair_indices : LongTensor ``[B, 2]``
         Pairs of pixel indices ``(i, j)`` into the N anchors.
     min_overlap : int
-        Minimum overlap size for a pair to be included.
+        Minimum size of the selected consecutive region for a pair to be
+        included.  Applied after region selection (not to the total shared
+        count).
 
     Returns
     -------
     dict with keys:
 
     - ``d_ref_self`` : Tensor ``[B_valid, M, M]``
-        Self-similarity reference distances (at pixel *j*).
+        Self-similarity reference distances at pixel *j* (spectral).
     - ``d_learned_self`` : Tensor ``[B_valid, M, M]``
-        Self-similarity learned distances (at pixel *i*).
+        Self-similarity learned distances at pixel *i* (embedding).
+    - ``d_learned_self_j`` : Tensor ``[B_valid, M, M]``
+        Self-similarity learned distances at pixel *j* (embedding).
     - ``mask_self`` : BoolTensor ``[B_valid, M, M]``
-        Mask for self-similarity (diagonal excluded).
+        Valid K_self × K_self block, diagonal excluded.
     - ``d_ref_cross`` : Tensor ``[B_valid, M, M]``
-        Cross-pixel reference distances.
+        Cross-pixel reference distances (K_i × K_j valid block).
     - ``d_learned_cross`` : Tensor ``[B_valid, M, M]``
-        Cross-pixel learned distances.
+        Cross-pixel learned distances (K_i × K_j valid block).
     - ``mask_cross`` : BoolTensor ``[B_valid, M, M]``
-        Mask for cross-pixel (diagonal included).
+        Valid K_i × K_j block (diagonal included).
     - ``valid_pair_mask`` : BoolTensor ``[B]``
-        Which input pairs had sufficient overlap.
+        Which input pairs had a selected region of sufficient size.
     - ``M`` : int
-        Padded matrix size.
+        Padded matrix size = max(K_i, K_j) across valid pairs.
     """
     B = pair_indices.shape[0]
     N, T, C = spectral_features.shape
@@ -280,39 +364,60 @@ def build_phase_neighborhood_batch(
     device = spectral_features.device
     dtype = spectral_features.dtype
 
-    # --- Remap ysfc to contiguous 0..V-1 ---
     ysfc_long = ysfc.long()
-    unique_vals, ysfc_remapped = torch.unique(ysfc_long, return_inverse=True)
-    ysfc_remapped = ysfc_remapped.reshape(N, T)
-    V = unique_vals.shape[0]
 
-    # --- Build indicator matrix [N, V, T] ---
-    # indicator[n, v, t] = 1.0 if ysfc_remapped[n, t] == v
-    indicator = torch.zeros(N, V, T, device=device, dtype=dtype)
-    n_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(ysfc_remapped)
-    t_idx = torch.arange(T, device=device).unsqueeze(0).expand_as(ysfc_remapped)
-    indicator[n_idx, ysfc_remapped, t_idx] = 1.0
+    # --- Pass 1: per-pair region selection ---
+    valid_pair_mask = torch.zeros(B, dtype=torch.bool, device=device)
+    # Each entry: (pi, pj, t_i_cross, t_j_cross, t_i_self, t_j_self)
+    pair_data: list[tuple | None] = [None] * B
 
-    # --- Counts and presence per (pixel, ysfc value) ---
-    counts = indicator.sum(dim=2)  # [N, V]
-    presence = counts > 0          # [N, V]
+    for b in range(B):
+        pi = int(pair_indices[b, 0])
+        pj = int(pair_indices[b, 1])
+        ysfc_pi = ysfc_long[pi]   # [T]
+        ysfc_pj = ysfc_long[pj]   # [T]
 
-    # --- Average features per ysfc value via batched matmul ---
-    counts_safe = counts.clamp(min=1).unsqueeze(-1)  # [N, V, 1]
-    # [N, V, T] @ [N, T, C] -> [N, V, C]
-    avg_spec = torch.bmm(indicator, spectral_features) / counts_safe
-    # [N, V, T] @ [N, T, D] -> [N, V, D]
-    avg_phase = torch.bmm(indicator, phase_embeddings) / counts_safe
+        unique_i = ysfc_pi.unique()
+        unique_j = ysfc_pj.unique()
+        shared_all = unique_i[torch.isin(unique_i, unique_j)].sort().values
 
-    # --- Per-pair overlap ---
-    idx_i = pair_indices[:, 0]  # [B]
-    idx_j = pair_indices[:, 1]  # [B]
-    shared = presence[idx_i] & presence[idx_j]  # [B, V]
-    K_per_pair = shared.sum(dim=1)  # [B]
+        if shared_all.numel() == 0:
+            continue
 
-    # --- Filter by min_overlap ---
-    valid_pair_mask = K_per_pair >= min_overlap
+        regions = _split_consecutive_regions(shared_all.tolist())
+        region = _select_best_region(regions)
 
+        if len(region) < min_overlap:
+            continue
+
+        region_t = torch.tensor(region, dtype=ysfc_long.dtype, device=device)
+
+        # Cross-pixel: all timesteps in selected region for each pixel.
+        t_i_cross = torch.isin(ysfc_pi, region_t).nonzero(as_tuple=False).squeeze(1)
+        t_j_cross = torch.isin(ysfc_pj, region_t).nonzero(as_tuple=False).squeeze(1)
+        # Sort by ysfc value (stable preserves time order within same ysfc).
+        t_i_cross = t_i_cross[ysfc_pi[t_i_cross].argsort(stable=True)]
+        t_j_cross = t_j_cross[ysfc_pj[t_j_cross].argsort(stable=True)]
+
+        # Self-similarity: ysfc values with exactly one occurrence in each
+        # pixel so positions align unambiguously across i and j.
+        counts_i = (ysfc_pi.unsqueeze(0) == region_t.unsqueeze(1)).sum(dim=1)
+        counts_j = (ysfc_pj.unsqueeze(0) == region_t.unsqueeze(1)).sum(dim=1)
+        aligned_vals = region_t[(counts_i == 1) & (counts_j == 1)]
+
+        if aligned_vals.numel() >= 2:
+            t_i_self = torch.isin(ysfc_pi, aligned_vals).nonzero(as_tuple=False).squeeze(1)
+            t_j_self = torch.isin(ysfc_pj, aligned_vals).nonzero(as_tuple=False).squeeze(1)
+            t_i_self = t_i_self[ysfc_pi[t_i_self].argsort(stable=True)]
+            t_j_self = t_j_self[ysfc_pj[t_j_self].argsort(stable=True)]
+        else:
+            t_i_self = torch.empty(0, dtype=torch.long, device=device)
+            t_j_self = torch.empty(0, dtype=torch.long, device=device)
+
+        valid_pair_mask[b] = True
+        pair_data[b] = (pi, pj, t_i_cross, t_j_cross, t_i_self, t_j_self)
+
+    # --- Early exit ---
     empty_result = {
         "d_ref_self": torch.zeros(0, T, T, device=device, dtype=dtype),
         "d_learned_self": torch.zeros(0, T, T, device=device, dtype=dtype),
@@ -328,70 +433,75 @@ def build_phase_neighborhood_batch(
     if not valid_pair_mask.any():
         return empty_result
 
-    # --- Restrict to valid pairs ---
-    valid_idx = valid_pair_mask.nonzero(as_tuple=False).squeeze(1)
-    B_valid = valid_idx.shape[0]
-    idx_i_v = idx_i[valid_idx]   # [B_valid]
-    idx_j_v = idx_j[valid_idx]   # [B_valid]
-    shared_v = shared[valid_idx]  # [B_valid, V]
-    K_valid = K_per_pair[valid_idx]  # [B_valid]
-    M = K_valid.max().item()
+    valid_indices = valid_pair_mask.nonzero(as_tuple=False).squeeze(1)
+    B_valid = int(valid_indices.shape[0])
+    valid_pairs = [pair_data[int(b)] for b in valid_indices]
 
-    # --- Build mapping matrix [B_valid, M, V] ---
-    # Maps each shared ysfc value to a compressed position 0..K-1.
-    # mapping[b, pos, v] = 1.0 iff ysfc value v is the pos-th shared
-    # value for pair b.  Used via bmm to align features.
-    positions = shared_v.long().cumsum(dim=1) - 1  # [B_valid, V]
-    b_nz, v_nz = shared_v.nonzero(as_tuple=True)
-    pos_nz = positions[b_nz, v_nz]
+    # M = max sequence length across valid pairs (for padding).
+    M = max(
+        max(int(p[2].shape[0]), int(p[3].shape[0]))  # max(K_i_cross, K_j_cross)
+        for p in valid_pairs
+    )
 
-    mapping = torch.zeros(B_valid, M, V, device=device, dtype=dtype)
-    mapping[b_nz, pos_nz, v_nz] = 1.0
+    # --- Pass 2: build padded distance matrices ---
+    d_ref_self      = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
+    d_learned_self  = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
+    d_learned_self_j = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
+    mask_self       = torch.zeros(B_valid, M, M, device=device, dtype=torch.bool)
+    d_ref_cross     = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
+    d_learned_cross = torch.zeros(B_valid, M, M, device=device, dtype=dtype)
+    mask_cross      = torch.zeros(B_valid, M, M, device=device, dtype=torch.bool)
 
-    # --- Gather per-pair averaged features and align via bmm ---
-    avg_spec_i = avg_spec[idx_i_v]    # [B_valid, V, C]
-    avg_spec_j = avg_spec[idx_j_v]    # [B_valid, V, C]
-    avg_phase_i = avg_phase[idx_i_v]  # [B_valid, V, D]
-    avg_phase_j = avg_phase[idx_j_v]  # [B_valid, V, D]
+    for b, (pi, pj, t_i_c, t_j_c, t_i_s, t_j_s) in enumerate(valid_pairs):
+        K_i = int(t_i_c.shape[0])
+        K_j = int(t_j_c.shape[0])
+        K_self = int(t_i_s.shape[0])  # == t_j_s.shape[0]
 
-    aligned_i_spec = torch.bmm(mapping, avg_spec_i)    # [B_valid, M, C]
-    aligned_j_spec = torch.bmm(mapping, avg_spec_j)    # [B_valid, M, C]
-    aligned_i_phase = torch.bmm(mapping, avg_phase_i)  # [B_valid, M, D]
-    aligned_j_phase = torch.bmm(mapping, avg_phase_j)  # [B_valid, M, D]
+        # --- Cross-pixel distances (all timesteps in selected region) ---
+        # Demeaning removes per-pixel mean spectral level so distances
+        # reflect trajectory shape only.
+        fi = spectral_features[pi][t_i_c]   # [K_i, C]
+        fj = spectral_features[pj][t_j_c]   # [K_j, C]
+        fi = fi - fi.mean(0, keepdim=True)
+        fj = fj - fj.mean(0, keepdim=True)
+        zi = phase_embeddings[pi][t_i_c]     # [K_i, D]
+        zj = phase_embeddings[pj][t_j_c]     # [K_j, D]
 
-    # --- Per-pair demeaning over shared ysfc values ---
-    # Removing the per-pair mean removes the static spectral signature so
-    # that distances reflect temporal trajectory shape only.  Demeaning
-    # here (after alignment to shared ysfc positions) ensures both pixels
-    # are centred on the same set of recovery stages, avoiding baseline
-    # contamination from pre-disturbance values not shared by the pair.
-    shared_mean_i = aligned_i_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    shared_mean_j = aligned_j_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    aligned_i_spec = aligned_i_spec - shared_mean_i
-    aligned_j_spec = aligned_j_spec - shared_mean_j
+        drc = torch.cdist(fi.unsqueeze(0), fj.unsqueeze(0)).squeeze(0)   # [K_i, K_j]
+        dlc = torch.cdist(zi.unsqueeze(0), zj.unsqueeze(0)).squeeze(0)   # [K_i, K_j]
+        d_ref_cross[b, :K_i, :K_j] = drc
+        d_learned_cross[b, :K_i, :K_j] = dlc
+        mask_cross[b, :K_i, :K_j] = True
 
-    # --- Batched distance matrices ---
-    d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)         # [B_valid, M, M]
-    d_learned_self = torch.cdist(aligned_i_phase, aligned_i_phase)   # [B_valid, M, M]
-    d_learned_self_j = torch.cdist(aligned_j_phase, aligned_j_phase) # [B_valid, M, M]
-    d_ref_cross = torch.cdist(aligned_i_spec, aligned_j_spec)        # [B_valid, M, M]
-    d_learned_cross = torch.cdist(aligned_i_phase, aligned_j_phase)  # [B_valid, M, M]
+        # --- Self-similarity distances (single-occurrence ysfc values) ---
+        if K_self >= 2:
+            fi_s = spectral_features[pi][t_i_s]   # [K_self, C]
+            fj_s = spectral_features[pj][t_j_s]   # [K_self, C]
+            fi_s = fi_s - fi_s.mean(0, keepdim=True)
+            fj_s = fj_s - fj_s.mean(0, keepdim=True)
+            zi_s = phase_embeddings[pi][t_i_s]     # [K_self, D]
+            zj_s = phase_embeddings[pj][t_j_s]     # [K_self, D]
 
-    # --- Masks ---
-    range_M = torch.arange(M, device=device)
-    valid_pos = range_M.unsqueeze(0) < K_valid.unsqueeze(1)  # [B_valid, M]
-    mask_cross_batch = valid_pos.unsqueeze(2) & valid_pos.unsqueeze(1)  # [B_valid, M, M]
-    diag = torch.eye(M, device=device, dtype=torch.bool).unsqueeze(0)
-    mask_self_batch = mask_cross_batch & ~diag
+            drs = torch.cdist(fj_s.unsqueeze(0), fj_s.unsqueeze(0)).squeeze(0)
+            dls_i = torch.cdist(zi_s.unsqueeze(0), zi_s.unsqueeze(0)).squeeze(0)
+            dls_j = torch.cdist(zj_s.unsqueeze(0), zj_s.unsqueeze(0)).squeeze(0)
+            d_ref_self[b, :K_self, :K_self] = drs
+            d_learned_self[b, :K_self, :K_self] = dls_i
+            d_learned_self_j[b, :K_self, :K_self] = dls_j
+
+            ks_arange = torch.arange(K_self, device=device)
+            ms = torch.ones(K_self, K_self, dtype=torch.bool, device=device)
+            ms[ks_arange, ks_arange] = False
+            mask_self[b, :K_self, :K_self] = ms
 
     return {
         "d_ref_self": d_ref_self,
         "d_learned_self": d_learned_self,
         "d_learned_self_j": d_learned_self_j,
-        "mask_self": mask_self_batch,
+        "mask_self": mask_self,
         "d_ref_cross": d_ref_cross,
         "d_learned_cross": d_learned_cross,
-        "mask_cross": mask_cross_batch,
+        "mask_cross": mask_cross,
         "valid_pair_mask": valid_pair_mask,
         "M": M,
     }

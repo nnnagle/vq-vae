@@ -7,6 +7,8 @@ import torch
 
 from losses.soft_neighborhood import soft_neighborhood_matching_loss
 from losses.phase_neighborhood import (
+    _select_best_region,
+    _split_consecutive_regions,
     average_features_by_ysfc,
     build_phase_neighborhood_batch,
     build_ysfc_overlap,
@@ -215,13 +217,18 @@ class TestYsfcOverlap:
         assert groups_j[idx_0].tolist() == [0]  # one occurrence
 
     def test_pre_and_post_disturbance_overlap(self):
-        """Pixel with pre- and post-disturbance ysfc values overlaps
-        with a post-disturbance-only pixel."""
+        """When shared values span pre- and post-disturbance epochs, only
+        the post-disturbance (low-ysfc) consecutive region is selected."""
+        # Both pixels share 20, 21 (pre-disturbance) AND 0, 1, 2 (recovery).
+        # Shared set = {0,1,2,20,21} → two regions [0,1,2] and [20,21].
+        # Region [0,1,2] starts at 0 < 20, so it is selected.
         ysfc_i = torch.tensor([20, 21, 0, 1, 2], dtype=torch.float32)
-        ysfc_j = torch.tensor([0, 1, 2, 3, 4], dtype=torch.float32)
+        ysfc_j = torch.tensor([20, 21, 0, 1, 2, 3, 4], dtype=torch.float32)
 
         shared, groups_i, groups_j = build_ysfc_overlap(ysfc_i, ysfc_j)
         assert set(shared.tolist()) == {0.0, 1.0, 2.0}
+        assert len(groups_i) == 3
+        assert len(groups_j) == 3
 
     def test_sorted_output(self):
         """Shared values should be sorted."""
@@ -323,10 +330,14 @@ class TestBuildBatch:
         assert not batch["valid_pair_mask"][0].item()
         assert batch["d_ref_self"].shape[0] == 0
 
-    def test_stuttering_ysfc_averaging(self):
-        """Pixels with repeated ysfc values should produce averaged features."""
+    def test_no_averaging_of_repeated_ysfc(self):
+        """Repeated ysfc values are kept as separate timesteps, not averaged.
+
+        ysfc=[0,0,1,2,3] has 5 timesteps in the selected region [0,1,2,3].
+        M should be 5 (one slot per timestep), not 4 (one slot per unique value).
+        """
         N, T, C, D = 1, 5, 2, 2
-        # ysfc has ysfc=0 at t=0 and t=1.
+        # ysfc=0 at t=0 and t=1; ysfc=1,2,3 at t=2,3,4.
         ysfc = torch.tensor([[0, 0, 1, 2, 3]], dtype=torch.float32)
         spec = torch.randn(N, T, C)
         emb = torch.randn(N, T, D)
@@ -334,9 +345,9 @@ class TestBuildBatch:
         pairs = torch.tensor([[0, 0]])
         batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
 
-        # 4 unique ysfc values: {0, 1, 2, 3}
         assert batch["valid_pair_mask"][0].item()
-        assert batch["M"] == 4
+        # 5 timesteps in region (two ysfc=0 occurrences kept separately).
+        assert batch["M"] == 5
 
     def test_both_distance_types_computed(self):
         """Both self-similarity and cross-pixel matrices should be non-zero."""
@@ -353,6 +364,99 @@ class TestBuildBatch:
         assert batch["d_ref_cross"].abs().sum() > 0
         assert batch["d_learned_self"].abs().sum() > 0
         assert batch["d_learned_cross"].abs().sum() > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Consecutive-region helpers
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestConsecutiveRegionHelpers:
+    """Tests for _split_consecutive_regions and _select_best_region."""
+
+    def test_split_single_run(self):
+        assert _split_consecutive_regions([0, 1, 2, 3]) == [[0, 1, 2, 3]]
+
+    def test_split_two_runs(self):
+        result = _split_consecutive_regions([0, 1, 2, 20, 21])
+        assert result == [[0, 1, 2], [20, 21]]
+
+    def test_split_all_separate(self):
+        result = _split_consecutive_regions([0, 5, 10])
+        assert result == [[0], [5], [10]]
+
+    def test_split_empty(self):
+        assert _split_consecutive_regions([]) == []
+
+    def test_select_lowest_start(self):
+        """Region with lowest starting value wins."""
+        regions = [[20, 21], [0, 1, 2, 3]]
+        assert _select_best_region(regions) == [0, 1, 2, 3]
+
+    def test_select_tie_broken_by_length(self):
+        """When two regions share the same start, the longer one wins."""
+        # In practice tied starts can't arise from integer unique-value
+        # intersection, but the logic must be correct per spec.
+        regions = [[0, 1], [0, 1, 2, 3, 4, 5, 6]]
+        assert _select_best_region(regions) == [0, 1, 2, 3, 4, 5, 6]
+
+    def test_select_empty(self):
+        assert _select_best_region([]) == []
+
+    def test_build_ysfc_overlap_two_regions_selects_low(self):
+        """When shared values span two consecutive regions, the one
+        starting at the lower ysfc value is returned."""
+        # Shared = {0,1,2,20,21} → regions [0,1,2] and [20,21].
+        # [0,1,2] starts lower → selected.
+        ysfc_i = torch.tensor([20.0, 21.0, 0.0, 1.0, 2.0])
+        ysfc_j = torch.tensor([20.0, 21.0, 0.0, 1.0, 2.0, 3.0, 4.0])
+        shared, gi, gj = build_ysfc_overlap(ysfc_i, ysfc_j)
+        assert set(shared.tolist()) == {0.0, 1.0, 2.0}
+        assert len(gi) == 3
+        assert len(gj) == 3
+
+    def test_two_region_selection_in_batch(self):
+        """build_phase_neighborhood_batch uses only the selected region."""
+        # pixel 0: ysfc = [23,24, 0,1,2,3,4,5,6,7]  (pre-disturb then recovery)
+        # pixel 1: ysfc = [0,1,2,3,4,5,6, 23,24,25] (recovery then pre-disturb)
+        # Shared unique: {0..6,23,24} → regions [0..6] and [23,24].
+        # Best: [0..6] (len=7, starts at 0).  M should be 7.
+        T = 10
+        N, C, D = 2, 4, 8
+        torch.manual_seed(7)
+        spec = torch.randn(N, T, C)
+        emb = torch.randn(N, T, D)
+        ysfc = torch.tensor([
+            [23, 24, 0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, 2, 3, 4, 5, 6, 23, 24, 25],
+        ], dtype=torch.float32)
+
+        pairs = torch.tensor([[0, 1]])
+        batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
+
+        assert batch["valid_pair_mask"][0].item()
+        # Selected region is [0..6], 7 timesteps each → M = 7.
+        assert batch["M"] == 7
+        # Cross-pixel mask: 7 × 7 block.
+        assert batch["mask_cross"][0, :7, :7].all()
+        assert not batch["mask_cross"][0, 7:, :].any()
+
+    def test_region_smaller_than_min_overlap_excluded(self):
+        """If the selected region is shorter than min_overlap, pair is invalid."""
+        # Shared = {0,1,20,21} → regions [0,1] and [20,21].
+        # Best: [0,1], len=2 < min_overlap=3 → excluded.
+        T = 6
+        N, C, D = 2, 4, 8
+        spec = torch.randn(N, T, C)
+        emb = torch.randn(N, T, D)
+        ysfc = torch.tensor([
+            [20, 21, 0, 1, 5, 6],
+            [20, 21, 0, 1, 7, 8],
+        ], dtype=torch.float32)
+
+        pairs = torch.tensor([[0, 1]])
+        batch = build_phase_neighborhood_batch(spec, emb, ysfc, pairs, min_overlap=3)
+        assert not batch["valid_pair_mask"][0].item()
 
 
 # ══════════════════════════════════════════════════════════════════════════
