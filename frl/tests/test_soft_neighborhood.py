@@ -7,7 +7,7 @@ import torch
 
 from losses.soft_neighborhood import soft_neighborhood_matching_loss
 from losses.phase_neighborhood import (
-    average_features_by_ysfc,
+    select_features_by_ysfc,
     build_phase_neighborhood_batch,
     build_ysfc_overlap,
     phase_neighborhood_loss,
@@ -232,48 +232,65 @@ class TestYsfcOverlap:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Feature averaging
+# Feature selection
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestAverageFeatures:
+class TestSelectFeatures:
 
     def test_single_entry_groups(self):
-        """When each group has one entry, averaging is identity."""
+        """When each group has one entry, selection is identity."""
         T, C = 5, 3
         features = torch.randn(T, C)
+        ysfc = torch.arange(T, dtype=torch.float32)
         groups = [torch.tensor([t]) for t in range(T)]
-        result = average_features_by_ysfc(features, groups, K=T)
+        result = select_features_by_ysfc(features, groups, K=T, ysfc=ysfc)
         assert torch.allclose(result, features)
 
-    def test_averaging_reduces_duplicates(self):
-        """Groups with multiple entries produce the mean."""
-        features = torch.tensor([
-            [1.0, 2.0],
-            [3.0, 4.0],
-            [5.0, 6.0],
-            [7.0, 8.0],
-        ])
-        # Group 0: t=0,1 → mean [2, 3]
-        # Group 1: t=2,3 → mean [6, 7]
-        groups = [torch.tensor([0, 1]), torch.tensor([2, 3])]
-        result = average_features_by_ysfc(features, groups, K=2)
+    def test_selection_picks_longer_sequence(self):
+        """When a ysfc value appears in two sequences, the one from the
+        longer sequence is selected."""
+        # ysfc = [0, 1, 2, 0, 1, 2, 3, 4]
+        # Sequence 0: t=0,1,2 (length 3); Sequence 1: t=3,4,5,6,7 (length 5).
+        # For ysfc=0: t=0 (seq len 3) vs t=3 (seq len 5) → pick t=3.
+        ysfc = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4], dtype=torch.float32)
+        T, C = ysfc.shape[0], 2
+        features = torch.arange(T * C, dtype=torch.float32).reshape(T, C)
 
-        expected = torch.tensor([[2.0, 3.0], [6.0, 7.0]])
-        assert torch.allclose(result, expected)
+        # Group for ysfc=0: t=0 and t=3.
+        groups = [torch.tensor([0, 3])]
+        result = select_features_by_ysfc(features, groups, K=1, ysfc=ysfc)
 
-    def test_gradient_flows_through_averaging(self):
-        """Gradients should propagate through the averaging."""
+        # Should select t=3 (longer sequence).
+        assert torch.allclose(result[0], features[3])
+
+    def test_tie_broken_by_most_recent(self):
+        """Equal-length sequences → most-recent timestep wins."""
+        # ysfc = [0, 1, 2, 0, 1, 2] — two sequences each of length 3.
+        # For ysfc=0 at t=0 and t=3 → both seq len 3, pick t=3 (most recent).
+        ysfc = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.float32)
+        T, C = ysfc.shape[0], 2
+        features = torch.arange(T * C, dtype=torch.float32).reshape(T, C)
+
+        groups = [torch.tensor([0, 3])]  # group for ysfc=0
+        result = select_features_by_ysfc(features, groups, K=1, ysfc=ysfc)
+        assert torch.allclose(result[0], features[3])
+
+    def test_gradient_flows_through_selection(self):
+        """Gradient flows only through the selected timestep (not others)."""
+        # Two sequences of lengths 2 and 3; ysfc=0 appears at t=0 (seq len 2)
+        # and t=2 (seq len 3). Selection picks t=2.
+        ysfc = torch.tensor([0, 1, 0, 1, 2], dtype=torch.float32)
         features = torch.randn(5, 3, requires_grad=True)
-        groups = [torch.tensor([0, 1]), torch.tensor([2]), torch.tensor([3, 4])]
-        result = average_features_by_ysfc(features, groups, K=3)
+        groups = [torch.tensor([0, 2])]  # group for ysfc=0
+        result = select_features_by_ysfc(features, groups, K=1, ysfc=ysfc)
         result.sum().backward()
 
         assert features.grad is not None
-        # t=0 and t=1 are in a group of 2, so gradient = 1/2.
-        assert torch.allclose(features.grad[0], torch.tensor([0.5, 0.5, 0.5]))
-        # t=2 is alone, gradient = 1.
-        assert torch.allclose(features.grad[2], torch.tensor([1.0, 1.0, 1.0]))
+        # Selected t=2: gradient = 1.
+        assert torch.allclose(features.grad[2], torch.ones(3))
+        # Non-selected t=0: gradient = 0.
+        assert torch.allclose(features.grad[0], torch.zeros(3))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -323,8 +340,8 @@ class TestBuildBatch:
         assert not batch["valid_pair_mask"][0].item()
         assert batch["d_ref_self"].shape[0] == 0
 
-    def test_stuttering_ysfc_averaging(self):
-        """Pixels with repeated ysfc values should produce averaged features."""
+    def test_stuttering_ysfc_selection(self):
+        """Pixels with repeated ysfc values should produce one representative per ysfc value."""
         N, T, C, D = 1, 5, 2, 2
         # ysfc has ysfc=0 at t=0 and t=1.
         ysfc = torch.tensor([[0, 0, 1, 2, 3]], dtype=torch.float32)

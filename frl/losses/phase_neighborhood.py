@@ -7,8 +7,8 @@ domain-specific logic for comparing forest pixel trajectories:
 1.  **ysfc-based temporal alignment** — two pixels are compared at
     recovery stages (ysfc values) that both have observed.  When a ysfc
     value appears at multiple time steps (e.g. two disturbances), the
-    spectral features and embeddings are averaged across those time steps
-    to produce one representative per ysfc value.
+    time step from the **longest recovery sequence** is selected as the
+    representative.  Ties are broken by most-recent (highest t).
 
 2.  **Self-similarity and cross-pixel matching** — for each pair the
     wrapper computes both:
@@ -103,12 +103,45 @@ def build_ysfc_overlap(
     return shared_values, groups_i, groups_j
 
 
-def average_features_by_ysfc(
+def _compute_seq_lengths_per_t(ysfc: torch.Tensor) -> torch.Tensor:
+    """Return the length of the recovery sequence each timestep belongs to.
+
+    A new sequence starts at t=0 or whenever ysfc decreases (reset after
+    disturbance).
+
+    Parameters
+    ----------
+    ysfc : Tensor ``[T]``
+        Per-timestep ysfc values (integer-valued float).
+
+    Returns
+    -------
+    lengths : Tensor ``[T]`` (float)
+        Length of the sequence containing each timestep.
+    """
+    T = ysfc.shape[0]
+    device = ysfc.device
+    ysfc_f = ysfc.float()
+    # Pad so that t=0 is always a sequence start.
+    ysfc_prev = torch.cat([ysfc_f[:1] + 1.0, ysfc_f[:-1]])
+    seq_id = (ysfc_f < ysfc_prev).long().cumsum(0) - 1  # [T]
+    S = int(seq_id.max().item()) + 1
+    seq_len = torch.zeros(S, device=device, dtype=ysfc_f.dtype)
+    seq_len.scatter_add_(0, seq_id, torch.ones(T, device=device, dtype=ysfc_f.dtype))
+    return seq_len[seq_id]  # [T]
+
+
+def select_features_by_ysfc(
     features: torch.Tensor,
     groups: list[torch.Tensor],
     K: int,
+    ysfc: torch.Tensor,
 ) -> torch.Tensor:
-    """Average features within each ysfc group.
+    """Select one feature vector per ysfc group using the longest sequence.
+
+    When a ysfc value appears at multiple time steps (two disturbances),
+    the time step from the longest recovery sequence is chosen.  Ties are
+    broken by most-recent (highest t).
 
     Parameters
     ----------
@@ -118,18 +151,29 @@ def average_features_by_ysfc(
         Each entry contains time indices belonging to one ysfc value.
     K : int
         Number of groups (= number of shared ysfc values).
+    ysfc : Tensor ``[T]``
+        Full ysfc time series for this pixel (used for sequence detection).
 
     Returns
     -------
-    averaged : Tensor ``[K, C]``
-        One averaged feature vector per ysfc value.  Gradients flow
-        through the averaging operation.
+    selected : Tensor ``[K, C]``
+        One selected feature vector per ysfc value.  Gradients flow
+        through the selected time step.
     """
+    T = ysfc.shape[0]
+    seq_lengths_per_t = _compute_seq_lengths_per_t(ysfc)
     parts = []
     for k in range(K):
-        idx = groups[k]
-        parts.append(features[idx].mean(dim=0))  # [C]
+        idx = groups[k]  # [m] time indices for this ysfc value
+        # Score: longer sequence first, most recent as tie-break.
+        scores = seq_lengths_per_t[idx] * (T + 1) + idx.float()
+        best = idx[scores.argmax()]
+        parts.append(features[best])  # [C]
     return torch.stack(parts, dim=0)  # [K, C]
+
+
+# Keep old name as alias so any external callers don't break immediately.
+average_features_by_ysfc = select_features_by_ysfc
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +189,9 @@ def compute_aligned_distances(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Compute ysfc-aligned self-similarity and cross-pixel distance matrices.
 
-    For each shared ysfc value, features are averaged across any
-    duplicate time steps.  Then two pairs of distance matrices are
-    produced:
+    For each shared ysfc value, the time step from the longest recovery
+    sequence is selected (ties broken by most-recent).  Then two pairs
+    of distance matrices are produced:
 
     * **Self-similarity reference** at pixel *j*: ``d(r_j(y), r_j(y'))``
     * **Self-similarity learned** at pixel *i*: ``d(z_i(y), z_i(y'))``
@@ -196,9 +240,9 @@ def compute_aligned_distances(
     if K == 0:
         return d_self, d_cross, mask_self, mask_cross, K
 
-    # Average features within ysfc groups.
-    avg_i = average_features_by_ysfc(features_i, groups_i, K)  # [K, C]
-    avg_j = average_features_by_ysfc(features_j, groups_j, K)  # [K, C]
+    # Select features within ysfc groups (longest sequence; tie-break: most recent).
+    avg_i = select_features_by_ysfc(features_i, groups_i, K, ysfc_i)  # [K, C]
+    avg_j = select_features_by_ysfc(features_j, groups_j, K, ysfc_j)  # [K, C]
 
     # Self-similarity at pixel j: d(r_j(y), r_j(y'))
     d_self_kk = torch.cdist(avg_j.unsqueeze(0), avg_j.unsqueeze(0)).squeeze(0)
@@ -234,7 +278,8 @@ def build_phase_neighborhood_batch(
 
     1. Build per-pixel indicator matrices ``[N, V, T]`` mapping each ysfc
        value to its timestep(s).
-    2. Average features per ysfc value via batched matmul.
+    2. Detect recovery sequences and select the best timestep per (pixel,
+       ysfc value): prefer the longest sequence; tie-break by most-recent.
     3. Compute per-pair overlap from presence vectors.
     4. Align shared ysfc values to padded positions via a mapping matrix
        and batched matmul (autograd-safe).
@@ -297,12 +342,32 @@ def build_phase_neighborhood_batch(
     counts = indicator.sum(dim=2)  # [N, V]
     presence = counts > 0          # [N, V]
 
-    # --- Average features per ysfc value via batched matmul ---
-    counts_safe = counts.clamp(min=1).unsqueeze(-1)  # [N, V, 1]
-    # [N, V, T] @ [N, T, C] -> [N, V, C]
-    avg_spec = torch.bmm(indicator, spectral_features) / counts_safe
-    # [N, V, T] @ [N, T, D] -> [N, V, D]
-    avg_phase = torch.bmm(indicator, phase_embeddings) / counts_safe
+    # --- Sequence detection: new sequence at t=0 or whenever ysfc decreases ---
+    ysfc_f = ysfc.float()
+    ysfc_prev = torch.cat([ysfc_f[:, :1] + 1.0, ysfc_f[:, :-1]], dim=1)  # [N, T]
+    seq_id = (ysfc_f < ysfc_prev).long().cumsum(dim=1) - 1               # [N, T]
+
+    # --- Sequence lengths per timestep [N, T] ---
+    S = int(seq_id.max().item()) + 1
+    seq_ind = torch.zeros(N, S, T, device=device, dtype=dtype)
+    seq_ind[n_idx, seq_id, t_idx] = 1.0
+    seq_lengths = seq_ind.sum(dim=2)          # [N, S]
+    seq_lengths_per_t = seq_lengths[n_idx, seq_id]  # [N, T]
+
+    # --- Select best timestep per (pixel, ysfc value) ---
+    # Priority: longer sequence first, tie-break by most-recent (highest t).
+    t_range = torch.arange(T, device=device, dtype=dtype).unsqueeze(0)  # [1, T]
+    score_per_t = seq_lengths_per_t * (T + 1) + t_range                 # [N, T]
+    score_expanded = score_per_t.unsqueeze(1).expand(N, V, T)           # [N, V, T]
+    masked_score = torch.where(
+        indicator > 0,
+        score_expanded,
+        torch.full_like(score_expanded, float('-inf')),
+    )
+    best_t = masked_score.argmax(dim=2)                                  # [N, V]
+    n_exp = torch.arange(N, device=device).unsqueeze(1).expand(N, V)    # [N, V]
+    selected_spec  = spectral_features[n_exp, best_t, :]                # [N, V, C]
+    selected_phase = phase_embeddings[n_exp, best_t, :]                 # [N, V, D]
 
     # --- Per-pair overlap ---
     idx_i = pair_indices[:, 0]  # [B]
@@ -348,16 +413,16 @@ def build_phase_neighborhood_batch(
     mapping = torch.zeros(B_valid, M, V, device=device, dtype=dtype)
     mapping[b_nz, pos_nz, v_nz] = 1.0
 
-    # --- Gather per-pair averaged features and align via bmm ---
-    avg_spec_i = avg_spec[idx_i_v]    # [B_valid, V, C]
-    avg_spec_j = avg_spec[idx_j_v]    # [B_valid, V, C]
-    avg_phase_i = avg_phase[idx_i_v]  # [B_valid, V, D]
-    avg_phase_j = avg_phase[idx_j_v]  # [B_valid, V, D]
+    # --- Gather per-pair selected features and align via bmm ---
+    sel_spec_i  = selected_spec[idx_i_v]   # [B_valid, V, C]
+    sel_spec_j  = selected_spec[idx_j_v]   # [B_valid, V, C]
+    sel_phase_i = selected_phase[idx_i_v]  # [B_valid, V, D]
+    sel_phase_j = selected_phase[idx_j_v]  # [B_valid, V, D]
 
-    aligned_i_spec = torch.bmm(mapping, avg_spec_i)    # [B_valid, M, C]
-    aligned_j_spec = torch.bmm(mapping, avg_spec_j)    # [B_valid, M, C]
-    aligned_i_phase = torch.bmm(mapping, avg_phase_i)  # [B_valid, M, D]
-    aligned_j_phase = torch.bmm(mapping, avg_phase_j)  # [B_valid, M, D]
+    aligned_i_spec  = torch.bmm(mapping, sel_spec_i)   # [B_valid, M, C]
+    aligned_j_spec  = torch.bmm(mapping, sel_spec_j)   # [B_valid, M, C]
+    aligned_i_phase = torch.bmm(mapping, sel_phase_i)  # [B_valid, M, D]
+    aligned_j_phase = torch.bmm(mapping, sel_phase_j)  # [B_valid, M, D]
 
     # --- Per-pair demeaning over shared ysfc values ---
     # Removing the per-pair mean removes the static spectral signature so
@@ -427,8 +492,8 @@ def phase_neighborhood_loss(
       values.  Anchors embeddings in a shared metric space.
 
     When a ysfc value appears at multiple time steps (e.g. two
-    disturbances), features are averaged across those time steps to
-    produce one representative per ysfc value.
+    disturbances), the time step from the longest recovery sequence is
+    selected as the representative (ties broken by most-recent).
 
     Parameters
     ----------
