@@ -465,6 +465,10 @@ class LossConfig:
     margin: Optional[float] = None   # softplus ranking margin
     delta: Optional[float] = None    # min dynamism difference to trigger constraint
 
+    # --- phase_recovery_discrimination-specific ---
+    low_ysfc_max: Optional[float] = None   # ysfc <= this → "disturbed" (default 1)
+    high_ysfc_min: Optional[float] = None  # ysfc >= this → "recovered" (default 5)
+
 
 @dataclass
 class BindingsConfig:

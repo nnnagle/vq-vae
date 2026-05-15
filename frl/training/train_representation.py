@@ -45,6 +45,7 @@ from losses.phase_neighborhood import (
     compute_phase_spread_ranking,
     phase_neighborhood_loss,
 )
+from losses.triplet_phase import phase_recovery_discrimination_loss
 from losses.variance_covariance import variance_covariance_loss
 from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
 from utils import (
@@ -115,6 +116,7 @@ def process_batch(
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
     spread_config: dict | None = None,
+    recovery_disc_config: dict | None = None,
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
@@ -156,6 +158,7 @@ def process_batch(
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
     total_phase_spread_loss = 0.0
+    total_phase_recovery_disc_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -389,6 +392,7 @@ def process_batch(
         # Loss computation runs on GPU (requires gradients through phase encoder).
         phase_loss_val = torch.tensor(0.0, device=device)
         phase_spread_loss_val = torch.tensor(0.0, device=device)
+        phase_recovery_disc_loss_val = torch.tensor(0.0, device=device)
         phase_vcr_loss_val = torch.tensor(0.0, device=device)
         if phase_sampler is not None and phase_config is not None:
             # Build ysfc feature via FeatureBuilder (returns numpy)
@@ -583,11 +587,35 @@ def process_batch(
                                     spread_config['weight'] * spread_w * spread_loss
                                 )
 
+                        # --- Phase recovery discrimination loss ---
+                        if recovery_disc_config is not None:
+                            rd_start = recovery_disc_config['curriculum_start_epoch']
+                            rd_ramp  = recovery_disc_config['curriculum_ramp_epochs']
+                            if epoch < rd_start:
+                                rd_w = 0.0
+                            elif epoch >= rd_start + rd_ramp:
+                                rd_w = 1.0
+                            else:
+                                rd_w = (epoch - rd_start) / rd_ramp
+
+                            if rd_w > 0.0:
+                                rd_loss, _ = phase_recovery_discrimination_loss(
+                                    z_phase=z_phase_at_anchors,
+                                    ysfc=ysfc_at_anchors_gpu,
+                                    margin=recovery_disc_config['margin'],
+                                    low_ysfc_max=recovery_disc_config['low_ysfc_max'],
+                                    high_ysfc_min=recovery_disc_config['high_ysfc_min'],
+                                )
+                                phase_recovery_disc_loss_val = (
+                                    recovery_disc_config['weight'] * rd_w * rd_loss
+                                )
+
         # Combine losses with weights (spectral loss computed globally after loop)
         spatial_weight = config.get('spatial_loss_weight', 1.0)
         loss = (spatial_weight * spatial_loss_val
                 + phase_loss_val
                 + phase_spread_loss_val
+                + phase_recovery_disc_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
                 + evt_loss_val)
@@ -618,6 +646,7 @@ def process_batch(
             total_spatial_loss += spatial_loss_val
             total_phase_loss += phase_loss_val
             total_phase_spread_loss += phase_spread_loss_val
+            total_phase_recovery_disc_loss += phase_recovery_disc_loss_val
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
             total_evt_loss += evt_loss_val
@@ -626,6 +655,7 @@ def process_batch(
             total_spatial_loss += spatial_loss_val.item()
             total_phase_loss += phase_loss_val.item()
             total_phase_spread_loss += phase_spread_loss_val.item()
+            total_phase_recovery_disc_loss += phase_recovery_disc_loss_val.item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_evt_loss += evt_loss_val.item()
@@ -764,7 +794,7 @@ def process_batch(
     if n_valid == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'phase_spread_loss': 0.0,
+            'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'n_valid': 0,
@@ -788,6 +818,7 @@ def process_batch(
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = total_phase_loss / n_valid
     mean_phase_spread_loss = total_phase_spread_loss / n_valid
+    mean_phase_recovery_disc_loss = total_phase_recovery_disc_loss / n_valid
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
     mean_evt_loss = total_evt_loss / n_valid
@@ -799,7 +830,7 @@ def process_batch(
             return {
                 'loss': float('nan'), 'spectral_loss': float('nan'),
                 'spatial_loss': float('nan'), 'phase_loss': float('nan'),
-                'phase_spread_loss': float('nan'),
+                'phase_spread_loss': float('nan'), 'phase_recovery_disc_loss': float('nan'),
                 'vcr_loss': float('nan'), 'phase_vcr_loss': float('nan'),
                 'evt_loss': float('nan'), 'evt_diag': _empty_evt_diag,
                 'n_valid': 0,
@@ -827,6 +858,7 @@ def process_batch(
         mean_spatial_loss = mean_spatial_loss.item()
         mean_phase_loss = mean_phase_loss.item()
         mean_phase_spread_loss = mean_phase_spread_loss.item()
+        mean_phase_recovery_disc_loss = mean_phase_recovery_disc_loss.item()
         mean_vcr_loss = mean_vcr_loss.item()
         mean_phase_vcr_loss = mean_phase_vcr_loss.item()
         mean_evt_loss = mean_evt_loss.item() if hasattr(mean_evt_loss, 'item') else float(mean_evt_loss)
@@ -890,6 +922,7 @@ def process_batch(
         'spatial_loss': mean_spatial_loss,
         'phase_loss': mean_phase_loss,
         'phase_spread_loss': mean_phase_spread_loss,
+        'phase_recovery_disc_loss': mean_phase_recovery_disc_loss if not hasattr(mean_phase_recovery_disc_loss, 'item') else mean_phase_recovery_disc_loss.item(),
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
@@ -923,6 +956,7 @@ def train_epoch(
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
     spread_config: dict | None = None,
+    recovery_disc_config: dict | None = None,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
 ) -> dict:
@@ -932,6 +966,7 @@ def train_epoch(
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
     total_phase_spread_loss = 0.0
+    total_phase_recovery_disc_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -957,7 +992,7 @@ def train_epoch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
             phase_sampler=phase_sampler, phase_config=phase_config,
-            spread_config=spread_config,
+            spread_config=spread_config, recovery_disc_config=recovery_disc_config,
             epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
@@ -969,6 +1004,7 @@ def train_epoch(
             total_spatial_loss += stats['spatial_loss']
             total_phase_loss += stats['phase_loss']
             total_phase_spread_loss += stats.get('phase_spread_loss', 0.0)
+            total_phase_recovery_disc_loss += stats.get('phase_recovery_disc_loss', 0.0)
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_evt_loss += stats.get('evt_loss', 0.0)
@@ -1021,7 +1057,7 @@ def train_epoch(
     if total_batches == 0:
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'phase_spread_loss': 0.0,
+            'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'evt_loss': 0.0,
             'batches': 0,
@@ -1048,6 +1084,7 @@ def train_epoch(
         'spatial_loss': total_spatial_loss / total_batches,
         'phase_loss': total_phase_loss / total_batches,
         'phase_spread_loss': total_phase_spread_loss / total_batches,
+        'phase_recovery_disc_loss': total_phase_recovery_disc_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
@@ -1074,6 +1111,7 @@ def validate_epoch(
     phase_sampler: AnchorSampler | None = None,
     phase_config: dict | None = None,
     spread_config: dict | None = None,
+    recovery_disc_config: dict | None = None,
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
@@ -1084,6 +1122,7 @@ def validate_epoch(
     total_spatial_loss = 0.0
     total_phase_loss = 0.0
     total_phase_spread_loss = 0.0
+    total_phase_recovery_disc_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -1106,7 +1145,7 @@ def validate_epoch(
                 batch, feature_builder, model, device, config,
                 training=False,
                 phase_sampler=phase_sampler, phase_config=phase_config,
-                spread_config=spread_config,
+                spread_config=spread_config, recovery_disc_config=recovery_disc_config,
                 epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
             )
             if stats['n_valid'] > 0:
@@ -1115,6 +1154,7 @@ def validate_epoch(
                 total_spatial_loss += stats['spatial_loss']
                 total_phase_loss += stats['phase_loss']
                 total_phase_spread_loss += stats.get('phase_spread_loss', 0.0)
+                total_phase_recovery_disc_loss += stats.get('phase_recovery_disc_loss', 0.0)
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_evt_loss += stats.get('evt_loss', 0.0)
@@ -1140,7 +1180,7 @@ def validate_epoch(
         )
         return {
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
-            'phase_loss': 0.0, 'phase_spread_loss': 0.0,
+            'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'batches': 0,
@@ -1167,6 +1207,7 @@ def validate_epoch(
         'spatial_loss': total_spatial_loss / total_batches,
         'phase_loss': total_phase_loss / total_batches,
         'phase_spread_loss': total_phase_spread_loss / total_batches,
+        'phase_recovery_disc_loss': total_phase_recovery_disc_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
@@ -1653,6 +1694,28 @@ def main():
             f"ramp={spread_config['curriculum_ramp_epochs']}]"
         )
 
+    # --- Phase recovery discrimination loss setup ---
+    recovery_disc_loss_cfg = bindings_config.get_loss('phase_recovery_discrimination')
+    recovery_disc_config = None
+    if recovery_disc_loss_cfg is not None:
+        cur_rd = recovery_disc_loss_cfg.curriculum
+        recovery_disc_config = {
+            'weight': recovery_disc_loss_cfg.weight if recovery_disc_loss_cfg.weight is not None else 1.0,
+            'margin': recovery_disc_loss_cfg.margin if recovery_disc_loss_cfg.margin is not None else 0.5,
+            'low_ysfc_max': recovery_disc_loss_cfg.low_ysfc_max if recovery_disc_loss_cfg.low_ysfc_max is not None else 1.0,
+            'high_ysfc_min': recovery_disc_loss_cfg.high_ysfc_min if recovery_disc_loss_cfg.high_ysfc_min is not None else 5.0,
+            'curriculum_start_epoch': cur_rd.start_epoch if cur_rd else 30,
+            'curriculum_ramp_epochs': cur_rd.ramp_epochs if cur_rd else 10,
+        }
+        logger.info(
+            f"Phase recovery discrimination loss enabled: weight={recovery_disc_config['weight']}, "
+            f"margin={recovery_disc_config['margin']}, "
+            f"low_ysfc_max={recovery_disc_config['low_ysfc_max']}, "
+            f"high_ysfc_min={recovery_disc_config['high_ysfc_min']}, "
+            f"curriculum=[start={recovery_disc_config['curriculum_start_epoch']}, "
+            f"ramp={recovery_disc_config['curriculum_ramp_epochs']}]"
+        )
+
     # --- EVT soft neighbourhood loss setup ---
     # The EVT-stratified anchor sampler is built whenever the EVT loss config
     # exists, regardless of loss weight. This allows EVT-stratified anchor
@@ -1890,7 +1953,7 @@ def main():
           train_dataloader, feature_builder, model,
           optimizer, scheduler, device, loss_config, epoch, num_epochs,
           phase_sampler=phase_sampler, phase_config=phase_config,
-          spread_config=spread_config,
+          spread_config=spread_config, recovery_disc_config=recovery_disc_config,
           evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
@@ -1898,7 +1961,7 @@ def main():
           val_dataloader, feature_builder, model,
           device, loss_config,
           phase_sampler=phase_sampler, phase_config=phase_config,
-          spread_config=spread_config,
+          spread_config=spread_config, recovery_disc_config=recovery_disc_config,
           epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
         )
 
@@ -1907,6 +1970,7 @@ def main():
             f"  Train: {train_stats['loss']:.4f} "
             f"spec={train_stats['spectral_loss']:.4f} spat={train_stats['spatial_loss']:.4f} "
             f"phase={train_stats['phase_loss']:.4f} spr={train_stats.get('phase_spread_loss', 0.0):.4f} "
+            f"rdisc={train_stats.get('phase_recovery_disc_loss', 0.0):.4f} "
             f"vcr={train_stats['vcr_loss']:.4f} "
             f"pvcr={train_stats['phase_vcr_loss']:.4f} evt={train_stats['evt_loss']:.4f}"
         )
@@ -1914,6 +1978,7 @@ def main():
             f"  Val:   {val_stats['loss']:.4f} "
             f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "
             f"phase={val_stats['phase_loss']:.4f} spr={val_stats.get('phase_spread_loss', 0.0):.4f} "
+            f"rdisc={val_stats.get('phase_recovery_disc_loss', 0.0):.4f} "
             f"vcr={val_stats['vcr_loss']:.4f} "
             f"pvcr={val_stats['phase_vcr_loss']:.4f} evt={val_stats['evt_loss']:.4f}"
         )
@@ -2043,17 +2108,19 @@ def main():
             "train/loss_total":         train_stats['loss'],
             "train/loss_spectral":      train_stats['spectral_loss'],
             "train/loss_spatial":       train_stats['spatial_loss'],
-            "train/loss_phase":         train_stats['phase_loss'],
-            "train/loss_phase_spread":  train_stats.get('phase_spread_loss', 0.0),
-            "train/loss_vcr":           train_stats['vcr_loss'],
-            "train/loss_phase_vcr":     train_stats['phase_vcr_loss'],
-            "val/loss_total":           val_stats['loss'],
-            "val/loss_spectral":        val_stats['spectral_loss'],
-            "val/loss_spatial":         val_stats['spatial_loss'],
-            "val/loss_phase":           val_stats['phase_loss'],
-            "val/loss_phase_spread":    val_stats.get('phase_spread_loss', 0.0),
-            "val/loss_vcr":             val_stats['vcr_loss'],
-            "val/loss_phase_vcr":       val_stats['phase_vcr_loss'],
+            "train/loss_phase":              train_stats['phase_loss'],
+            "train/loss_phase_spread":       train_stats.get('phase_spread_loss', 0.0),
+            "train/loss_phase_recovery_disc": train_stats.get('phase_recovery_disc_loss', 0.0),
+            "train/loss_vcr":                train_stats['vcr_loss'],
+            "train/loss_phase_vcr":          train_stats['phase_vcr_loss'],
+            "val/loss_total":                val_stats['loss'],
+            "val/loss_spectral":             val_stats['spectral_loss'],
+            "val/loss_spatial":              val_stats['spatial_loss'],
+            "val/loss_phase":                val_stats['phase_loss'],
+            "val/loss_phase_spread":         val_stats.get('phase_spread_loss', 0.0),
+            "val/loss_phase_recovery_disc":  val_stats.get('phase_recovery_disc_loss', 0.0),
+            "val/loss_vcr":                  val_stats['vcr_loss'],
+            "val/loss_phase_vcr":            val_stats['phase_vcr_loss'],
         }
 
         # Checkpoint state dict (shared by periodic and last saves).
