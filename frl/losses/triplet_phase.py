@@ -27,8 +27,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -341,3 +343,84 @@ def phase_triplet_loss(
     }
 
     return loss, stats
+
+
+# ---------------------------------------------------------------------------
+# Recovery discrimination loss
+# ---------------------------------------------------------------------------
+
+def phase_recovery_discrimination_loss(
+    z_phase: torch.Tensor,
+    ysfc: torch.Tensor,
+    margin: float = 0.5,
+    low_ysfc_max: float = 1.0,
+    high_ysfc_min: float = 5.0,
+) -> Tuple[torch.Tensor, dict]:
+    """Margin loss: fresh-disturbance embeddings should differ from recovered embeddings.
+
+    For each pixel that has both a "disturbed" timestep (ysfc <= low_ysfc_max,
+    typically ysfc=0 or 1) and a "recovered" timestep (ysfc >= high_ysfc_min),
+    every (disturbed, recovered) pair contributes::
+
+        softplus(margin - L2_distance(z_disturbed, z_recovered))
+
+    This fills the gap left by the triplet loss, which skips ysfc=0 years.
+    Pinning disturbance-year embeddings away from recovered-state embeddings
+    directly trains the model to encode recovery stage.
+
+    Parameters
+    ----------
+    z_phase : Tensor ``[N, T, D]``
+        Phase embeddings at N anchor pixels, T timesteps.
+    ysfc : Tensor ``[N, T]``
+        Per-pixel ysfc time series (NaN = invalid / undisturbed).
+    margin : float
+        Minimum desired L2 distance between disturbed and recovered embeddings.
+    low_ysfc_max : float
+        Upper bound for the "disturbed" class (inclusive). Default 1 captures
+        ysfc=0 (disturbance year) and ysfc=1 (first recovery year).
+    high_ysfc_min : float
+        Lower bound for the "recovered" class (inclusive). Default 5 gives a
+        clear gap between the two groups.
+
+    Returns
+    -------
+    loss : scalar Tensor
+    stats : dict with ``n_pairs`` and ``n_active_pixels``.
+    """
+    N, T, D = z_phase.shape
+    device = z_phase.device
+    dtype = z_phase.dtype
+
+    valid = torch.isfinite(ysfc) & (ysfc >= 0)
+    is_low  = valid & (ysfc <= low_ysfc_max)   # "disturbed"
+    is_high = valid & (ysfc >= high_ysfc_min)   # "recovered"
+
+    # Only process pixels that have at least one disturbed AND one recovered timestep.
+    has_low  = is_low.any(dim=1)   # [N]
+    has_high = is_high.any(dim=1)  # [N]
+    active = has_low & has_high    # [N]
+
+    n_active = int(active.sum().item())
+    if n_active == 0:
+        return (
+            torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True),
+            {"n_pairs": 0, "n_active_pixels": 0},
+        )
+
+    z_act  = z_phase[active]    # [N_a, T, D]
+    low_a  = is_low[active]     # [N_a, T]
+    high_a = is_high[active]    # [N_a, T]
+
+    # pair_mask[n, t_l, t_h] = True iff pixel n has disturbed t_l and recovered t_h
+    pair_mask = low_a.unsqueeze(2) & high_a.unsqueeze(1)  # [N_a, T, T]
+    n_pairs = int(pair_mask.sum().item())
+
+    # Pairwise L2 distances [N_a, T, T]
+    za = z_act.unsqueeze(2)  # [N_a, T, 1, D]
+    zb = z_act.unsqueeze(1)  # [N_a, 1, T, D]
+    dists = (za - zb).pow(2).sum(dim=-1).clamp(min=1e-12).sqrt()  # [N_a, T, T]
+
+    loss = F.softplus(margin - dists)[pair_mask].mean()
+
+    return loss, {"n_pairs": n_pairs, "n_active_pixels": n_active}

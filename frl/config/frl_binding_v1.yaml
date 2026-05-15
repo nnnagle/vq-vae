@@ -673,6 +673,22 @@ losses:
       start_epoch: 30   # same as soft_neighborhood_phase
       ramp_epochs: 10
 
+  # Margin loss: post-disturbance (ysfc <= low_ysfc_max) embeddings should differ
+  # from recovered-forest (ysfc >= high_ysfc_min) embeddings within the same pixel.
+  # Fills the gap left by phase_triplet (which skips ysfc=0 years) by directly
+  # pinning disturbance-year embeddings away from recovered-state embeddings.
+  phase_recovery_discrimination:
+    weight: 1.0
+    type: phase_recovery_discrimination
+
+    margin: 0.5           # minimum desired L2 distance between disturbed and recovered
+    low_ysfc_max: 1.0     # ysfc <= this → "disturbed" (captures ysfc=0 and ysfc=1)
+    high_ysfc_min: 5.0    # ysfc >= this → "recovered"
+
+    curriculum:
+      start_epoch: 30     # activate together with soft_neighborhood_phase
+      ramp_epochs: 10
+
   soft_neighborhood_evt:
     weight: 0.0
     type: soft_neighborhood_evt
