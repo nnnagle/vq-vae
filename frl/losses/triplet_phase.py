@@ -364,9 +364,9 @@ def phase_recovery_discrimination_loss(
 
         softplus(margin - L2_distance(z_disturbed, z_recovered))
 
-    This fills the gap left by the triplet loss, which skips ysfc=0 years.
-    Pinning disturbance-year embeddings away from recovered-state embeddings
-    directly trains the model to encode recovery stage.
+    The soft_neighborhood_phase loss matches relative distance structure across
+    shared ysfc values but does not enforce an absolute separation between
+    disturbed and recovered states. This loss fills that gap directly.
 
     Parameters
     ----------

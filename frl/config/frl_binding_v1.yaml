@@ -675,8 +675,9 @@ losses:
 
   # Margin loss: post-disturbance (ysfc <= low_ysfc_max) embeddings should differ
   # from recovered-forest (ysfc >= high_ysfc_min) embeddings within the same pixel.
-  # Fills the gap left by phase_triplet (which skips ysfc=0 years) by directly
-  # pinning disturbance-year embeddings away from recovered-state embeddings.
+  # The soft_neighborhood_phase loss operates on relative distance structure across
+  # shared ysfc values; it does not enforce an absolute separation between disturbed
+  # and recovered states. This loss fills that gap directly.
   phase_recovery_discrimination:
     weight: 1.0
     type: phase_recovery_discrimination
