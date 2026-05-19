@@ -466,3 +466,142 @@ The `phase_ccdc` feature includes `temporal_position` (fractional year index, 0�
 
 **8.12 Spectral distance for spatial pair weighting uses static features, not type embedding**  
 Spatial InfoNCE pair weights are computed from `spec_dist_data` (the `infonce_type_spectral` static feature), not from z_type itself. This means the weighting is data-driven from the raw features, not adaptive to the current state of the learned embedding. Whether this is intended (avoids circular dependency) or a limitation should be noted.
+
+---
+
+## 9. Diagnostic Analyses Completed
+
+All diagnostic scripts live in `frl/training/`. None require retraining — they consume a frozen checkpoint plus precomputed stats. They fall into four categories: (A) type-embedding quality, (B) phase-embedding quality, (C) data characterization, and (D) clustering alignment.
+
+### 9.1 Type Encoder Quality — Linear Probe (`fit_linear_probe.py`, `train_linear_probe.py`)
+
+**What it measures**: How well a linear function of frozen z_type embeddings [64-d] can predict five static spectral/structural target channels:
+- `static.mean_ndvi`, `static.mean_ndmi`, `static.mean_nbr`, `static.mean_seasonal_amp_nir`, `static.variance_ndvi`
+
+**Method**: Closed-form ridge regression (`fit_linear_probe.py`) accumulates normal equations in streaming fashion (pass over training split), solves `(XᵀX + λI)W = XᵀY` with λ=1e-3. An SGD variant (`train_linear_probe.py`, Adam, lr=0.1) is available for rapid iteration. Metrics: per-channel MSE, R², Spearman ρ².
+
+**Outputs**: `linear_probe_closed_form.pt` (weights W [64, 5], bias b [5], per-channel train/val metrics). SGD variant also saves `probe_best.pt` keyed by best val R².
+
+**Findings from code comments**: Typical val R² ~0.5–0.7 across the five channels; `variance_ndvi` is the hardest target (noted as a known limitation in CLAUDE.md — linear probe R² ~0.25–0.63 for variance-like targets). Spearman ρ² tracks R² ranking but is more robust to outliers.
+
+### 9.2 Spatial Gate Visualization (`visualize_test_patches.py`)
+
+**What it measures**: Spatial structure of the GatedResidualConv2D gate values and of linear probe predictions, across a random sample of test patches.
+
+**Method**: Runs the type encoder on 16 randomly selected test patches (seed=42), collecting both z_type and the gate tensor [64, H, W] returned by `model(encoder_input, return_gate=True)`. Applies the linear probe to produce predicted target-metric maps. Gate channels with spatial std < 0.1 are filtered as uninformative; the remaining channels are stratified by variance and 6 representative channels are selected for display.
+
+**Outputs**: `test_<metric>.png` (observed vs. predicted spatial maps, viridis colormap, 16 patches); `test_gate_ch<idx>.png` (per gate channel, RdYlBu_r colormap, title includes channel index and spatial variance). Spearman ρ² logged per target.
+
+**Utility for paper**: Gate visualization reveals which spatial features the GatedResidualConv2D amplifies — e.g., whether it responds to forest edges, ridgelines, or stand boundaries.
+
+### 9.3 Phase Linear Probe with Interaction Design (`fit_phase_linear_probe.py`)
+
+**What it measures**: How well a linear function of z_phase (and optionally z_type, and their interaction) predicts the 7-channel `soft_neighborhood_phase_target` feature — annual CCDC spectral values (red, nir, swir1, swir2, nbr, ndvi, ndmi, spectral_velocity) at each timestep.
+
+**Method**: Four design matrix options:
+- `"full"` (default): [z_type (64-d) | z_phase (12-d) | z_type ⊗ z_phase (768-d, PCA-compressed to k=20)] = 96 + 20 = 96-d effective
+- `"additive"`: [z_type | z_phase] = 76-d
+- `"type-only"`: z_type = 64-d  
+- `"phase-only"`: z_phase = 12-d
+
+Two-pass streaming ridge regression. Predictions are back-transformed from normalized (whitened Mahalanobis) space to original spectral units via the inverse Mahalanobis pipeline. Two sets of metrics are computed:
+- **Spatial R²**: standard; measures static mean level prediction
+- **Temporal (within-pixel) R²**: computed on per-pixel temporal anomalies (deviation from each pixel's time-mean), measuring whether the embedding encodes recovery dynamics
+
+**Embedding diagnostics recorded in checkpoint**:
+- FiLM gamma and beta per channel (mean, std, min, max) — provides the channel-level gamma statistics referenced in CLAUDE.md
+- Temporal variance fraction (TVF): `E[Var(z_phase | pixel)] / Var(z_phase)` — proportion of z_phase variance that is within-pixel temporal variation vs. across-pixel spatial variation
+- Pre-FiLM (TCN output) vs. post-FiLM TVF comparison
+- Interaction PCA: fraction of z_type ⊗ z_phase variance explained by top-k components
+
+**Outputs**: `phase_linear_probe.pt` containing weights, preprocessor (means, stds, PCA components), and all metrics.
+
+**Findings from code comments**: Temporal R² is often lower than spatial R², consistent with the pre-exp017 finding that z_phase encoded pixel identity rather than recovery stage. Post-FiLM temporal variance fraction higher than pre-FiLM, indicating FiLM amplifies temporal structure. Phase-only R² lower than additive, suggesting z_type contributes independent information about spectral level.
+
+### 9.4 EVT-Stratified FiLM Gamma and Temporal Variance Diagnostics (`phase_evt_diagnostics.py`)
+
+**What it measures**: Whether FiLM conditioning is type-conditional — do different EVT forest types receive systematically different gamma values and temporal variance fractions in z_phase?
+
+**Method**: Full forward pass (type encoder + FiLM layer, dense spatial grid) over all dataset patches. Per pixel: extract EVT code (from `static_categorical.evt`), FiLM gamma [12] from `model.phase_film(z_type)`, and compute temporal variance fraction [12] as the proportion of within-pixel temporal variance to total z_phase variance. Accumulates per-EVT statistics across all forest pixels. Also optionally applies a pre-loaded phase linear probe to compute per-EVT R².
+
+**Outputs**:
+- `gamma_by_evt.csv`: per-EVT mean/std of FiLM gamma per z_phase channel (0–11)
+- `temporal_frac_by_evt.csv`: per-EVT temporal variance fraction per channel
+- `probe_r2_by_evt.csv`: per-EVT per-target R² (if probe loaded)
+- `gamma_heatmap.png`: top-20 EVT × 12 channels heatmap (column z-scores); EVTs as rows, channels as columns
+- `gamma_ranking.png`: all EVTs ranked by mean gamma, horizontal bar chart
+- `temporal_frac_heatmap.png`: top-20 EVT × 12 channels heatmap (raw 0–1 range)
+- `summary.json`: all statistics plus run metadata
+
+**Findings from code and CLAUDE.md**: After training, gamma converges to ~3.5 (from initialization of 1.0). Gamma is type-conditional: plantation/pine types (e.g. EVT 9322, 7368) receive above-average gamma, particularly in channel 4 (identified as NBR-sensitive). Stable oak types receive below-average gamma. Channels 8–10 have near-zero temporal variance fraction (largely redundant with z_type); channel 11 is most temporally active. These findings motivated the recovery discrimination loss — prior losses enforced only relative ordering in a space that remained type-specific rather than recovery-stage-specific.
+
+### 9.5 Post-Disturbance NBR Recovery Curves (`phase_recovery_curves.py`)
+
+**What it measures**: Whether the phase embedding encodes recovery stage (ysfc) as a metrically meaningful quantity, by examining how predicted NBR varies as a function of years since disturbance, stratified by EVT.
+
+**Method**: Requires both a phase-encoder checkpoint and a trained phase linear probe (from `fit_phase_linear_probe.py`). For each pixel-timestep with 0 ≤ ysfc ≤ 30: records (ysfc, predicted_NBR, observed_NBR). Bins ysfc into: {0}, {1}, {2}, {3–4}, {5–7}, {8–12}, {13–19}, {20–30}. Computes per-bin quartile statistics (Q25, median, Q75) within each of the top-20 EVT classes. Reservoir sampling (capacity 10,000 per EVT) handles memory.
+
+**Outputs**:
+- `recovery_curves.png`: 4×5 grid (one panel per EVT class). X-axis: ysfc bin; Y-axis: predicted NBR in z-score normalized units. Blue boxes (IQR) show predicted distribution; orange line shows observed median. Rising curve from ysfc≈0 (post-disturbance) to ysfc≈20 (recovered) indicates learned recovery dynamics.
+- `nbr_by_ysfc_by_evt.csv`: per-EVT, per-bin statistics (count, pred Q25/Q50/Q75, obs median)
+
+**Findings from code and CLAUDE.md**: Pre-exp017 analysis (`phase_recovery_curves.py`) showed predicted NBR did not rise clearly with ysfc across most EVT types — confirming that pre-exp017 z_phase encoded pixel identity rather than recovery stage. The recovery discrimination loss was designed specifically to fix this. Whether post-exp017 recovery curves show clear monotone NBR recovery is a key validation target.
+
+### 9.6 Forest Diagnostic Maps (`visualize_forest_diagnostics.py`)
+
+**What it measures**: Spatial fidelity of phase predictions at pixels with recent disturbance history, and the temporal anomaly structure of phase predictions.
+
+**Method**: Ranks all test patches by count of forest pixels with `ysfc_min < 10` (recently disturbed); selects top-N (default 4) for visualization. For each selected patch: runs dense forward pass (type + phase encoders), applies phase linear probe, back-transforms predictions from whitened to original spectral scale. Produces two types of maps per target channel: (1) raw observed vs. predicted, and (2) temporal anomalies (per-pixel temporal demeaning to isolate recovery signal from static spectral baseline). Logs per-patch temporal and spatial standard deviation of both z_phase and each predicted channel.
+
+**Outputs**:
+- `forest_diag_ysfc_min.png`: spatial maps of ysfc_min for selected patches (RdYlGn, vmin=0, vmax=40)
+- `forest_diag_<channel>.png`: per-channel, per-patch tiled maps of observed and predicted spectral values (original units), with columns = timesteps (years 2010–2024)
+- `forest_diag_<channel>_anomaly.png`: same layout but per-pixel demeaned, diverging colormap (RdBu_r, ±98th percentile of anomaly magnitude)
+
+**Utility for paper**: Anomaly maps directly reveal whether the model predicts a recovery trajectory (NBR rising after disturbance) at the correct spatial locations. This is the most interpretable visual validation of the phase embedding's recovery encoding.
+
+### 9.7 GMM Clustering (`fit_gmm_clusters.py`, `compare_gmm_evt.py`)
+
+**What it measures**: Whether z_type embeddings cluster in a way that aligns with ecologically defined forest types (LANDFIRE EVT classes).
+
+**`fit_gmm_clusters.py`**: Reservoir-samples up to 500,000 valid forest pixels from the training split, fits a sklearn `GaussianMixture` (default: 50 components, diagonal covariance, 3 initializations, 200 iterations), and records BIC, AIC, and component weights. Output: `gmm_k50_diag.pkl`.
+
+**`compare_gmm_evt.py`**: Applies the fitted GMM to predict cluster labels for all forest pixels. Builds a full contingency table [K_gmm × N_evt]. Reservoir-samples 500,000 (cluster, EVT) pairs for sklearn metrics. Computes:
+- **NMI** (normalized mutual information): global alignment between cluster and EVT label distributions
+- **Homogeneity**: each cluster contains predominantly one EVT type
+- **Completeness**: each EVT type is concentrated in one cluster
+- **V-measure**: harmonic mean of homogeneity and completeness
+- **Purity**: per-cluster fraction of majority EVT class
+
+**Outputs**: `contingency_raw.csv`; `contingency_heatmap.png` (row-normalized, YlOrRd, rows=clusters, cols=top-K EVTs); `metrics.json` (NMI, homogeneity, completeness, V-measure, purity, plus metadata).
+
+**Findings from code comments**: V-measure > 0.6 is noted as indicating good alignment; the default threshold for "good" homogeneity/completeness is 0.5. These metrics provide a quantitative complement to the recovery curve visualization.
+
+### 9.8 ysfc and EVT Data Characterization (`ysfc_evt_histograms.py`)
+
+**What it measures**: The disturbance history diversity (ysfc distributions) of the training domain, stratified by EVT class. This is a data-level diagnostic — no model checkpoint is needed.
+
+**Method**: Iterates over dataset patches (masked by AOI × forest × halo), extracting (ysfc, EVT code) pairs for all valid pixel-timesteps. Reservoir sampling (50,000 per EVT class). Bins ysfc into 9 intervals from 0 to 40, computes KDE density and bin statistics per EVT.
+
+**Outputs**:
+- `ysfc_histograms.png`: 4×5 KDE density grid (one panel per top-20 EVT), x-axis = ysfc [0, 40], y-axis = density, colored steelblue
+- `ysfc_by_evt.csv`: per-EVT, per-bin: count, density_per_year, fraction, mean_ysfc, median_ysfc
+
+**Utility for paper**: Documents the extent of disturbance history in the training domain; identifies EVT types with sparse disturbance history (few pixels at low ysfc) that may have insufficient training signal for the recovery discrimination loss. Bimodal ysfc distributions indicate EVT types that have experienced multiple disturbance events.
+
+---
+
+### Summary of Diagnostic Scripts
+
+| Script | Model req. | Phase probe req. | Primary output | What it validates |
+|---|---|---|---|---|
+| `fit_linear_probe.py` | z_type encoder | No | `linear_probe_closed_form.pt` | z_type linear separability for 5 static targets |
+| `train_linear_probe.py` | z_type encoder | No | `probe_best.pt` | Same, SGD variant |
+| `visualize_test_patches.py` | z_type encoder + linear probe | No | PNG tiles | Gate structure; probe spatial fidelity |
+| `fit_phase_linear_probe.py` | type + phase encoders | No (this creates it) | `phase_linear_probe.pt` | z_phase linearly encodes temporal spectral targets; FiLM diagnostics |
+| `phase_evt_diagnostics.py` | type + phase encoders | Optional | CSVs + heatmaps + `summary.json` | FiLM gamma type-conditionality; temporal variance fraction per EVT |
+| `phase_recovery_curves.py` | type + phase encoders | Yes | `recovery_curves.png`, CSV | Recovery trajectory in predicted NBR vs. ysfc per EVT |
+| `visualize_forest_diagnostics.py` | type + phase encoders | Yes | Spatial map PNGs | Temporal anomaly structure in disturbed pixels |
+| `fit_gmm_clusters.py` | z_type encoder | No | `gmm_k50_diag.pkl` | Unsupervised cluster structure of z_type |
+| `compare_gmm_evt.py` | z_type encoder + GMM pkl | No | `metrics.json`, contingency PNG | GMM vs. EVT alignment (NMI, V-measure, purity) |
+| `ysfc_evt_histograms.py` | None | No | `ysfc_histograms.png`, CSV | Disturbance history distribution per EVT class |
