@@ -4,6 +4,8 @@
 
 **Note on naming:** This repo is called `vq-vae` but that name is vestigial from an early design. The actual model is **not** a VQ-VAE. It is a dual-pathway contrastive representation learner using InfoNCE and VICReg losses.
 
+**Model status:** As of experiment `frl_v0_exp017`, the model is considered **complete and fit for purpose**. The addition of `phase_recovery_discrimination_loss` (`frl/losses/triplet_phase.py`) was the final missing piece: prior losses (`soft_neighborhood_phase`, phase VICReg) enforced only relative distance ordering in z_phase, which allowed the model to satisfy all training objectives while compressing all recovery stages into an arbitrarily small region of embedding space. The recovery discrimination loss adds an absolute margin constraint — within each pixel, disturbed-state embeddings (ysfc ≤ 1) must be at least `margin` apart from recovered-state embeddings (ysfc ≥ 5) — forcing the temporal dynamics to be metrically meaningful, not just rank-ordered.
+
 ### Scientific Goal
 
 Learn a metric embedding space for 30×30m forest pixels where distance reflects similarity of forest status. The embedding is designed for use with USFS Forest Inventory and Analysis (FIA) data in:
@@ -71,7 +73,7 @@ PHASE PATHWAY (temporal):
 - **L2 normalization before FiLM** — controls embedding scale; FiLM gamma owns the scaling.
 - **Sparse forward pass** — `forward_phase_at_locations()` runs the phase encoder only at sampled anchor pixel locations (not the full spatial grid) for training efficiency.
 - **FiLM initialized near identity** — gamma≈1, beta≈0 at initialization for stable early training.
-- **FiLM gamma amplification observed** — after training, FiLM gamma converges to ~3.5 (from init=1.0). The TCN produces ~78% temporal variance in pre-FiLM z; post-FiLM z_phase retains ~32%. EVT-stratified diagnostics (`phase_evt_diagnostics.py`) confirm gamma is type-conditional: plantation/pine types (e.g. EVT 9322, 7368) receive above-average gamma especially in channel 4 (NBR-sensitive); stable oak types receive below-average gamma. Channels 8–10 have near-zero temporal variance fraction (largely redundant with z_type); channel 11 is most temporally active. Recovery curve analysis (`phase_recovery_curves.py`) shows the phase embedding mostly encodes pixel identity rather than recovery stage — post-disturbance NBR does not rise clearly with ysfc across most EVT types.
+- **FiLM gamma amplification observed** — after training, FiLM gamma converges to ~3.5 (from init=1.0). The TCN produces ~78% temporal variance in pre-FiLM z; post-FiLM z_phase retains ~32%. EVT-stratified diagnostics (`phase_evt_diagnostics.py`) confirm gamma is type-conditional: plantation/pine types (e.g. EVT 9322, 7368) receive above-average gamma especially in channel 4 (NBR-sensitive); stable oak types receive below-average gamma. Channels 8–10 have near-zero temporal variance fraction (largely redundant with z_type); channel 11 is most temporally active. Pre-exp017 recovery curve analysis (`phase_recovery_curves.py`) showed the phase embedding mostly encoded pixel identity rather than recovery stage — post-disturbance NBR did not rise clearly with ysfc across most EVT types. This was the root failure that `phase_recovery_discrimination_loss` was designed to fix.
 
 ### Model Entry Points
 
@@ -126,8 +128,9 @@ The bindings YAML defines dataset groups:
 | Pair generation | `pairs.py` | kNN, mutual-kNN, quantile, radius, spatial-constrained |
 | VICReg | `variance_covariance.py` | Collapse prevention: enforces variance + decorrelation |
 | Phase neighborhood | `phase_neighborhood.py` | Temporal consistency of z_phase |
-| Phase triplet | `phase_triplet.py` | Temporal ordering constraints |
-| Soft neighborhood | `soft_neighborhood.py` | Soft version of neighborhood matching |
+| Phase triplet | `phase_triplet.py` | Temporal ordering constraints (defined but not wired into training loop) |
+| Soft neighborhood | `soft_neighborhood.py` | Soft KL matching of relative z_phase distance structure at shared ysfc |
+| Phase recovery discrimination | `triplet_phase.py` | **Absolute** margin between disturbed (ysfc≤1) and recovered (ysfc≥5) embeddings within each pixel — the loss that makes recovery stage metrically separable |
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
 
 **Pair construction:**
@@ -140,12 +143,15 @@ The bindings YAML defines dataset groups:
 
 ## Training (`frl/training/train_representation.py`)
 
-The training loop applies four loss components:
+The training loop applies the following loss components:
 
 1. **Spectral InfoNCE** — contrastive loss on `z_type` using cross-batch mutual kNN positives and cross-batch random negatives (scaled by `spectral_neg_per_anchor`, default 20)
 2. **Spatial InfoNCE** — contrastive loss on `z_type` using spatial kNN pairs
 3. **VICReg** — variance + covariance regularization on `z_type`
-4. **Phase loss** — temporal consistency on `z_phase`
+4. **Soft neighborhood phase** — KL-divergence matching of relative z_phase distance structure at shared ysfc values between pixel pairs
+5. **Phase spread ranking** — pixels with higher inter-annual spectral variance must have more spread-out z_phase trajectories
+6. **Phase VICReg** — collapse prevention on z_phase dimensions (note: operates on the wrong population for recovery; see Known Limitations)
+7. **Phase recovery discrimination** — absolute margin loss: within each pixel, embeddings at ysfc ≤ 1 must be at least `margin` apart from embeddings at ysfc ≥ 5. This is the loss that closes the gap between relative ordering and metrically meaningful recovery stage representation.
 
 ### Important: Phase Loss Curriculum
 
@@ -298,3 +304,5 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 - ~~Stratify probe diagnostics by EVT forest type before concluding the signal is missing~~ *(done — EVT stratification shows weak phase signal is broadly true across types, not just a stable-forest artifact)*
 
 ~~**TODO: Compute EVT-forest-type-stratified diagnostics for phase signal strength.**~~ *(implemented — see `phase_evt_diagnostics.py` and `phase_recovery_curves.py`; key findings recorded in the FiLM gamma bullet above)*
+
+~~**TODO: Make z_phase encode recovery stage, not just pixel identity.** The `soft_neighborhood_phase` loss enforced only relative distance ordering (KL-softmax), which is equivariant to uniform scaling of the embedding space. A model could satisfy it perfectly while compressing all recovery stages into an arbitrarily small region. Phase VICReg did not fix this because it operated on the wrong population (N_phase×T flattened timesteps, dominated by within-pixel temporal variation rather than across-pixel recovery-stage variation). The fix — `phase_recovery_discrimination_loss` in `frl/losses/triplet_phase.py` — adds an absolute margin constraint directly between disturbed and recovered timesteps within each pixel.~~ *(implemented in exp017; model considered complete)*
