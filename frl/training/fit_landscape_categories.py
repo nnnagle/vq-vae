@@ -132,6 +132,7 @@ def extract_batch(
     model: RepresentationModel,
     device: torch.device,
     enc_feature_name: str,
+    phase_batch_size: int = 1,
 ) -> Optional[np.ndarray]:
     """Run both pathways on one batch and return combined pixel vectors.
 
@@ -187,21 +188,36 @@ def extract_batch(
         masks.append(m)
 
     Ximg = torch.stack(encoder_inputs).to(device)    # [B, C, H, W]
-    Xphase = torch.stack(phase_inputs).to(device)    # [B, 8, T, H, W]
+    Xphase = torch.stack(phase_inputs)               # [B, 8, T, H, W]  (CPU until sub-batch)
     Xysfc = torch.stack(ysfc_arrays)                 # [B, T, H, W]  (kept on CPU)
     M = torch.stack(masks)                            # [B, H, W]
 
+    B = Ximg.shape[0]
+
     with torch.no_grad():
-        z_type = model(Ximg)                                    # [B, 64, H, W]
-        z_phase = model.forward_phase(Xphase, z_type.detach())  # [B, 12, T, H, W]
+        z_type = model(Ximg)   # [B, 64, H, W]  — type encoder at full batch size
 
-    B, D_type, H, W = z_type.shape
-    _, D_phase, T, _, _ = z_phase.shape
+    D_type = z_type.shape[1]
 
+    # Phase encoder in sub-batches to avoid OOM on large spatial grids.
+    z_phase_parts: List[torch.Tensor] = []
+    for start in range(0, B, phase_batch_size):
+        end = min(start + phase_batch_size, B)
+        xp = Xphase[start:end].to(device)            # [pb, 8, T, H, W]
+        zt = z_type[start:end].detach()               # [pb, 64, H, W]
+        with torch.no_grad():
+            zp = model.forward_phase(xp, zt)          # [pb, 12, T, H, W]
+        z_phase_parts.append(zp.cpu())
+
+    z_phase = torch.cat(z_phase_parts, dim=0)         # [B, 12, T, H, W]
+    D_phase = z_phase.shape[1]
+    T = z_phase.shape[2]
+
+    _, _, H, W = z_type.shape
     m_flat = M.reshape(-1)  # [B*H*W]
 
     # z_type: [B, D, H, W] → [B*H*W, D]
-    z_type_pix = z_type.permute(0, 2, 3, 1).reshape(-1, D_type)
+    z_type_pix = z_type.cpu().permute(0, 2, 3, 1).reshape(-1, D_type)
 
     # z_phase: [B, D, T, H, W] → [B, H, W, T, D] → [B*H*W, T, D]
     z_phase_pix = z_phase.permute(0, 3, 4, 2, 1).reshape(-1, T, D_phase)
@@ -356,6 +372,8 @@ def main() -> None:
     parser.add_argument("--max-iter", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--phase-batch-size", type=int, default=1,
+                        help="Samples per forward_phase call (reduce to avoid OOM, default: 1)")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -406,7 +424,8 @@ def main() -> None:
     sampler = ReservoirSampler(capacity=args.max_pixels, dim=combined_dim, seed=args.seed)
 
     for batch_idx, batch in enumerate(train_loader):
-        pixels = extract_batch(batch, feature_builder, model, device, enc_feature_name)
+        pixels = extract_batch(batch, feature_builder, model, device, enc_feature_name,
+                               phase_batch_size=args.phase_batch_size)
         if pixels is not None:
             sampler.add(pixels)
 
