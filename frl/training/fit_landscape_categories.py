@@ -133,25 +133,18 @@ def extract_batch(
     model: RepresentationModel,
     device: torch.device,
     enc_feature_name: str,
-    pixel_batch_size: int = 50_000,
 ) -> Optional[np.ndarray]:
     """Run both pathways on one batch and return combined pixel vectors.
 
-    The type encoder runs densely on the full spatial grid [B, C, H, W].
-    The phase encoder uses forward_phase_at_locations([N_valid, C, T]) so it
-    only processes valid forest pixels — not the full spatial grid — keeping
-    memory proportional to the number of valid pixels rather than B×H×W.
+    Processes one patch at a time through the phase encoder to keep GPU
+    memory bounded (one [1, C, T, H, W] tensor rather than the full batch).
 
     Returns:
-        float32 array [N, 64+36] for valid pixels, or None if none.
+        float32 array [N, 101] for valid pixels across all patches, or None.
     """
-    batch_size = len(batch["metadata"])
-    encoder_inputs: List[torch.Tensor] = []
-    phase_inputs: List[torch.Tensor] = []
-    ysfc_arrays: List[torch.Tensor] = []
-    masks: List[torch.Tensor] = []
+    all_pixels: List[np.ndarray] = []
 
-    for i in range(batch_size):
+    for i in range(len(batch["metadata"])):
         sample = {
             key: val[i].numpy() if isinstance(val, torch.Tensor) else val[i]
             for key, val in batch.items()
@@ -163,82 +156,48 @@ def extract_batch(
         phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
         ysfc_f = feature_builder.build_feature(YSFC_FEATURE, sample)
 
-        enc = torch.from_numpy(enc_f.data).float()           # [C, H, W]
-        phase = torch.from_numpy(phase_f.data).float()       # [8, T, H, W]
+        enc = torch.from_numpy(enc_f.data).float().unsqueeze(0).to(device)   # [1, C, H, W]
+        phase = torch.from_numpy(phase_f.data).float().unsqueeze(0).to(device)  # [1, 8, T, H, W]
 
-        # ysfc: [1, T, H, W]; mask invalid timesteps → NaN so isfinite() works later
-        ysfc_data = ysfc_f.data[0].astype(np.float32)        # [T, H, W]
-        ysfc_mask = ysfc_f.mask                               # [T, H, W] bool
-        ysfc_data = np.where(ysfc_mask, ysfc_data, np.nan)   # NaN where unobserved
-        ysfc_t = torch.from_numpy(ysfc_data).float()          # [T, H, W]
+        ysfc_data = ysfc_f.data[0].astype(np.float32)       # [T, H, W]
+        ysfc_data = np.where(ysfc_f.mask, ysfc_data, np.nan)
+        ysfc = torch.from_numpy(ysfc_data).float()           # [T, H, W]
 
         sm_names = sample["metadata"]["channel_names"]["static_mask"]
         sm_data = sample["static_mask"]
         aoi_mask = torch.from_numpy(sm_data[sm_names.index("aoi")]).bool()
         forest_mask = torch.from_numpy(sm_data[sm_names.index("forest")]).bool()
+        phase_mask = torch.from_numpy(phase_f.mask).all(dim=0)
 
-        # Collapse phase mask to spatial: valid if ALL timesteps valid (consistent
-        # with how phase probe masks pixels — require complete temporal coverage).
-        phase_mask_spatial = torch.from_numpy(phase_f.mask).all(dim=0)  # [H, W]
+        m = torch.from_numpy(enc_f.mask) & phase_mask & aoi_mask & forest_mask  # [H, W]
 
-        m = (
-            torch.from_numpy(enc_f.mask)
-            & phase_mask_spatial
-            & aoi_mask
-            & forest_mask
-        )
-
-        encoder_inputs.append(enc)
-        phase_inputs.append(phase)
-        ysfc_arrays.append(ysfc_t)
-        masks.append(m)
-
-    Ximg = torch.stack(encoder_inputs).to(device)    # [B, C, H, W]
-    Xphase = torch.stack(phase_inputs)               # [B, 8, T, H, W]  (CPU)
-    Xysfc = torch.stack(ysfc_arrays)                 # [B, T, H, W]     (CPU)
-    M = torch.stack(masks)                            # [B, H, W]
-
-    with torch.no_grad():
-        z_type = model(Ximg)   # [B, 64, H, W]
-
-    B, D_type, H, W = z_type.shape
-    T = Xphase.shape[2]
-    m_flat = M.reshape(-1)     # [B*H*W]
-
-    # Extract valid pixels — all subsequent work is on N_valid pixels, not B×H×W.
-    # z_type: [B, D, H, W] → [B*H*W, D] → [N_valid, D]
-    z_type_pix = z_type.cpu().permute(0, 2, 3, 1).reshape(-1, D_type)
-    z_type_v = z_type_pix[m_flat]   # [N_valid, 64]
-
-    if z_type_v.shape[0] == 0:
-        return None
-
-    # phase: [B, 8, T, H, W] → [B, H, W, 8, T] → [B*H*W, 8, T] → [N_valid, 8, T]
-    x_phase_pix = Xphase.permute(0, 3, 4, 1, 2).reshape(-1, Xphase.shape[1], T)
-    x_phase_v = x_phase_pix[m_flat].to(device)  # [N_valid, 8, T]
-
-    # ysfc: [B, T, H, W] → [B, H, W, T] → [B*H*W, T] → [N_valid, T]
-    ysfc_pix = Xysfc.permute(0, 2, 3, 1).reshape(-1, T)
-    ysfc_v = ysfc_pix[m_flat]    # [N_valid, T]  (CPU)
-
-    # Phase encoder on valid pixels only, in pixel-level chunks to bound peak
-    # GPU memory regardless of how many valid pixels the batch contains.
-    z_phase_chunks: List[torch.Tensor] = []
-    for start in range(0, x_phase_v.shape[0], pixel_batch_size):
-        end = min(start + pixel_batch_size, x_phase_v.shape[0])
         with torch.no_grad():
-            chunk = model.forward_phase_at_locations(
-                x_phase_v[start:end], z_type_v[start:end].to(device)
-            ).cpu()
-        z_phase_chunks.append(chunk)
-    z_phase_v = torch.cat(z_phase_chunks, dim=0)  # [N_valid, T, 12]
+            z_type = model(enc)                                   # [1, 64, H, W]
+            z_phase = model.forward_phase(phase, z_type.detach()) # [1, 12, T, H, W]
 
-    D_phase = z_phase_v.shape[2]
-    phase_summary, temporal_var = _compute_phase_summary(z_phase_v, ysfc_v)
-    combined = torch.cat(
-        [z_type_v, phase_summary, temporal_var.unsqueeze(1)], dim=1
-    )  # [N_valid, 101]
-    return combined.numpy().astype(np.float32)
+        T = phase.shape[2]
+        H, W = m.shape
+        m_flat = m.reshape(-1)  # [H*W]
+
+        # [H*W, D] → valid pixels
+        z_type_pix = z_type[0].permute(1, 2, 0).reshape(-1, z_type.shape[1])
+        z_phase_pix = z_phase[0].permute(2, 3, 0, 1).reshape(-1, T, z_phase.shape[1])
+        ysfc_pix = ysfc.permute(1, 2, 0).reshape(-1, T)
+
+        z_type_v = z_type_pix[m_flat].cpu()
+        z_phase_v = z_phase_pix[m_flat].cpu()
+        ysfc_v = ysfc_pix[m_flat]
+
+        if z_type_v.shape[0] == 0:
+            continue
+
+        phase_summary, temporal_var = _compute_phase_summary(z_phase_v, ysfc_v)
+        combined = torch.cat([z_type_v, phase_summary, temporal_var.unsqueeze(1)], dim=1)
+        all_pixels.append(combined.numpy().astype(np.float32))
+
+    if not all_pixels:
+        return None
+    return np.concatenate(all_pixels, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -591,8 +550,6 @@ def main() -> None:
     parser.add_argument("--max-iter", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--pixel-batch-size", type=int, default=50_000,
-                        help="Max pixels per forward_phase_at_locations call (default: 50000)")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -643,8 +600,7 @@ def main() -> None:
     sampler = ReservoirSampler(capacity=args.max_pixels, dim=combined_dim, seed=args.seed)
 
     for batch_idx, batch in enumerate(train_loader):
-        pixels = extract_batch(batch, feature_builder, model, device, enc_feature_name,
-                               pixel_batch_size=args.pixel_batch_size)
+        pixels = extract_batch(batch, feature_builder, model, device, enc_feature_name)
         if pixels is not None:
             sampler.add(pixels)
 
