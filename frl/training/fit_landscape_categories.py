@@ -133,6 +133,7 @@ def extract_batch(
     model: RepresentationModel,
     device: torch.device,
     enc_feature_name: str,
+    pixel_batch_size: int = 50_000,
 ) -> Optional[np.ndarray]:
     """Run both pathways on one batch and return combined pixel vectors.
 
@@ -220,12 +221,17 @@ def extract_batch(
     ysfc_pix = Xysfc.permute(0, 2, 3, 1).reshape(-1, T)
     ysfc_v = ysfc_pix[m_flat]    # [N_valid, T]  (CPU)
 
-    # Phase encoder on valid pixels only — same result as dense forward_phase
-    # but memory scales with N_valid not B×H×W.
-    with torch.no_grad():
-        z_phase_v = model.forward_phase_at_locations(
-            x_phase_v, z_type_v.to(device)
-        ).cpu()                  # [N_valid, T, 12]
+    # Phase encoder on valid pixels only, in pixel-level chunks to bound peak
+    # GPU memory regardless of how many valid pixels the batch contains.
+    z_phase_chunks: List[torch.Tensor] = []
+    for start in range(0, x_phase_v.shape[0], pixel_batch_size):
+        end = min(start + pixel_batch_size, x_phase_v.shape[0])
+        with torch.no_grad():
+            chunk = model.forward_phase_at_locations(
+                x_phase_v[start:end], z_type_v[start:end].to(device)
+            ).cpu()
+        z_phase_chunks.append(chunk)
+    z_phase_v = torch.cat(z_phase_chunks, dim=0)  # [N_valid, T, 12]
 
     D_phase = z_phase_v.shape[2]
     phase_summary, temporal_var = _compute_phase_summary(z_phase_v, ysfc_v)
@@ -585,6 +591,8 @@ def main() -> None:
     parser.add_argument("--max-iter", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--pixel-batch-size", type=int, default=50_000,
+                        help="Max pixels per forward_phase_at_locations call (default: 50000)")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -635,7 +643,8 @@ def main() -> None:
     sampler = ReservoirSampler(capacity=args.max_pixels, dim=combined_dim, seed=args.seed)
 
     for batch_idx, batch in enumerate(train_loader):
-        pixels = extract_batch(batch, feature_builder, model, device, enc_feature_name)
+        pixels = extract_batch(batch, feature_builder, model, device, enc_feature_name,
+                               pixel_batch_size=args.pixel_batch_size)
         if pixels is not None:
             sampler.add(pixels)
 
