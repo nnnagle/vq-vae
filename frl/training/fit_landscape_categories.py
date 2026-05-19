@@ -338,9 +338,9 @@ def main() -> None:
                         help="Bindings config YAML (default: config/frl_binding_v1.yaml)")
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: <checkpoint_dir>/taxonomy/)")
-    parser.add_argument("--k-type-min", type=int, default=10)
-    parser.add_argument("--k-type-max", type=int, default=100)
-    parser.add_argument("--k-type-step", type=int, default=10)
+    parser.add_argument("--k-type-min", type=int, default=5)
+    parser.add_argument("--k-type-max", type=int, default=50)
+    parser.add_argument("--k-type-step", type=int, default=5)
     parser.add_argument("--k-phase-max", type=int, default=5,
                         help="Hard cap on phase sub-categories (default: 5)")
     parser.add_argument("--covariance-type", default="diag",
