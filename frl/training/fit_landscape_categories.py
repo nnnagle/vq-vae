@@ -92,22 +92,22 @@ HIGH_YSFC_MIN: float = 5.0  # recovered: ysfc ≥ 5
 def _compute_phase_summary(
     z_phase: torch.Tensor,
     ysfc: torch.Tensor,
-) -> torch.Tensor:
-    """Compute 36-dim phase summary per pixel.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute phase summary and per-pixel temporal variance.
 
     Args:
         z_phase: [N, T, D]  D = z_phase_dim (12)
         ysfc:    [N, T]     float, NaN where ysfc is not observed
 
     Returns:
-        [N, 36] = concat(disturbed_centroid, recovered_centroid, overall_mean)
-        where each block is [N, D].  Pixels lacking disturbed or recovered
-        timesteps fall back to overall_mean for that block.
+        phase_summary: [N, 36] = concat(disturbed_centroid, recovered_centroid, overall_mean)
+            Pixels lacking disturbed or recovered timesteps fall back to overall_mean.
+        temporal_var: [N] mean across channels of per-timestep variance (z_phase.var(dim=T))
     """
     overall_mean = z_phase.mean(dim=1)  # [N, D]
+    temporal_var = z_phase.var(dim=1).mean(dim=-1)  # [N]  (var over T, mean over D)
 
     def _masked_mean(mask: torch.Tensor) -> torch.Tensor:
-        # mask: [N, T] bool
         w = mask.float().unsqueeze(-1)          # [N, T, 1]
         s = (z_phase * w).sum(dim=1)            # [N, D]
         c = w.sum(dim=1).clamp(min=1.0)         # [N, 1]
@@ -119,7 +119,8 @@ def _compute_phase_summary(
     disturbed_centroid = _masked_mean(valid & (ysfc <= LOW_YSFC_MAX))
     recovered_centroid = _masked_mean(valid & (ysfc >= HIGH_YSFC_MIN))
 
-    return torch.cat([disturbed_centroid, recovered_centroid, overall_mean], dim=1)  # [N, 36]
+    phase_summary = torch.cat([disturbed_centroid, recovered_centroid, overall_mean], dim=1)
+    return phase_summary, temporal_var
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +228,15 @@ def extract_batch(
         ).cpu()                  # [N_valid, T, 12]
 
     D_phase = z_phase_v.shape[2]
-    phase_summary = _compute_phase_summary(z_phase_v, ysfc_v)          # [N_valid, 36]
-    combined = torch.cat([z_type_v, phase_summary], dim=1)              # [N_valid, 100]
+    phase_summary, temporal_var = _compute_phase_summary(z_phase_v, ysfc_v)
+    combined = torch.cat(
+        [z_type_v, phase_summary, temporal_var.unsqueeze(1)], dim=1
+    )  # [N_valid, 101]
     return combined.numpy().astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# BIC sweep helpers
+# GMM sweep helpers (silhouette for type, BIC for phase)
 # ---------------------------------------------------------------------------
 
 def _bic_sweep(
@@ -280,6 +283,94 @@ def _bic_sweep(
     return best_k, best_gmm, bic_dict
 
 
+def _silhouette_sweep(
+    X: np.ndarray,
+    k_values: List[int],
+    covariance_type: str,
+    n_init_sweep: int,
+    n_init_final: int,
+    max_iter: int,
+    seed: int,
+    n_silhouette_samples: int = 20_000,
+) -> Tuple[int, object, Dict[int, float]]:
+    """Fit GMMs for each K, score by average silhouette; return (best_k, best_gmm, scores).
+
+    Average silhouette measures cluster *separation* rather than model fit, so it
+    naturally penalises both under-clustering (poor separation) and over-clustering
+    (many points near cluster boundaries).  A score near 1 = well-separated; near 0
+    = overlapping clusters.
+
+    Silhouette is O(N²) — we subsample to n_silhouette_samples for speed.
+    """
+    from sklearn.mixture import GaussianMixture
+    from sklearn.metrics import silhouette_score
+
+    rng = np.random.default_rng(seed)
+    idx_sil = rng.choice(len(X), size=min(n_silhouette_samples, len(X)), replace=False)
+    X_sil = X[idx_sil]
+
+    scores: Dict[int, float] = {}
+    for k in k_values:
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type=covariance_type,
+            n_init=n_init_sweep,
+            max_iter=max_iter,
+            random_state=seed,
+        )
+        gmm.fit(X)
+        labels_sil = gmm.predict(X_sil)
+        if len(np.unique(labels_sil)) < 2:
+            scores[k] = -1.0  # degenerate: all points in one cluster
+        else:
+            scores[k] = float(silhouette_score(X_sil, labels_sil, metric="euclidean"))
+        logger.info(f"  K={k:3d}  silhouette={scores[k]:.4f}  converged={gmm.converged_}")
+
+    best_k = max(scores, key=scores.__getitem__)
+
+    logger.info(f"Silhouette selected K={best_k} (score={scores[best_k]:.4f}); refitting...")
+    best_gmm = GaussianMixture(
+        n_components=best_k,
+        covariance_type=covariance_type,
+        n_init=n_init_final,
+        max_iter=max_iter,
+        random_state=seed,
+    )
+    best_gmm.fit(X)
+    if not best_gmm.converged_:
+        logger.warning(f"  Final GMM (K={best_k}) did not converge.")
+    return best_k, best_gmm, scores
+
+
+def _save_score_plot(
+    scores: Dict[int, float],
+    best_k: int,
+    ylabel: str,
+    title: str,
+    out_path: Path,
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not available; skipping plot.")
+        return
+
+    ks = sorted(scores)
+    vals = [scores[k] for k in ks]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(ks, vals, "o-", ms=4, lw=1.5)
+    ax.axvline(best_k, color="red", ls="--", lw=1, label=f"K*={best_k}")
+    ax.set_xlabel("K (number of components)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
 def _save_bic_plot(
     bic_dict: Dict[int, float],
     best_k: int,
@@ -309,28 +400,156 @@ def _save_bic_plot(
 
 
 # ---------------------------------------------------------------------------
-# Dynamic-score diagnostic
+# Variability diagnostic
 # ---------------------------------------------------------------------------
 
-def _dynamic_scores(
-    X_phase_summary: np.ndarray,
-    labels: np.ndarray,
+def _compute_variability_stats(
+    X_phase: np.ndarray,
+    temporal_var: np.ndarray,
+    type_labels: np.ndarray,
     n_type: int,
-) -> Dict[int, float]:
-    """Per-cluster mean temporal spread in z_phase embedding.
+) -> Dict[int, dict]:
+    """Per-cluster temporal and spatial variability stats.
 
-    Uses the standard deviation across the phase_summary's overall_mean block
-    (last 12 dims) as a proxy for temporal spread diversity within each cluster.
-    Higher scores → more heterogeneous temporal dynamics.
+    temporal_var[n]: mean-across-channels variance of z_phase over T timesteps for pixel n.
+    X_phase[n, 24:36]: overall_mean block — spatial spread captures between-pixel diversity.
 
-    Returns dict: cluster_id → score.
+    temporal_fraction = var_temporal / (var_temporal + var_spatial)
+        → 1.0: dynamics are mostly within-pixel temporal change
+        → 0.0: pixels are stable but spatially heterogeneous within the cluster
     """
-    scores: Dict[int, float] = {}
-    overall_mean_block = X_phase_summary[:, 24:36]  # [N, 12] — the overall_mean part
+    overall_mean_block = X_phase[:, 24:36]  # [N, 12]
+    stats: Dict[int, dict] = {}
     for k in range(n_type):
-        sel = overall_mean_block[labels == k]
-        scores[k] = float(np.std(sel, axis=0).mean()) if sel.shape[0] > 1 else 0.0
-    return scores
+        mask = type_labels == k
+        tv = temporal_var[mask]
+        om = overall_mean_block[mask]
+        var_t = float(tv.mean()) if len(tv) > 0 else 0.0
+        var_s = float(om.var(axis=0).mean()) if len(om) > 1 else 0.0
+        denom = var_t + var_s
+        stats[k] = {
+            "n_pixels": int(mask.sum()),
+            "mean_temporal_var": var_t,
+            "median_temporal_var": float(np.median(tv)) if len(tv) > 0 else 0.0,
+            "q25_temporal_var": float(np.percentile(tv, 25)) if len(tv) > 0 else 0.0,
+            "q75_temporal_var": float(np.percentile(tv, 75)) if len(tv) > 0 else 0.0,
+            "spatial_spread": var_s,
+            "temporal_fraction": float(var_t / denom) if denom > 0 else 0.0,
+        }
+    return stats
+
+
+def _generate_variability_diagnostic(
+    temporal_var: np.ndarray,
+    type_labels: np.ndarray,
+    phase_labels: Dict[int, np.ndarray],
+    var_stats: Dict[int, dict],
+    taxonomy: Dict[int, dict],
+    out_dir: Path,
+) -> None:
+    """Save variability CSV and figures.
+
+    type_variability.png — violin plots of per-pixel temporal_var per type cluster,
+        sorted by temporal_fraction.  Clusters whose phase GMM split them into
+        K_phase > 1 sub-groups show each sub-group overlaid in colour.
+
+    variability_summary.csv — one row per type cluster with variability stats.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+    except ImportError:
+        logger.warning("matplotlib not available; skipping diagnostic plots.")
+        return
+
+    # --- CSV ------------------------------------------------------------------
+    with open(out_dir / "variability_summary.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "cluster", "n_pixels", "k_phase", "is_dynamic",
+            "mean_temporal_var", "median_temporal_var",
+            "q25_temporal_var", "q75_temporal_var",
+            "spatial_spread", "temporal_fraction",
+        ])
+        for k, s in var_stats.items():
+            t = taxonomy.get(k, {})
+            writer.writerow([
+                k, s["n_pixels"], t.get("k_phase", 1), t.get("is_dynamic", False),
+                f"{s['mean_temporal_var']:.6f}", f"{s['median_temporal_var']:.6f}",
+                f"{s['q25_temporal_var']:.6f}", f"{s['q75_temporal_var']:.6f}",
+                f"{s['spatial_spread']:.6f}", f"{s['temporal_fraction']:.4f}",
+            ])
+    logger.info("Saved variability_summary.csv")
+
+    # --- Sort clusters by temporal_fraction -----------------------------------
+    order = sorted(var_stats, key=lambda k: var_stats[k]["temporal_fraction"])
+    n_clusters = len(order)
+
+    # Colour palette for phase sub-clusters (up to 5)
+    phase_colours = ["#4e9af1", "#f4a261", "#2a9d8f", "#e76f51", "#8ecae6"]
+
+    # --- Figure: one violin per type cluster, before/after overlay -----------
+    fig_h = max(4, n_clusters * 0.35 + 1)
+    fig, ax = plt.subplots(figsize=(9, fig_h))
+
+    yticks, yticklabels = [], []
+
+    for row_idx, k in enumerate(order):
+        tv_k = temporal_var[type_labels == k]
+        tf = var_stats[k]["temporal_fraction"]
+        k_phase = taxonomy.get(k, {}).get("k_phase", 1)
+
+        # Background violin — full cluster (grey)
+        vp = ax.violinplot(
+            [tv_k], positions=[row_idx], vert=False,
+            showmedians=True, showextrema=False, widths=0.7,
+        )
+        for pc in vp["bodies"]:
+            pc.set_facecolor("#cccccc")
+            pc.set_alpha(0.5)
+        vp["cmedians"].set_color("#888888")
+
+        # Phase sub-cluster violins (coloured, narrower)
+        ph_labels_k = phase_labels.get(k)
+        if ph_labels_k is not None and k_phase > 1:
+            for j in range(k_phase):
+                tv_kj = tv_k[ph_labels_k == j]
+                if len(tv_kj) < 5:
+                    continue
+                vp2 = ax.violinplot(
+                    [tv_kj], positions=[row_idx], vert=False,
+                    showmedians=True, showextrema=False, widths=0.5,
+                )
+                col = phase_colours[j % len(phase_colours)]
+                for pc in vp2["bodies"]:
+                    pc.set_facecolor(col)
+                    pc.set_alpha(0.6)
+                vp2["cmedians"].set_color(col)
+
+        label = f"C{k}  tf={tf:.2f}  K_φ={k_phase}"
+        yticks.append(row_idx)
+        yticklabels.append(label)
+
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(yticklabels, fontsize=7)
+    ax.set_xlabel("Per-pixel temporal variance of z_phase  (mean over channels)")
+    ax.set_title(
+        "Interannual variability by type cluster\n"
+        "Grey = full cluster · Coloured = phase sub-clusters (sorted by temporal fraction ↑)"
+    )
+
+    # Legend
+    legend_elements = [Patch(facecolor="#cccccc", alpha=0.6, label="Full type cluster")]
+    for j in range(min(3, max((taxonomy.get(k, {}).get("k_phase", 1) for k in order), default=1))):
+        legend_elements.append(Patch(facecolor=phase_colours[j], alpha=0.7, label=f"Phase sub-cluster {j}"))
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "type_variability.png", dpi=150)
+    plt.close(fig)
+    logger.info("Saved type_variability.png")
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +627,7 @@ def main() -> None:
     model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
     z_type_dim = model.z_type_dim      # 64
     z_phase_dim = model.z_phase_dim    # 12
-    combined_dim = z_type_dim + 3 * z_phase_dim  # 64 + 36 = 100
+    combined_dim = z_type_dim + 3 * z_phase_dim + 1  # 64 + 36 + 1 = 101
     logger.info(f"z_type_dim={z_type_dim}  z_phase_dim={z_phase_dim}  encoder_feature='{enc_feature_name}'")
 
     # --- Reservoir sampling pass ----------------------------------------------
@@ -426,18 +645,19 @@ def main() -> None:
                 f"seen={sampler.n_seen:,}  buffer={sampler.filled:,}"
             )
 
-    buf = sampler.get()                          # [N, 100]
+    buf = sampler.get()                          # [N, 101]
     X_type = buf[:, :z_type_dim]                 # [N, 64]
-    X_phase = buf[:, z_type_dim:]                # [N, 36]
+    X_phase = buf[:, z_type_dim:z_type_dim + 3 * z_phase_dim]  # [N, 36]
+    temporal_var = buf[:, -1]                    # [N]  per-pixel temporal variance
     logger.info(f"Reservoir: {buf.shape[0]:,} pixels  (total seen: {sampler.n_seen:,})")
 
-    # --- Type GMM BIC sweep ---------------------------------------------------
+    # --- Type GMM silhouette sweep --------------------------------------------
     k_type_values = list(range(args.k_type_min, args.k_type_max + 1, args.k_type_step))
     if not k_type_values:
         raise ValueError(f"Empty k-type range: [{args.k_type_min}, {args.k_type_max}, {args.k_type_step}]")
 
-    logger.info(f"Type BIC sweep: K ∈ {k_type_values}")
-    k_type_star, gmm_type, type_bic = _bic_sweep(
+    logger.info(f"Type silhouette sweep: K ∈ {k_type_values}")
+    k_type_star, gmm_type, type_silhouette = _silhouette_sweep(
         X_type, k_type_values,
         covariance_type=args.covariance_type,
         n_init_sweep=args.n_init_sweep,
@@ -447,8 +667,9 @@ def main() -> None:
     )
     logger.info(f"Type GMM: K*={k_type_star}  converged={gmm_type.converged_}")
 
-    _save_bic_plot(type_bic, k_type_star, f"Type BIC sweep (K*={k_type_star})",
-                   out_dir / "bic_curve_type.png")
+    _save_score_plot(type_silhouette, k_type_star,
+                     "Average silhouette score", f"Type silhouette sweep (K*={k_type_star})",
+                     out_dir / "silhouette_curve_type.png")
 
     type_gmm_payload = {
         "gmm": gmm_type,
@@ -457,9 +678,8 @@ def main() -> None:
         "z_type_dim": z_type_dim,
         "n_pixels_fit": X_type.shape[0],
         "n_pixels_seen": sampler.n_seen,
-        "bic": float(gmm_type.bic(X_type)),
-        "aic": float(gmm_type.aic(X_type)),
-        "bic_curve": type_bic,
+        "silhouette": float(type_silhouette[k_type_star]),
+        "silhouette_curve": type_silhouette,
         "converged": bool(gmm_type.converged_),
         "encoder_checkpoint": str(args.checkpoint),
         "seed": args.seed,
@@ -473,30 +693,24 @@ def main() -> None:
     cluster_sizes = {k: int((type_labels == k).sum()) for k in range(k_type_star)}
     logger.info("Cluster sizes: " + "  ".join(f"C{k}:{sz}" for k, sz in cluster_sizes.items()))
 
-    # --- Dynamic-score diagnostic ---------------------------------------------
-    dyn_scores = _dynamic_scores(X_phase, type_labels, k_type_star)
-
-    dyn_csv_path = out_dir / "dynamic_scores.csv"
-    with open(dyn_csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["cluster", "n_pixels", "dynamic_score"])
-        for k in range(k_type_star):
-            writer.writerow([k, cluster_sizes[k], f"{dyn_scores[k]:.6f}"])
-    logger.info(f"Saved dynamic_scores.csv")
+    # --- Variability stats (before phase discretization) ----------------------
+    var_stats = _compute_variability_stats(X_phase, temporal_var, type_labels, k_type_star)
 
     # --- Phase GMM per type cluster -------------------------------------------
     k_phase_values = list(range(1, args.k_phase_max + 1))  # 1..5
     taxonomy: Dict[int, dict] = {}
+    phase_labels: Dict[int, np.ndarray] = {}  # cluster_k → phase label array for pixels in k
 
     for k in range(k_type_star):
         sel = X_phase[type_labels == k]   # [n_k, 36]
         n_k = sel.shape[0]
-        logger.info(f"  Cluster {k}: n={n_k}  dynamic_score={dyn_scores[k]:.4f}")
+        tf = var_stats[k]["temporal_fraction"]
+        logger.info(f"  Cluster {k}: n={n_k}  temporal_fraction={tf:.3f}")
 
         if n_k < args.min_cluster_pixels:
             logger.warning(f"    Too few pixels ({n_k} < {args.min_cluster_pixels}); assigning K_phase=1.")
             taxonomy[k] = {"n_type_pixels": n_k, "k_phase": 1, "is_dynamic": False,
-                           "dynamic_score": dyn_scores[k], "phase_bic_skipped": True}
+                           "temporal_fraction": tf, "phase_bic_skipped": True}
             continue
 
         # Limit K_phase candidates by data: can't have more components than pixels
@@ -515,6 +729,9 @@ def main() -> None:
         is_dynamic = k_phase_star > 1
         logger.info(f"    K_phase*={k_phase_star}  is_dynamic={is_dynamic}  converged={gmm_phase.converged_}")
 
+        # Store phase sub-cluster labels for the diagnostic
+        phase_labels[k] = gmm_phase.predict(sel)  # [n_k]
+
         _save_bic_plot(phase_bic, k_phase_star,
                        f"Cluster {k} phase BIC (K_phase*={k_phase_star}, dynamic={is_dynamic})",
                        out_dir / f"bic_curve_phase_{k}.png")
@@ -532,7 +749,7 @@ def main() -> None:
             "bic": float(gmm_phase.bic(sel)),
             "bic_curve": phase_bic,
             "converged": bool(gmm_phase.converged_),
-            "dynamic_score": dyn_scores[k],
+            "temporal_fraction": tf,
         }
         with open(out_dir / f"phase_gmm_{k}.pkl", "wb") as f:
             pickle.dump(phase_gmm_payload, f, protocol=5)
@@ -541,7 +758,7 @@ def main() -> None:
             "n_type_pixels": n_k,
             "k_phase": k_phase_star,
             "is_dynamic": is_dynamic,
-            "dynamic_score": dyn_scores[k],
+            "temporal_fraction": tf,
             "phase_bic": float(gmm_phase.bic(sel)),
             "phase_bic_skipped": False,
         }
@@ -570,11 +787,21 @@ def main() -> None:
 
     # Summary table
     logger.info("\nFinal taxonomy:")
-    logger.info(f"  {'Cluster':>7}  {'N pixels':>10}  {'K_phase':>7}  {'Dynamic':>7}  {'Dyn score':>10}")
+    logger.info(f"  {'Cluster':>7}  {'N pixels':>10}  {'K_phase':>7}  {'Dynamic':>7}  {'Temp frac':>10}")
     for k in range(k_type_star):
         t = taxonomy[k]
         logger.info(f"  {k:>7}  {t['n_type_pixels']:>10,}  {t['k_phase']:>7}  "
-                    f"{'yes' if t['is_dynamic'] else 'no':>7}  {t['dynamic_score']:>10.4f}")
+                    f"{'yes' if t['is_dynamic'] else 'no':>7}  {t.get('temporal_fraction', 0):.4f}")
+
+    # --- Variability diagnostic -----------------------------------------------
+    _generate_variability_diagnostic(
+        temporal_var=temporal_var,
+        type_labels=type_labels,
+        phase_labels=phase_labels,
+        var_stats=var_stats,
+        taxonomy=taxonomy,
+        out_dir=out_dir,
+    )
 
 
 if __name__ == "__main__":
