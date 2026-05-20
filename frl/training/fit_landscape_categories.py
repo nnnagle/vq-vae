@@ -674,6 +674,7 @@ def main() -> None:
     k_phase_dynamic = [2, 3, 4]
     taxonomy: Dict[int, dict] = {}
     phase_labels: Dict[int, np.ndarray] = {}
+    phase_gmms: Dict[int, object] = {}  # fitted GMM for each dynamic cluster
 
     logger.info(
         f"Phase classification: dynamic if q{args.dynamic_var_quantile}(temporal_var) "
@@ -724,6 +725,7 @@ def main() -> None:
         )
 
         phase_labels[k] = gmm_phase.predict(sel)
+        phase_gmms[k] = gmm_phase
 
         _save_score_plot(
             phase_sil, k_phase_star,
@@ -801,6 +803,213 @@ def main() -> None:
         out_dir=out_dir,
     )
 
+    # --- ysfc-by-phase diagnostic (second streaming pass) --------------------
+    _run_ysfc_diagnostic(
+        train_loader=train_loader,
+        feature_builder=feature_builder,
+        model=model,
+        device=device,
+        enc_feature_name=enc_feature_name,
+        gmm_type=gmm_type,
+        phase_gmms=phase_gmms,
+        taxonomy=taxonomy,
+        z_type_dim=z_type_dim,
+        z_phase_dim=z_phase_dim,
+        out_dir=out_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ysfc-by-phase diagnostic (second pass)
+# ---------------------------------------------------------------------------
+
+def _run_ysfc_diagnostic(
+    train_loader: DataLoader,
+    feature_builder: FeatureBuilder,
+    model: RepresentationModel,
+    device: torch.device,
+    enc_feature_name: str,
+    gmm_type,
+    phase_gmms: Dict[int, object],
+    taxonomy: Dict[int, dict],
+    z_type_dim: int,
+    z_phase_dim: int,
+    out_dir: Path,
+    max_per_group: int = 20_000,
+) -> None:
+    """Second streaming pass: collect ysfc values per (type_cluster, phase_sub_cluster).
+
+    For each dynamic type cluster k and phase sub-cluster j, accumulates the ysfc
+    value of every valid (pixel, timestep) whose pixel is assigned to (k, j).
+    Produces a grid figure: rows = dynamic clusters, columns = phase sub-clusters,
+    each cell a violin of ysfc (years since fast change).
+
+    ysfc = 0  →  disturbance year
+    ysfc = 1  →  one year post-disturbance
+    ysfc ≥ 5  →  model considers "recovered"
+    NaN       →  no disturbance observed in study window (stable/never disturbed)
+    """
+    dynamic_clusters = {k: v for k, v in taxonomy.items() if v["is_dynamic"]}
+    if not dynamic_clusters:
+        logger.info("No dynamic clusters — skipping ysfc diagnostic.")
+        return
+
+    # Storage: (cluster_k, phase_j) → list of valid ysfc floats
+    ysfc_store: Dict[Tuple[int, int], List[float]] = {
+        (k, j): [] for k, t in dynamic_clusters.items() for j in range(t["k_phase"])
+    }
+    # Also track total pixels per group to report NaN fraction
+    n_pixels_store: Dict[Tuple[int, int], int] = {key: 0 for key in ysfc_store}
+
+    logger.info("ysfc diagnostic: second pass through training data...")
+
+    for batch_idx, batch in enumerate(train_loader):
+        for i in range(len(batch["metadata"])):
+            sample = {
+                key: val[i].numpy() if isinstance(val, torch.Tensor) else val[i]
+                for key, val in batch.items()
+                if key != "metadata"
+            }
+            sample["metadata"] = batch["metadata"][i]
+
+            enc_f   = feature_builder.build_feature(enc_feature_name, sample)
+            phase_f = feature_builder.build_feature(PHASE_INPUT_FEATURE, sample)
+            ysfc_f  = feature_builder.build_feature(YSFC_FEATURE, sample)
+
+            enc   = torch.from_numpy(enc_f.data).float().unsqueeze(0).to(device)
+            phase = torch.from_numpy(phase_f.data).float().unsqueeze(0).to(device)
+
+            ysfc_data = ysfc_f.data[0].astype(np.float32)
+            ysfc_data = np.where(ysfc_f.mask, ysfc_data, np.nan)
+            ysfc_t = torch.from_numpy(ysfc_data).float()   # [T, H, W]
+
+            sm_names    = sample["metadata"]["channel_names"]["static_mask"]
+            sm_data     = sample["static_mask"]
+            aoi_mask    = torch.from_numpy(sm_data[sm_names.index("aoi")]).bool()
+            forest_mask = torch.from_numpy(sm_data[sm_names.index("forest")]).bool()
+            phase_mask  = torch.from_numpy(phase_f.mask).all(dim=0)
+            m = torch.from_numpy(enc_f.mask) & phase_mask & aoi_mask & forest_mask
+
+            with torch.no_grad():
+                z_type = model(enc)   # [1, 64, H, W]
+
+            T = phase.shape[2]
+            m_flat = m.reshape(-1)
+
+            z_type_pix = z_type[0].permute(1, 2, 0).reshape(-1, z_type_dim).cpu().numpy()
+            z_type_v   = z_type_pix[m_flat.numpy()]   # [N_valid, 64]
+
+            if z_type_v.shape[0] == 0:
+                continue
+
+            type_labels_v = gmm_type.predict(z_type_v)   # [N_valid]
+            has_dynamic   = any(taxonomy.get(int(k), {}).get("is_dynamic", False)
+                                for k in type_labels_v)
+            if not has_dynamic:
+                continue
+
+            # Run phase encoder for all valid pixels (one patch at a time)
+            with torch.no_grad():
+                z_phase = model.forward_phase(phase, z_type.detach())   # [1, 12, T, H, W]
+
+            z_phase_pix = z_phase[0].permute(2, 3, 0, 1).reshape(-1, T, z_phase_dim).cpu()
+            ysfc_pix    = ysfc_t.permute(1, 2, 0).reshape(-1, T)        # [H*W, T]
+
+            z_phase_v = z_phase_pix[m_flat]    # [N_valid, T, 12]
+            ysfc_v    = ysfc_pix[m_flat]       # [N_valid, T]
+
+            # Process each dynamic cluster's pixels in one vectorised block
+            for k, t in dynamic_clusters.items():
+                cluster_mask = type_labels_v == k
+                if not cluster_mask.any():
+                    continue
+
+                zp_k   = z_phase_v[cluster_mask]   # [N_k, T, 12]
+                yf_k   = ysfc_v[cluster_mask]      # [N_k, T]
+
+                phase_summary_k, _ = _compute_phase_summary(zp_k, yf_k)  # [N_k, 36]
+                phase_labels_k     = phase_gmms[k].predict(phase_summary_k.numpy())
+
+                for j in range(t["k_phase"]):
+                    key = (k, j)
+                    pix_j = phase_labels_k == j
+                    n_pixels_store[key] += int(pix_j.sum())
+
+                    # Collect valid (non-NaN) ysfc timestep values
+                    store = ysfc_store[key]
+                    if len(store) >= max_per_group:
+                        continue
+                    yf_j = yf_k[pix_j]   # [N_j, T]
+                    for n in range(yf_j.shape[0]):
+                        if len(store) >= max_per_group:
+                            break
+                        valid_vals = yf_j[n][yf_j[n].isfinite()].tolist()
+                        store.extend(valid_vals)
+
+        if batch_idx % 50 == 0:
+            logger.info(f"  ysfc pass: batch {batch_idx}/{len(train_loader)}")
+
+    # --- Plot -----------------------------------------------------------------
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not available; skipping ysfc plot.")
+        return
+
+    n_dyn     = len(dynamic_clusters)
+    k_phase_max = max(t["k_phase"] for t in dynamic_clusters.values())
+    phase_colours = ["#4e9af1", "#f4a261", "#2a9d8f", "#e76f51"]
+
+    fig, axes = plt.subplots(
+        n_dyn, k_phase_max,
+        figsize=(3 * k_phase_max, 2.5 * n_dyn),
+        squeeze=False,
+        sharey=True,
+    )
+
+    for row, (k, t) in enumerate(sorted(dynamic_clusters.items())):
+        k_phase = t["k_phase"]
+        for j in range(k_phase_max):
+            ax = axes[row, j]
+            if j >= k_phase:
+                ax.set_visible(False)
+                continue
+
+            key   = (k, j)
+            vals  = np.array(ysfc_store[key], dtype=np.float32)
+            n_pix = n_pixels_store[key]
+            n_valid_ysfc = int(np.isfinite(vals).sum()) if len(vals) > 0 else 0
+            nan_frac = 1.0 - n_valid_ysfc / max(len(vals), 1)
+
+            if len(vals) >= 5:
+                vp = ax.violinplot(vals[np.isfinite(vals)], showmedians=True, showextrema=False)
+                for pc in vp["bodies"]:
+                    pc.set_facecolor(phase_colours[j % len(phase_colours)])
+                    pc.set_alpha(0.7)
+                vp["cmedians"].set_color("black")
+            else:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=8)
+
+            ax.set_title(f"C{k} · Phase {j}\nn={n_pix:,}  NaN={nan_frac:.0%}",
+                         fontsize=8)
+            ax.set_xlabel("ysfc" if row == n_dyn - 1 else "")
+            ax.set_ylabel("years since\nfast change" if j == 0 else "")
+            ax.set_xticks([])
+
+    fig.suptitle(
+        "ysfc distribution by type cluster and phase sub-cluster\n"
+        "(NaN = pixel never disturbed in study window)",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    fig.savefig(out_dir / "ysfc_by_phase.png", dpi=150)
+    plt.close(fig)
+    logger.info("Saved ysfc_by_phase.png")
+
 
 if __name__ == "__main__":
     main()
+
