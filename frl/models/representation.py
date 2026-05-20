@@ -53,7 +53,7 @@ import torch.nn.functional as F
 
 from .conv2d_encoder import Conv2DEncoder
 from .conditioning import FiLMLayer
-from .spatial import GatedResidualConv2D
+from .spatial import GatedResidualConv2D, EdgeAwareSmoothingConv2D
 from .tcn import TCNEncoder
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ class RepresentationModel(nn.Module):
     """Full encoder pipeline for type and phase embeddings.
 
     **Type pathway**:
-        ``[B, C_type, H, W]`` → Conv2DEncoder → GatedResidualConv2D → z_type ``[B, z_type_dim, H, W]``
+        ``[B, C_type, H, W]`` → Conv2DEncoder → EdgeAwareSmoothingConv2D → z_type ``[B, z_type_dim, H, W]``
 
     **Phase pathway**:
         ``[B, C_phase, T, H, W]`` → TCN → 1×1 bottleneck → FiLM(stopgrad z_type)
@@ -99,12 +99,14 @@ class RepresentationModel(nn.Module):
         type_encoder_dropout: float = 0.1,
         type_encoder_num_groups: int = 8,
         type_encoder_input_dropout: float = 0.0,
-        # spatial conv (GatedResidualConv2D)
+        # spatial conv (EdgeAwareSmoothingConv2D)
         spatial_conv_num_layers: int = 2,
         spatial_conv_kernel_size: int = 3,
         spatial_conv_padding: int = 1,
         spatial_conv_gate_hidden: int = 64,
-        spatial_conv_gate_kernel_size: int = 1,
+        spatial_conv_gate_kernel_size: int = 3,
+        spatial_conv_num_directions: int = 4,
+        spatial_conv_coarse_dilation: int = 3,
         # phase TCN (TCNEncoder)
         phase_tcn_channels: List[int] = (64, 64, 64),
         phase_tcn_kernel_size: int = 3,
@@ -135,13 +137,15 @@ class RepresentationModel(nn.Module):
             num_groups=type_encoder_num_groups,
             input_dropout_rate=type_encoder_input_dropout,
         )
-        self.spatial_conv = GatedResidualConv2D(
+        self.spatial_conv = EdgeAwareSmoothingConv2D(
             channels=z_type_dim,
             num_layers=spatial_conv_num_layers,
             kernel_size=spatial_conv_kernel_size,
             padding=spatial_conv_padding,
             gate_hidden=spatial_conv_gate_hidden,
             gate_kernel_size=spatial_conv_gate_kernel_size,
+            num_directions=spatial_conv_num_directions,
+            coarse_dilation=spatial_conv_coarse_dilation,
         )
 
         # --- Phase pathway ---
@@ -238,7 +242,9 @@ class RepresentationModel(nn.Module):
             spatial_conv_kernel_size=sc.get("kernel_size", 3),
             spatial_conv_padding=sc.get("padding", 1),
             spatial_conv_gate_hidden=sc.get("gate_hidden", 64),
-            spatial_conv_gate_kernel_size=sc.get("gate_kernel_size", 1),
+            spatial_conv_gate_kernel_size=sc.get("gate_kernel_size", 3),
+            spatial_conv_num_directions=sc.get("num_directions", 4),
+            spatial_conv_coarse_dilation=sc.get("coarse_dilation", 3),
             # phase TCN
             phase_tcn_channels=pt.get("channels", [64, 64, 64]),
             phase_tcn_kernel_size=pt.get("kernel_size", 3),
