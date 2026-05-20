@@ -434,8 +434,10 @@ The following items are ambiguous in the code, underdocumented, or require autho
 **8.1 Spatial resolution and geographic bounds**  
 The config files confirm the data is in Virginia (`/data/VA/zarr/`) at 30m resolution (implied by CCDC/LCMS sources) with a full domain of 13,056 × 23,552 pixels, but neither the pixel size nor the CRS (UTM zone, EPSG code) are declared in any YAML. Exact geographic bounds and datum should be confirmed.
 
-**8.2 GatedResidualConv2D forward pass**  
-The current code (lines 125–128, `spatial.py`) computes `output = x + gate × (x − smoothed)`, which is an adaptive high-frequency amplification, not the blending described in the class docstring (OLD formulation). The paper will need to describe the actual behavior: it is adaptive sharpening where the gate is driven by the high-frequency residual, not a smooth/edge blend. Author should confirm which formulation is intended.
+~~**8.2 GatedResidualConv2D forward pass**~~  
+~~The current code (lines 125–128, `spatial.py`) computes `output = x + gate × (x − smoothed)`, which is an adaptive high-frequency amplification, not the blending described in the class docstring (OLD formulation). The paper will need to describe the actual behavior: it is adaptive sharpening where the gate is driven by the high-frequency residual, not a smooth/edge blend. Author should confirm which formulation is intended.~~
+
+**Resolved**: Code confirmed. Lines 125–128 of `spatial.py` implement `output = x + gate × (x − smoothed)` — adaptive sharpening where the gate is driven by the high-frequency residual. The old blending formulation (`gate * smoothed + (1-gate) * x`) exists only in commented-out code and the stale docstring. The paper should describe the actual executed behavior: gate ≈ 0 preserves the smoothed input; gate ≈ 1 doubles the high-frequency content, enhancing spatial edges and texture where they are already strong.
 
 **8.3 L2 normalization scope in the phase pathway**  
 `F.normalize(h.flatten(1,2), dim=1)` normalizes over the full `12 × T` dimensional vector per pixel. This is a joint normalization across channels and timesteps, not per-timestep. The paper should clarify whether this is the intended design, and what invariance it imparts: the unit sphere in (channel × time) space.
