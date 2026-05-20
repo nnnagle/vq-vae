@@ -303,12 +303,12 @@ def process_batch(
         if spatial_pos_pairs.numel() > 0:
             dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
-            all_pos_weights.append(pos_weights.detach())
+            all_pos_weights.append(pos_weights.detach().cpu())
 
         if spatial_neg_pairs.numel() > 0:
             dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
-            all_neg_weights.append(neg_weights.detach())
+            all_neg_weights.append(neg_weights.detach().cpu())
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -325,8 +325,8 @@ def process_batch(
         z_full = z_full.squeeze(0)  # [D, H, W]
         gate = gate.squeeze(0)  # [D, H, W]
 
-        # Collect gate values (flatten to 1D for stats)
-        all_gate_values.append(gate.detach().flatten())
+        # Collect gate values on CPU — kept for the full epoch, avoid GPU fragmentation
+        all_gate_values.append(gate.detach().flatten().cpu())
 
         # Extract embeddings at anchor locations for spectral loss
         z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
