@@ -28,6 +28,7 @@ from .conv2d_encoder import (
 # Spatial modules
 from .spatial import (
     GatedResidualConv2D,
+    EdgeAwareSmoothingConv2D,
     build_gated_residual_conv2d_from_config,
 )
 
@@ -62,6 +63,7 @@ __all__ = [
     'build_conv2d_from_config',
     # Spatial
     'GatedResidualConv2D',
+    'EdgeAwareSmoothingConv2D',
     'build_gated_residual_conv2d_from_config',
     # Representation
     'RepresentationModel',

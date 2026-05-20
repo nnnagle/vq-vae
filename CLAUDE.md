@@ -53,8 +53,8 @@ The `frl/` package is self-contained. Everything outside it is upstream preproce
 ```
 TYPE PATHWAY (atemporal):
   Input: [B, C_type, H, W]
-  → Conv2DEncoder          frl/models/conv2d_encoder.py
-  → GatedResidualConv2D    frl/models/spatial.py
+  → Conv2DEncoder               frl/models/conv2d_encoder.py
+  → EdgeAwareSmoothingConv2D    frl/models/spatial.py
   → z_type: [B, 64, H, W]
 
 PHASE PATHWAY (temporal):
@@ -69,7 +69,7 @@ PHASE PATHWAY (temporal):
 ### Key Design Decisions
 
 - **Stop-gradient on `z_type` before FiLM** — `z_type` is `.detach()`'d before being passed to `FiLMLayer`. This is intentional to prevent circular conditioning. Do not remove this.
-- **GatedResidualConv2D** — gate network blends smoothed vs. original features. Preserves edges while smoothing homogeneous regions.
+- **EdgeAwareSmoothingConv2D** (`frl/models/spatial.py`) — replaces `GatedResidualConv2D` starting from exp018. Uses a fixed directional filter bank (K=8: 4 orientations × 2 scales — fine 3×3 and coarse dilated-3×3) with per-channel softmax mixing weights predicted from per-channel Sobel gradients. Smooths **along** edges by concentrating weight on along-edge filters; a learned residual gate (`output = smoothed + gate·(x−smoothed)`) then preserves features **across** edges and at corners where no safe direction exists. `GatedResidualConv2D` is retained in `spatial.py` for historical reference.
 - **L2 normalization before FiLM** — controls embedding scale; FiLM gamma owns the scaling.
 - **Sparse forward pass** — `forward_phase_at_locations()` runs the phase encoder only at sampled anchor pixel locations (not the full spatial grid) for training efficiency.
 - **FiLM initialized near identity** — gamma≈1, beta≈0 at initialization for stable early training.
