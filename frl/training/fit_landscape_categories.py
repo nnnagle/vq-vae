@@ -398,6 +398,7 @@ def _compute_variability_stats(
             "median_temporal_var": float(np.median(tv)) if len(tv) > 0 else 0.0,
             "q25_temporal_var": float(np.percentile(tv, 25)) if len(tv) > 0 else 0.0,
             "q75_temporal_var": float(np.percentile(tv, 75)) if len(tv) > 0 else 0.0,
+            "q90_temporal_var": float(np.percentile(tv, 90)) if len(tv) > 0 else 0.0,
             "spatial_spread": var_s,
             "temporal_fraction": float(var_t / denom) if denom > 0 else 0.0,
         }
@@ -435,7 +436,7 @@ def _generate_variability_diagnostic(
         writer.writerow([
             "cluster", "n_pixels", "k_phase", "is_dynamic",
             "mean_temporal_var", "median_temporal_var",
-            "q25_temporal_var", "q75_temporal_var",
+            "q25_temporal_var", "q75_temporal_var", "q90_temporal_var",
             "spatial_spread", "temporal_fraction",
         ])
         for k, s in var_stats.items():
@@ -444,6 +445,7 @@ def _generate_variability_diagnostic(
                 k, s["n_pixels"], t.get("k_phase", 1), t.get("is_dynamic", False),
                 f"{s['mean_temporal_var']:.6f}", f"{s['median_temporal_var']:.6f}",
                 f"{s['q25_temporal_var']:.6f}", f"{s['q75_temporal_var']:.6f}",
+                f"{s['q90_temporal_var']:.6f}",
                 f"{s['spatial_spread']:.6f}", f"{s['temporal_fraction']:.4f}",
             ])
     logger.info("Saved variability_summary.csv")
@@ -543,6 +545,10 @@ def main() -> None:
                         help="Reservoir capacity for type GMM fitting (default: 500000)")
     parser.add_argument("--min-cluster-pixels", type=int, default=1_000,
                         help="Skip phase GMM for clusters smaller than this (default: 1000)")
+    parser.add_argument("--dynamic-var-quantile", type=int, default=90,
+                        help="Percentile of temporal_var used to assess tail activity (default: 90)")
+    parser.add_argument("--dynamic-var-threshold", type=float, default=0.25,
+                        help="A type is dynamic if its --dynamic-var-quantile exceeds this (default: 0.25)")
     parser.add_argument("--n-init", type=int, default=3,
                         help="n_init for final GMM refits (default: 3)")
     parser.add_argument("--n-init-sweep", type=int, default=1,
@@ -662,28 +668,49 @@ def main() -> None:
     var_stats = _compute_variability_stats(X_phase, temporal_var, type_labels, k_type_star)
 
     # --- Phase GMM per type cluster -------------------------------------------
-    k_phase_values = list(range(1, args.k_phase_max + 1))  # 1..5
+    # A type is dynamic if the --dynamic-var-quantile of its per-pixel temporal_var
+    # exceeds --dynamic-var-threshold.  Stable types get K_phase=1 (no GMM).
+    # Dynamic types: silhouette sweep over K=2,3,4 to pick K_phase.
+    k_phase_dynamic = [2, 3, 4]
     taxonomy: Dict[int, dict] = {}
-    phase_labels: Dict[int, np.ndarray] = {}  # cluster_k → phase label array for pixels in k
+    phase_labels: Dict[int, np.ndarray] = {}
+
+    logger.info(
+        f"Phase classification: dynamic if q{args.dynamic_var_quantile}(temporal_var) "
+        f"> {args.dynamic_var_threshold}"
+    )
 
     for k in range(k_type_star):
-        sel = X_phase[type_labels == k]   # [n_k, 36]
+        sel = X_phase[type_labels == k]      # [n_k, 36]
+        tv_k = temporal_var[type_labels == k]  # [n_k]
         n_k = sel.shape[0]
-        tf = var_stats[k]["temporal_fraction"]
-        logger.info(f"  Cluster {k}: n={n_k}  temporal_fraction={tf:.3f}")
+        q_tail = float(np.percentile(tv_k, args.dynamic_var_quantile)) if n_k > 0 else 0.0
+        is_dynamic = q_tail > args.dynamic_var_threshold
 
-        if n_k < args.min_cluster_pixels:
-            logger.warning(f"    Too few pixels ({n_k} < {args.min_cluster_pixels}); assigning K_phase=1.")
-            taxonomy[k] = {"n_type_pixels": n_k, "k_phase": 1, "is_dynamic": False,
-                           "temporal_fraction": tf, "phase_bic_skipped": True}
+        logger.info(
+            f"  Cluster {k}: n={n_k}  "
+            f"q{args.dynamic_var_quantile}_temporal_var={q_tail:.4f}  "
+            f"dynamic={is_dynamic}"
+        )
+
+        if n_k < args.min_cluster_pixels or not is_dynamic:
+            reason = "too few pixels" if n_k < args.min_cluster_pixels else "stable"
+            logger.info(f"    → K_phase=1 ({reason})")
+            taxonomy[k] = {
+                "n_type_pixels": n_k,
+                "k_phase": 1,
+                "is_dynamic": False,
+                f"q{args.dynamic_var_quantile}_temporal_var": q_tail,
+                "phase_gmm_skipped": True,
+            }
             continue
 
-        # Limit K_phase candidates by data: can't have more components than pixels
-        k_phase_available = [kp for kp in k_phase_values if kp <= n_k]
-        if len(k_phase_available) < 2:
-            k_phase_available = [1]
+        # Dynamic: silhouette sweep over K=2,3,4
+        k_phase_available = [kp for kp in k_phase_dynamic if kp <= n_k]
+        if not k_phase_available:
+            k_phase_available = [2]
 
-        k_phase_star, gmm_phase, phase_bic = _bic_sweep(
+        k_phase_star, gmm_phase, phase_sil = _silhouette_sweep(
             sel, k_phase_available,
             covariance_type=args.covariance_type,
             n_init_sweep=args.n_init_sweep,
@@ -691,30 +718,34 @@ def main() -> None:
             max_iter=args.max_iter,
             seed=args.seed,
         )
-        is_dynamic = k_phase_star > 1
-        logger.info(f"    K_phase*={k_phase_star}  is_dynamic={is_dynamic}  converged={gmm_phase.converged_}")
+        logger.info(
+            f"    → K_phase={k_phase_star} "
+            f"(silhouette={phase_sil[k_phase_star]:.4f})  converged={gmm_phase.converged_}"
+        )
 
-        # Store phase sub-cluster labels for the diagnostic
-        phase_labels[k] = gmm_phase.predict(sel)  # [n_k]
+        phase_labels[k] = gmm_phase.predict(sel)
 
-        _save_bic_plot(phase_bic, k_phase_star,
-                       f"Cluster {k} phase BIC (K_phase*={k_phase_star}, dynamic={is_dynamic})",
-                       out_dir / f"bic_curve_phase_{k}.png")
+        _save_score_plot(
+            phase_sil, k_phase_star,
+            "Average silhouette score",
+            f"Cluster {k} phase silhouette (K_phase*={k_phase_star})",
+            out_dir / f"silhouette_curve_phase_{k}.png",
+        )
 
         phase_gmm_payload = {
             "gmm": gmm_phase,
             "type_cluster": k,
             "k_phase": k_phase_star,
-            "is_dynamic": is_dynamic,
+            "is_dynamic": True,
             "covariance_type": args.covariance_type,
             "z_type_dim": z_type_dim,
             "z_phase_dim": z_phase_dim,
             "phase_summary_dim": 3 * z_phase_dim,
             "n_pixels_fit": n_k,
-            "bic": float(gmm_phase.bic(sel)),
-            "bic_curve": phase_bic,
+            "silhouette": float(phase_sil[k_phase_star]),
+            "silhouette_curve": phase_sil,
             "converged": bool(gmm_phase.converged_),
-            "temporal_fraction": tf,
+            f"q{args.dynamic_var_quantile}_temporal_var": q_tail,
         }
         with open(out_dir / f"phase_gmm_{k}.pkl", "wb") as f:
             pickle.dump(phase_gmm_payload, f, protocol=5)
@@ -722,10 +753,10 @@ def main() -> None:
         taxonomy[k] = {
             "n_type_pixels": n_k,
             "k_phase": k_phase_star,
-            "is_dynamic": is_dynamic,
-            "temporal_fraction": tf,
-            "phase_bic": float(gmm_phase.bic(sel)),
-            "phase_bic_skipped": False,
+            "is_dynamic": True,
+            f"q{args.dynamic_var_quantile}_temporal_var": q_tail,
+            "phase_silhouette": float(phase_sil[k_phase_star]),
+            "phase_gmm_skipped": False,
         }
 
     # --- Taxonomy summary -----------------------------------------------------
@@ -738,7 +769,8 @@ def main() -> None:
         "k_type": k_type_star,
         "n_dynamic_clusters": n_dynamic,
         "n_nondynamic_clusters": n_nondynamic,
-        "k_phase_max": args.k_phase_max,
+        "dynamic_var_quantile": args.dynamic_var_quantile,
+        "dynamic_var_threshold": args.dynamic_var_threshold,
         "low_ysfc_max": LOW_YSFC_MAX,
         "high_ysfc_min": HIGH_YSFC_MIN,
         "encoder_checkpoint": str(args.checkpoint),
@@ -752,11 +784,12 @@ def main() -> None:
 
     # Summary table
     logger.info("\nFinal taxonomy:")
-    logger.info(f"  {'Cluster':>7}  {'N pixels':>10}  {'K_phase':>7}  {'Dynamic':>7}  {'Temp frac':>10}")
+    q_key = f"q{args.dynamic_var_quantile}_temporal_var"
+    logger.info(f"  {'Cluster':>7}  {'N pixels':>10}  {'K_phase':>7}  {'Dynamic':>7}  {f'q{args.dynamic_var_quantile}_tvar':>12}")
     for k in range(k_type_star):
         t = taxonomy[k]
         logger.info(f"  {k:>7}  {t['n_type_pixels']:>10,}  {t['k_phase']:>7}  "
-                    f"{'yes' if t['is_dynamic'] else 'no':>7}  {t.get('temporal_fraction', 0):.4f}")
+                    f"{'yes' if t['is_dynamic'] else 'no':>7}  {t.get(q_key, 0):.4f}")
 
     # --- Variability diagnostic -----------------------------------------------
     _generate_variability_diagnostic(
