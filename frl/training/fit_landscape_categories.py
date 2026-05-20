@@ -257,6 +257,7 @@ def _silhouette_sweep(
     max_iter: int,
     seed: int,
     n_silhouette_samples: int = 20_000,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> Tuple[int, object, Dict[int, float]]:
     """Fit GMMs for each K, score by average silhouette; return (best_k, best_gmm, scores).
 
@@ -266,6 +267,12 @@ def _silhouette_sweep(
     = overlapping clusters.
 
     Silhouette is O(N²) — we subsample to n_silhouette_samples for speed.
+
+    Args:
+        sample_weight: Optional per-sample weights passed to gmm.fit().  When
+            provided, the EM objective becomes a weighted log-likelihood so that
+            high-weight pixels (e.g. high temporal_var) anchor the component
+            positions.  Silhouette scoring is always unweighted (uniform subsample).
     """
     from sklearn.mixture import GaussianMixture
     from sklearn.metrics import silhouette_score
@@ -283,7 +290,7 @@ def _silhouette_sweep(
             max_iter=max_iter,
             random_state=seed,
         )
-        gmm.fit(X)
+        gmm.fit(X, sample_weight=sample_weight)
         labels_sil = gmm.predict(X_sil)
         if len(np.unique(labels_sil)) < 2:
             scores[k] = -1.0  # degenerate: all points in one cluster
@@ -301,7 +308,7 @@ def _silhouette_sweep(
         max_iter=max_iter,
         random_state=seed,
     )
-    best_gmm.fit(X)
+    best_gmm.fit(X, sample_weight=sample_weight)
     if not best_gmm.converged_:
         logger.warning(f"  Final GMM (K={best_k}) did not converge.")
     return best_k, best_gmm, scores
@@ -718,6 +725,7 @@ def main() -> None:
             n_init_final=args.n_init,
             max_iter=args.max_iter,
             seed=args.seed,
+            sample_weight=tv_k,
         )
         logger.info(
             f"    → K_phase={k_phase_star} "
