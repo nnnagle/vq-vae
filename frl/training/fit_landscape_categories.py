@@ -281,6 +281,22 @@ def _silhouette_sweep(
     idx_sil = rng.choice(len(X), size=min(n_silhouette_samples, len(X)), replace=False)
     X_sil = X[idx_sil]
 
+    # Weighted bootstrap: resample X with prob ∝ sample_weight so that high-weight
+    # pixels appear more often in the EM objective.  sklearn GMM has no native
+    # sample_weight support, so this is the standard workaround.
+    if sample_weight is not None:
+        w = sample_weight.astype(np.float64)
+        w = np.clip(w, 0, None)
+        w_sum = w.sum()
+        if w_sum > 0:
+            w /= w_sum
+            idx_w = rng.choice(len(X), size=len(X), replace=True, p=w)
+            X_fit = X[idx_w]
+        else:
+            X_fit = X
+    else:
+        X_fit = X
+
     scores: Dict[int, float] = {}
     for k in k_values:
         gmm = GaussianMixture(
@@ -290,7 +306,7 @@ def _silhouette_sweep(
             max_iter=max_iter,
             random_state=seed,
         )
-        gmm.fit(X, sample_weight=sample_weight)
+        gmm.fit(X_fit)
         labels_sil = gmm.predict(X_sil)
         if len(np.unique(labels_sil)) < 2:
             scores[k] = -1.0  # degenerate: all points in one cluster
@@ -308,7 +324,7 @@ def _silhouette_sweep(
         max_iter=max_iter,
         random_state=seed,
     )
-    best_gmm.fit(X, sample_weight=sample_weight)
+    best_gmm.fit(X_fit)
     if not best_gmm.converged_:
         logger.warning(f"  Final GMM (K={best_k}) did not converge.")
     return best_k, best_gmm, scores
