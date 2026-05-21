@@ -107,6 +107,7 @@ class RepresentationModel(nn.Module):
         spatial_conv_gate_kernel_size: int = 3,
         spatial_conv_num_directions: int = 4,
         spatial_conv_coarse_dilation: int = 3,
+        spatial_conv_rank: int = 4,
         # phase TCN (TCNEncoder)
         phase_tcn_channels: List[int] = (64, 64, 64),
         phase_tcn_kernel_size: int = 3,
@@ -146,6 +147,7 @@ class RepresentationModel(nn.Module):
             gate_kernel_size=spatial_conv_gate_kernel_size,
             num_directions=spatial_conv_num_directions,
             coarse_dilation=spatial_conv_coarse_dilation,
+            rank=spatial_conv_rank,
         )
 
         # --- Phase pathway ---
@@ -245,6 +247,7 @@ class RepresentationModel(nn.Module):
             spatial_conv_gate_kernel_size=sc.get("gate_kernel_size", 3),
             spatial_conv_num_directions=sc.get("num_directions", 4),
             spatial_conv_coarse_dilation=sc.get("coarse_dilation", 3),
+            spatial_conv_rank=sc.get("rank", 4),
             # phase TCN
             phase_tcn_channels=pt.get("channels", [64, 64, 64]),
             phase_tcn_kernel_size=pt.get("kernel_size", 3),

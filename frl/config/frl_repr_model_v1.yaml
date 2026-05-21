@@ -53,6 +53,7 @@ spatial_conv:
   gate_kernel_size: 3
   num_directions: 4       # orientations in filter bank; total K = num_directions × 2 scales
   coarse_dilation: 3      # dilation for coarse-scale bank filters (7×7 effective)
+  rank: 4                 # R shared direction-basis patterns; channels correlated but not tied
 
 # ================================================================
 # Phase pathway
