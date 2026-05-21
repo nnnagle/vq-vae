@@ -167,8 +167,13 @@ class EdgeAwareSmoothingConv2D(nn.Module):
     Two complementary mechanisms work together:
 
     1. **Directional filter bank** (K = num_directions × 2 fixed filters, two spatial
-       scales per orientation) with **per-channel learned mixing weights**: concentrates
-       smoothing along edges while suppressing cross-edge blurring.
+       scales per orientation) with **rank-R factored per-channel mixing weights**:
+       concentrates smoothing along edges while suppressing cross-edge blurring.
+       Mixing weights are factored as W[k,c] = Σ_r A[k,r] · B[c,r], where A holds
+       R shared direction-basis patterns and B holds per-channel mixture coefficients.
+       This enforces correlation across channels (they share R basis patterns) while
+       still allowing each channel its own directional preference — e.g. topographic
+       channels can load on coarse-scale bases, spectral channels on fine-scale bases.
 
     2. **Residual edge gate**: where no safe smooth direction exists (corners, strong
        cross-edge content), gate ≈ 1 preserves the original features.
@@ -184,10 +189,13 @@ class EdgeAwareSmoothingConv2D(nn.Module):
         num_layers: Accepted for signature compatibility; unused in this design.
         kernel_size: Fine-scale directional filter kernel size (3).
         padding: Padding for fine-scale filters (1).
-        gate_hidden: Hidden channels for both the mixing network and gate network.
+        gate_hidden: Hidden channels for the mixing backbone and gate network.
         gate_kernel_size: Spatial kernel size for the gate network convolutions.
         num_directions: Number of orientations; total K = num_directions × 2 (fine+coarse).
         coarse_dilation: Dilation for coarse-scale bank filters (default 3 → 7×7 effective).
+        rank: Number of shared direction-basis patterns R. Controls the degree of
+            cross-channel correlation in the mixing weights. Larger R allows more
+            independent channel behaviour; smaller R enforces tighter coupling.
     """
 
     def __init__(
@@ -200,6 +208,7 @@ class EdgeAwareSmoothingConv2D(nn.Module):
         gate_kernel_size: int = 3,
         num_directions: int = 4,
         coarse_dilation: int = 3,
+        rank: int = 4,
     ):
         super().__init__()
 
@@ -207,6 +216,7 @@ class EdgeAwareSmoothingConv2D(nn.Module):
         self.num_directions = num_directions
         self.coarse_dilation = coarse_dilation
         self.K = num_directions * 2
+        self.rank = rank
 
         # --- Fixed directional filter bank ---
         # Four orientations, two scales each (fine dilation=1, coarse dilation=coarse_dilation).
@@ -237,14 +247,19 @@ class EdgeAwareSmoothingConv2D(nn.Module):
             sobel_y.reshape(1, 1, 3, 3).expand(channels, 1, 3, 3).contiguous(),
         )
 
-        # --- Mixing weight network ---
-        # Maps [B, 2C, H, W] (per-channel Sobel gradients) to K-way softmax
-        # weights [B, K, C, H, W] — each channel chooses its own blend direction.
-        self.mixing_net = nn.Sequential(
+        # --- Factored mixing weight network ---
+        # Shared backbone extracts spatial features from per-channel Sobel gradients.
+        # head_A: K*R outputs → A[k, r] — K-way softmax direction weights for R slots.
+        # head_B: C*R outputs → B[c, r] — R-way softmax channel mixture over slots.
+        # Effective per-channel weight: w[k,c] = Σ_r A[k,r] · B[c,r].
+        # Largest single output tensor is [B, C*R, H, W] = [B, 256, H, W] vs
+        # the unfactored [B, K*C, H, W] = [B, 512, H, W].
+        self.mix_backbone = nn.Sequential(
             nn.Conv2d(2 * channels, gate_hidden, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(gate_hidden, self.K * channels, kernel_size=1),
         )
+        self.mix_head_A = nn.Conv2d(gate_hidden, self.K * rank, kernel_size=1)
+        self.mix_head_B = nn.Conv2d(gate_hidden, channels * rank, kernel_size=1)
 
         # --- Residual edge gate ---
         gate_pad = (gate_kernel_size - 1) // 2
@@ -269,17 +284,29 @@ class EdgeAwareSmoothingConv2D(nn.Module):
         """
         B, C, H, W = x.shape
         K = self.K
+        R = self.rank
 
-        # Per-channel Sobel gradients → mixing weight input
+        # Per-channel Sobel gradients → shared mixing backbone
         dx = F.conv2d(x, self.sobel_x, padding=1, groups=C)  # [B, C, H, W]
         dy = F.conv2d(x, self.sobel_y, padding=1, groups=C)
+        feat = self.mix_backbone(torch.cat([dx, dy], dim=1))  # [B, gate_hidden, H, W]
 
-        # Per-channel K-way softmax mixing weights
-        w_raw = self.mixing_net(torch.cat([dx, dy], dim=1))       # [B, K*C, H, W]
-        w = torch.softmax(w_raw.reshape(B, K, C, H, W), dim=1)   # [B, K, C, H, W]
+        # A: K-way softmax direction weights for each of R basis slots
+        A = torch.softmax(
+            self.mix_head_A(feat).reshape(B, K, R, H, W), dim=1
+        )  # [B, K, R, H, W]
 
-        # Directional weighted smoothing
-        smoothed = torch.zeros_like(x)
+        # B: R-way softmax per-channel mixture over the R basis slots
+        B_w = torch.softmax(
+            self.mix_head_B(feat).reshape(B, C, R, H, W), dim=2
+        )  # [B, C, R, H, W]
+
+        # Accumulate slot smoothed outputs:
+        #   slot[b, c, r, h, w] = Σ_k  A[b, k, r, h, w] · filtered_k[b, c, h, w]
+        # A[:, k]: [B, R, H, W] → unsqueeze(1) → [B, 1, R, H, W]
+        # filtered:  [B, C, H, W] → unsqueeze(2) → [B, C, 1, H, W]
+        # product broadcasts to [B, C, R, H, W]
+        slot = torch.zeros(B, C, R, H, W, device=x.device, dtype=x.dtype)
         for i in range(self.num_directions):
             filt = self.bank[i]  # [C, 1, 3, 3]
             fine = F.conv2d(x, filt, padding=1, groups=C)
@@ -289,7 +316,11 @@ class EdgeAwareSmoothingConv2D(nn.Module):
                 dilation=self.coarse_dilation,
                 groups=C,
             )
-            smoothed = smoothed + w[:, 2 * i] * fine + w[:, 2 * i + 1] * coarse
+            slot = slot + fine.unsqueeze(2) * A[:, 2 * i].unsqueeze(1)
+            slot = slot + coarse.unsqueeze(2) * A[:, 2 * i + 1].unsqueeze(1)
+
+        # Per-channel mix over R slots: smoothed[b,c,h,w] = Σ_r B[b,c,r,h,w] · slot[b,c,r,h,w]
+        smoothed = (B_w * slot).sum(dim=2)  # [B, C, H, W]
 
         # Residual edge gate: high residual (cross-edge/corner) → gate ≈ 1 → preserve x
         residual = x - smoothed
