@@ -4,6 +4,7 @@ embed_locations.py
 Given a CSV with lat/lon/year columns, embed each location using the FoR-EST
 model and write a new CSV with:
   - pixel_row, pixel_col       — Zarr pixel coordinates
+  - split                      — 'train', 'val', or 'test' (checkerboard partition)
   - ysfc                       — years since fire/disturbance at the given year
   - evt                        — Existing Vegetation Type code
   - x_type_0 .. x_type_{C-1}  — normalized type encoder inputs at the pixel
@@ -90,6 +91,20 @@ def latlon_to_pixel(lat: float, lon: float, transformer: Transformer,
     col = int((x - x0) / pw)
     row = int((y - y0) / ph)
     return row, col
+
+
+def pixel_split(pix_row: int, pix_col: int, patch_size: int) -> str:
+    """Return 'train', 'val', or 'test' using the same checkerboard as ForestDatasetV2."""
+    block_height, block_width = 4, 4
+    block_row = (pix_row // patch_size) // block_height
+    block_col = (pix_col // patch_size) // block_width
+    A = (block_row // 2 + block_col // 2) % 2
+    B = (block_row + block_col) % 4
+    if A == 0 and B == 0:
+        return "test"
+    if A == 0 and B == 2:
+        return "val"
+    return "train"
 
 
 def load_sample_at_window(dataset: ForestDatasetV2, window: SpatialWindow) -> dict:
@@ -237,6 +252,7 @@ def main():
         record = dict(row_data)
         record["pixel_row"] = pix_row
         record["pixel_col"] = pix_col
+        record["split"] = pixel_split(pix_row, pix_col, args.patch_size)
         record["ysfc"] = ysfc_val
         record["evt"] = evt_val
         for i, v in enumerate(x_type):
