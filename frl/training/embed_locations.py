@@ -13,12 +13,13 @@ model and write a new CSV with:
   - z_phase_0 .. z_phase_11   — phase embedding (12-d) at the given year
 
 Usage:
-  python frl/training/embed_locations.py \\
+  python -m training.embed_locations \\
       --csv plots.csv \\
       --checkpoint runs/.../encoder_last.pt \\
-      --training frl/config/frl_training_v1.yaml \\
-      --zarr-config zarr_builder/va_vae_dataset.yaml \\
-      --output embeddings.csv
+      --training config/frl_training_v1.yaml \\
+      --zarr-config ../zarr_builder/va_vae_dataset.yaml \\
+      --output embeddings.csv \\
+      --batch-size 32 --num-workers 4
 """
 
 import argparse
@@ -30,6 +31,7 @@ import pandas as pd
 import torch
 import yaml
 from pyproj import Transformer
+from torch.utils.data import DataLoader, Dataset
 
 from data.loaders.builders.feature_builder import FeatureBuilder
 from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
@@ -55,12 +57,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lat-col", default="LAT_ACTUAL", help="Latitude column name")
     p.add_argument("--lon-col", default="LON_ACTUAL", help="Longitude column name")
     p.add_argument("--year-col", default="MEASYEAR", help="Year column name")
-    p.add_argument(
-        "--patch-size",
-        type=int,
-        default=64,
-        help="Spatial context patch size for type encoder (pixels)",
-    )
+    p.add_argument("--patch-size", type=int, default=64,
+                   help="Spatial context patch size for type encoder (pixels)")
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="Model inference batch size")
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="DataLoader worker processes for parallel Zarr I/O")
     p.add_argument("--device", default="cpu", help="Torch device (cpu or cuda)")
     return p.parse_args()
 
@@ -79,18 +81,6 @@ def load_spatial_config(zarr_config_path: str):
     crs_wkt = spatial["crs"]["wkt"]
     t = spatial["transform"]  # [pw, rx, x0, ry, ph, y0]
     return crs_wkt, float(t[2]), float(t[5]), float(t[0]), float(t[4])
-
-
-def latlon_to_pixel(lat: float, lon: float, transformer: Transformer,
-                    x0: float, y0: float, pw: float, ph: float):
-    """Project WGS84 (lat, lon) to Zarr integer pixel (row, col).
-
-    ph is expected to be negative (north-up raster).
-    """
-    x, y = transformer.transform(lon, lat)
-    col = int((x - x0) / pw)
-    row = int((y - y0) / ph)
-    return row, col
 
 
 def pixel_split(pix_row: int, pix_col: int, patch_size: int) -> str:
@@ -119,16 +109,76 @@ def load_sample_at_window(dataset: ForestDatasetV2, window: SpatialWindow) -> di
     return result
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    args = parse_args()
+class LocationDataset(Dataset):
+    """Loads one patch per (pixel_row, pixel_col, year_idx) record."""
 
+    def __init__(
+        self,
+        records: list[dict],
+        fv2_dataset: ForestDatasetV2,
+        feature_builder: FeatureBuilder,
+        type_enc_feature: str,
+        phase_enc_feature: str,
+        patch_size: int,
+        full_height: int,
+        full_width: int,
+        ysfc_channel_idx: int,
+        evt_channel_idx: int,
+    ):
+        self.records = records
+        self.dataset = fv2_dataset
+        self.feature_builder = feature_builder
+        self.type_enc_feature = type_enc_feature
+        self.phase_enc_feature = phase_enc_feature
+        self.P = patch_size
+        self.full_height = full_height
+        self.full_width = full_width
+        self.ysfc_channel_idx = ysfc_channel_idx
+        self.evt_channel_idx = evt_channel_idx
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict:
+        rec = self.records[idx]
+        pix_row, pix_col = rec["pix_row"], rec["pix_col"]
+        year_idx = rec["year_idx"]
+        P = self.P
+
+        r0 = max(0, min(pix_row - P // 2, self.full_height - P))
+        c0 = max(0, min(pix_col - P // 2, self.full_width - P))
+        lr = pix_row - r0
+        lc = pix_col - c0
+
+        window = SpatialWindow(row_start=r0, col_start=c0, height=P, width=P)
+        sample = load_sample_at_window(self.dataset, window)
+
+        ysfc_val = float(sample["annual"][self.ysfc_channel_idx, year_idx, lr, lc])
+        evt_val = int(sample["static_categorical"][self.evt_channel_idx, lr, lc])
+
+        feat_type = self.feature_builder.build_feature(self.type_enc_feature, sample)
+        feat_phase = self.feature_builder.build_feature(self.phase_enc_feature, sample)
+
+        return {
+            "x_type_patch": torch.from_numpy(feat_type.data).float(),          # [C_type, P, P]
+            "x_phase_pixel": torch.from_numpy(feat_phase.data[:, :, lr, lc]).float(),  # [C_phase, T]
+            "x_type_center": torch.from_numpy(feat_type.data[:, lr, lc]).float(),      # [C_type]
+            "x_phase_center": torch.from_numpy(feat_phase.data[:, year_idx, lr, lc]).float(),  # [C_phase]
+            "local_row": lr,
+            "local_col": lc,
+            "year_idx": year_idx,
+            "ysfc": ysfc_val,
+            "evt": evt_val,
+            "orig_idx": rec["orig_idx"],
+        }
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
     device = torch.device(args.device)
 
-    # --- Training config -------------------------------------------------
+    # --- Configs -------------------------------------------------------------
     training_config = TrainingConfigParser(args.training).parse()
     bindings_path = training_config.config_paths.get("bindings_path")
     if not bindings_path:
@@ -138,139 +188,126 @@ def main():
     logger.info("Type encoder feature : %s", type_enc_feature)
     logger.info("Phase encoder feature: %s", phase_enc_feature)
 
-    # --- Bindings config + FeatureBuilder --------------------------------
     bindings_config = DatasetBindingsParser(bindings_path).parse()
     feature_builder = FeatureBuilder(bindings_config)
     time_start = bindings_config.time_window.start
     time_end = bindings_config.time_window.end
     n_years = bindings_config.time_window.n_years
 
-    # --- Model -----------------------------------------------------------
-    model = RepresentationModel.from_checkpoint(
-        args.checkpoint, device=device, freeze=True
-    )
+    # --- Model ---------------------------------------------------------------
+    model = RepresentationModel.from_checkpoint(args.checkpoint, device=device, freeze=True)
     model.eval()
 
-    # --- Spatial reference -----------------------------------------------
+    # --- Spatial reference ---------------------------------------------------
     crs_wkt, x0, y0, pw, ph = load_spatial_config(args.zarr_config)
     transformer = Transformer.from_crs("EPSG:4326", crs_wkt, always_xy=True)
 
-    # --- Dataset (loads AOI once; gives us _load_group) ------------------
-    dataset = ForestDatasetV2(
-        bindings_config,
-        split=None,
-        patch_size=args.patch_size,
-        min_aoi_fraction=0.0,
-    )
-    full_height, full_width = dataset.zarr_root["aoi"].shape
+    # --- Dataset + channel indices -------------------------------------------
+    P = args.patch_size
+    fv2 = ForestDatasetV2(bindings_config, split=None, patch_size=P, min_aoi_fraction=0.0)
+    full_height, full_width = fv2.zarr_root["aoi"].shape
     logger.info("Zarr extent: %d rows × %d cols", full_height, full_width)
 
-    # --- CSV -------------------------------------------------------------
+    # Determine fixed channel indices from one probe load (same for every patch)
+    probe = load_sample_at_window(fv2, SpatialWindow(0, 0, P, P))
+    annual_names = probe["metadata"]["channel_names"]["annual"]
+    cat_names = probe["metadata"]["channel_names"]["static_categorical"]
+    ysfc_channel_idx = annual_names.index("ysfc")
+    evt_channel_idx = cat_names.index("evt")
+
+    # --- Validate all rows (vectorized projection) ---------------------------
     df = pd.read_csv(args.csv)
     logger.info("Loaded %d rows from %s", len(df), args.csv)
 
-    out_records = []
+    lats = df[args.lat_col].to_numpy(dtype=float)
+    lons = df[args.lon_col].to_numpy(dtype=float)
+    years = df[args.year_col].to_numpy(dtype=int)
 
-    for idx, row_data in df.iterrows():
-        lat = float(row_data[args.lat_col])
-        lon = float(row_data[args.lon_col])
-        year = int(row_data[args.year_col])
+    # Vectorized WGS84 → projected → pixel
+    xs, ys = transformer.transform(lons, lats)
+    pix_cols = ((xs - x0) / pw).astype(int)
+    pix_rows = ((ys - y0) / ph).astype(int)
 
-        # Year → time index
-        year_idx = year - time_start
+    records = []
+    orig_indices = list(df.index)
+    for i, orig_idx in enumerate(orig_indices):
+        year_idx = int(years[i]) - time_start
         if not (0 <= year_idx < n_years):
-            logger.warning(
-                "Row %d: year %d outside time window %d-%d; skipping.",
-                idx, year, time_start, time_end,
-            )
+            logger.warning("Row %s: year %d outside %d-%d; skipping.",
+                           orig_idx, years[i], time_start, time_end)
             continue
-
-        # Lat/lon → pixel
-        pix_row, pix_col = latlon_to_pixel(lat, lon, transformer, x0, y0, pw, ph)
-        if not (0 <= pix_row < full_height and 0 <= pix_col < full_width):
-            logger.warning(
-                "Row %d: pixel (%d, %d) out of bounds [0-%d, 0-%d]; skipping.",
-                idx, pix_row, pix_col, full_height - 1, full_width - 1,
-            )
+        pr, pc = int(pix_rows[i]), int(pix_cols[i])
+        if not (0 <= pr < full_height and 0 <= pc < full_width):
+            logger.warning("Row %s: pixel (%d,%d) out of bounds; skipping.", orig_idx, pr, pc)
             continue
+        records.append({"pix_row": pr, "pix_col": pc, "year_idx": year_idx, "orig_idx": orig_idx})
 
-        # Patch origin (centered on pixel, clamped to valid extent)
-        P = args.patch_size
-        r0 = max(0, min(pix_row - P // 2, full_height - P))
-        c0 = max(0, min(pix_col - P // 2, full_width - P))
-        lr = pix_row - r0  # local row within patch
-        lc = pix_col - c0  # local col within patch
+    logger.info("%d of %d rows are within bounds and time window", len(records), len(df))
 
-        # Load raw data for patch
-        window = SpatialWindow(row_start=r0, col_start=c0, height=P, width=P)
-        sample = load_sample_at_window(dataset, window)
+    # --- DataLoader ----------------------------------------------------------
+    loc_ds = LocationDataset(
+        records, fv2, feature_builder, type_enc_feature, phase_enc_feature,
+        P, full_height, full_width, ysfc_channel_idx, evt_channel_idx,
+    )
+    loader = DataLoader(
+        loc_ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        shuffle=False,
+    )
 
-        # --- ysfc and evt from the raw sample dict ----------------------
-        annual_data = sample["annual"]   # [C_annual, T, P, P]
-        annual_names = sample["metadata"]["channel_names"]["annual"]
-        ysfc_idx = annual_names.index("ysfc")
-        ysfc_val = float(annual_data[ysfc_idx, year_idx, lr, lc])
+    # --- Batched inference ---------------------------------------------------
+    out_records = []
+    n_done = 0
 
-        cat_data = sample["static_categorical"]   # [C_cat, P, P]
-        cat_names = sample["metadata"]["channel_names"]["static_categorical"]
-        evt_idx = cat_names.index("evt")
-        evt_val = int(cat_data[evt_idx, lr, lc])
+    for batch in loader:
+        B = batch["x_type_patch"].shape[0]
+        lr_vec = batch["local_row"]   # [B] int
+        lc_vec = batch["local_col"]   # [B] int
+        yi_vec = batch["year_idx"]    # [B] int
+        bidx = torch.arange(B)
 
-        # --- Normalized input features -----------------------------------
-        feat_type = feature_builder.build_feature(type_enc_feature, sample)
-        # feat_type.data: [C_type, P, P]
-        feat_phase = feature_builder.build_feature(phase_enc_feature, sample)
-        # feat_phase.data: [C_phase, T, P, P]
+        x_type_batch = batch["x_type_patch"].to(device)    # [B, C_type, P, P]
+        x_phase_batch = batch["x_phase_pixel"].to(device)  # [B, C_phase, T]
 
-        x_type = feat_type.data[:, lr, lc]           # [C_type]
-        x_phase_year = feat_phase.data[:, year_idx, lr, lc]  # [C_phase]
-
-        # --- Type embedding (needs spatial patch for context) ------------
-        x_type_tensor = (
-            torch.from_numpy(feat_type.data).float().unsqueeze(0).to(device)
-        )  # [1, C_type, P, P]
         with torch.no_grad():
-            z_type_patch = model(x_type_tensor)  # [1, 64, P, P]
-        z_type = z_type_patch[0, :, lr, lc].cpu().numpy()  # [64]
-
-        # --- Phase embedding at target pixel / all years -----------------
-        # x_phase_pixel: [1, C_phase, T]
-        x_phase_pixel = (
-            torch.from_numpy(feat_phase.data[:, :, lr, lc])
-            .float()
-            .unsqueeze(0)
-            .to(device)
-        )
-        z_type_pixel = torch.from_numpy(z_type).float().unsqueeze(0).to(device)  # [1, 64]
-        with torch.no_grad():
+            z_type_patch = model(x_type_batch)                    # [B, 64, P, P]
+            z_type_center = z_type_patch[bidx, :, lr_vec, lc_vec] # [B, 64]
             z_phase_all = model.forward_phase_at_locations(
-                x_phase_pixel, z_type_pixel
-            )  # [1, T, 12]
-        z_phase = z_phase_all[0, year_idx, :].cpu().numpy()  # [12]
+                x_phase_batch, z_type_center
+            )                                                      # [B, T, 12]
+            z_phase_center = z_phase_all[bidx, yi_vec, :]         # [B, 12]
 
-        # --- Assemble record --------------------------------------------
-        record = dict(row_data)
-        record["pixel_row"] = pix_row
-        record["pixel_col"] = pix_col
-        record["split"] = pixel_split(pix_row, pix_col, args.patch_size)
-        record["ysfc"] = ysfc_val
-        record["evt"] = evt_val
-        for i, v in enumerate(x_type):
-            record[f"x_type_{i}"] = float(v)
-        for i, v in enumerate(x_phase_year):
-            record[f"x_phase_{i}"] = float(v)
-        for i, v in enumerate(z_type):
-            record[f"z_type_{i}"] = float(v)
-        for i, v in enumerate(z_phase):
-            record[f"z_phase_{i}"] = float(v)
+        z_type_np = z_type_center.cpu().numpy()    # [B, 64]
+        z_phase_np = z_phase_center.cpu().numpy()  # [B, 12]
+        x_type_np = batch["x_type_center"].numpy() # [B, C_type]
+        x_phase_np = batch["x_phase_center"].numpy()  # [B, C_phase]
 
-        out_records.append(record)
-        logger.info(
-            "Row %d: pixel=(%d,%d)  ysfc=%.1f  evt=%d",
-            idx, pix_row, pix_col, ysfc_val, evt_val,
-        )
+        for i in range(B):
+            oi = int(batch["orig_idx"][i])
+            rec = dict(df.loc[oi])
+            pr = records[n_done + i]["pix_row"]
+            pc = records[n_done + i]["pix_col"]
+            rec["pixel_row"] = pr
+            rec["pixel_col"] = pc
+            rec["split"] = pixel_split(pr, pc, P)
+            rec["ysfc"] = float(batch["ysfc"][i])
+            rec["evt"] = int(batch["evt"][i])
+            for j, v in enumerate(x_type_np[i]):
+                rec[f"x_type_{j}"] = float(v)
+            for j, v in enumerate(x_phase_np[i]):
+                rec[f"x_phase_{j}"] = float(v)
+            for j, v in enumerate(z_type_np[i]):
+                rec[f"z_type_{j}"] = float(v)
+            for j, v in enumerate(z_phase_np[i]):
+                rec[f"z_phase_{j}"] = float(v)
+            out_records.append(rec)
 
-    # --- Write output ----------------------------------------------------
+        n_done += B
+        logger.info("Embedded %d / %d", n_done, len(records))
+
+    # --- Write output --------------------------------------------------------
     out_path = args.output or str(Path(args.csv).stem) + "_embeddings.csv"
     pd.DataFrame(out_records).to_csv(out_path, index=False)
     logger.info("Wrote %d rows to %s", len(out_records), out_path)
