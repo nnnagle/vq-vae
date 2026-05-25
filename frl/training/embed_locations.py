@@ -30,12 +30,12 @@ import torch
 import yaml
 from pyproj import Transformer
 
-from frl.data.loaders.builders.feature_builder import FeatureBuilder
-from frl.data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
-from frl.data.loaders.config.training_config_parser import TrainingConfigParser
-from frl.data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2
-from frl.data.loaders.readers.windows import SpatialWindow
-from frl.models.representation import RepresentationModel
+from data.loaders.builders.feature_builder import FeatureBuilder
+from data.loaders.config.dataset_bindings_parser import DatasetBindingsParser
+from data.loaders.config.training_config_parser import TrainingConfigParser
+from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2
+from data.loaders.readers.windows import SpatialWindow
+from models.representation import RepresentationModel
 
 logger = logging.getLogger(__name__)
 
