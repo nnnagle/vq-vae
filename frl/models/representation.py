@@ -52,6 +52,7 @@ import torch.nn.functional as F
 
 from .conv2d_encoder import Conv2DEncoder
 from .conditioning import FiLMLayer
+from .heads import MLPProjectionHead
 from .spatial import GatedResidualConv2D, EdgeAwareSmoothingConv2D
 from .tcn import TCNEncoder
 
@@ -113,6 +114,10 @@ class RepresentationModel(nn.Module):
         phase_tcn_dilations: List[int] = (1, 2, 4),
         phase_tcn_dropout: float = 0.1,
         phase_tcn_num_groups: int = 8,
+        # type projection head (SimCLR-style; None = disabled)
+        type_proj_hidden_dim: Optional[int] = None,
+        type_proj_output_dim: Optional[int] = None,
+        type_proj_l2_normalize: bool = True,
     ) -> None:
         super().__init__()
 
@@ -169,6 +174,19 @@ class RepresentationModel(nn.Module):
             target_dim=z_phase_dim,
         )
 
+        # --- Type projection head (SimCLR-style) ---
+        # Applied between z_type and InfoNCE losses during training.
+        # None when disabled (project_type() acts as identity).
+        if type_proj_hidden_dim is not None and type_proj_output_dim is not None:
+            self.type_projection: Optional[MLPProjectionHead] = MLPProjectionHead(
+                in_dim=z_type_dim,
+                hidden_dim=type_proj_hidden_dim,
+                output_dim=type_proj_output_dim,
+                l2_normalize=type_proj_l2_normalize,
+            )
+        else:
+            self.type_projection = None
+
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
@@ -213,6 +231,7 @@ class RepresentationModel(nn.Module):
         te = cfg.get("type_encoder", {})
         sc = cfg.get("spatial_conv", {})
         pt = cfg.get("phase_tcn", {})
+        tp = cfg.get("type_projection", {})
 
         # input_dropout may be a scalar (constant) or a schedule dict.
         # At construction time we always use the initial rate:
@@ -253,6 +272,10 @@ class RepresentationModel(nn.Module):
             phase_tcn_dilations=pt.get("dilations", [1, 2, 4]),
             phase_tcn_dropout=pt.get("dropout", 0.1),
             phase_tcn_num_groups=pt.get("num_groups", 8),
+            # type projection head
+            type_proj_hidden_dim=tp.get("hidden_dim") if tp.get("enabled", False) else None,
+            type_proj_output_dim=tp.get("output_dim") if tp.get("enabled", False) else None,
+            type_proj_l2_normalize=tp.get("l2_normalize", True),
         )
 
     def set_input_dropout_rate(self, rate: float) -> None:
@@ -265,6 +288,23 @@ class RepresentationModel(nn.Module):
             rate: Dropout probability in [0, 1]. 0.0 disables dropout.
         """
         self.encoder.set_input_dropout_rate(rate)
+
+    def project_type(self, z: torch.Tensor) -> torch.Tensor:
+        """Apply the SimCLR projection head to z_type embeddings.
+
+        Used before InfoNCE losses during training. At inference time call
+        the model forward() directly and use z_type without projection.
+
+        Args:
+            z: Type embeddings ``[N, z_type_dim]``.
+
+        Returns:
+            Projected embeddings ``[N, output_dim]`` if the projection head is
+            enabled, otherwise ``z`` unchanged.
+        """
+        if self.type_projection is None:
+            return z
+        return self.type_projection(z)
 
     # ------------------------------------------------------------------
     # Forward passes

@@ -198,6 +198,50 @@ class Conv2DHead(nn.Module):
         return self.layers(x)
 
 
+class MLPProjectionHead(nn.Module):
+    """SimCLR-style projection head: Linear → BN → ReLU → Linear [→ L2 norm].
+
+    Operates on [N, in_dim] tensors (post-anchor-extraction).
+    Discarded at inference time — only used for contrastive loss evaluation.
+    Generic: suitable for any embedding pathway (type, phase, etc.).
+
+    Args:
+        in_dim: Input feature dimension.
+        hidden_dim: Hidden layer dimension.
+        output_dim: Output projection dimension.
+        l2_normalize: If True, L2-normalize the output.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        l2_normalize: bool = True,
+    ):
+        super().__init__()
+        self.l2_normalize = l2_normalize
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [N, in_dim]
+
+        Returns:
+            [N, output_dim]
+        """
+        z = self.net(x)
+        if self.l2_normalize:
+            z = F.normalize(z, dim=1)
+        return z
+
+
 def build_mlp_from_config(config: dict) -> MLPHead:
     """
     Build MLP head from configuration dict.

@@ -56,6 +56,18 @@ spatial_conv:
   rank: 4                 # R shared direction-basis patterns; channels correlated but not tied
 
 # ================================================================
+# Type projection head (SimCLR-style)
+# ================================================================
+# Applied between z_type and InfoNCE losses during training.
+# Discarded at inference — z_type is used directly downstream.
+# VICReg operates on raw z_type (not projected) to guard backbone.
+type_projection:
+  enabled: true
+  hidden_dim: 48      # matches z_type_dim; single bottleneck layer
+  output_dim: 8       # small: spectral data has ~3-4 significant PCs
+  l2_normalize: true
+
+# ================================================================
 # Phase pathway
 # ================================================================
 phase_tcn:

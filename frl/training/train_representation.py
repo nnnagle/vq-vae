@@ -367,7 +367,7 @@ def process_batch(
 
         # Collect embeddings and spectral features for cross-batch pair construction
         if has_spectral:
-            cross_patch_z_anchors.append(z_anchors)
+            cross_patch_z_anchors.append(model.project_type(z_anchors))
             cross_patch_spec_features.append(spec_dist_at_anchors)
             cross_patch_anchor_coords.append(anchors)
 
@@ -378,7 +378,7 @@ def process_batch(
             z_spatial = extract_at_locations(z_full, unique_coords)  # [num_unique, D]
 
             spatial_loss_val = contrastive_loss(
-                z_spatial,
+                model.project_type(z_spatial),
                 spatial_pos_pairs,
                 spatial_neg_pairs,
                 pos_weights=pos_weights,
