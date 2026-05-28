@@ -11,6 +11,7 @@ model and write a new CSV with:
   - x_phase_0 .. x_phase_{C-1}— normalized phase encoder inputs at the pixel for the given year
   - z_type_0 .. z_type_63     — type embedding (64-d)
   - z_phase_0 .. z_phase_11   — phase embedding (12-d) at the given year
+  - g_type_0 .. g_type_{P-1}  — projected type embedding (output_dim-d); g(h) in SimCLR notation
 
 Usage:
   python -m training.embed_locations \\
@@ -272,14 +273,16 @@ def main():
         x_phase_batch = batch["x_phase_pixel"].to(device)  # [B, C_phase, T]
 
         with torch.no_grad():
-            z_type_patch = model(x_type_batch)                    # [B, 64, P, P]
-            z_type_center = z_type_patch[bidx, :, lr_vec, lc_vec] # [B, 64]
+            z_type_patch = model(x_type_batch)                     # [B, 64, P, P]
+            z_type_center = z_type_patch[bidx, :, lr_vec, lc_vec]  # [B, 64]
+            z_proj_center = model.project_type(z_type_center)       # [B, proj_dim]
             z_phase_all = model.forward_phase_at_locations(
                 x_phase_batch, z_type_center
-            )                                                      # [B, T, 12]
-            z_phase_center = z_phase_all[bidx, yi_vec, :]         # [B, 12]
+            )                                                       # [B, T, 12]
+            z_phase_center = z_phase_all[bidx, yi_vec, :]          # [B, 12]
 
         z_type_np = z_type_center.cpu().numpy()    # [B, 64]
+        z_proj_np = z_proj_center.cpu().numpy()    # [B, proj_dim]
         z_phase_np = z_phase_center.cpu().numpy()  # [B, 12]
         x_type_np = batch["x_type_center"].numpy() # [B, C_type]
         x_phase_np = batch["x_phase_center"].numpy()  # [B, C_phase]
@@ -302,6 +305,8 @@ def main():
                 rec[f"z_type_{j}"] = float(v)
             for j, v in enumerate(z_phase_np[i]):
                 rec[f"z_phase_{j}"] = float(v)
+            for j, v in enumerate(z_proj_np[i]):
+                rec[f"g_type_{j}"] = float(v)
             out_records.append(rec)
 
         n_done += B
