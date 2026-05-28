@@ -68,6 +68,7 @@ scheduler:
 
   # Phase 2 (epochs warmup → curriculum_start_epoch): cosine decay from peak.
   # Spectral/spatial losses train freely while phase loss is silent (weight=0).
+  # Spatial smoothing gate is also locked open during this period (see spatial_smoothing_curriculum).
 
   # Phase 3 (curriculum_start_epoch → curriculum_start_epoch + phase_warmup.epochs):
   # True re-warmup for phase parameters. When phase loss enters, AdamW's variance
@@ -88,6 +89,17 @@ scheduler:
   # Phase 4 (phase_warmup_end → end): cosine decay from peak_factor × lr down to eta_min.
   # ~165 epochs of smooth decay covering the bulk of training.
   eta_min: 1.0e-6       # floor ≈ 1% of peak lr; prevents LR from reaching zero
+
+# Spatial smoothing curriculum: prevents EdgeAwareSmoothingConv2D from acting as a
+# shortcut (aggressive smoothing to trivially satisfy spatial InfoNCE) before z_type
+# has developed genuine spectral structure.
+# gate floor = 1.0 (identity, no smoothing) until freeze_until_epoch,
+# then linearly released to 0.0 (unconstrained) over ramp_epochs.
+# Should align: freeze_until_epoch matches spectral convergence; ramp ends at phase start.
+spatial_smoothing_curriculum:
+  enabled: true
+  freeze_until_epoch: 20   # gate=1.0 (identity) for epochs 0–19
+  ramp_epochs: 30          # gate floor 1.0→0.0 over epochs 20–49; fully released at epoch 50
     
 spatial_domain:
   debug_mode: false
