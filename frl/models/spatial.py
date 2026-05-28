@@ -269,6 +269,10 @@ class EdgeAwareSmoothingConv2D(nn.Module):
             nn.Conv2d(gate_hidden, channels, kernel_size=gate_kernel_size, padding=gate_pad),
             nn.Sigmoid(),
         )
+        # Curriculum floor: clamped from below during early training to prevent
+        # the model using smoothing as a shortcut before spectral structure develops.
+        # 1.0 = identity (no smoothing); 0.0 = unconstrained.  Set via set_min_gate().
+        self.min_gate: float = 0.0
 
     def forward(
         self, x: torch.Tensor, return_gate: bool = False
@@ -325,8 +329,14 @@ class EdgeAwareSmoothingConv2D(nn.Module):
         # Residual edge gate: high residual (cross-edge/corner) → gate ≈ 1 → preserve x
         residual = x - smoothed
         gate = self.gate_net(residual)
+        if self.min_gate > 0.0:
+            gate = gate.clamp(min=self.min_gate)
         output = smoothed + gate * residual
 
         if return_gate:
             return output, gate
         return output
+
+    def set_min_gate(self, value: float) -> None:
+        """Set the curriculum floor for the residual gate (0.0 = unconstrained, 1.0 = identity)."""
+        self.min_gate = float(value)

@@ -1290,7 +1290,9 @@ def main():
 
     # Parse configs first to get defaults
     logger.info(f"Loading training config from {args.training}")
-    training_config = TrainingConfigParser(args.training).parse()
+    _training_parser = TrainingConfigParser(args.training)
+    training_config = _training_parser.parse()
+    raw_training_config: dict = _training_parser.raw_config or {}
 
     bindings_path = args.bindings or training_config.config_paths.get('bindings_path')
     if bindings_path is None:
@@ -1933,6 +1935,18 @@ def main():
     # Pre-extract input dropout schedule config (scalar or dict) for the epoch loop.
     input_dropout_schedule_cfg = model_config.get("type_encoder", {}).get("input_dropout", 0.0)
 
+    # Pre-extract spatial smoothing curriculum config.
+    smoothing_cur_cfg = raw_training_config.get("spatial_smoothing_curriculum", {})
+    smoothing_cur_enabled = smoothing_cur_cfg.get("enabled", False)
+    smoothing_freeze_until = int(smoothing_cur_cfg.get("freeze_until_epoch", 20))
+    smoothing_ramp_epochs = int(smoothing_cur_cfg.get("ramp_epochs", 30))
+    if smoothing_cur_enabled:
+        logger.info(
+            f"Spatial smoothing curriculum: gate=1.0 (identity) for epochs 0–{smoothing_freeze_until - 1}, "
+            f"linearly released to 0.0 over epochs {smoothing_freeze_until}–"
+            f"{smoothing_freeze_until + smoothing_ramp_epochs - 1}"
+        )
+
     # Tracks (monitor_val, path) for top-k checkpoint pruning.
     saved_ckpts: list = []
 
@@ -1948,6 +1962,19 @@ def main():
         model.set_input_dropout_rate(input_dropout_rate)
         if input_dropout_rate > 0.0:
             logger.debug(f"Epoch {epoch}: input_dropout_rate={input_dropout_rate:.4f}")
+
+        # Apply spatial smoothing curriculum: lock gate open early so the model
+        # can't use smoothing as a shortcut before z_type develops spectral structure.
+        if smoothing_cur_enabled:
+            if epoch < smoothing_freeze_until:
+                min_gate = 1.0
+            elif epoch < smoothing_freeze_until + smoothing_ramp_epochs:
+                progress = (epoch - smoothing_freeze_until) / smoothing_ramp_epochs
+                min_gate = 1.0 - progress
+            else:
+                min_gate = 0.0
+            model.set_spatial_min_gate(min_gate)
+            logger.debug(f"Epoch {epoch}: spatial min_gate={min_gate:.3f}")
 
         train_stats = train_epoch(
           train_dataloader, feature_builder, model,

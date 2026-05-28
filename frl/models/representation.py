@@ -279,6 +279,10 @@ class RepresentationModel(nn.Module):
             type_proj_l2_normalize=tp.get("l2_normalize", True),
         )
 
+    def set_spatial_min_gate(self, value: float) -> None:
+        """Set the curriculum gate floor on the spatial smoothing conv (0.0 = off, 1.0 = identity)."""
+        self.spatial_conv.set_min_gate(value)
+
     def set_input_dropout_rate(self, rate: float) -> None:
         """Update the type encoder's input dropout rate at runtime.
 
