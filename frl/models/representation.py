@@ -41,8 +41,6 @@ Load from checkpoint::
     model = RepresentationModel.from_checkpoint(path, device=device)
 """
 
-from __future__ import annotations
-
 import inspect
 import logging
 from pathlib import Path

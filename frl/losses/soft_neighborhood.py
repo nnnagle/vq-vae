@@ -38,7 +38,6 @@ The final loss is a weighted mean across pairs:
     \\mathcal{L} = \\frac{\\sum_b w_b \\, \\mathcal{L}_b}{\\sum_b w_b}
 """
 
-from __future__ import annotations
 
 import torch
 import torch.nn.functional as F

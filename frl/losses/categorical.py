@@ -19,7 +19,6 @@ Example:
     >>> loss = categorical_loss(logits, target, mask)
 """
 
-from __future__ import annotations
 
 from typing import Literal
 

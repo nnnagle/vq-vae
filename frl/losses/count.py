@@ -18,7 +18,6 @@ Example:
     >>> loss = count_loss(predicted_rate, target_counts, loss_type="poisson")
 """
 
-from __future__ import annotations
 
 from typing import Literal
 
