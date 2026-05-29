@@ -15,47 +15,91 @@ Authenticate with your UT NetID password + Duo MFA.
 | What | Path |
 |------|------|
 | Home directory | `/nfs/home/nnagle` |
-| Scratch (data + venv) | `/lustre/isaac24/scratch/nnagle/` |
+| Scratch (data + code) | `/lustre/isaac24/scratch/nnagle/` |
 | Code (repo) | `/lustre/isaac24/scratch/nnagle/vq-vae/` |
-| Python venv | `/lustre/isaac24/scratch/nnagle/envs/frl/` |
-| Zarr archive | `/lustre/isaac24/scratch/nnagle/<zarr-name>` |
+| Conda environment | `/nfs/home/nnagle/.conda/envs/frl/` |
+| Zarr archive | `/lustre/isaac24/scratch/nnagle/zarr/va_vae_dataset.zarr` |
+| Stats file | `/lustre/isaac24/scratch/nnagle/zarr/va_vae_dataset_stats.json` |
 
 ---
 
-## Starting an Interactive GPU Session
+## Environment Setup (first time only)
 
 ```bash
-srun --partition=campus-gpu \
-     --account=acf-utk0011 \
-     --qos=campus-gpu \
-     --gpus=1 \
-     --pty bash
+module purge
+module load anaconda3
+conda create -n frl python=3.11
+conda activate /nfs/home/nnagle/.conda/envs/frl
+
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install zarr numpy pandas scipy matplotlib pyproj PyYAML pytest
+```
+
+Add these lines to `~/.bashrc`:
+
+```bash
+export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae:$PYTHONPATH
+export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
 ```
 
 ---
 
 ## Activating the Environment
 
-Once on a compute node (or after login), run:
+Every time you log in:
 
 ```bash
-module load Python/3.9.10-gcc
-module load cuda/12.2.0-binary
-source /lustre/isaac24/scratch/nnagle/envs/frl/bin/activate
+module purge
+conda activate /nfs/home/nnagle/.conda/envs/frl
 ```
 
-Your PYTHONPATH is already set in `~/.bashrc`, so `import frl` will work automatically.
+The `PYTHONPATH` and `ZARR_ROOT` variables are set automatically via `~/.bashrc`.
 
 ---
 
-## Before Training: Update the Zarr Path
+## Running a Training Job (batch — recommended)
 
-Edit `frl/config/frl_binding_v1.yaml` and update the zarr paths:
+Submit the job from the login node:
 
-```yaml
-zarr:
-  path: /lustre/isaac24/scratch/nnagle/<zarr-name>.zarr
-  file: /lustre/isaac24/scratch/nnagle/<zarr-name>_stats.json
+```bash
+sbatch /lustre/isaac24/scratch/nnagle/vq-vae/train_isaac.sh
+```
+
+Check job status:
+
+```bash
+squeue -u nnagle
+```
+
+Watch the log (replace JOBID with the number printed by sbatch):
+
+```bash
+tail -f /lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-JOBID.log
+```
+
+---
+
+## Running an Interactive GPU Session (for debugging)
+
+```bash
+srun --partition=campus-gpu \
+     --account=acf-utk0011 \
+     --qos=campus-gpu \
+     --gpus=1 \
+     --cpus-per-task=4 \
+     --mem=32G \
+     --pty bash
+```
+
+Then activate the environment and run training manually:
+
+```bash
+module purge
+conda activate /nfs/home/nnagle/.conda/envs/frl
+export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae:$PYTHONPATH
+export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
+cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
+python -m training.train_representation --training config/frl_training_v1.yaml
 ```
 
 ---
@@ -63,18 +107,8 @@ zarr:
 ## Compute Statistics (first time only)
 
 ```bash
-cd /lustre/isaac24/scratch/nnagle/vq-vae
-python frl/examples/data/example_compute_stats.py
-```
-
----
-
-## Training
-
-```bash
-cd /lustre/isaac24/scratch/nnagle/vq-vae
-python frl/training/train_representation.py \
-    --training frl/config/frl_training_v1.yaml
+cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
+python -m data.examples.example_compute_stats
 ```
 
 ---
@@ -86,12 +120,12 @@ Run this on the Linux server (inside `tmux`):
 ```bash
 tmux new -s zarr-transfer
 rsync -avP --no-compress /path/to/your.zarr \
-    nnagle@dtn1.isaac.utk.edu:/lustre/isaac24/scratch/nnagle/
+    nnagle@dtn1.isaac.utk.edu:/lustre/isaac24/scratch/nnagle/zarr/
 ```
 
 Authenticate with NetID password + Duo (type `1` for push). Detach with `Ctrl+B, D`.
 
-To resume an interrupted transfer, just rerun the same command — rsync skips already-transferred data.
+To resume an interrupted transfer, rerun the same command — rsync skips already-transferred data.
 
 ---
 
