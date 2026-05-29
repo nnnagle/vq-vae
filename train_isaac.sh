@@ -5,7 +5,7 @@
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=v100s:1
 #SBATCH --cpus-per-task=6
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
 
@@ -21,4 +21,4 @@ echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
-python -m training.train_representation --training config/frl_training_v1.yaml
+python -m training.train_representation --training config/frl_training_v1.yaml --overwrite
