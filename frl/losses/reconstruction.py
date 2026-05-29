@@ -1,4 +1,5 @@
 """
+from __future__ import annotations
 Reconstruction loss functions with masking support.
 
 This module provides flexible reconstruction losses that support various loss types
