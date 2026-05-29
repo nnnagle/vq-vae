@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=frl-train
-#SBATCH --partition=campus-gpu
+#SBATCH --partition=campus-gpu-large
 #SBATCH --account=acf-utk0011
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=v100s:1
