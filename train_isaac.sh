@@ -2,11 +2,11 @@
 #SBATCH --job-name=frl-train
 #SBATCH --partition=campus-gpu-large
 #SBATCH --account=acf-utk0011
-#SBATCH --qos=long-gpu
+#SBATCH --qos=campus-gpu
 #SBATCH --gpus=v100s:1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=64G
-#SBATCH --time=5-00:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
 
 module purge
