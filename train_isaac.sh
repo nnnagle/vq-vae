@@ -10,6 +10,8 @@
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
 
 module purge
+module load anaconda3
+source /sw/isaac/applications/anaconda3/2024.06/rhel8_cascadelake_binary/anaconda3-2024.06/etc/profile.d/conda.sh
 conda activate /nfs/home/nnagle/.conda/envs/frl
 
 export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae:$PYTHONPATH
