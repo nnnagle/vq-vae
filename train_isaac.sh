@@ -4,6 +4,7 @@
 #SBATCH --account=acf-utk0011
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
+#SBATCH --constraint=v100s
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
