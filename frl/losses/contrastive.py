@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Contrastive loss functions for representation learning.
 
 This module provides vectorized contrastive loss implementations that support

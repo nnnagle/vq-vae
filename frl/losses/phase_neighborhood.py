@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Forest phase neighborhood matching.
 
 Wrapper around :func:`soft_neighborhood_matching_loss` that handles the

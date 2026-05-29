@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Pair generation functions for contrastive learning.
 
 This module provides functions to generate positive and negative pair indices

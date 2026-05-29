@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Count loss functions with masking support.
 
 This module provides loss functions for count/rate data including Poisson

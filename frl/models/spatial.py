@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Spatial processing modules including gated residual convolutions.
 
 The GatedResidualConv2D applies learnable spatial smoothing while preserving

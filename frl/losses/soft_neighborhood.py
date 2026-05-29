@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Soft Neighborhood Matching Loss.
 
 A generic loss that trains learned embeddings to reproduce the neighborhood

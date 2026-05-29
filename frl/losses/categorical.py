@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 Categorical loss functions with masking support.
 
 This module provides cross-entropy loss for discrete/categorical targets

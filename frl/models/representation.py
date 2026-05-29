@@ -1,5 +1,5 @@
-"""
 from __future__ import annotations
+"""
 RepresentationModel — unified encoder pipeline for contrastive representation learning.
 
 This module defines the complete forward pipeline (encoder -> spatial conv -> embedding)
