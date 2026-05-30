@@ -378,7 +378,7 @@ def process_batch(
             z_spatial = extract_at_locations(z_full, unique_coords)  # [num_unique, D]
 
             spatial_loss_val = contrastive_loss(
-                model.project_type(z_spatial),
+                z_spatial,
                 spatial_pos_pairs,
                 spatial_neg_pairs,
                 pos_weights=pos_weights,
