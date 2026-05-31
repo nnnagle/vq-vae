@@ -365,11 +365,8 @@ def process_batch(
             )
             vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
 
-        # Collect embeddings and spectral features for cross-batch pair construction
-        if has_spectral:
-            cross_patch_z_anchors.append(model.project_type(z_anchors))
-            cross_patch_spec_features.append(spec_dist_at_anchors)
-            cross_patch_anchor_coords.append(anchors)
+        # cross_patch_z_anchors is populated after the NaN check below so that
+        # samples with non-finite loss don't corrupt the cross-batch spectral computation.
 
         # Compute spatial loss
         spatial_loss_val = torch.tensor(0.0, device=device)
@@ -639,6 +636,12 @@ def process_batch(
                 f"pvcr={_fmt(phase_vcr_loss_val)}"
             )
             continue
+
+        # Accumulate cross-batch spectral inputs only for finite-loss samples.
+        if has_spectral:
+            cross_patch_z_anchors.append(model.project_type(z_anchors))
+            cross_patch_spec_features.append(spec_dist_at_anchors)
+            cross_patch_anchor_coords.append(anchors)
 
         # Accumulate: keep as tensor for training (backward), use .item() for validation
         if training:
@@ -2190,9 +2193,14 @@ def main():
         # Top-k save: only track best after monitor_start_epoch so pre-curriculum
         # epochs (where phase loss is zero) can't be selected as the best checkpoint.
         # saved_ckpts is sorted best-first (index 0 = rank 1).
+        # NaN-safe sort: map non-finite values to the worst possible sentinel so they
+        # sort to the tail and can be displaced by any finite value.
         reverse = (ckpt_cfg.mode == "max")
-        saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
+        nan_sentinel = float('-inf') if reverse else float('inf')
+        saved_ckpts.sort(key=lambda x: x[0] if math.isfinite(x[0]) else nan_sentinel, reverse=reverse)
         worst_val_in_top_k = saved_ckpts[-1][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
+        if worst_val_in_top_k is not None and not math.isfinite(worst_val_in_top_k):
+            worst_val_in_top_k = nan_sentinel
         is_better = (
             math.isfinite(monitor_val)
             and (
