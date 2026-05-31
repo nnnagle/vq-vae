@@ -2194,9 +2194,12 @@ def main():
         saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
         worst_val_in_top_k = saved_ckpts[-1][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
         is_better = (
-            worst_val_in_top_k is None
-            or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
-            or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
+            math.isfinite(monitor_val)
+            and (
+                worst_val_in_top_k is None
+                or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
+                or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
+            )
         )
         if is_better and epoch >= ckpt_cfg.monitor_start_epoch:
             # Save under a temporary name; will be renamed with rank below.
