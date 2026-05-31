@@ -20,6 +20,7 @@ run:
     monitor: val/loss_total
     mode: min
     save_last: true
+    monitor_start_epoch: 100  # phase curriculum ends ~60; allow model to settle before top-k tracking
     
 hardware:
   device: cuda
