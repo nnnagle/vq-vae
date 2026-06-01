@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Pair generation functions for contrastive learning.
 
@@ -21,7 +22,6 @@ Example:
     >>> loss = contrastive_loss(embeddings, pos_pairs, neg_pairs)
 """
 
-from __future__ import annotations
 
 import torch
 

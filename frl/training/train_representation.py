@@ -365,11 +365,8 @@ def process_batch(
             )
             vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
 
-        # Collect embeddings and spectral features for cross-batch pair construction
-        if has_spectral:
-            cross_patch_z_anchors.append(z_anchors)
-            cross_patch_spec_features.append(spec_dist_at_anchors)
-            cross_patch_anchor_coords.append(anchors)
+        # cross_patch_z_anchors is populated after the NaN check below so that
+        # samples with non-finite loss don't corrupt the cross-batch spectral computation.
 
         # Compute spatial loss
         spatial_loss_val = torch.tensor(0.0, device=device)
@@ -639,6 +636,12 @@ def process_batch(
                 f"pvcr={_fmt(phase_vcr_loss_val)}"
             )
             continue
+
+        # Accumulate cross-batch spectral inputs only for finite-loss samples.
+        if has_spectral:
+            cross_patch_z_anchors.append(model.project_type(z_anchors))
+            cross_patch_spec_features.append(spec_dist_at_anchors)
+            cross_patch_anchor_coords.append(anchors)
 
         # Accumulate: keep as tensor for training (backward), use .item() for validation
         if training:
@@ -1290,7 +1293,9 @@ def main():
 
     # Parse configs first to get defaults
     logger.info(f"Loading training config from {args.training}")
-    training_config = TrainingConfigParser(args.training).parse()
+    _training_parser = TrainingConfigParser(args.training)
+    training_config = _training_parser.parse()
+    raw_training_config: dict = _training_parser.raw_config or {}
 
     bindings_path = args.bindings or training_config.config_paths.get('bindings_path')
     if bindings_path is None:
@@ -1933,6 +1938,18 @@ def main():
     # Pre-extract input dropout schedule config (scalar or dict) for the epoch loop.
     input_dropout_schedule_cfg = model_config.get("type_encoder", {}).get("input_dropout", 0.0)
 
+    # Pre-extract spatial smoothing curriculum config.
+    smoothing_cur_cfg = raw_training_config.get("spatial_smoothing_curriculum", {})
+    smoothing_cur_enabled = smoothing_cur_cfg.get("enabled", False)
+    smoothing_freeze_until = int(smoothing_cur_cfg.get("freeze_until_epoch", 20))
+    smoothing_ramp_epochs = int(smoothing_cur_cfg.get("ramp_epochs", 30))
+    if smoothing_cur_enabled:
+        logger.info(
+            f"Spatial smoothing curriculum: gate=1.0 (identity) for epochs 0–{smoothing_freeze_until - 1}, "
+            f"linearly released to 0.0 over epochs {smoothing_freeze_until}–"
+            f"{smoothing_freeze_until + smoothing_ramp_epochs - 1}"
+        )
+
     # Tracks (monitor_val, path) for top-k checkpoint pruning.
     saved_ckpts: list = []
 
@@ -1948,6 +1965,19 @@ def main():
         model.set_input_dropout_rate(input_dropout_rate)
         if input_dropout_rate > 0.0:
             logger.debug(f"Epoch {epoch}: input_dropout_rate={input_dropout_rate:.4f}")
+
+        # Apply spatial smoothing curriculum: lock gate open early so the model
+        # can't use smoothing as a shortcut before z_type develops spectral structure.
+        if smoothing_cur_enabled:
+            if epoch < smoothing_freeze_until:
+                min_gate = 1.0
+            elif epoch < smoothing_freeze_until + smoothing_ramp_epochs:
+                progress = (epoch - smoothing_freeze_until) / smoothing_ramp_epochs
+                min_gate = 1.0 - progress
+            else:
+                min_gate = 0.0
+            model.set_spatial_min_gate(min_gate)
+            logger.debug(f"Epoch {epoch}: spatial min_gate={min_gate:.3f}")
 
         train_stats = train_epoch(
           train_dataloader, feature_builder, model,
@@ -2160,21 +2190,26 @@ def main():
                 f"({monitor_key}={monitor_val:.4f})"
             )
 
-        # Top-k save (evaluated only after the phase loss curriculum is fully ramped).
+        # Top-k save: only track best after monitor_start_epoch so pre-curriculum
+        # epochs (where phase loss is zero) can't be selected as the best checkpoint.
         # saved_ckpts is sorted best-first (index 0 = rank 1).
-        phase_schedule_complete = (
-            phase_config is None
-            or epoch >= phase_config['curriculum_start_epoch'] + phase_config['curriculum_ramp_epochs']
-        )
+        # NaN-safe sort: map non-finite values to the worst possible sentinel so they
+        # sort to the tail and can be displaced by any finite value.
         reverse = (ckpt_cfg.mode == "max")
-        saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
+        nan_sentinel = float('-inf') if reverse else float('inf')
+        saved_ckpts.sort(key=lambda x: x[0] if math.isfinite(x[0]) else nan_sentinel, reverse=reverse)
         worst_val_in_top_k = saved_ckpts[-1][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
+        if worst_val_in_top_k is not None and not math.isfinite(worst_val_in_top_k):
+            worst_val_in_top_k = nan_sentinel
         is_better = (
-            worst_val_in_top_k is None
-            or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
-            or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
+            math.isfinite(monitor_val)
+            and (
+                worst_val_in_top_k is None
+                or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
+                or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
+            )
         )
-        if is_better and phase_schedule_complete:
+        if is_better and epoch >= ckpt_cfg.monitor_start_epoch:
             # Save under a temporary name; will be renamed with rank below.
             tmp_path = ckpt_dir / f"encoder_best_epoch_{epoch+1:03d}.pt"
             torch.save(ckpt_state, tmp_path)

@@ -5,6 +5,7 @@ This module provides a simple parser that loads YAML configuration
 and creates typed configuration objects.
 """
 
+import os
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Union
@@ -135,7 +136,7 @@ class DatasetBindingsParser:
         if not zarr_dict:
             raise BindingsParseError("Missing required section: 'zarr'")
 
-        path = zarr_dict.get('path')
+        path = os.path.expandvars(zarr_dict.get('path', ''))
         if not path:
             raise BindingsParseError("Missing required field: 'zarr.path'")
 
@@ -274,7 +275,7 @@ class DatasetBindingsParser:
 
         compute = stats_dict.get('compute', 'if-not-exists')
         type_ = stats_dict.get('type', 'json')
-        file = stats_dict.get('file')
+        file = os.path.expandvars(stats_dict.get('file', ''))
         if not file:
             raise BindingsParseError("stats.file is required")
 

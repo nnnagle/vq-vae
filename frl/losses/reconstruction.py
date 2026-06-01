@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Reconstruction loss functions with masking support.
 
@@ -18,7 +19,6 @@ Example:
     >>> loss = reconstruction_loss(input, target, mask)
 """
 
-from __future__ import annotations
 
 from typing import Literal
 

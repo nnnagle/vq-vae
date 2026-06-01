@@ -42,6 +42,7 @@ class CheckpointConfig:
     monitor: str = "val/loss_total"
     mode: str = "min"  # 'min' or 'max'
     save_last: bool = True
+    monitor_start_epoch: int = 0  # epoch after which top-k tracking begins
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'CheckpointConfig':
