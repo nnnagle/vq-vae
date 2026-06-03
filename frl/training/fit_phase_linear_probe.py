@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Closed-form linear probe for evaluating phase + type representations.
 
@@ -40,8 +41,6 @@ Notes
 - z_type is detached before being fed to the phase pathway (same convention as
   training: the type encoder is not trained through the phase pathway).
 """
-
-from __future__ import annotations
 
 import argparse
 import logging
