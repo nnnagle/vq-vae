@@ -698,6 +698,7 @@ def process_batch(
     # (cross-patch pairs that happen to be spectrally similar).
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
+    spectral_neg_tau_sweep: dict = {}
     if cross_patch_z_anchors:
         n_patches = len(cross_patch_z_anchors)
         z_all = torch.cat(cross_patch_z_anchors, dim=0)        # [N_total, D]
@@ -750,6 +751,18 @@ def process_batch(
         # Distances computed only for sampled pairs — O(n_neg × C), not O(N²)
         neg_spec_dist = torch.norm(spec_all[global_neg_i] - spec_all[global_neg_j], dim=1)
         neg_weights = (1.0 - torch.exp(-neg_spec_dist / tau_neg)).clamp(min=min_w, max=1.0)
+        if epoch == 0:
+            _nsd_cpu = neg_spec_dist.detach().cpu()
+            spectral_neg_tau_sweep = {
+                t: {
+                    'neg_mean': (1.0 - torch.exp(-_nsd_cpu / t)).clamp(min=min_w, max=1.0).mean().item(),
+                    'neg_q25':  torch.quantile((1.0 - torch.exp(-_nsd_cpu / t)).clamp(min=min_w, max=1.0), 0.25).item(),
+                    'neg_q50':  torch.quantile((1.0 - torch.exp(-_nsd_cpu / t)).clamp(min=min_w, max=1.0), 0.50).item(),
+                }
+                for t in [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+            }
+        else:
+            spectral_neg_tau_sweep = {}
 
         global_spectral_loss_val = contrastive_loss(
             z_all, global_pos, global_neg,
@@ -1152,6 +1165,7 @@ def train_epoch(
         'pos_spec_dist_stats': last_pos_spec_dist_stats,
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'tau_sweep': last_tau_sweep,
+        'spectral_neg_tau_sweep': spectral_neg_tau_sweep,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -2138,6 +2152,14 @@ def main():
                 for t, v in sorted(tau_sweep.items()):
                     logger.info(
                         f"    {t:>6.1f}  {v['pos_mean']:>8.3f}  {v['pos_q25']:>8.3f}  {v['pos_q50']:>8.3f}  {v['neg_mean']:>8.3f}"
+                    )
+            spec_neg_sweep = train_stats.get('spectral_neg_tau_sweep', {})
+            if spec_neg_sweep:
+                logger.info("  Spectral neg weight τ sweep (epoch 0):")
+                logger.info(f"    {'tau':>6}  {'neg_mean':>8}  {'neg_q25':>8}  {'neg_q50':>8}")
+                for t, v in sorted(spec_neg_sweep.items()):
+                    logger.info(
+                        f"    {t:>6.1f}  {v['neg_mean']:>8.3f}  {v['neg_q25']:>8.3f}  {v['neg_q50']:>8.3f}"
                     )
         ps = train_stats.get('pos_sim_stats', {})
         ns = train_stats.get('neg_sim_stats', {})
