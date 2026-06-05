@@ -175,6 +175,8 @@ def process_batch(
     all_neg_weights = []
     all_pos_sims = []
     all_neg_sims = []
+    all_pos_spec_dists = []
+    all_neg_spec_dists = []
 
     # Phase pair stats accumulators
     all_phase_pair_stats = []
@@ -306,11 +308,13 @@ def process_batch(
             dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
             all_pos_weights.append(pos_weights.detach().cpu())
+            all_pos_spec_dists.append(dpos.detach().cpu())
 
         if spatial_neg_pairs.numel() > 0:
             dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
             all_neg_weights.append(neg_weights.detach().cpu())
+            all_neg_spec_dists.append(dneg.detach().cpu())
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -950,6 +954,8 @@ def process_batch(
         'neg_weight_stats': compute_stats(all_neg_weights),
         'pos_sim_stats': compute_stats(all_pos_sims),
         'neg_sim_stats': compute_stats(all_neg_sims),
+        'pos_spec_dist_stats': compute_stats(all_pos_spec_dists),
+        'neg_spec_dist_stats': compute_stats(all_neg_spec_dists),
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
@@ -999,6 +1005,8 @@ def train_epoch(
     last_neg_weight_stats = empty_stats
     last_pos_sim_stats = empty_stats
     last_neg_sim_stats = empty_stats
+    last_pos_spec_dist_stats = empty_stats
+    last_neg_spec_dist_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1038,6 +1046,8 @@ def train_epoch(
             last_neg_weight_stats = stats['neg_weight_stats']
             last_pos_sim_stats = stats.get('pos_sim_stats', empty_stats)
             last_neg_sim_stats = stats.get('neg_sim_stats', empty_stats)
+            last_pos_spec_dist_stats = stats.get('pos_spec_dist_stats', empty_stats)
+            last_neg_spec_dist_stats = stats.get('neg_spec_dist_stats', empty_stats)
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
@@ -1082,6 +1092,7 @@ def train_epoch(
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'pos_sim_stats': empty_stats, 'neg_sim_stats': empty_stats,
+            'pos_spec_dist_stats': empty_stats, 'neg_spec_dist_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
         }
@@ -1118,6 +1129,8 @@ def train_epoch(
         'neg_weight_stats': last_neg_weight_stats,
         'pos_sim_stats': last_pos_sim_stats,
         'neg_sim_stats': last_neg_sim_stats,
+        'pos_spec_dist_stats': last_pos_spec_dist_stats,
+        'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -1158,6 +1171,8 @@ def validate_epoch(
     last_neg_weight_stats = empty_stats
     last_pos_sim_stats = empty_stats
     last_neg_sim_stats = empty_stats
+    last_pos_spec_dist_stats = empty_stats
+    last_neg_spec_dist_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1243,6 +1258,8 @@ def validate_epoch(
         'neg_weight_stats': last_neg_weight_stats,
         'pos_sim_stats': last_pos_sim_stats,
         'neg_sim_stats': last_neg_sim_stats,
+        'pos_spec_dist_stats': last_pos_spec_dist_stats,
+        'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -2086,6 +2103,12 @@ def main():
         logger.info(
             f"  Spatial neg weights: {fmt_stats(train_stats['neg_weight_stats'])}"
         )
+        psd = train_stats.get('pos_spec_dist_stats', {})
+        nsd = train_stats.get('neg_spec_dist_stats', {})
+        if psd.get('mean', 0.0) != 0.0 or nsd.get('mean', 0.0) != 0.0:
+            logger.info(
+                f"  Spatial spec dists: pos={fmt_stats(psd)} | neg={fmt_stats(nsd)}"
+            )
         ps = train_stats.get('pos_sim_stats', {})
         ns = train_stats.get('neg_sim_stats', {})
         if ps.get('mean', 0.0) != 0.0 or ns.get('mean', 0.0) != 0.0:
