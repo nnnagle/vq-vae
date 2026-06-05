@@ -177,6 +177,9 @@ def process_batch(
     all_neg_sims = []
     all_pos_spec_dists = []
     all_neg_spec_dists = []
+    _TAU_SWEEP = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+    tau_sweep_pos: dict[float, list] = {t: [] for t in _TAU_SWEEP}
+    tau_sweep_neg: dict[float, list] = {t: [] for t in _TAU_SWEEP}
 
     # Phase pair stats accumulators
     all_phase_pair_stats = []
@@ -309,12 +312,18 @@ def process_batch(
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
             all_pos_weights.append(pos_weights.detach().cpu())
             all_pos_spec_dists.append(dpos.detach().cpu())
+            dpos_cpu = dpos.detach().cpu()
+            for t in _TAU_SWEEP:
+                tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
 
         if spatial_neg_pairs.numel() > 0:
             dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
             all_neg_weights.append(neg_weights.detach().cpu())
             all_neg_spec_dists.append(dneg.detach().cpu())
+            dneg_cpu = dneg.detach().cpu()
+            for t in _TAU_SWEEP:
+                tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -956,6 +965,15 @@ def process_batch(
         'neg_sim_stats': compute_stats(all_neg_sims),
         'pos_spec_dist_stats': compute_stats(all_pos_spec_dists),
         'neg_spec_dist_stats': compute_stats(all_neg_spec_dists),
+        'tau_sweep': {
+            t: {
+                'pos_mean': torch.cat(tau_sweep_pos[t]).mean().item() if tau_sweep_pos[t] else 0.0,
+                'pos_q25':  torch.quantile(torch.cat(tau_sweep_pos[t]), 0.25).item() if tau_sweep_pos[t] else 0.0,
+                'pos_q50':  torch.quantile(torch.cat(tau_sweep_pos[t]), 0.50).item() if tau_sweep_pos[t] else 0.0,
+                'neg_mean': torch.cat(tau_sweep_neg[t]).mean().item() if tau_sweep_neg[t] else 0.0,
+            }
+            for t in _TAU_SWEEP
+        },
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
@@ -1007,6 +1025,7 @@ def train_epoch(
     last_neg_sim_stats = empty_stats
     last_pos_spec_dist_stats = empty_stats
     last_neg_spec_dist_stats = empty_stats
+    last_tau_sweep: dict = {}
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1048,6 +1067,7 @@ def train_epoch(
             last_neg_sim_stats = stats.get('neg_sim_stats', empty_stats)
             last_pos_spec_dist_stats = stats.get('pos_spec_dist_stats', empty_stats)
             last_neg_spec_dist_stats = stats.get('neg_spec_dist_stats', empty_stats)
+            last_tau_sweep = stats.get('tau_sweep', {})
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
@@ -1131,6 +1151,7 @@ def train_epoch(
         'neg_sim_stats': last_neg_sim_stats,
         'pos_spec_dist_stats': last_pos_spec_dist_stats,
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
+        'tau_sweep': last_tau_sweep,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -2109,6 +2130,15 @@ def main():
             logger.info(
                 f"  Spatial spec dists: pos={fmt_stats(psd)} | neg={fmt_stats(nsd)}"
             )
+        if epoch == 0:
+            tau_sweep = train_stats.get('tau_sweep', {})
+            if tau_sweep:
+                logger.info("  Spatial spectral weight τ sweep (epoch 0):")
+                logger.info(f"    {'tau':>6}  {'pos_mean':>8}  {'pos_q25':>8}  {'pos_q50':>8}  {'neg_mean':>8}")
+                for t, v in sorted(tau_sweep.items()):
+                    logger.info(
+                        f"    {t:>6.1f}  {v['pos_mean']:>8.3f}  {v['pos_q25']:>8.3f}  {v['pos_q50']:>8.3f}  {v['neg_mean']:>8.3f}"
+                    )
         ps = train_stats.get('pos_sim_stats', {})
         ns = train_stats.get('neg_sim_stats', {})
         if ps.get('mean', 0.0) != 0.0 or ns.get('mean', 0.0) != 0.0:
