@@ -2147,19 +2147,23 @@ def main():
         if epoch == 0:
             tau_sweep = train_stats.get('tau_sweep', {})
             if tau_sweep:
-                logger.info("  Spatial spectral weight τ sweep (epoch 0):")
+                active_tau = loss_config.get('spatial_spectral_tau', 1.0)
+                logger.info(f"  Spatial spectral weight τ sweep (epoch 0, active τ={active_tau}):")
                 logger.info(f"    {'tau':>6}  {'pos_mean':>8}  {'pos_q25':>8}  {'pos_q50':>8}  {'neg_mean':>8}")
                 for t, v in sorted(tau_sweep.items()):
+                    marker = " <-- active" if t == active_tau else ""
                     logger.info(
-                        f"    {t:>6.1f}  {v['pos_mean']:>8.3f}  {v['pos_q25']:>8.3f}  {v['pos_q50']:>8.3f}  {v['neg_mean']:>8.3f}"
+                        f"    {t:>6.1f}  {v['pos_mean']:>8.3f}  {v['pos_q25']:>8.3f}  {v['pos_q50']:>8.3f}  {v['neg_mean']:>8.3f}{marker}"
                     )
             spec_neg_sweep = train_stats.get('spectral_neg_tau_sweep', {})
             if spec_neg_sweep:
-                logger.info("  Spectral neg weight τ sweep (epoch 0):")
+                active_tau_neg = loss_config.get('spectral_neg_tau', 1.0)
+                logger.info(f"  Spectral neg weight τ sweep (epoch 0, active τ={active_tau_neg}):")
                 logger.info(f"    {'tau':>6}  {'neg_mean':>8}  {'neg_q25':>8}  {'neg_q50':>8}")
                 for t, v in sorted(spec_neg_sweep.items()):
+                    marker = " <-- active" if t == active_tau_neg else ""
                     logger.info(
-                        f"    {t:>6.1f}  {v['neg_mean']:>8.3f}  {v['neg_q25']:>8.3f}  {v['neg_q50']:>8.3f}"
+                        f"    {t:>6.1f}  {v['neg_mean']:>8.3f}  {v['neg_q25']:>8.3f}  {v['neg_q50']:>8.3f}{marker}"
                     )
         ps = train_stats.get('pos_sim_stats', {})
         ns = train_stats.get('neg_sim_stats', {})
