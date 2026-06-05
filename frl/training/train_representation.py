@@ -1165,7 +1165,7 @@ def train_epoch(
         'pos_spec_dist_stats': last_pos_spec_dist_stats,
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'tau_sweep': last_tau_sweep,
-        'spectral_neg_tau_sweep': spectral_neg_tau_sweep,
+        'spectral_neg_tau_sweep': locals().get('spectral_neg_tau_sweep', {}),
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
