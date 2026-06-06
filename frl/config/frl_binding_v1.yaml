@@ -560,7 +560,7 @@ losses:
         type: spatial-knn
         k: 4
         min_distance: 1  # Not self
-        max_distance: 8  # Local neighborhood only
+        max_distance: 4  # Local neighborhood only
 
     negative_strategy:
       candidates: patch

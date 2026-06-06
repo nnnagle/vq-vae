@@ -173,6 +173,13 @@ def process_batch(
     all_gate_values = []
     all_pos_weights = []
     all_neg_weights = []
+    all_pos_sims = []
+    all_neg_sims = []
+    all_pos_spec_dists = []
+    all_neg_spec_dists = []
+    _TAU_SWEEP = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+    tau_sweep_pos: dict[float, list] = {t: [] for t in _TAU_SWEEP}
+    tau_sweep_neg: dict[float, list] = {t: [] for t in _TAU_SWEEP}
 
     # Phase pair stats accumulators
     all_phase_pair_stats = []
@@ -307,11 +314,19 @@ def process_batch(
             dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
             all_pos_weights.append(pos_weights.detach().cpu())
+            all_pos_spec_dists.append(dpos.detach().cpu())
+            dpos_cpu = dpos.detach().cpu()
+            for t in _TAU_SWEEP:
+                tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
 
         if spatial_neg_pairs.numel() > 0:
             dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
             neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
             all_neg_weights.append(neg_weights.detach().cpu())
+            all_neg_spec_dists.append(dneg.detach().cpu())
+            dneg_cpu = dneg.detach().cpu()
+            for t in _TAU_SWEEP:
+                tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -384,8 +399,15 @@ def process_batch(
                 pos_weights=pos_weights,
                 neg_weights=neg_weights,
                 temperature=config.get('spatial_temperature', 0.07),
-                similarity='l2',
+                similarity='cosine',
             )
+
+            # Collect cosine similarities for diagnostics (z_spatial is unit-norm)
+            with torch.no_grad():
+                p_a, p_b = z_spatial[spatial_pos_pairs[:, 0]], z_spatial[spatial_pos_pairs[:, 1]]
+                n_a, n_b = z_spatial[spatial_neg_pairs[:, 0]], z_spatial[spatial_neg_pairs[:, 1]]
+                all_pos_sims.append((p_a * p_b).sum(1).cpu())
+                all_neg_sims.append((n_a * n_b).sum(1).cpu())
 
         # --- Phase pair construction + loss ---
         # Pair construction (kNN + overlap) runs on CPU.
@@ -683,6 +705,7 @@ def process_batch(
     # (cross-patch pairs that happen to be spectrally similar).
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
+    spectral_neg_tau_sweep: dict = {}
     if cross_patch_z_anchors:
         n_patches = len(cross_patch_z_anchors)
         z_all = torch.cat(cross_patch_z_anchors, dim=0)        # [N_total, D]
@@ -735,6 +758,18 @@ def process_batch(
         # Distances computed only for sampled pairs — O(n_neg × C), not O(N²)
         neg_spec_dist = torch.norm(spec_all[global_neg_i] - spec_all[global_neg_j], dim=1)
         neg_weights = (1.0 - torch.exp(-neg_spec_dist / tau_neg)).clamp(min=min_w, max=1.0)
+        if epoch == 0:
+            _nsd_cpu = neg_spec_dist.detach().cpu()
+            spectral_neg_tau_sweep = {
+                t: {
+                    'neg_mean': (1.0 - torch.exp(-_nsd_cpu / t)).clamp(min=min_w, max=1.0).mean().item(),
+                    'neg_q25':  torch.quantile((1.0 - torch.exp(-_nsd_cpu / t)).clamp(min=min_w, max=1.0), 0.25).item(),
+                    'neg_q50':  torch.quantile((1.0 - torch.exp(-_nsd_cpu / t)).clamp(min=min_w, max=1.0), 0.50).item(),
+                }
+                for t in [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+            }
+        else:
+            spectral_neg_tau_sweep = {}
 
         global_spectral_loss_val = contrastive_loss(
             z_all, global_pos, global_neg,
@@ -979,6 +1014,19 @@ def process_batch(
         'gate_stats': compute_stats(all_gate_values),
         'pos_weight_stats': compute_stats(all_pos_weights),
         'neg_weight_stats': compute_stats(all_neg_weights),
+        'pos_sim_stats': compute_stats(all_pos_sims),
+        'neg_sim_stats': compute_stats(all_neg_sims),
+        'pos_spec_dist_stats': compute_stats(all_pos_spec_dists),
+        'neg_spec_dist_stats': compute_stats(all_neg_spec_dists),
+        'tau_sweep': {
+            t: {
+                'pos_mean': torch.cat(tau_sweep_pos[t]).mean().item() if tau_sweep_pos[t] else 0.0,
+                'pos_q25':  torch.quantile(torch.cat(tau_sweep_pos[t]), 0.25).item() if tau_sweep_pos[t] else 0.0,
+                'pos_q50':  torch.quantile(torch.cat(tau_sweep_pos[t]), 0.50).item() if tau_sweep_pos[t] else 0.0,
+                'neg_mean': torch.cat(tau_sweep_neg[t]).mean().item() if tau_sweep_neg[t] else 0.0,
+            }
+            for t in _TAU_SWEEP
+        },
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
@@ -1027,6 +1075,11 @@ def train_epoch(
     last_gate_stats = empty_stats
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
+    last_pos_sim_stats = empty_stats
+    last_neg_sim_stats = empty_stats
+    last_pos_spec_dist_stats = empty_stats
+    last_neg_spec_dist_stats = empty_stats
+    last_tau_sweep: dict = {}
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1064,6 +1117,11 @@ def train_epoch(
             last_gate_stats = stats['gate_stats']
             last_pos_weight_stats = stats['pos_weight_stats']
             last_neg_weight_stats = stats['neg_weight_stats']
+            last_pos_sim_stats = stats.get('pos_sim_stats', empty_stats)
+            last_neg_sim_stats = stats.get('neg_sim_stats', empty_stats)
+            last_pos_spec_dist_stats = stats.get('pos_spec_dist_stats', empty_stats)
+            last_neg_spec_dist_stats = stats.get('neg_spec_dist_stats', empty_stats)
+            last_tau_sweep = stats.get('tau_sweep', {})
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
@@ -1107,6 +1165,8 @@ def train_epoch(
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
+            'pos_sim_stats': empty_stats, 'neg_sim_stats': empty_stats,
+            'pos_spec_dist_stats': empty_stats, 'neg_spec_dist_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
         }
@@ -1141,6 +1201,12 @@ def train_epoch(
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
+        'pos_sim_stats': last_pos_sim_stats,
+        'neg_sim_stats': last_neg_sim_stats,
+        'pos_spec_dist_stats': last_pos_spec_dist_stats,
+        'neg_spec_dist_stats': last_neg_spec_dist_stats,
+        'tau_sweep': last_tau_sweep,
+        'spectral_neg_tau_sweep': locals().get('spectral_neg_tau_sweep', {}),
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -1179,6 +1245,10 @@ def validate_epoch(
     last_gate_stats = empty_stats
     last_pos_weight_stats = empty_stats
     last_neg_weight_stats = empty_stats
+    last_pos_sim_stats = empty_stats
+    last_neg_sim_stats = empty_stats
+    last_pos_spec_dist_stats = empty_stats
+    last_neg_spec_dist_stats = empty_stats
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1210,6 +1280,8 @@ def validate_epoch(
                 last_gate_stats = stats['gate_stats']
                 last_pos_weight_stats = stats['pos_weight_stats']
                 last_neg_weight_stats = stats['neg_weight_stats']
+                last_pos_sim_stats = stats.get('pos_sim_stats', empty_stats)
+                last_neg_sim_stats = stats.get('neg_sim_stats', empty_stats)
                 last_phase_pair_stats = stats.get('phase_pair_stats')
                 last_phase_loss_stats = stats.get('phase_loss_stats')
                 if stats.get('film_stats') is not None:
@@ -1260,6 +1332,10 @@ def validate_epoch(
         'gate_stats': last_gate_stats,
         'pos_weight_stats': last_pos_weight_stats,
         'neg_weight_stats': last_neg_weight_stats,
+        'pos_sim_stats': last_pos_sim_stats,
+        'neg_sim_stats': last_neg_sim_stats,
+        'pos_spec_dist_stats': last_pos_spec_dist_stats,
+        'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -2103,6 +2179,43 @@ def main():
         logger.info(
             f"  Spatial neg weights: {fmt_stats(train_stats['neg_weight_stats'])}"
         )
+        psd = train_stats.get('pos_spec_dist_stats', {})
+        nsd = train_stats.get('neg_spec_dist_stats', {})
+        if psd.get('mean', 0.0) != 0.0 or nsd.get('mean', 0.0) != 0.0:
+            logger.info(
+                f"  Spatial spec dists: pos={fmt_stats(psd)} | neg={fmt_stats(nsd)}"
+            )
+        if epoch == 0:
+            tau_sweep = train_stats.get('tau_sweep', {})
+            if tau_sweep:
+                active_tau = loss_config.get('spatial_spectral_tau', 1.0)
+                logger.info(f"  Spatial spectral weight τ sweep (epoch 0, active τ={active_tau}):")
+                logger.info(f"    {'tau':>6}  {'pos_mean':>8}  {'pos_q25':>8}  {'pos_q50':>8}  {'neg_mean':>8}")
+                for t, v in sorted(tau_sweep.items()):
+                    marker = " <-- active" if t == active_tau else ""
+                    logger.info(
+                        f"    {t:>6.1f}  {v['pos_mean']:>8.3f}  {v['pos_q25']:>8.3f}  {v['pos_q50']:>8.3f}  {v['neg_mean']:>8.3f}{marker}"
+                    )
+            spec_neg_sweep = train_stats.get('spectral_neg_tau_sweep', {})
+            if spec_neg_sweep:
+                active_tau_neg = loss_config.get('spectral_neg_tau', 1.0)
+                logger.info(f"  Spectral neg weight τ sweep (epoch 0, active τ={active_tau_neg}):")
+                logger.info(f"    {'tau':>6}  {'neg_mean':>8}  {'neg_q25':>8}  {'neg_q50':>8}")
+                for t, v in sorted(spec_neg_sweep.items()):
+                    marker = " <-- active" if t == active_tau_neg else ""
+                    logger.info(
+                        f"    {t:>6.1f}  {v['neg_mean']:>8.3f}  {v['neg_q25']:>8.3f}  {v['neg_q50']:>8.3f}{marker}"
+                    )
+        ps = train_stats.get('pos_sim_stats', {})
+        ns = train_stats.get('neg_sim_stats', {})
+        if ps.get('mean', 0.0) != 0.0 or ns.get('mean', 0.0) != 0.0:
+            gap = ps.get('mean', 0.0) - ns.get('mean', 0.0)
+            eff_confusers = f"{2.718 ** train_stats.get('spatial_loss', 0.0):.1f}"
+            logger.info(
+                f"  Spatial sims: pos={fmt_stats(ps)} | "
+                f"neg mean={ns.get('mean', 0.0):.4f} | "
+                f"gap={gap:.4f} | eff_confusers={eff_confusers}/{train_stats.get('spatial_neg_pairs', '?')}"
+            )
         logger.info(
             f"  Pairs/batch: "
             f"spec(batch total) pos={train_stats.get('spectral_pos_pairs', 0)} neg={train_stats.get('spectral_neg_pairs', 0)} | "
