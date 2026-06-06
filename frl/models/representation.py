@@ -383,7 +383,8 @@ class RepresentationModel(nn.Module):
         x_phase_pixels: torch.Tensor,
         z_type_pixels: torch.Tensor,
         return_film: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_pre_film: bool = False,
+    ) -> torch.Tensor | tuple:
         """Phase pathway forward at sampled pixel locations only.
 
         Runs the same TCN → bottleneck → FiLM pipeline but only on the
@@ -397,11 +398,17 @@ class RepresentationModel(nn.Module):
                 (**caller must stop-grad**).
             return_film: If True, also return the data-dependent gamma and
                 beta tensors (useful for diagnostics).
+            return_pre_film: If True, also return the pre-FiLM bottleneck
+                output ``h [N, z_phase_dim, T]`` (post-normalization, pre-FiLM).
+                Useful for monitoring type leakage into the TCN.
 
         Returns:
-            If *return_film* is False: ``z_phase_pixels [N, T, z_phase_dim]``.
+            If neither flag is set: ``z_phase_pixels [N, T, z_phase_dim]``.
             If *return_film* is True: ``(z_phase_pixels, gamma, beta)``
                 where gamma and beta are ``[N, z_phase_dim]``.
+            If *return_pre_film* is True: ``(z_phase_pixels, h)``
+                where h is ``[N, z_phase_dim, T]``.
+            If both are True: ``(z_phase_pixels, gamma, beta, h)``.
         """
         N, C, T = x_phase_pixels.shape
         zp = self.z_phase_dim
@@ -428,9 +435,12 @@ class RepresentationModel(nn.Module):
         z = gamma * h + beta  # [N, zp, T]
 
         z = z.permute(0, 2, 1)  # [N, T, zp]
+        if return_film and return_pre_film:
+            return z, gamma.squeeze(-1), beta.squeeze(-1), h
         if return_film:
-            # Return gamma/beta as [N, zp] (squeeze the broadcast time dim)
             return z, gamma.squeeze(-1), beta.squeeze(-1)
+        if return_pre_film:
+            return z, h
         return z
 
     # ------------------------------------------------------------------

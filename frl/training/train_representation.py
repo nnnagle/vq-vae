@@ -181,6 +181,9 @@ def process_batch(
     # FiLM data-dependent stats accumulators
     all_film_gamma = []
     all_film_beta = []
+    # Pre-FiLM type-leakage accumulators: h mean-pooled over T, and z_type
+    all_pre_film_h_mean = []   # [N, zp] per batch
+    all_z_type_at_phase = []   # [N, z_type_dim] per batch
 
     # Collectors for global spectral loss (pairs built cross-batch after loop)
     cross_patch_z_anchors: list[torch.Tensor] = []
@@ -479,12 +482,16 @@ def process_batch(
                         )  # [N_phase, 64]
 
                         # Run phase encoder on anchor pixels only
-                        z_phase_at_anchors, film_gamma, film_beta = model.forward_phase_at_locations(
+                        z_phase_at_anchors, film_gamma, film_beta, pre_film_h = model.forward_phase_at_locations(
                             phase_ccdc_at_anchors, z_type_at_anchors,
                             return_film=True,
-                        )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12]
+                            return_pre_film=True,
+                        )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12], [N_phase, 12, T]
                         all_film_gamma.append(film_gamma.detach())
                         all_film_beta.append(film_beta.detach())
+                        # Mean-pool pre-FiLM h over T for type-leakage diagnostics
+                        all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())  # [N_phase, zp]
+                        all_z_type_at_phase.append(z_type_at_anchors.detach())       # [N_phase, z_type_dim]
 
                         # Phase VCR: prevent dimensional collapse in z_phase
                         phase_vcr_cfg = config.get('phase_vcr_config')
@@ -904,6 +911,39 @@ def process_batch(
             'beta_per_dim_std': beta_cat.std(dim=0).mean().item(),
         }
 
+    # Type-leakage diagnostics: how much type information is in pre-FiLM h?
+    type_leakage_stats = None
+    if all_pre_film_h_mean and all_z_type_at_phase:
+        h_cat = torch.cat(all_pre_film_h_mean, dim=0).float()   # [N, zp]
+        zt_cat = torch.cat(all_z_type_at_phase, dim=0).float()  # [N, z_type_dim]
+        N = h_cat.shape[0]
+
+        # Option 1: Cross-covariance Frobenius norm
+        # Demean both to get unbiased cross-covariance
+        h_c = h_cat - h_cat.mean(dim=0, keepdim=True)
+        zt_c = zt_cat - zt_cat.mean(dim=0, keepdim=True)
+        cross_cov = (h_c.T @ zt_c) / (N - 1)  # [zp, z_type_dim]
+        cross_cov_frob = cross_cov.pow(2).sum().sqrt().item()
+
+        # Option 2: Ridge regression R² of z_type predicted from h
+        # Fit closed-form ridge: W = (h^T h + λI)^{-1} h^T zt
+        lam = 1e-3
+        A = h_c.T @ h_c + lam * torch.eye(h_c.shape[1], device=h_c.device)
+        B = h_c.T @ zt_c
+        W = torch.linalg.solve(A, B)  # [zp, z_type_dim]
+        pred = h_c @ W               # [N, z_type_dim]
+        ss_res = (zt_c - pred).pow(2).sum(dim=0)   # [z_type_dim]
+        ss_tot = zt_c.pow(2).sum(dim=0).clamp(min=1e-8)
+        r2_per_dim = (1.0 - ss_res / ss_tot)       # [z_type_dim]
+        r2_mean = r2_per_dim.mean().item()
+        r2_max = r2_per_dim.max().item()
+
+        type_leakage_stats = {
+            'cross_cov_frob': cross_cov_frob,
+            'r2_mean': r2_mean,
+            'r2_max': r2_max,
+        }
+
     # Aggregate EVT diagnostics across samples
     empty_evt_diag = dict(
         mean_entropy_ref=0.0, mean_entropy_learned=0.0,
@@ -942,6 +982,7 @@ def process_batch(
         'phase_pair_stats': aggregate_phase_stats(all_phase_pair_stats),
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
+        'type_leakage_stats': type_leakage_stats,
     }
 
 
@@ -2133,6 +2174,14 @@ def main():
         else:
             logger.info("  FiLM: no data (phase pathway not active yet)")
 
+        # Log pre-FiLM type-leakage diagnostics
+        tls = train_stats.get('type_leakage_stats')
+        if tls is not None:
+            logger.info(
+                f"  Pre-FiLM type leakage: cross_cov_frob={tls['cross_cov_frob']:.4f} | "
+                f"z_type R² from h: mean={tls['r2_mean']:.4f}, max={tls['r2_max']:.4f}"
+            )
+
         # Flat metrics dict — keys match the monitor strings used in the YAML.
         epoch_metrics = {
             "train/loss_total":         train_stats['loss'],
@@ -2152,6 +2201,14 @@ def main():
             "val/loss_vcr":                  val_stats['vcr_loss'],
             "val/loss_phase_vcr":            val_stats['phase_vcr_loss'],
         }
+
+        # Type-leakage metrics (train only — val computed separately below)
+        for prefix, stats in [("train", train_stats), ("val", val_stats)]:
+            tls = stats.get('type_leakage_stats')
+            if tls is not None:
+                epoch_metrics[f"{prefix}/phase_type_leakage_cov"]  = tls['cross_cov_frob']
+                epoch_metrics[f"{prefix}/phase_type_leakage_r2_mean"] = tls['r2_mean']
+                epoch_metrics[f"{prefix}/phase_type_leakage_r2_max"]  = tls['r2_max']
 
         # Checkpoint state dict (shared by periodic and last saves).
         ckpt_state = {
