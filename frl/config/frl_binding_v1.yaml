@@ -626,6 +626,12 @@ losses:
     self_similarity_weight: 1.0    # trajectory shape matching
     cross_pixel_weight: 1.0        # shared metric space anchoring
 
+    # Type-projection demeaning of spectral reference features.
+    # SVD reduces z_type to K dimensions; kNN in that space defines the
+    # type-local baseline subtracted from each pixel's spectral trajectory.
+    phase_type_proj_rank: 8        # K: number of SVD components of z_type to retain
+    phase_type_proj_neighbors: 20  # k: nearest neighbors in reduced type space for baseline
+
     # Curriculum: ramp in after type encoder stabilises.
     # start_epoch should align with scheduler.phase_warmup so the LR bump
     # coincides with phase loss entering — keeps the two schedules in sync.

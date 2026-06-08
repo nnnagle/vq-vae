@@ -424,17 +424,6 @@ def build_phase_neighborhood_batch(
     aligned_i_phase = torch.bmm(mapping, sel_phase_i)  # [B_valid, M, D]
     aligned_j_phase = torch.bmm(mapping, sel_phase_j)  # [B_valid, M, D]
 
-    # --- Per-pair demeaning over shared ysfc values ---
-    # Removing the per-pair mean removes the static spectral signature so
-    # that distances reflect temporal trajectory shape only.  Demeaning
-    # here (after alignment to shared ysfc positions) ensures both pixels
-    # are centred on the same set of recovery stages, avoiding baseline
-    # contamination from pre-disturbance values not shared by the pair.
-    shared_mean_i = aligned_i_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    shared_mean_j = aligned_j_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    aligned_i_spec = aligned_i_spec - shared_mean_i
-    aligned_j_spec = aligned_j_spec - shared_mean_j
-
     # --- Batched distance matrices ---
     d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)         # [B_valid, M, M]
     d_learned_self = torch.cdist(aligned_i_phase, aligned_i_phase)   # [B_valid, M, M]

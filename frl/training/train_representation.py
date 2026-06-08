@@ -197,6 +197,53 @@ def process_batch(
     cross_patch_spec_features: list[torch.Tensor] = []
     cross_patch_anchor_coords: list[torch.Tensor] = []
 
+    # Collectors for cross-batch phase loss (assembled after loop like spectral loss)
+    cross_phase_z_type: list[torch.Tensor] = []
+    cross_phase_spec: list[torch.Tensor] = []
+    cross_phase_embeddings: list[torch.Tensor] = []
+    cross_phase_ysfc: list[torch.Tensor] = []
+    cross_phase_pairs: list[torch.Tensor] = []
+    cross_phase_weights: list[torch.Tensor] = []
+    cross_phase_dynamism: list[torch.Tensor] = []
+    cross_phase_n_offset: int = 0  # running pixel count for pair index remapping
+
+    # Hoist epoch-dependent curriculum weights (same for every patch in the batch)
+    if phase_config is not None:
+        _start = phase_config.get('curriculum_start_epoch', 10)
+        _ramp  = phase_config.get('curriculum_ramp_epochs', 10)
+        if epoch < _start:
+            curriculum_w = 0.0
+        elif epoch >= _start + _ramp:
+            curriculum_w = 1.0
+        else:
+            curriculum_w = (epoch - _start) / _ramp
+    else:
+        curriculum_w = 0.0
+
+    if spread_config is not None:
+        _s_start = spread_config['curriculum_start_epoch']
+        _s_ramp  = spread_config['curriculum_ramp_epochs']
+        if epoch < _s_start:
+            spread_w = 0.0
+        elif epoch >= _s_start + _s_ramp:
+            spread_w = 1.0
+        else:
+            spread_w = (epoch - _s_start) / _s_ramp
+    else:
+        spread_w = 0.0
+
+    if recovery_disc_config is not None:
+        _rd_start = recovery_disc_config['curriculum_start_epoch']
+        _rd_ramp  = recovery_disc_config['curriculum_ramp_epochs']
+        if epoch < _rd_start:
+            rd_w = 0.0
+        elif epoch >= _rd_start + _rd_ramp:
+            rd_w = 1.0
+        else:
+            rd_w = (epoch - _rd_start) / _rd_ramp
+    else:
+        rd_w = 0.0
+
     batch_size = len(batch['metadata'])
 
     for i in range(batch_size):
@@ -463,45 +510,26 @@ def process_batch(
 
                 all_phase_pair_stats.append(phase_stats)
 
-                # --- Compute phase loss if pairs survived ---
-                if phase_pairs.shape[0] > 0:
-                    # Curriculum weighting
-                    start_epoch = phase_config.get('curriculum_start_epoch', 10)
-                    ramp_epochs = phase_config.get('curriculum_ramp_epochs', 10)
-                    if epoch < start_epoch:
-                        curriculum_w = 0.0
-                    elif epoch >= start_epoch + ramp_epochs:
-                        curriculum_w = 1.0
-                    else:
-                        curriculum_w = (epoch - start_epoch) / ramp_epochs
-
-                    if curriculum_w > 0.0:
+                # --- Accumulate phase data for cross-batch loss (computed after loop) ---
+                if phase_pairs.shape[0] > 0 and curriculum_w > 0.0:
                         # Build phase_ccdc temporal feature
                         phase_ccdc_feature = feature_builder.build_feature(config['phase_encoder_feature'], sample)
                         phase_ccdc_data = torch.from_numpy(
                             phase_ccdc_feature.data
                         ).float().to(device)
-                        # phase_ccdc_data: [C, T, H, W]
 
                         # Extract only anchor pixel time-series (avoid dense TCN)
                         phase_anchors_dev = phase_anchors.to(device)
                         phase_ccdc_at_anchors = extract_temporal_at_locations(
                             phase_ccdc_data, phase_anchors_dev
                         )  # [N_phase, T, C]
-                        # Temporal spectral features as loss reference
-                        # (phase_ccdc varies over time, unlike the old
-                        #  static spec_dist_data which was identical at
-                        #  every timestep and collapsed to zero after
-                        #  demeaning)
                         spec_at_phase_anchors = phase_ccdc_at_anchors  # [N_phase, T, C]
-                        phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(
-                            0, 2, 1
-                        )  # [N_phase, C, T]
+                        phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(0, 2, 1)  # [N_phase, C, T]
 
                         # Extract z_type at anchor locations (stop-grad)
                         z_type_at_anchors = extract_at_locations(
                             z_full.detach(), phase_anchors_dev
-                        )  # [N_phase, 64]
+                        )  # [N_phase, z_type_dim]
 
                         # Run phase encoder on anchor pixels only
                         z_phase_at_anchors, film_gamma, film_beta, pre_film_h = model.forward_phase_at_locations(
@@ -511,14 +539,12 @@ def process_batch(
                         )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12], [N_phase, 12, T]
                         all_film_gamma.append(film_gamma.detach())
                         all_film_beta.append(film_beta.detach())
-                        # Mean-pool pre-FiLM h over T for type-leakage diagnostics
-                        all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())  # [N_phase, zp]
-                        all_z_type_at_phase.append(z_type_at_anchors.detach())       # [N_phase, z_type_dim]
+                        all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())
+                        all_z_type_at_phase.append(z_type_at_anchors.detach())
 
-                        # Phase VCR: prevent dimensional collapse in z_phase
+                        # Phase VCR: prevent dimensional collapse in z_phase (per-patch)
                         phase_vcr_cfg = config.get('phase_vcr_config')
                         if phase_vcr_cfg is not None:
-                            # Flatten [N_phase, T, 12] -> [N_phase*T, 12]
                             z_phase_flat = z_phase_at_anchors.reshape(-1, 12)
                             pvcr_total, _, _ = variance_covariance_loss(
                                 z_phase_flat,
@@ -530,118 +556,30 @@ def process_batch(
                         else:
                             phase_vcr_loss_val = torch.tensor(0.0, device=device)
 
-                        # ysfc on GPU for loss
+                        # Accumulate for cross-batch phase loss (offset pair indices)
                         ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
-                        phase_pairs_gpu = phase_pairs.to(device)
+                        cross_phase_z_type.append(z_type_at_anchors)
+                        cross_phase_spec.append(spec_at_phase_anchors)
+                        cross_phase_embeddings.append(z_phase_at_anchors)
+                        cross_phase_ysfc.append(ysfc_at_anchors_gpu)
+                        cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
+                        cross_phase_weights.append(phase_weights.to(device))
+                        cross_phase_n_offset += z_type_at_anchors.shape[0]
 
-                        # Build aligned batch once; reuse for both losses.
-                        phase_batch = build_phase_neighborhood_batch(
-                            spectral_features=spec_at_phase_anchors,
-                            phase_embeddings=z_phase_at_anchors,
-                            ysfc=ysfc_at_anchors_gpu,
-                            pair_indices=phase_pairs_gpu,
-                            min_overlap=phase_config.get('min_overlap', 3),
-                        )
-
-                        # Compute phase neighborhood loss
-                        p_loss, p_loss_stats = phase_neighborhood_loss(
-                            spectral_features=spec_at_phase_anchors,
-                            phase_embeddings=z_phase_at_anchors,
-                            ysfc=ysfc_at_anchors_gpu,
-                            pair_indices=phase_pairs_gpu,
-                            pair_weights=phase_weights.to(device),
-                            tau_ref=phase_config.get('tau_ref', 0.1),
-                            tau_learned=phase_config.get('tau_learned', 0.1),
-                            min_overlap=phase_config.get('min_overlap', 3),
-                            min_valid_per_row=phase_config.get(
-                                'min_valid_per_row', 2
-                            ),
-                            self_similarity_weight=phase_config.get(
-                                'self_similarity_weight', 1.0
-                            ),
-                            cross_pixel_weight=phase_config.get(
-                                'cross_pixel_weight', 1.0
-                            ),
-                            _batch=phase_batch,
-                        )
-
-                        phase_loss_weight = phase_config.get('weight', 1.0)
-                        phase_loss_val = phase_loss_weight * curriculum_w * p_loss
-                        p_loss_stats['curriculum_w'] = curriculum_w
-                        all_phase_loss_stats.append(p_loss_stats)
-
-                        # --- Phase spread ranking loss (reuses same batch) ---
-                        if spread_config is not None and phase_batch['valid_pair_mask'].any():
-                            # Extract dynamism feature at phase anchors.
-                            # feature_builder applies Mahalanobis whitening (covariance configured).
+                        # Accumulate dynamism for spread loss
+                        if spread_config is not None:
                             dynamism_data = torch.from_numpy(
                                 feature_builder.build_feature(
                                     'phase_dynamism_supervision', sample
                                 ).data
                             ).float()
-                            dynamism_at_anchors = extract_at_locations(
-                                dynamism_data, phase_anchors
-                            )  # [N_phase, C]
-                            # Mean of whitened channels → per-anchor dynamism scalar.
-                            # Larger positive = more dynamic; near zero = typical; negative = static.
-                            dynamism_ref = dynamism_at_anchors.mean(dim=1).to(device)  # [N_phase]
+                            cross_phase_dynamism.append(
+                                extract_at_locations(dynamism_data, phase_anchors)
+                            )
 
-                            valid_mask = phase_batch['valid_pair_mask']
-                            idx_i_v = phase_pairs_gpu[valid_mask, 0]
-                            idx_j_v = phase_pairs_gpu[valid_mask, 1]
-
-                            # Compute spread ranking curriculum weight (same schedule as phase loss).
-                            s_start = spread_config['curriculum_start_epoch']
-                            s_ramp = spread_config['curriculum_ramp_epochs']
-                            if epoch < s_start:
-                                spread_w = 0.0
-                            elif epoch >= s_start + s_ramp:
-                                spread_w = 1.0
-                            else:
-                                spread_w = (epoch - s_start) / s_ramp
-
-                            if spread_w > 0.0:
-                                spread_loss, spread_stats = compute_phase_spread_ranking(
-                                    batch_result=phase_batch,
-                                    idx_i_valid=idx_i_v,
-                                    idx_j_valid=idx_j_v,
-                                    dynamism_ref=dynamism_ref,
-                                    margin=spread_config['margin'],
-                                    delta=spread_config['delta'],
-                                )
-                                phase_spread_loss_val = (
-                                    spread_config['weight'] * spread_w * spread_loss
-                                )
-
-                        # --- Phase recovery discrimination loss ---
-                        if recovery_disc_config is not None:
-                            rd_start = recovery_disc_config['curriculum_start_epoch']
-                            rd_ramp  = recovery_disc_config['curriculum_ramp_epochs']
-                            if epoch < rd_start:
-                                rd_w = 0.0
-                            elif epoch >= rd_start + rd_ramp:
-                                rd_w = 1.0
-                            else:
-                                rd_w = (epoch - rd_start) / rd_ramp
-
-                            if rd_w > 0.0:
-                                rd_loss, _ = phase_recovery_discrimination_loss(
-                                    z_phase=z_phase_at_anchors,
-                                    ysfc=ysfc_at_anchors_gpu,
-                                    margin=recovery_disc_config['margin'],
-                                    low_ysfc_max=recovery_disc_config['low_ysfc_max'],
-                                    high_ysfc_min=recovery_disc_config['high_ysfc_min'],
-                                )
-                                phase_recovery_disc_loss_val = (
-                                    recovery_disc_config['weight'] * rd_w * rd_loss
-                                )
-
-        # Combine losses with weights (spectral loss computed globally after loop)
+        # Combine per-patch losses (phase losses computed cross-batch after loop)
         spatial_weight = config.get('spatial_loss_weight', 1.0)
         loss = (spatial_weight * spatial_loss_val
-                + phase_loss_val
-                + phase_spread_loss_val
-                + phase_recovery_disc_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
                 + evt_loss_val)
@@ -676,18 +614,12 @@ def process_batch(
         if training:
             total_loss += loss
             total_spatial_loss += spatial_loss_val
-            total_phase_loss += phase_loss_val
-            total_phase_spread_loss += phase_spread_loss_val
-            total_phase_recovery_disc_loss += phase_recovery_disc_loss_val
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
             total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
             total_spatial_loss += spatial_loss_val.item()
-            total_phase_loss += phase_loss_val.item()
-            total_phase_spread_loss += phase_spread_loss_val.item()
-            total_phase_recovery_disc_loss += phase_recovery_disc_loss_val.item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_evt_loss += evt_loss_val.item()
@@ -851,19 +783,116 @@ def process_batch(
             'phase_loss_stats': empty_phase_loss_stats,
         }
 
+    # --- Cross-batch phase losses ---
+    # Phase neighborhood, spread, and recovery discrimination losses are computed
+    # once over all patches in the batch. Spectral reference features are demeaned
+    # by a type-local baseline computed via SVD rank reduction + kNN in type space.
+    cross_phase_loss_val = torch.tensor(0.0, device=device)
+    cross_phase_spread_val = torch.tensor(0.0, device=device)
+    cross_phase_rd_val = torch.tensor(0.0, device=device)
+
+    if cross_phase_embeddings:
+        Z = torch.cat(cross_phase_z_type, dim=0)           # [N_total, z_type_dim]
+        spec_all = torch.cat(cross_phase_spec, dim=0)      # [N_total, T, C]
+        z_phase_all = torch.cat(cross_phase_embeddings, dim=0)  # [N_total, T, 12]
+        ysfc_all = torch.cat(cross_phase_ysfc, dim=0)      # [N_total, T]
+        pairs_all = torch.cat(cross_phase_pairs, dim=0)    # [B_total, 2]
+        weights_all = torch.cat(cross_phase_weights, dim=0)  # [B_total]
+
+        # SVD rank reduction on z_type for stable kNN type baseline
+        K = phase_config.get('phase_type_proj_rank', 8)
+        k_nbrs = phase_config.get('phase_type_proj_neighbors', 20)
+        Z_c = Z - Z.mean(0, keepdim=True)
+        U, _, _ = torch.linalg.svd(Z_c, full_matrices=False)
+        Z_k = U[:, :K]  # [N_total, K]
+
+        # kNN in reduced type space → type-local spectral baseline per pixel
+        sim = Z_k @ Z_k.T  # [N_total, N_total]
+        sim.fill_diagonal_(float('-inf'))
+        k_nbrs = min(k_nbrs, sim.shape[0] - 1)
+        topk_idx = sim.topk(k_nbrs, dim=1).indices  # [N_total, k_nbrs]
+        S_mean = spec_all.mean(dim=1)                # [N_total, C] — pixel mean over T
+        S_hat = S_mean[topk_idx].mean(dim=1)         # [N_total, C] — type-local baseline
+        spec_demeaned = spec_all - S_hat.unsqueeze(1)  # [N_total, T, C]
+
+        # Build aligned distance batch once; reuse for neighborhood + spread losses
+        phase_batch = build_phase_neighborhood_batch(
+            spectral_features=spec_demeaned,
+            phase_embeddings=z_phase_all,
+            ysfc=ysfc_all,
+            pair_indices=pairs_all,
+            min_overlap=phase_config.get('min_overlap', 3),
+        )
+
+        # Phase neighborhood loss
+        p_loss, p_loss_stats = phase_neighborhood_loss(
+            spectral_features=spec_demeaned,
+            phase_embeddings=z_phase_all,
+            ysfc=ysfc_all,
+            pair_indices=pairs_all,
+            pair_weights=weights_all,
+            tau_ref=phase_config.get('tau_ref', 0.1),
+            tau_learned=phase_config.get('tau_learned', 0.1),
+            min_overlap=phase_config.get('min_overlap', 3),
+            min_valid_per_row=phase_config.get('min_valid_per_row', 2),
+            self_similarity_weight=phase_config.get('self_similarity_weight', 1.0),
+            cross_pixel_weight=phase_config.get('cross_pixel_weight', 1.0),
+            _batch=phase_batch,
+        )
+        cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * p_loss
+        p_loss_stats['curriculum_w'] = curriculum_w
+        all_phase_loss_stats.append(p_loss_stats)
+
+        # Phase spread ranking loss
+        if spread_config is not None and spread_w > 0.0 and cross_phase_dynamism:
+            dynamism_all = torch.cat(cross_phase_dynamism, dim=0)  # [N_total, C]
+            dynamism_ref = dynamism_all.mean(dim=1).to(device)     # [N_total]
+            valid_mask = phase_batch['valid_pair_mask']
+            if valid_mask.any():
+                idx_i_v = pairs_all[valid_mask, 0]
+                idx_j_v = pairs_all[valid_mask, 1]
+                spread_loss, _ = compute_phase_spread_ranking(
+                    batch_result=phase_batch,
+                    idx_i_valid=idx_i_v,
+                    idx_j_valid=idx_j_v,
+                    dynamism_ref=dynamism_ref,
+                    margin=spread_config['margin'],
+                    delta=spread_config['delta'],
+                )
+                cross_phase_spread_val = spread_config['weight'] * spread_w * spread_loss
+
+        # Phase recovery discrimination loss
+        if recovery_disc_config is not None and rd_w > 0.0:
+            rd_loss, _ = phase_recovery_discrimination_loss(
+                z_phase=z_phase_all,
+                ysfc=ysfc_all,
+                margin=recovery_disc_config['margin'],
+                low_ysfc_max=recovery_disc_config['low_ysfc_max'],
+                high_ysfc_min=recovery_disc_config['high_ysfc_min'],
+            )
+            cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
+
     # Average losses over valid samples in batch.
-    # Spectral loss is computed globally (cross-patch) and added on top.
+    # Spectral and phase losses are computed globally (cross-patch) and added on top.
+    _scalar = lambda t: t.item() if hasattr(t, 'item') else float(t)
     if training:
-        mean_loss = total_loss / n_valid + spectral_weight * global_spectral_loss_val
+        mean_loss = (total_loss / n_valid
+                     + spectral_weight * global_spectral_loss_val
+                     + cross_phase_loss_val
+                     + cross_phase_spread_val
+                     + cross_phase_rd_val)
         mean_spectral_loss = global_spectral_loss_val
     else:
-        spectral_scalar = global_spectral_loss_val.item()
-        mean_loss = total_loss / n_valid + spectral_weight * spectral_scalar
-        mean_spectral_loss = spectral_scalar
+        mean_loss = (total_loss / n_valid
+                     + spectral_weight * _scalar(global_spectral_loss_val)
+                     + _scalar(cross_phase_loss_val)
+                     + _scalar(cross_phase_spread_val)
+                     + _scalar(cross_phase_rd_val))
+        mean_spectral_loss = _scalar(global_spectral_loss_val)
     mean_spatial_loss = total_spatial_loss / n_valid
-    mean_phase_loss = total_phase_loss / n_valid
-    mean_phase_spread_loss = total_phase_spread_loss / n_valid
-    mean_phase_recovery_disc_loss = total_phase_recovery_disc_loss / n_valid
+    mean_phase_loss = _scalar(cross_phase_loss_val)
+    mean_phase_spread_loss = _scalar(cross_phase_spread_val)
+    mean_phase_recovery_disc_loss = _scalar(cross_phase_rd_val)
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
     mean_evt_loss = total_evt_loss / n_valid

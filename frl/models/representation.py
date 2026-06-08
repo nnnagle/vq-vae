@@ -365,10 +365,11 @@ class RepresentationModel(nn.Module):
         h = self.phase_head(h)  # [B*T, zp, H, W]
         h = h.reshape(B, T, zp, H, W).permute(0, 2, 1, 3, 4)  # [B, zp, T, H, W]
 
-        # L2-normalize across (channel, time) jointly so the TCN controls
-        # direction & temporal shape, while FiLM gamma owns the per-channel scale.
-        # One norm factor per spatial location — temporal variation is preserved.
-        h = F.normalize(h.flatten(1, 2), dim=1).unflatten(1, (zp, T))
+        # Per-channel demean across batch, time, and space so the TCN encodes
+        # recovery position as deviation from the type-level mean rather than
+        # absolute spectral level.  Amplitude is preserved (only mean removed),
+        # so a recovering pixel sits lower than a mature pixel of the same type.
+        h = h - h.mean(dim=(0, 2, 3, 4), keepdim=True)  # [B, zp, T, H, W]
 
         # FiLM conditioning
         gamma, beta = self.phase_film(z_type)  # each [B, zp, H, W]
@@ -423,8 +424,8 @@ class RepresentationModel(nn.Module):
         h = self.phase_head(h)  # [N*T, zp, 1, 1]
         h = h.reshape(N, T, zp).permute(0, 2, 1)  # [N, zp, T]
 
-        # L2-normalize across (channel, time) jointly — see forward_phase.
-        h = F.normalize(h.flatten(1, 2), dim=1).unflatten(1, (zp, T))
+        # Per-channel demean across pixels and time — see forward_phase.
+        h = h - h.mean(dim=(0, 2), keepdim=True)  # [N, zp, T]
 
         # FiLM conditioning
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, z_type_dim, 1, 1]
