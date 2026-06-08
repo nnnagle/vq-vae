@@ -8,7 +8,8 @@ model and write a new CSV with:
   - ysfc                       — years since fire/disturbance at the given year
   - evt                        — Existing Vegetation Type code
   - x_type_0 .. x_type_{C-1}  — normalized type encoder inputs at the pixel
-  - x_phase_0 .. x_phase_{C-1}— normalized phase encoder inputs at the pixel for the given year
+  - x_phase_0 .. x_phase_{C-1}   — normalized phase encoder inputs at the pixel for the given year
+  - x_phase_dm_0 .. x_phase_dm_{C-1} — same, demeaned over all years (pixel mean subtracted)
   - z_type_0 .. z_type_63     — type embedding (64-d)
   - z_phase_0 .. z_phase_11   — phase embedding (12-d) at the given year
   - g_type_0 .. g_type_{P-1}  — projected type embedding (output_dim-d); g(h) in SimCLR notation
@@ -165,6 +166,9 @@ class LocationDataset(Dataset):
             "x_phase_pixel": torch.from_numpy(feat_phase.data[:, :, lr, lc]).float(),  # [C_phase, T]
             "x_type_center": torch.from_numpy(feat_type.data[:, lr, lc]).float(),      # [C_type]
             "x_phase_center": torch.from_numpy(feat_phase.data[:, year_idx, lr, lc]).float(),  # [C_phase]
+            "x_phase_center_dm": torch.from_numpy(
+                feat_phase.data[:, :, lr, lc] - feat_phase.data[:, :, lr, lc].mean(axis=1, keepdims=True)
+            ).float()[:, year_idx],  # [C_phase] demeaned over T, extracted at year_idx
             "local_row": lr,
             "local_col": lc,
             "year_idx": year_idx,
@@ -284,8 +288,9 @@ def main():
         z_type_np = z_type_center.cpu().numpy()    # [B, 64]
         z_proj_np = z_proj_center.cpu().numpy()    # [B, proj_dim]
         z_phase_np = z_phase_center.cpu().numpy()  # [B, 12]
-        x_type_np = batch["x_type_center"].numpy() # [B, C_type]
-        x_phase_np = batch["x_phase_center"].numpy()  # [B, C_phase]
+        x_type_np = batch["x_type_center"].numpy()       # [B, C_type]
+        x_phase_np = batch["x_phase_center"].numpy()     # [B, C_phase]
+        x_phase_dm_np = batch["x_phase_center_dm"].numpy()  # [B, C_phase]
 
         for i in range(B):
             oi = int(batch["orig_idx"][i])
@@ -301,6 +306,8 @@ def main():
                 rec[f"x_type_{j}"] = float(v)
             for j, v in enumerate(x_phase_np[i]):
                 rec[f"x_phase_{j}"] = float(v)
+            for j, v in enumerate(x_phase_dm_np[i]):
+                rec[f"x_phase_dm_{j}"] = float(v)
             for j, v in enumerate(z_type_np[i]):
                 rec[f"z_type_{j}"] = float(v)
             for j, v in enumerate(z_phase_np[i]):
