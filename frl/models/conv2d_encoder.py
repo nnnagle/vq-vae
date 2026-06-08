@@ -193,8 +193,10 @@ def build_conv2d_from_config(config: dict) -> Conv2DEncoder:
     dropout_config = config.get('dropout', {})
     if isinstance(dropout_config, dict):
         dropout_rate = dropout_config.get('rate', 0.0)
+    elif isinstance(dropout_config, list):
+        dropout_rate = dropout_config
     else:
-        dropout_rate = 0.0
+        dropout_rate = float(dropout_config) if dropout_config else 0.0
 
     # Normalization
     norm_config = config.get('norm', {})

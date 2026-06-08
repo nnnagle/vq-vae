@@ -22,7 +22,7 @@ type_encoder:
   channels: [128, 48]
   kernel_size: 1
   padding: 0
-  dropout: 0.1
+  dropout: [0.1, 0.0]
   num_groups: 8
 
   # input_dropout: zeros entire input channel maps before the first conv.
