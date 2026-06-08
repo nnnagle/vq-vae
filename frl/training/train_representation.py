@@ -752,7 +752,7 @@ def process_batch(
         # Distances computed only for sampled pairs — O(n_neg × C), not O(N²)
         neg_spec_dist = torch.norm(spec_all[global_neg_i] - spec_all[global_neg_j], dim=1)
         neg_weights = (1.0 - torch.exp(-neg_spec_dist / tau_neg)).clamp(min=min_w, max=1.0)
-        if epoch == 0:
+        if epoch in (0, 6):
             _nsd_cpu = neg_spec_dist.detach().cpu()
             spectral_neg_tau_sweep = {
                 t: {
@@ -2145,11 +2145,11 @@ def main():
             logger.info(
                 f"  Spatial spec dists: pos={fmt_stats(psd)} | neg={fmt_stats(nsd)}"
             )
-        if epoch == 0:
+        if epoch in (0, 6):
             tau_sweep = train_stats.get('tau_sweep', {})
             if tau_sweep:
                 active_tau = loss_config.get('spatial_spectral_tau', 1.0)
-                logger.info(f"  Spatial spectral weight τ sweep (epoch 0, active τ={active_tau}):")
+                logger.info(f"  Spatial spectral weight τ sweep (epoch {epoch}, active τ={active_tau}):")
                 logger.info(f"    {'tau':>6}  {'pos_mean':>8}  {'pos_q25':>8}  {'pos_q50':>8}  {'neg_mean':>8}")
                 for t, v in sorted(tau_sweep.items()):
                     marker = " <-- active" if t == active_tau else ""
@@ -2159,7 +2159,7 @@ def main():
             spec_neg_sweep = train_stats.get('spectral_neg_tau_sweep', {})
             if spec_neg_sweep:
                 active_tau_neg = loss_config.get('spectral_neg_tau', 1.0)
-                logger.info(f"  Spectral neg weight τ sweep (epoch 0, active τ={active_tau_neg}):")
+                logger.info(f"  Spectral neg weight τ sweep (epoch {epoch}, active τ={active_tau_neg}):")
                 logger.info(f"    {'tau':>6}  {'neg_mean':>8}  {'neg_q25':>8}  {'neg_q50':>8}")
                 for t, v in sorted(spec_neg_sweep.items()):
                     marker = " <-- active" if t == active_tau_neg else ""
