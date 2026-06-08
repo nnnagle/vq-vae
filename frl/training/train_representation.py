@@ -396,15 +396,16 @@ def process_batch(
                 pos_weights=pos_weights,
                 neg_weights=neg_weights,
                 temperature=config.get('spatial_temperature', 0.07),
-                similarity='cosine',
+                similarity='l2',
             )
 
-            # Collect cosine similarities for diagnostics (z_spatial is unit-norm)
+            # Collect l2 similarities for diagnostics: sim = -||a-b||^2 / D
             with torch.no_grad():
+                dim = z_spatial.shape[1]
                 p_a, p_b = z_spatial[spatial_pos_pairs[:, 0]], z_spatial[spatial_pos_pairs[:, 1]]
                 n_a, n_b = z_spatial[spatial_neg_pairs[:, 0]], z_spatial[spatial_neg_pairs[:, 1]]
-                all_pos_sims.append((p_a * p_b).sum(1).cpu())
-                all_neg_sims.append((n_a * n_b).sum(1).cpu())
+                all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / dim).cpu())
+                all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / dim).cpu())
 
         # --- Phase pair construction + loss ---
         # Pair construction (kNN + overlap) runs on CPU.
@@ -2171,7 +2172,7 @@ def main():
             gap = ps.get('mean', 0.0) - ns.get('mean', 0.0)
             eff_confusers = f"{2.718 ** train_stats.get('spatial_loss', 0.0):.1f}"
             logger.info(
-                f"  Spatial sims: pos={fmt_stats(ps)} | "
+                f"  Spatial l2-sims: pos={fmt_stats(ps)} | "
                 f"neg mean={ns.get('mean', 0.0):.4f} | "
                 f"gap={gap:.4f} | eff_confusers={eff_confusers}/{train_stats.get('spatial_neg_pairs', '?')}"
             )

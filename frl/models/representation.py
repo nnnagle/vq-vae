@@ -330,8 +330,8 @@ class RepresentationModel(nn.Module):
         h = self.encoder(x)
         if return_gate:
             z, gate = self.spatial_conv(h, return_gate=True)
-            return F.normalize(z, dim=1), gate
-        return F.normalize(self.spatial_conv(h), dim=1)
+            return z, gate
+        return self.spatial_conv(h)
 
     def forward_phase(
         self,
