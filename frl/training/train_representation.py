@@ -752,7 +752,7 @@ def process_batch(
         # Distances computed only for sampled pairs — O(n_neg × C), not O(N²)
         neg_spec_dist = torch.norm(spec_all[global_neg_i] - spec_all[global_neg_j], dim=1)
         neg_weights = (1.0 - torch.exp(-neg_spec_dist / tau_neg)).clamp(min=min_w, max=1.0)
-        if epoch in (0, 6):
+        if epoch == 0:
             _nsd_cpu = neg_spec_dist.detach().cpu()
             spectral_neg_tau_sweep = {
                 t: {
@@ -2145,7 +2145,7 @@ def main():
             logger.info(
                 f"  Spatial spec dists: pos={fmt_stats(psd)} | neg={fmt_stats(nsd)}"
             )
-        if epoch in (0, 6):
+        if epoch == 0:
             tau_sweep = train_stats.get('tau_sweep', {})
             if tau_sweep:
                 active_tau = loss_config.get('spatial_spectral_tau', 1.0)
