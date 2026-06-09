@@ -205,6 +205,7 @@ def process_batch(
     cross_phase_pairs: list[torch.Tensor] = []
     cross_phase_weights: list[torch.Tensor] = []
     cross_phase_dynamism: list[torch.Tensor] = []
+    cross_phase_h: list[torch.Tensor] = []  # non-detached h for Frobenius loss
     cross_phase_n_offset: int = 0  # running pixel count for pair index remapping
 
     # Hoist epoch-dependent curriculum weights (same for every patch in the batch)
@@ -541,6 +542,7 @@ def process_batch(
                         all_film_beta.append(film_beta.detach())
                         all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())
                         all_z_type_at_phase.append(z_type_at_anchors.detach())
+                        cross_phase_h.append(pre_film_h.mean(dim=2))  # [N, zp] non-detached for Frobenius
 
                         # Phase VCR: prevent dimensional collapse in z_phase (per-patch)
                         phase_vcr_cfg = config.get('phase_vcr_config')
@@ -790,6 +792,7 @@ def process_batch(
     cross_phase_loss_val = torch.tensor(0.0, device=device)
     cross_phase_spread_val = torch.tensor(0.0, device=device)
     cross_phase_rd_val = torch.tensor(0.0, device=device)
+    cross_phase_leakage_val = torch.tensor(0.0, device=device)
 
     if cross_phase_embeddings:
         Z = torch.cat(cross_phase_z_type, dim=0)           # [N_total, z_type_dim]
@@ -872,6 +875,20 @@ def process_batch(
             )
             cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
 
+        # Frobenius cross-covariance loss: penalise type info in pre-FiLM h.
+        # Stop-gradient on Z so only the TCN (h) receives gradient.
+        # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
+        leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
+        if training and leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
+            h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
+            Z_sg = Z.detach()                                 # stop-grad on z_type
+            h_c = h_all - h_all.mean(0, keepdim=True)
+            Z_c = Z_sg - Z_sg.mean(0, keepdim=True)
+            N_h = h_c.shape[0]
+            cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
+            frob = cross_cov.pow(2).sum().sqrt()
+            cross_phase_leakage_val = leakage_weight * curriculum_w * frob
+
     # Average losses over valid samples in batch.
     # Spectral and phase losses are computed globally (cross-patch) and added on top.
     _scalar = lambda t: t.item() if hasattr(t, 'item') else float(t)
@@ -880,19 +897,22 @@ def process_batch(
                      + spectral_weight * global_spectral_loss_val
                      + cross_phase_loss_val
                      + cross_phase_spread_val
-                     + cross_phase_rd_val)
+                     + cross_phase_rd_val
+                     + cross_phase_leakage_val)
         mean_spectral_loss = global_spectral_loss_val
     else:
         mean_loss = (total_loss / n_valid
                      + spectral_weight * _scalar(global_spectral_loss_val)
                      + _scalar(cross_phase_loss_val)
                      + _scalar(cross_phase_spread_val)
-                     + _scalar(cross_phase_rd_val))
+                     + _scalar(cross_phase_rd_val)
+                     + _scalar(cross_phase_leakage_val))
         mean_spectral_loss = _scalar(global_spectral_loss_val)
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = _scalar(cross_phase_loss_val)
     mean_phase_spread_loss = _scalar(cross_phase_spread_val)
     mean_phase_recovery_disc_loss = _scalar(cross_phase_rd_val)
+    mean_phase_leakage_loss = _scalar(cross_phase_leakage_val)
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
     mean_evt_loss = total_evt_loss / n_valid
@@ -933,6 +953,7 @@ def process_batch(
         mean_phase_loss = mean_phase_loss.item()
         mean_phase_spread_loss = mean_phase_spread_loss.item()
         mean_phase_recovery_disc_loss = mean_phase_recovery_disc_loss.item()
+        mean_phase_leakage_loss = mean_phase_leakage_loss.item()
         mean_vcr_loss = mean_vcr_loss.item()
         mean_phase_vcr_loss = mean_phase_vcr_loss.item()
         mean_evt_loss = mean_evt_loss.item() if hasattr(mean_evt_loss, 'item') else float(mean_evt_loss)
@@ -1030,6 +1051,7 @@ def process_batch(
         'phase_loss': mean_phase_loss,
         'phase_spread_loss': mean_phase_spread_loss,
         'phase_recovery_disc_loss': mean_phase_recovery_disc_loss if not hasattr(mean_phase_recovery_disc_loss, 'item') else mean_phase_recovery_disc_loss.item(),
+        'phase_leakage_loss': mean_phase_leakage_loss,
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
@@ -1435,6 +1457,13 @@ def main():
              'optimizer state; the scheduler is reinitialized as a fresh cosine decay '
              'from the checkpoint LR over the remaining epochs (num_epochs - start_epoch).'
     )
+    parser.add_argument(
+        '--no-resume',
+        action='store_true',
+        default=False,
+        help='Disable automatic resume from encoder_last.pt even if it exists in the '
+             'experiment directory. Starts training fresh from epoch 0.'
+    )
     args = parser.parse_args()
 
     # Parse configs first to get defaults
@@ -1586,10 +1615,18 @@ def main():
         weight_decay=weight_decay,
     )
 
-    # Load checkpoint for resume (model weights + optimizer state).
-    # The scheduler is NOT restored — it is rebuilt as a fresh cosine from the
-    # checkpoint LR over the remaining epochs so the full LR range is used.
+    # Tracks (monitor_val, path) for top-k checkpoint pruning.
+    saved_ckpts: list = []
+
+    # --- Checkpoint resume ---
+    # Auto-resume: if encoder_last.pt exists in the experiment dir, resume from it
+    # unless --no-resume or an explicit --resume path was given.
+    # Manual --resume: load the specified checkpoint and rebuild scheduler as a fresh
+    # cosine from the checkpoint LR (original behavior).
     start_epoch = 0
+    resume_lr = lr  # used only if manual --resume triggers the fresh-cosine path
+    auto_resume_path = ckpt_dir / "encoder_last.pt"
+
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -1598,6 +1635,28 @@ def main():
         start_epoch = ckpt['epoch']  # saved as epoch+1 (the next epoch to run)
         resume_lr = optimizer.param_groups[0]['lr']
         logger.info(f"Resumed: start_epoch={start_epoch}, resume_lr={resume_lr:.3e}")
+
+    elif not args.no_resume and auto_resume_path.exists():
+        logger.info(f"Auto-resuming from {auto_resume_path}")
+        ckpt = torch.load(auto_resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt['epoch']
+        logger.info(f"Auto-resumed: start_epoch={start_epoch}, "
+                    f"lr={optimizer.param_groups[0]['lr']:.3e}")
+        # Rebuild saved_ckpts from existing best checkpoints on disk so top-k
+        # pruning is aware of what was saved before the crash.
+        monitor_key_for_resume = training_config.run.checkpoint.monitor
+        for p in sorted(ckpt_dir.glob("encoder_best_*.pt")):
+            try:
+                c = torch.load(p, map_location='cpu', weights_only=False)
+                val = c.get(monitor_key_for_resume, float('nan'))
+                saved_ckpts.append((val, p))
+                logger.info(f"  Restored top-k entry: {p.name} ({monitor_key_for_resume}={val:.4f})")
+            except Exception as e:
+                logger.warning(f"  Could not load {p.name} for top-k restore: {e}")
+        # scheduler state is restored below after scheduler creation
+        _auto_resume_scheduler_state = ckpt.get('scheduler_state_dict')
 
     # Scheduler is created after phase_config below, so it can condition on whether
     # phase loss is active (needed for the two-phase LR schedule).
@@ -2052,6 +2111,16 @@ def main():
             eta_min=scheduler_config.eta_min,
         )
 
+    # For auto-resume: restore scheduler state so LR continues exactly where it left off.
+    # (Manual --resume intentionally rebuilds a fresh cosine; auto-resume is a crash recovery.)
+    _auto_resume_scheduler_state = locals().get('_auto_resume_scheduler_state')
+    if _auto_resume_scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(_auto_resume_scheduler_state)
+            logger.info("Restored scheduler state from auto-resume checkpoint")
+        except Exception as e:
+            logger.warning(f"Could not restore scheduler state: {e}; continuing with rebuilt schedule")
+
     # Create output directories
     ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -2067,18 +2136,22 @@ def main():
     console_handler.setFormatter(log_format)
     root_logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(log_dir / 'training.log')
+    file_handler = logging.FileHandler(log_dir / 'training.log', mode='a')
     file_handler.setFormatter(log_format)
     root_logger.addHandler(file_handler)
 
     logger.info(f"Checkpoint dir: {ckpt_dir}")
     logger.info(f"Log dir: {log_dir}")
 
-    # Save experiment artifacts for reproducibility
-    shutil.copy2(bindings_path, experiment_dir / Path(bindings_path).name)
-    shutil.copy2(args.training, experiment_dir / Path(args.training).name)
-    shutil.copy2(model_config_path, experiment_dir / Path(model_config_path).name)
-    shutil.copy2(RepresentationModel.source_file(), experiment_dir / "representation.py")
+    # Save experiment artifacts for reproducibility (skip if already present — resume case)
+    for src, dst in [
+        (bindings_path, experiment_dir / Path(bindings_path).name),
+        (args.training, experiment_dir / Path(args.training).name),
+        (model_config_path, experiment_dir / Path(model_config_path).name),
+        (RepresentationModel.source_file(), experiment_dir / "representation.py"),
+    ]:
+        if not Path(dst).exists():
+            shutil.copy2(src, dst)
     logger.info(f"Saved config and model source to {experiment_dir}")
 
     # Pre-extract input dropout schedule config (scalar or dict) for the epoch loop.
@@ -2095,9 +2168,6 @@ def main():
             f"linearly released to 0.0 over epochs {smoothing_freeze_until}–"
             f"{smoothing_freeze_until + smoothing_ramp_epochs - 1}"
         )
-
-    # Tracks (monitor_val, path) for top-k checkpoint pruning.
-    saved_ckpts: list = []
 
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs (from epoch {start_epoch})...")
@@ -2147,6 +2217,7 @@ def main():
             f"spec={train_stats['spectral_loss']:.4f} spat={train_stats['spatial_loss']:.4f} "
             f"phase={train_stats['phase_loss']:.4f} spr={train_stats.get('phase_spread_loss', 0.0):.4f} "
             f"rdisc={train_stats.get('phase_recovery_disc_loss', 0.0):.4f} "
+            f"leak={train_stats.get('phase_leakage_loss', 0.0):.4f} "
             f"vcr={train_stats['vcr_loss']:.4f} "
             f"pvcr={train_stats['phase_vcr_loss']:.4f} evt={train_stats['evt_loss']:.4f}"
         )
@@ -2332,6 +2403,7 @@ def main():
             "train/loss_phase":              train_stats['phase_loss'],
             "train/loss_phase_spread":       train_stats.get('phase_spread_loss', 0.0),
             "train/loss_phase_recovery_disc": train_stats.get('phase_recovery_disc_loss', 0.0),
+            "train/loss_phase_leakage":      train_stats.get('phase_leakage_loss', 0.0),
             "train/loss_vcr":                train_stats['vcr_loss'],
             "train/loss_phase_vcr":          train_stats['phase_vcr_loss'],
             "val/loss_total":                val_stats['loss'],

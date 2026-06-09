@@ -330,8 +330,8 @@ class RepresentationModel(nn.Module):
         h = self.encoder(x)
         if return_gate:
             z, gate = self.spatial_conv(h, return_gate=True)
-            return F.normalize(z, dim=1), gate
-        return F.normalize(self.spatial_conv(h), dim=1)
+            return z, gate
+        return self.spatial_conv(h)
 
     def forward_phase(
         self,
@@ -364,12 +364,6 @@ class RepresentationModel(nn.Module):
         h = h.permute(0, 2, 1, 3, 4).reshape(B * T, tcn_out, H, W)
         h = self.phase_head(h)  # [B*T, zp, H, W]
         h = h.reshape(B, T, zp, H, W).permute(0, 2, 1, 3, 4)  # [B, zp, T, H, W]
-
-        # Per-channel demean across batch, time, and space so the TCN encodes
-        # recovery position as deviation from the type-level mean rather than
-        # absolute spectral level.  Amplitude is preserved (only mean removed),
-        # so a recovering pixel sits lower than a mature pixel of the same type.
-        h = h - h.mean(dim=(0, 2, 3, 4), keepdim=True)  # [B, zp, T, H, W]
 
         # FiLM conditioning
         gamma, beta = self.phase_film(z_type)  # each [B, zp, H, W]
@@ -423,9 +417,6 @@ class RepresentationModel(nn.Module):
         h = h.permute(0, 2, 1).reshape(N * T, tcn_out, 1, 1)
         h = self.phase_head(h)  # [N*T, zp, 1, 1]
         h = h.reshape(N, T, zp).permute(0, 2, 1)  # [N, zp, T]
-
-        # Per-channel demean across pixels and time — see forward_phase.
-        h = h - h.mean(dim=(0, 2), keepdim=True)  # [N, zp, T]
 
         # FiLM conditioning
         # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, z_type_dim, 1, 1]

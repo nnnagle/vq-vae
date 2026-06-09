@@ -632,6 +632,11 @@ losses:
     phase_type_proj_rank: 8        # K: number of SVD components of z_type to retain
     phase_type_proj_neighbors: 20  # k: nearest neighbors in reduced type space for baseline
 
+    # Frobenius norm of cross-covariance between pre-FiLM h and z_type.
+    # Penalises type information leaking into the phase bottleneck.
+    # Stop-gradient on z_type; active only when phase curriculum is active.
+    phase_type_leakage_weight: 0.01
+
     # Curriculum: ramp in after type encoder stabilises.
     # start_epoch should align with scheduler.phase_warmup so the LR bump
     # coincides with phase loss entering — keeps the two schedules in sync.

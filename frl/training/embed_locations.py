@@ -165,6 +165,9 @@ class LocationDataset(Dataset):
             "x_phase_pixel": torch.from_numpy(feat_phase.data[:, :, lr, lc]).float(),  # [C_phase, T]
             "x_type_center": torch.from_numpy(feat_type.data[:, lr, lc]).float(),      # [C_type]
             "x_phase_center": torch.from_numpy(feat_phase.data[:, year_idx, lr, lc]).float(),  # [C_phase]
+            "x_phase_center_dm": torch.from_numpy(
+                feat_phase.data[:, :, lr, lc] - feat_phase.data[:, :, lr, lc].mean(axis=1, keepdims=True)
+            ).float()[:, year_idx],  # [C_phase] demeaned over T, extracted at year_idx
             "local_row": lr,
             "local_col": lc,
             "year_idx": year_idx,
@@ -284,8 +287,9 @@ def main():
         z_type_np = z_type_center.cpu().numpy()    # [B, 64]
         z_proj_np = z_proj_center.cpu().numpy()    # [B, proj_dim]
         z_phase_np = z_phase_center.cpu().numpy()  # [B, 12]
-        x_type_np = batch["x_type_center"].numpy() # [B, C_type]
-        x_phase_np = batch["x_phase_center"].numpy()  # [B, C_phase]
+        x_type_np = batch["x_type_center"].numpy()          # [B, C_type]
+        x_phase_np = batch["x_phase_center"].numpy()         # [B, C_phase]
+        x_phase_dm_np = batch["x_phase_center_dm"].numpy()  # [B, C_phase]
 
         for i in range(B):
             oi = int(batch["orig_idx"][i])
@@ -301,6 +305,8 @@ def main():
                 rec[f"x_type_{j}"] = float(v)
             for j, v in enumerate(x_phase_np[i]):
                 rec[f"x_phase_{j}"] = float(v)
+            for j, v in enumerate(x_phase_dm_np[i]):
+                rec[f"x_phase_dm_{j}"] = float(v)
             for j, v in enumerate(z_type_np[i]):
                 rec[f"z_type_{j}"] = float(v)
             for j, v in enumerate(z_phase_np[i]):
