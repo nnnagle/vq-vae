@@ -1625,7 +1625,7 @@ def main():
     # cosine from the checkpoint LR (original behavior).
     start_epoch = 0
     resume_lr = lr  # used only if manual --resume triggers the fresh-cosine path
-    auto_resume_path = ckpt_dir / "encoder_last.pt"
+    auto_resume_path = Path(checkpoint_dir) / "encoder_last.pt"
 
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
@@ -1647,7 +1647,7 @@ def main():
         # Rebuild saved_ckpts from existing best checkpoints on disk so top-k
         # pruning is aware of what was saved before the crash.
         monitor_key_for_resume = training_config.run.checkpoint.monitor
-        for p in sorted(ckpt_dir.glob("encoder_best_*.pt")):
+        for p in sorted(Path(checkpoint_dir).glob("encoder_best_*.pt")):
             try:
                 c = torch.load(p, map_location='cpu', weights_only=False)
                 val = c.get(monitor_key_for_resume, float('nan'))
