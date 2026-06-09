@@ -555,6 +555,10 @@ class FeatureBuilder:
         # Reshape to [C, N] where N = all other dimensions
         centered_flat = centered_data.reshape(n_channels, -1)
 
+        # Replace non-finite values before matmul to avoid RuntimeWarning.
+        # These occur in masked/boundary pixels and are clamped to 0 after whitening.
+        np.nan_to_num(centered_flat, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Apply whitening: W @ X where W is [C, C] and X is [C, N]
         transformed_flat = whitening_matrix @ centered_flat
 
