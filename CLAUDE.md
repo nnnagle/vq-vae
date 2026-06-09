@@ -297,7 +297,12 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 
 ## Known Issues / Gotchas
 
-**Invalid values in boundary/masked patches.** Patches that touch the domain boundary or contain heavily masked pixels can have NaN or Inf values that survive into the whitening transform (`frl/data/loaders/builders/feature_builder.py`). These are zeroed by `nan_to_num` before the matmul and then clamped to ±5 — so they are harmless to training, but if you see a `RuntimeWarning: invalid value encountered in matmul` it means more boundary patches than usual are reaching that code path (e.g. after increasing batch size). The downstream NaN loss check in `process_batch` will skip any sample whose loss goes non-finite.
+**Invalid values in boundary/masked patches.**
+```
+frl/data/loaders/builders/feature_builder.py:559: RuntimeWarning: invalid value encountered in matmul
+  transformed_flat = whitening_matrix @ centered_flat
+```
+Patches that touch the domain boundary or contain heavily masked pixels can have NaN or Inf values that survive into the whitening transform. These are zeroed by `nan_to_num` before the matmul and then clamped to ±5 — so they are harmless to training. If you see this warning it means more boundary patches than usual are reaching that code path (e.g. after increasing batch size). The downstream NaN loss check in `process_batch` will skip any sample whose loss goes non-finite.
 
 ---
 
