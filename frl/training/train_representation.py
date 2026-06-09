@@ -949,14 +949,14 @@ def process_batch(
         optimizer.step()
         mean_loss = mean_loss.item()
         mean_spectral_loss = mean_spectral_loss.item()
-        mean_spatial_loss = mean_spatial_loss.item()
-        mean_phase_loss = mean_phase_loss.item()
-        mean_phase_spread_loss = mean_phase_spread_loss.item()
-        mean_phase_recovery_disc_loss = mean_phase_recovery_disc_loss.item()
-        mean_phase_leakage_loss = mean_phase_leakage_loss.item()
-        mean_vcr_loss = mean_vcr_loss.item()
-        mean_phase_vcr_loss = mean_phase_vcr_loss.item()
-        mean_evt_loss = mean_evt_loss.item() if hasattr(mean_evt_loss, 'item') else float(mean_evt_loss)
+        mean_spatial_loss = float(mean_spatial_loss)
+        mean_phase_loss = float(mean_phase_loss)
+        mean_phase_spread_loss = float(mean_phase_spread_loss)
+        mean_phase_recovery_disc_loss = float(mean_phase_recovery_disc_loss)
+        mean_phase_leakage_loss = float(mean_phase_leakage_loss)
+        mean_vcr_loss = float(mean_vcr_loss)
+        mean_phase_vcr_loss = float(mean_phase_vcr_loss)
+        mean_evt_loss = float(mean_evt_loss) if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item()
 
     # Compute distribution statistics for gate values and weights
     def compute_stats(tensors: list[torch.Tensor]) -> dict:
