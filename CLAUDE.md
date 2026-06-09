@@ -295,6 +295,12 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 
 ---
 
+## Known Issues / Gotchas
+
+**Invalid values in boundary/masked patches.** Patches that touch the domain boundary or contain heavily masked pixels can have NaN or Inf values that survive into the whitening transform (`frl/data/loaders/builders/feature_builder.py`). These are zeroed by `nan_to_num` before the matmul and then clamped to ±5 — so they are harmless to training, but if you see a `RuntimeWarning: invalid value encountered in matmul` it means more boundary patches than usual are reaching that code path (e.g. after increasing batch size). The downstream NaN loss check in `process_batch` will skip any sample whose loss goes non-finite.
+
+---
+
 ## Known Limitations / Future Work
 
 ~~**TODO: Weight cross-patch negatives by spectral distance.** Currently cross-patch negatives are unweighted (uniform), which accepts false negatives — spectrally similar forests from different patches that get incorrectly pushed apart. A principled fix: compute spectral distances between cross-patch pairs and apply `neg_weights = 1 - exp(-d_spec / tau)`, consistent with how spatial InfoNCE negatives are already weighted (`frl/training/train_representation.py`, spatial weighting block). This requires computing spectral distances for sampled cross-patch pairs only (not the full O(N²B²) matrix).~~ *(implemented)*
