@@ -564,19 +564,24 @@ def phase_neighborhood_loss(
 
     # --- Distance distribution stats (for tau calibration) -----------------
     with torch.no_grad():
+        _MAX_QUANTILE_ELEMS = 2 ** 23
         def _dist_stats(d: torch.Tensor, mask: torch.Tensor) -> dict:
             vals = d[mask]
             if vals.numel() == 0:
                 return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0}
             finite_vals = vals[torch.isfinite(vals)]
+            q_input = (
+                vals[torch.randperm(vals.numel(), device=vals.device)[:_MAX_QUANTILE_ELEMS]]
+                if vals.numel() > _MAX_QUANTILE_ELEMS else vals
+            )
             return {
                 "mean": vals.mean().item(),
                 "std": vals.std().item(),
                 "min": finite_vals.min().item() if finite_vals.numel() > 0 else 0.0,
                 "max": finite_vals.max().item() if finite_vals.numel() > 0 else 0.0,
-                "q25": torch.quantile(vals, 0.25).item(),
-                "q50": torch.quantile(vals, 0.50).item(),
-                "q75": torch.quantile(vals, 0.75).item(),
+                "q25": torch.quantile(q_input, 0.25).item(),
+                "q50": torch.quantile(q_input, 0.50).item(),
+                "q75": torch.quantile(q_input, 0.75).item(),
             }
         d_ref_self_stats = _dist_stats(batch["d_ref_self"], batch["mask_self"])
         d_ref_cross_stats = _dist_stats(batch["d_ref_cross"], batch["mask_cross"])
