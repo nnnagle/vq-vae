@@ -879,6 +879,8 @@ def process_batch(
         # Stop-gradient on Z so only the TCN (h) receives gradient.
         # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
         leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
+        if leakage_weight == 0.0 or curriculum_w == 0.0 or not cross_phase_h:
+            logger.debug(f"Leakage skipped: weight={leakage_weight}, curriculum_w={curriculum_w}, h_len={len(cross_phase_h)}")
         if leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
             h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
             Z_sg = Z.detach()                                 # stop-grad on z_type
@@ -1887,7 +1889,8 @@ def main():
             f"tau_ref={phase_config['tau_ref']}, tau_learned={phase_config['tau_learned']}, "
             f"weight={phase_config['weight']}, "
             f"curriculum=[start={phase_config['curriculum_start_epoch']}, "
-            f"ramp={phase_config['curriculum_ramp_epochs']}]"
+            f"ramp={phase_config['curriculum_ramp_epochs']}], "
+            f"leakage_weight={phase_config['phase_type_leakage_weight']}"
         )
     else:
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
