@@ -623,6 +623,9 @@ class DatasetBindingsParser:
             binary_threshold=spec.get('binary_threshold'),
             margin=spec.get('margin'),
             delta=spec.get('delta'),
+            low_ysfc_max=spec.get('low_ysfc_max'),
+            high_ysfc_min=spec.get('high_ysfc_min'),
+            phase_type_leakage_weight=spec.get('phase_type_leakage_weight', 0.0),
         )
 
     def _parse_pair_endpoint_strategy(

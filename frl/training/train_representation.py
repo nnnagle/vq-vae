@@ -1872,6 +1872,8 @@ def main():
             # Curriculum
             'curriculum_start_epoch': cur.start_epoch if cur else 10,
             'curriculum_ramp_epochs': cur.ramp_epochs if cur else 10,
+            # Type-leakage penalty
+            'phase_type_leakage_weight': phase_loss_cfg.phase_type_leakage_weight,
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "
@@ -2412,6 +2414,7 @@ def main():
             "val/loss_phase":                val_stats['phase_loss'],
             "val/loss_phase_spread":         val_stats.get('phase_spread_loss', 0.0),
             "val/loss_phase_recovery_disc":  val_stats.get('phase_recovery_disc_loss', 0.0),
+            "val/loss_phase_leakage":        val_stats.get('phase_leakage_loss', 0.0),
             "val/loss_vcr":                  val_stats['vcr_loss'],
             "val/loss_phase_vcr":            val_stats['phase_vcr_loss'],
         }
