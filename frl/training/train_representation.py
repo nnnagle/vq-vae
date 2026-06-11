@@ -1502,12 +1502,17 @@ def main():
         if args.overwrite:
             logger.info(f"Overwriting existing experiment directory: {experiment_dir}")
             shutil.rmtree(experiment_dir)
-        else:
+        elif args.no_resume:
             logger.error(
                 f"Experiment directory already exists: {experiment_dir}. "
-                f"Use --overwrite to replace it."
+                f"Use --overwrite to replace it, or remove --no-resume to auto-resume."
             )
             raise SystemExit(1)
+        else:
+            logger.info(
+                f"Experiment directory already exists: {experiment_dir}. "
+                f"Will auto-resume if checkpoint found."
+            )
 
     checkpoint_dir = args.checkpoint_dir or str(experiment_dir / training_config.run.ckpt_dir)
     log_dir = experiment_dir / training_config.run.log_dir
