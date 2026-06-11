@@ -879,7 +879,7 @@ def process_batch(
         # Stop-gradient on Z so only the TCN (h) receives gradient.
         # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
         leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
-        if training and leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
+        if leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
             h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
             Z_sg = Z.detach()                                 # stop-grad on z_type
             h_c = h_all - h_all.mean(0, keepdim=True)
