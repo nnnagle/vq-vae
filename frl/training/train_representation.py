@@ -2227,7 +2227,7 @@ def main():
             f"spec={train_stats['spectral_loss']:.4f} spat={train_stats['spatial_loss']:.4f} "
             f"phase={train_stats['phase_loss']:.4f} spr={train_stats.get('phase_spread_loss', 0.0):.4f} "
             f"rdisc={train_stats.get('phase_recovery_disc_loss', 0.0):.4f} "
-            f"leak={train_stats.get('phase_leakage_loss', 0.0):.4f} "
+            f"leak={train_stats.get('phase_leakage_loss', 0.0):.2e} "
             f"vcr={train_stats['vcr_loss']:.4f} "
             f"pvcr={train_stats['phase_vcr_loss']:.4f} evt={train_stats['evt_loss']:.4f}"
         )
@@ -2236,7 +2236,7 @@ def main():
             f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "
             f"phase={val_stats['phase_loss']:.4f} spr={val_stats.get('phase_spread_loss', 0.0):.4f} "
             f"rdisc={val_stats.get('phase_recovery_disc_loss', 0.0):.4f} "
-            f"leak={val_stats.get('phase_leakage_loss', 0.0):.4f} "
+            f"leak={val_stats.get('phase_leakage_loss', 0.0):.2e} "
             f"vcr={val_stats['vcr_loss']:.4f} "
             f"pvcr={val_stats['phase_vcr_loss']:.4f} evt={val_stats['evt_loss']:.4f}"
         )
