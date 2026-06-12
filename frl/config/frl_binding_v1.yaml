@@ -641,8 +641,8 @@ losses:
     # start_epoch should align with scheduler.phase_warmup so the LR bump
     # coincides with phase loss entering — keeps the two schedules in sync.
     curriculum:
-      start_epoch: 5           # begin contributing to total loss (matches scheduler phase_warmup trigger)
-      ramp_epochs: 5           # linear ramp from 0 to full weight
+      start_epoch: 50          # begin contributing to total loss (matches scheduler phase_warmup trigger)
+      ramp_epochs: 10          # linear ramp from 0 to full weight (epochs 50-60)
 
   # VICReg-style regularization to prevent embedding collapse
   # Encourages variance across dimensions (anti-collapse) and
@@ -681,8 +681,8 @@ losses:
     delta: 0.5        # min dynamism difference (in whitened feature units) to trigger constraint
 
     curriculum:
-      start_epoch: 5
-      ramp_epochs: 5
+      start_epoch: 50
+      ramp_epochs: 10
 
   # Margin loss: post-disturbance (ysfc <= low_ysfc_max) embeddings should differ
   # from recovered-forest (ysfc >= high_ysfc_min) embeddings within the same pixel.
@@ -698,8 +698,8 @@ losses:
     high_ysfc_min: 5.0    # ysfc >= this → "recovered"
 
     curriculum:
-      start_epoch: 5
-      ramp_epochs: 5
+      start_epoch: 50
+      ramp_epochs: 10
 
   soft_neighborhood_evt:
     weight: 0.0

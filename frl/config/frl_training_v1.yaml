@@ -20,7 +20,7 @@ run:
     monitor: val/loss_total
     mode: min
     save_last: true
-    monitor_start_epoch: 15   # phase curriculum ends ~10; allow model to settle before top-k tracking
+    monitor_start_epoch: 100  # phase curriculum ends ~60; allow model to settle before top-k tracking
     
 hardware:
   device: cuda
@@ -99,11 +99,11 @@ scheduler:
 # Should align: freeze_until_epoch matches spectral convergence; ramp ends at phase start.
 spatial_smoothing_curriculum:
   enabled: true
-  freeze_until_epoch: 2    # gate=1.0 (identity) for epochs 0–1
-  ramp_epochs: 3           # gate floor 1.0→0.0 over epochs 2–4; fully released at epoch 5
+  freeze_until_epoch: 20   # gate=1.0 (identity) for epochs 0–19
+  ramp_epochs: 30          # gate floor 1.0→0.0 over epochs 20–49; fully released at epoch 50
     
 spatial_domain:
-  debug_mode: true
+  debug_mode: false
   debug_window:
     origin: [6016, 11264] #[row, col] — top-left of old test dataset within full VA extent
     size: [4096, 4096] # [H,W]

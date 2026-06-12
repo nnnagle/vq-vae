@@ -879,8 +879,6 @@ def process_batch(
         # Stop-gradient on Z so only the TCN (h) receives gradient.
         # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
         leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
-        if leakage_weight == 0.0 or curriculum_w == 0.0 or not cross_phase_h:
-            logger.info(f"Leakage skipped: weight={leakage_weight}, curriculum_w={curriculum_w}, h_len={len(cross_phase_h)}")
         if leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
             h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
             Z_sg = Z.detach()                                 # stop-grad on z_type
@@ -890,7 +888,6 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
-            logger.info(f"Leakage computed: frob={frob.item():.4e}, h_shape={h_all.shape}, Z_shape={Z_sg.shape}, val={cross_phase_leakage_val.item():.4e}")
 
     # Average losses over valid samples in batch.
     # Spectral and phase losses are computed globally (cross-patch) and added on top.
