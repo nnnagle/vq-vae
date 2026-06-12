@@ -1113,6 +1113,7 @@ def train_epoch(
     total_phase_loss = 0.0
     total_phase_spread_loss = 0.0
     total_phase_recovery_disc_loss = 0.0
+    total_phase_leakage_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -1156,6 +1157,7 @@ def train_epoch(
             total_phase_loss += stats['phase_loss']
             total_phase_spread_loss += stats.get('phase_spread_loss', 0.0)
             total_phase_recovery_disc_loss += stats.get('phase_recovery_disc_loss', 0.0)
+            total_phase_leakage_loss += stats.get('phase_leakage_loss', 0.0)
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_evt_loss += stats.get('evt_loss', 0.0)
@@ -1243,6 +1245,7 @@ def train_epoch(
         'phase_loss': total_phase_loss / total_batches,
         'phase_spread_loss': total_phase_spread_loss / total_batches,
         'phase_recovery_disc_loss': total_phase_recovery_disc_loss / total_batches,
+        'phase_leakage_loss': total_phase_leakage_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
@@ -1287,6 +1290,7 @@ def validate_epoch(
     total_phase_loss = 0.0
     total_phase_spread_loss = 0.0
     total_phase_recovery_disc_loss = 0.0
+    total_phase_leakage_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -1323,6 +1327,7 @@ def validate_epoch(
                 total_phase_loss += stats['phase_loss']
                 total_phase_spread_loss += stats.get('phase_spread_loss', 0.0)
                 total_phase_recovery_disc_loss += stats.get('phase_recovery_disc_loss', 0.0)
+                total_phase_leakage_loss += stats.get('phase_leakage_loss', 0.0)
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_evt_loss += stats.get('evt_loss', 0.0)
@@ -1378,6 +1383,7 @@ def validate_epoch(
         'phase_loss': total_phase_loss / total_batches,
         'phase_spread_loss': total_phase_spread_loss / total_batches,
         'phase_recovery_disc_loss': total_phase_recovery_disc_loss / total_batches,
+        'phase_leakage_loss': total_phase_leakage_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'evt_loss': total_evt_loss / total_batches,
