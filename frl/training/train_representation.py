@@ -890,6 +890,7 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
+            logger.info(f"Leakage computed: frob={frob.item():.4e}, h_shape={h_all.shape}, Z_shape={Z_sg.shape}, val={cross_phase_leakage_val.item():.4e}")
 
     # Average losses over valid samples in batch.
     # Spectral and phase losses are computed globally (cross-patch) and added on top.
