@@ -103,7 +103,7 @@ spatial_smoothing_curriculum:
   ramp_epochs: 3           # gate floor 1.0→0.0 over epochs 2–4; fully released at epoch 5
     
 spatial_domain:
-  debug_mode: false
+  debug_mode: true
   debug_window:
     origin: [6016, 11264] #[row, col] — top-left of old test dataset within full VA extent
     size: [4096, 4096] # [H,W]
