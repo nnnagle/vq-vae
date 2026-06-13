@@ -542,7 +542,7 @@ losses:
 
   # Spatial smoothness (coordinate-driven)
   infonce_type_spatial:
-    weight: 1.0
+    weight: 0.1
     type: infonce
     temperature: 1.5
     mask:
