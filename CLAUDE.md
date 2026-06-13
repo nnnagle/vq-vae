@@ -55,12 +55,12 @@ TYPE PATHWAY (atemporal):
   Input: [B, C_type, H, W]
   → Conv2DEncoder               frl/models/conv2d_encoder.py
   → EdgeAwareSmoothingConv2D    frl/models/spatial.py
-  → z_type: [B, 64, H, W]
+  → z_type: [B, 64, H, W]      (unconstrained magnitude; no L2 norm on output)
 
 PHASE PATHWAY (temporal):
   Input: [B, C_phase, T, H, W]
   → TCNEncoder             frl/models/tcn.py  (dilated convolutions, multi-scale temporal RF)
-  → 1×1 bottleneck Conv
+  → 1×1 bottleneck Conv    → h  (pre-FiLM; type-agnostic trajectory prototype)
   → L2 normalize
   → FiLMLayer              frl/models/conditioning.py  (conditioned on z_type, STOP-GRADIENT)
   → z_phase: [B, 12, T, H, W]
@@ -71,7 +71,9 @@ PHASE PATHWAY (temporal):
 - **SimCLR projection head on z_type** (`frl/models/heads.py` — `MLPProjectionHead`) — A small MLP (Linear → BN → ReLU → Linear, optionally L2-normalized) sits between `z_type` and the spectral/spatial InfoNCE losses during training. Following the SimCLR convention, this head absorbs distortions introduced by contrastive training so the backbone embedding stays clean for downstream tasks. It is discarded at inference time — `z_type` is used directly. VICReg operates on raw `z_type` (not projected) to guard against backbone collapse in the original embedding space. Enabled/disabled and sized via `type_projection` in `frl_repr_model_v1.yaml`; default output_dim=8 (small relative to z_type_dim=48, reflecting ~3–4 significant spectral PCs). `embed_locations.py` writes the projected embedding as `g_type_*` columns alongside `z_type_*`.
 - **Stop-gradient on `z_type` before FiLM** — `z_type` is `.detach()`'d before being passed to `FiLMLayer`. This is intentional to prevent circular conditioning. Do not remove this.
 - **EdgeAwareSmoothingConv2D** (`frl/models/spatial.py`) — replaces `GatedResidualConv2D` starting from exp018. Uses a fixed directional filter bank (K=8: 4 orientations × 2 scales — fine 3×3 and coarse dilated-3×3) with **rank-R factored per-channel mixing weights** predicted from per-channel Sobel gradients. Mixing weights are factored as W[k,c] = Σ_r A[k,r]·B[c,r]: A holds R shared direction-basis patterns (K-way softmax each), B holds per-channel mixture coefficients over those R patterns (R-way softmax per channel). This enforces cross-channel correlation while preserving per-channel flexibility — e.g. topographic channels can load on coarse-scale bases, spectral channels on fine-scale bases. A learned residual gate (`output = smoothed + gate·(x−smoothed)`) preserves features **across** edges and at corners. `GatedResidualConv2D` is retained in `spatial.py` for historical reference.
-- **L2 normalization before FiLM** — controls embedding scale; FiLM gamma owns the scaling.
+- **z_type is unconstrained in magnitude** — `F.normalize()` was removed from `forward_type` (festive-shannon sync). VICReg enforces std ≥ 1 per dimension and decorrelates dimensions, but does not constrain the mean. Downstream users should center z_type (e.g. via `StandardScaler`) before linear probes or clustering. Spatial InfoNCE operates directly on raw z_type (no projection head), so dot-product similarities are in the 10–40 range rather than [-1, 1]; the temperature of 0.07 is calibrated to this scale via the effective loss value, not the raw logit range.
+- **L2 normalization before FiLM** — the pre-FiLM bottleneck h is L2-normalized before being passed to FiLM; FiLM gamma then owns the scaling. Per-channel batch demeaning of h was removed — it was ineffective because all phase losses operate on relative distances (pairwise or within-pixel), so any additive offset cancels.
+- **Frobenius type-leakage penalty** — `||cov(h, z_type)||_F` is added to the training loss (weight 0.01, active only when phase curriculum is active). Stop-gradient on z_type so only the TCN receives gradient. This discourages the pre-FiLM bottleneck h from encoding forest-type information, keeping type separated from temporal dynamics. Configured via `phase_type_leakage_weight` in `frl_binding_v1.yaml` under `soft_neighborhood_phase`.
 - **Sparse forward pass** — `forward_phase_at_locations()` runs the phase encoder only at sampled anchor pixel locations (not the full spatial grid) for training efficiency.
 - **FiLM initialized near identity** — gamma≈1, beta≈0 at initialization for stable early training.
 - **FiLM gamma amplification observed** — after training, FiLM gamma converges to ~3.5 (from init=1.0). The TCN produces ~78% temporal variance in pre-FiLM z; post-FiLM z_phase retains ~32%. EVT-stratified diagnostics (`phase_evt_diagnostics.py`) confirm gamma is type-conditional: plantation/pine types (e.g. EVT 9322, 7368) receive above-average gamma especially in channel 4 (NBR-sensitive); stable oak types receive below-average gamma. Channels 8–10 have near-zero temporal variance fraction (largely redundant with z_type); channel 11 is most temporally active. Pre-exp017 recovery curve analysis (`phase_recovery_curves.py`) showed the phase embedding mostly encoded pixel identity rather than recovery stage — post-disturbance NBR did not rise clearly with ysfc across most EVT types. This was the root failure that `phase_recovery_discrimination_loss` was designed to fix.
@@ -132,6 +134,7 @@ The bindings YAML defines dataset groups:
 | Phase triplet | `phase_triplet.py` | Temporal ordering constraints (defined but not wired into training loop) |
 | Soft neighborhood | `soft_neighborhood.py` | Soft KL matching of relative z_phase distance structure at shared ysfc |
 | Phase recovery discrimination | `triplet_phase.py` | **Absolute** margin between disturbed (ysfc≤1) and recovered (ysfc≥5) embeddings within each pixel — the loss that makes recovery stage metrically separable |
+| Frobenius leakage penalty | (inline in `train_representation.py`) | `\|\|cov(h, z_type)\|\|_F` — discourages type information in the pre-FiLM bottleneck h |
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
 
 **Pair construction:**
@@ -153,6 +156,7 @@ The training loop applies the following loss components:
 5. **Phase spread ranking** — pixels with higher inter-annual spectral variance must have more spread-out z_phase trajectories
 6. **Phase VICReg** — collapse prevention on z_phase dimensions (note: operates on the wrong population for recovery; see Known Limitations)
 7. **Phase recovery discrimination** — absolute margin loss: within each pixel, embeddings at ysfc ≤ 1 must be at least `margin` apart from embeddings at ysfc ≥ 5. This is the loss that closes the gap between relative ordering and metrically meaningful recovery stage representation.
+8. **Frobenius type-leakage penalty** — `||cov(h, z_type)||_F` penalises type information in the pre-FiLM bottleneck h. Stop-gradient on z_type; active only when phase curriculum weight > 0.
 
 ### Important: Phase Loss Curriculum
 
@@ -196,6 +200,8 @@ python frl/examples/data/example_compute_stats.py
 python frl/training/train_representation.py \
     --training frl/config/frl_training_v1.yaml
 ```
+
+If the experiment directory already exists, training **auto-resumes** from `encoder_last.pt` (restores model, optimizer, and scheduler; appends to the existing log). To start fresh, use `--overwrite` (deletes the directory). To prevent auto-resume without overwriting, use `--no-resume`.
 
 ### Evaluate with Linear Probe
 
