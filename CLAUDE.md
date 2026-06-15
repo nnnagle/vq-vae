@@ -162,6 +162,14 @@ The training loop applies the following loss components:
 
 The phase loss uses **curriculum learning** — it is **zero for the first N epochs** (warmup), then ramps up. This is intentional. If you see phase loss = 0 early in training, that is expected behavior, not a bug. The warmup epoch count is set in the training config.
 
+### Important: Feature Precomputation in DataLoader Workers
+
+`feature_builder.build_feature()` (Mahalanobis whitening + normalization) runs in the DataLoader worker processes, not in the main training loop. This keeps the GPU from sitting idle during CPU-bound preprocessing.
+
+`ForestDatasetV2` is given a `feature_builder` and a `precompute_features` list at construction time (`setup_training()` in `train_representation.py`). Each worker calls `build_feature()` in `__getitem__` and stores the results in the batch dict under `__feat_{name}_data` / `__feat_{name}_mask`. The `_get_feature()` helper in `process_batch()` reads these pre-built arrays from the batch; it falls back to calling `feature_builder.build_feature()` silently if a name is missing — meaning the fallback is correct but slow.
+
+**When adding a new `_get_feature()` call in `process_batch()`, also add the feature name to the `precompute_features` list in `setup_training()`.** Omitting it won't break training, but the feature will be built in the main process and the speedup won't apply.
+
 ### Optimizer Setup
 
 - AdamW (lr=1e-4, weight_decay=0.01)
