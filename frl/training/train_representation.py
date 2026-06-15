@@ -390,8 +390,9 @@ def process_batch(
             all_pos_weights.append(pos_weights.detach().cpu())
             all_pos_spec_dists.append(dpos.detach().cpu())
             dpos_cpu = dpos.detach().cpu()
-            for t in _TAU_SWEEP:
-                tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
+            if epoch == 0:
+                for t in _TAU_SWEEP:
+                    tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
 
         if spatial_neg_pairs.numel() > 0:
             dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
@@ -399,8 +400,9 @@ def process_batch(
             all_neg_weights.append(neg_weights.detach().cpu())
             all_neg_spec_dists.append(dneg.detach().cpu())
             dneg_cpu = dneg.detach().cpu()
-            for t in _TAU_SWEEP:
-                tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
+            if epoch == 0:
+                for t in _TAU_SWEEP:
+                    tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -2237,6 +2239,20 @@ def main():
             f"linearly released to 0.0 over epochs {smoothing_freeze_until}–"
             f"{smoothing_freeze_until + smoothing_ramp_epochs - 1}"
         )
+
+    # Log git commit so checkpoints can be traced back to exact code.
+    try:
+        import subprocess
+        _git_hash = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        _git_dirty = subprocess.check_output(
+            ['git', 'status', '--porcelain'], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        _dirty_marker = ' (dirty)' if _git_dirty else ''
+        logger.info(f"Git commit: {_git_hash}{_dirty_marker}")
+    except Exception:
+        logger.info("Git commit: unavailable")
 
     # Training loop
     logger.info(f"Starting training for {num_epochs} epochs (from epoch {start_epoch})...")
