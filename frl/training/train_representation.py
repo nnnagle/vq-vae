@@ -2395,7 +2395,9 @@ def main():
         ns = train_stats.get('neg_sim_stats', {})
         if ps.get('mean', 0.0) != 0.0 or ns.get('mean', 0.0) != 0.0:
             gap = ps.get('mean', 0.0) - ns.get('mean', 0.0)
-            eff_confusers = f"{2.718 ** train_stats.get('spatial_loss', 0.0):.1f}"
+            _sw = loss_config.get('spatial_loss_weight', 1.0)
+            _raw_spat = (train_stats.get('spatial_loss', 0.0) / _sw) if _sw > 0 else 0.0
+            eff_confusers = f"{2.718 ** _raw_spat:.1f}"
             logger.info(
                 f"  Spatial sims: pos={fmt_stats(ps)} | "
                 f"neg mean={ns.get('mean', 0.0):.4f} | "
