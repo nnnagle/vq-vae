@@ -105,6 +105,32 @@ def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
     return torch.norm(v1 - v2, dim=1)
 
 
+def _get_feature(
+    feature_name: str,
+    batch: dict,
+    sample_idx: int,
+    sample: dict,
+    feature_builder: FeatureBuilder,
+) -> 'FeatureResult':
+    """Return a precomputed FeatureResult from the batch if available, else build it.
+
+    When ForestDatasetV2 is configured with feature_builder + precompute_features,
+    the data/mask arrays arrive already processed in the batch dict. This avoids
+    repeating the whitening transform in the main process.
+    """
+    from data.loaders.builders.feature_builder import FeatureResult
+    data_key = f'__feat_{feature_name}_data'
+    if data_key in batch:
+        return FeatureResult(
+            data=batch[data_key][sample_idx].numpy(),
+            mask=batch[f'__feat_{feature_name}_mask'][sample_idx].numpy(),
+            feature_name=feature_name,
+            channel_names=[],
+            is_temporal=False,
+        )
+    return feature_builder.build_feature(feature_name, sample)
+
+
 def process_batch(
     batch: dict,
     feature_builder: FeatureBuilder,
@@ -257,8 +283,8 @@ def process_batch(
         sample['metadata'] = batch['metadata'][i]
 
         # Build features
-        encoder_feature = feature_builder.build_feature(config['type_encoder_feature'], sample)
-        spec_dist_feature = feature_builder.build_feature('infonce_type_spectral', sample)
+        encoder_feature = _get_feature(config['type_encoder_feature'], batch, i, sample, feature_builder)
+        spec_dist_feature = _get_feature('infonce_type_spectral', batch, i, sample, feature_builder)
 
         # Convert to tensors
         encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
@@ -400,7 +426,7 @@ def process_batch(
         # EVT soft neighbourhood loss
         evt_loss_val = torch.tensor(0.0, device=device)
         if evt_metric is not None:
-            evt_feature = feature_builder.build_feature('evt_class', sample)
+            evt_feature = _get_feature('evt_class', batch, i, sample, feature_builder)
             evt_data = torch.from_numpy(evt_feature.data).long().to(device)  # [1, H, W]
             if evt_sampler is not None:
                 # Draw EVT-stratified anchors (oversamples rare EVT codes)
@@ -466,7 +492,7 @@ def process_batch(
         phase_vcr_loss_val = torch.tensor(0.0, device=device)
         if phase_sampler is not None and phase_config is not None:
             # Build ysfc feature via FeatureBuilder (returns numpy)
-            ysfc_feature = feature_builder.build_feature('ysfc', sample)
+            ysfc_feature = _get_feature('ysfc', batch, i, sample, feature_builder)
             ysfc_data = torch.from_numpy(ysfc_feature.data).float()
             # ysfc_data: [1, T, H, W] (single channel, CPU)
 
@@ -514,7 +540,7 @@ def process_batch(
                 # --- Accumulate phase data for cross-batch loss (computed after loop) ---
                 if phase_pairs.shape[0] > 0 and curriculum_w > 0.0:
                         # Build phase_ccdc temporal feature
-                        phase_ccdc_feature = feature_builder.build_feature(config['phase_encoder_feature'], sample)
+                        phase_ccdc_feature = _get_feature(config['phase_encoder_feature'], batch, i, sample, feature_builder)
                         phase_ccdc_data = torch.from_numpy(
                             phase_ccdc_feature.data
                         ).float().to(device)
@@ -571,8 +597,8 @@ def process_batch(
                         # Accumulate dynamism for spread loss
                         if spread_config is not None:
                             dynamism_data = torch.from_numpy(
-                                feature_builder.build_feature(
-                                    'phase_dynamism_supervision', sample
+                                _get_feature(
+                                    'phase_dynamism_supervision', batch, i, sample, feature_builder
                                 ).data
                             ).float()
                             cross_phase_dynamism.append(
@@ -1526,6 +1552,32 @@ def main():
     device = torch.device(device_str)
     logger.info(f"Using device: {device}")
 
+    # Create feature builder early so datasets can precompute features in workers
+    logger.info("Creating feature builder...")
+    feature_builder = FeatureBuilder(bindings_config)
+
+    # Collect all feature names that process_batch() will need so workers can
+    # precompute them.  New features added to process_batch() should also be
+    # added here; the list drives what gets offloaded to the DataLoader workers.
+    _type_enc_feat = training_config.model_input.type_encoder_feature
+    _phase_enc_feat = training_config.model_input.phase_encoder_feature
+    precompute_features: list[str] = [
+        _type_enc_feat,
+        'infonce_type_spectral',
+        'ysfc',
+        _phase_enc_feat,
+        'phase_dynamism_supervision',
+        'evt_class',
+    ]
+    # Drop any names the bindings config doesn't actually define (conditional
+    # features like evt_class or phase_dynamism_supervision may not exist in all
+    # configs).
+    precompute_features = [
+        n for n in precompute_features
+        if bindings_config.get_feature(n) is not None
+    ]
+    logger.info(f"Features precomputed in DataLoader workers: {precompute_features}")
+
     # Create train dataset
     logger.info("Creating train dataset...")
     patch_size = training_config.sampling.patch_size
@@ -1546,6 +1598,8 @@ def main():
         epoch_mode=epoch_cfg.mode,
         sample_frac=epoch_cfg.sample_frac,
         sample_number=epoch_cfg.sample_number,
+        feature_builder=feature_builder,
+        precompute_features=precompute_features,
     )
     logger.info(
         f"Train dataset has {len(train_dataset.patches)} total patches "
@@ -1553,12 +1607,14 @@ def main():
         f"patches/epoch={len(train_dataset)})"
     )
 
+    n_workers = training_config.hardware.num_workers
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=training_config.hardware.num_workers,
+        num_workers=n_workers,
         pin_memory=training_config.hardware.pin_memory,
+        persistent_workers=n_workers > 0,
         collate_fn=collate_fn,
     )
 
@@ -1570,6 +1626,8 @@ def main():
         patch_size=patch_size,
         min_aoi_fraction=0.3,
         debug_window=debug_window,
+        feature_builder=feature_builder,
+        precompute_features=precompute_features,
     )
     logger.info(f"Validation dataset has {len(val_dataset)} patches")
 
@@ -1577,18 +1635,15 @@ def main():
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=training_config.hardware.num_workers,
+        num_workers=n_workers,
         pin_memory=training_config.hardware.pin_memory,
+        persistent_workers=n_workers > 0,
         collate_fn=collate_fn,
     )
 
-    # Create feature builder
-    logger.info("Creating feature builder...")
-    feature_builder = FeatureBuilder(bindings_config)
-
     # Read feature dimensions from bindings config
-    type_enc_feature = training_config.model_input.type_encoder_feature
-    phase_enc_feature = training_config.model_input.phase_encoder_feature
+    type_enc_feature = _type_enc_feat
+    phase_enc_feature = _phase_enc_feat
     type_in_channels = len(bindings_config.get_feature(type_enc_feature).channels)
     phase_in_channels = len(bindings_config.get_feature(phase_enc_feature).channels)
     logger.info(

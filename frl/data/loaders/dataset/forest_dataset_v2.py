@@ -8,7 +8,7 @@ to the new bindings configuration format.
 import numpy as np
 import zarr
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import TYPE_CHECKING, Dict, Any, Optional, List, Tuple
 import torch
 from torch.utils.data import Dataset
 
@@ -18,6 +18,9 @@ from ..config.dataset_config import (
     ChannelConfig,
 )
 from ..config.dataset_bindings_parser import DatasetBindingsParser
+
+if TYPE_CHECKING:
+    from ..builders.feature_builder import FeatureBuilder
 from ..readers.windows import SpatialWindow
 
 
@@ -49,6 +52,8 @@ class ForestDatasetV2(Dataset):
         sample_frac: Optional[float] = None,
         sample_number: Optional[int] = None,
         debug_window: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None,
+        feature_builder: Optional['FeatureBuilder'] = None,
+        precompute_features: Optional[List[str]] = None,
     ):
         """Initialize dataset.
 
@@ -61,10 +66,18 @@ class ForestDatasetV2(Dataset):
             sample_frac: Fraction of patches to sample per epoch (for 'frac' mode)
             sample_number: Number of patches per epoch (for 'number' mode)
             debug_window: Optional debug window ((row, col), (height, width))
+            feature_builder: Optional FeatureBuilder to precompute features in
+                workers. When provided, __getitem__ calls build_feature() for
+                each name in precompute_features and stores the results in the
+                returned dict so they arrive already processed in process_batch().
+            precompute_features: List of feature names to precompute. Has no
+                effect if feature_builder is None.
         """
         self.config = config
         self.split = split
         self.patch_size = patch_size
+        self.feature_builder = feature_builder
+        self.precompute_features: List[str] = precompute_features or []
 
         # Open zarr dataset
         self.zarr_path = Path(config.zarr.path)
@@ -332,6 +345,13 @@ class ForestDatasetV2(Dataset):
             metadata['channel_names'][group_name] = channel_names
 
         result['metadata'] = metadata
+
+        if self.feature_builder is not None and self.precompute_features:
+            for feat_name in self.precompute_features:
+                fr = self.feature_builder.build_feature(feat_name, result)
+                result[f'__feat_{feat_name}_data'] = fr.data
+                result[f'__feat_{feat_name}_mask'] = fr.mask
+
         return result
 
     def _load_group(
