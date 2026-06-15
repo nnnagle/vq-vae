@@ -626,7 +626,7 @@ def process_batch(
             logger.warning(
                 f"Skipping sample with non-finite loss: {loss.item()} | "
                 f"patch_idx={patch_idx} origin={origin} | "
-                f"spat={_fmt(spatial_loss_val)} "
+                f"spat={_fmt(spatial_weight * spatial_loss_val)} "
                 f"phase={_fmt(phase_loss_val)} "
                 f"spr={_fmt(phase_spread_loss_val)} "
                 f"vcr={_fmt(vcr_loss_val)} "
@@ -643,13 +643,13 @@ def process_batch(
         # Accumulate: keep as tensor for training (backward), use .item() for validation
         if training:
             total_loss += loss
-            total_spatial_loss += spatial_loss_val
+            total_spatial_loss += spatial_weight * spatial_loss_val
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
             total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
-            total_spatial_loss += spatial_loss_val.item()
+            total_spatial_loss += (spatial_weight * spatial_loss_val).item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_evt_loss += evt_loss_val.item()
@@ -927,7 +927,7 @@ def process_batch(
                      + cross_phase_spread_val
                      + cross_phase_rd_val
                      + cross_phase_leakage_val)
-        mean_spectral_loss = global_spectral_loss_val
+        mean_spectral_loss = spectral_weight * global_spectral_loss_val
     else:
         mean_loss = (total_loss / n_valid
                      + spectral_weight * _scalar(global_spectral_loss_val)
@@ -935,7 +935,7 @@ def process_batch(
                      + _scalar(cross_phase_spread_val)
                      + _scalar(cross_phase_rd_val)
                      + _scalar(cross_phase_leakage_val))
-        mean_spectral_loss = _scalar(global_spectral_loss_val)
+        mean_spectral_loss = spectral_weight * _scalar(global_spectral_loss_val)
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = _scalar(cross_phase_loss_val)
     mean_phase_spread_loss = _scalar(cross_phase_spread_val)
