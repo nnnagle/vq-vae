@@ -170,6 +170,8 @@ The phase loss uses **curriculum learning** — it is **zero for the first N epo
 
 **When adding a new `_get_feature()` call in `process_batch()`, also add the feature name to the `precompute_features` list in `setup_training()`.** Omitting it won't break training, but the feature will be built in the main process and the speedup won't apply.
 
+**Only add spatial (2D) features to `precompute_features` — not temporal ones.** Temporal features like `ysfc` and `phase_encoder_feature` are `[C, T, H, W]` arrays. Stacking them across a full batch (e.g. 32 samples × 22 channels × 15 years × 256×256 pixels) causes OOM. These features are only accessed at ~100–200 anchor pixel locations in `process_batch()`, so the full-grid whitening is wasted work anyway; leave them on the fallback path.
+
 ### Optimizer Setup
 
 - AdamW (lr=1e-4, weight_decay=0.01)

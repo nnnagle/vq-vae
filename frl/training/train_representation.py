@@ -1559,21 +1559,20 @@ def main():
     feature_builder = FeatureBuilder(bindings_config)
 
     # Collect all feature names that process_batch() will need so workers can
-    # precompute them.  New features added to process_batch() should also be
-    # added here; the list drives what gets offloaded to the DataLoader workers.
+    # precompute them.  Only include features that are used over the full
+    # spatial grid (H×W) — temporal features like ysfc and phase_encoder_feature
+    # are accessed only at ~100–200 anchor pixels, so precomputing and stacking
+    # the full [C, T, H, W] array for every sample in the batch would cause OOM.
+    # Those features are built on-demand in process_batch() via the fallback path.
     _type_enc_feat = training_config.model_input.type_encoder_feature
     _phase_enc_feat = training_config.model_input.phase_encoder_feature
     precompute_features: list[str] = [
         _type_enc_feat,
         'infonce_type_spectral',
-        'ysfc',
-        _phase_enc_feat,
-        'phase_dynamism_supervision',
         'evt_class',
     ]
     # Drop any names the bindings config doesn't actually define (conditional
-    # features like evt_class or phase_dynamism_supervision may not exist in all
-    # configs).
+    # features like evt_class may not exist in all configs).
     precompute_features = [
         n for n in precompute_features
         if bindings_config.get_feature(n) is not None
