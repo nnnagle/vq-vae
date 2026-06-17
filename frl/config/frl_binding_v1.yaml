@@ -544,7 +544,7 @@ losses:
   infonce_type_spatial:
     weight: 0.5
     type: infonce
-    temperature: 1.5
+    temperature: 0.5
     mask:
       - static_mask.aoi
       - static_mask.forest

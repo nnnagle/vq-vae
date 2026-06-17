@@ -475,15 +475,17 @@ def process_batch(
                 pos_weights=pos_weights,
                 neg_weights=neg_weights,
                 temperature=config.get('spatial_temperature', 0.07),
-                similarity='cosine',
+                similarity='l2',
             )
 
-            # Collect cosine similarities for diagnostics (z_spatial is unit-norm)
+            # Collect L2 similarities for diagnostics — matches what the loss computes:
+            # sim(a, b) = -||a - b||^2 / D
             with torch.no_grad():
                 p_a, p_b = z_spatial[spatial_pos_pairs[:, 0]], z_spatial[spatial_pos_pairs[:, 1]]
                 n_a, n_b = z_spatial[spatial_neg_pairs[:, 0]], z_spatial[spatial_neg_pairs[:, 1]]
-                all_pos_sims.append((p_a * p_b).sum(1).cpu())
-                all_neg_sims.append((n_a * n_b).sum(1).cpu())
+                D = z_spatial.shape[1]
+                all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / D).cpu())
+                all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / D).cpu())
 
         # --- Phase pair construction + loss ---
         # Pair construction (kNN + overlap) runs on CPU.
