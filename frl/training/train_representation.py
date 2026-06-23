@@ -307,12 +307,14 @@ def process_batch(
 
         # Convert to tensors. encoder_data stays on CPU until the batched forward.
         encoder_data = torch.from_numpy(encoder_feature.data).float()
-        spec_dist_data = torch.from_numpy(spec_dist_feature.data).float().to(device)
+        spec_dist_data_cpu = torch.from_numpy(spec_dist_feature.data).float()
+        spec_dist_data = spec_dist_data_cpu.to(device)
         mask = torch.from_numpy(encoder_feature.mask).to(device)
 
         # Also apply distance feature mask
         spec_dist_mask = torch.from_numpy(spec_dist_feature.mask).to(device)
         combined_mask = mask & spec_dist_mask
+        combined_mask_cpu = combined_mask.cpu()
         t_feature_build += time.perf_counter() - _t0
 
         # Worker-precomputed spatial pairs are only valid when anchors were drawn
