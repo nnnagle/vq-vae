@@ -451,24 +451,7 @@ def process_batch(
         has_spatial  = spatial_pos_pairs.shape[0] > 0 and spatial_neg_pairs.shape[0] > 0
 
         if not has_spectral and not has_spatial:
-            prep_list.append(None)
-            continue
-
-        prep_list[i] = {
-            'sample': sample,
-            'encoder_data': encoder_data,          # CPU [C, H, W]
-            'spec_dist_data': spec_dist_data,       # GPU [C, H, W]
-            'combined_mask': combined_mask,
-            'anchors': anchors,
-            'unique_coords': unique_coords,
-            'spatial_pos_pairs': spatial_pos_pairs,
-            'spatial_neg_pairs': spatial_neg_pairs,
-            'pos_weights': pos_weights,
-            'neg_weights': neg_weights,
-            'spec_dist_at_anchors': spec_dist_at_anchors,
-            'has_spectral': has_spectral,
-            'has_spatial': has_spatial,
-        }
+            continue  # prep_list[i] stays None
 
     # ------------------------------------------------------------------
     # Batched encoder forward — one [B,C,H,W] call instead of B sequential
@@ -575,13 +558,8 @@ def process_batch(
                 all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / D).cpu())
                 all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / D).cpu())
 
-        # --- Phase pair construction + loss ---
-        # Pair construction (kNN + overlap) runs on CPU.
-        # Loss computation runs on GPU (requires gradients through phase encoder).
-        phase_loss_val = torch.tensor(0.0, device=device)
-        phase_spread_loss_val = torch.tensor(0.0, device=device)
-        phase_recovery_disc_loss_val = torch.tensor(0.0, device=device)
-        phase_vcr_loss_val = torch.tensor(0.0, device=device)
+        # --- Phase pair construction (CPU; loss deferred to Pass 2) ---
+        phase_prep = None
         if phase_sampler is not None and phase_config is not None:
             ysfc_feature = _get_feature('ysfc', batch, i, sample, feature_builder)
             ysfc_data = torch.from_numpy(ysfc_feature.data).float()
