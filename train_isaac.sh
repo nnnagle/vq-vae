@@ -23,4 +23,4 @@ echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
-python -m training.train_representation --training config/frl_training_v1.yaml --batch-size 32
+python -m training.train_representation --training config/frl_training_v1.yaml --batch-size 16
