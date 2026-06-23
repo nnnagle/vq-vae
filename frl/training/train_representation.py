@@ -453,112 +453,7 @@ def process_batch(
         if not has_spectral and not has_spatial:
             continue  # prep_list[i] stays None
 
-    # ------------------------------------------------------------------
-    # Batched encoder forward — one [B,C,H,W] call instead of B sequential
-    # [1,C,H,W] calls.
-    # ------------------------------------------------------------------
-    valid_prep = [(idx, p) for idx, p in enumerate(prep_list) if p is not None]
-    z_batch = None
-    gate_batch = None
-    if valid_prep:
-        _t0 = time.perf_counter()
-        enc_inputs = torch.stack([p['encoder_data'] for _, p in valid_prep]).to(device)
-        z_batch, gate_batch = model(enc_inputs, return_gate=True)  # [Nv, D, H, W] each
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t_gpu_forward += time.perf_counter() - _t0
-
-    # ------------------------------------------------------------------
-    # PASS 2 — per-sample loss computation using the batched embeddings.
-    # ------------------------------------------------------------------
-    for out_idx, (i, prep) in enumerate(valid_prep):
-        sample            = prep['sample']
-        spec_dist_data    = prep['spec_dist_data']
-        combined_mask     = prep['combined_mask']
-        anchors           = prep['anchors']
-        unique_coords     = prep['unique_coords']
-        spatial_pos_pairs = prep['spatial_pos_pairs']
-        spatial_neg_pairs = prep['spatial_neg_pairs']
-        pos_weights       = prep['pos_weights']
-        neg_weights       = prep['neg_weights']
-        spec_dist_at_anchors = prep['spec_dist_at_anchors']
-        spec_dist_data_cpu  = prep['spec_dist_data'].cpu()
-        combined_mask_cpu   = prep['combined_mask'].cpu()
-        has_spectral      = prep['has_spectral']
-        has_spatial       = prep['has_spatial']
-
-        z_full = z_batch[out_idx]      # [D, H, W]
-        gate   = gate_batch[out_idx]   # [D, H, W]
-
-        # Collect gate values on CPU — kept for the full epoch, avoid GPU fragmentation
-        all_gate_values.append(gate.detach().flatten().cpu())
-
-        # Extract embeddings at anchor locations for spectral loss
-        z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
-
-        # EVT soft neighbourhood loss
-        evt_loss_val = torch.tensor(0.0, device=device)
-        if evt_metric is not None:
-            evt_feature = _get_feature('evt_class', batch, i, sample, feature_builder)
-            evt_data = torch.from_numpy(evt_feature.data).long().to(device)  # [1, H, W]
-            if evt_sampler is not None:
-                # Draw EVT-stratified anchors (oversamples rare EVT codes)
-                evt_anchors = evt_sampler(combined_mask, training=training, sample=sample)
-                z_evt = extract_at_locations(z_full, evt_anchors)   # [M, D]
-                evt_at_anchors = extract_at_locations(evt_data, evt_anchors).squeeze(1)  # [M]
-            else:
-                z_evt = z_anchors
-                evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)  # [N]
-            evt_raw, evt_diag = evt_soft_neighborhood_loss(
-                z_evt,
-                evt_at_anchors,
-                evt_metric,
-                tau_ref=config.get('evt_tau_ref', 0.5),
-                tau_learned=config.get('evt_tau_learned', 0.5),
-            )
-            all_evt_diag.append(evt_diag)
-            evt_loss_val = config.get('evt_weight', 0.0) * evt_raw
-
-        # Compute variance-covariance regularization on type embeddings
-        vcr_loss_val = torch.tensor(0.0, device=device)
-        if config.get('vcr_enabled', False) and z_anchors.shape[0] >= 2:
-            vcr_total, _, _ = variance_covariance_loss(
-                z_anchors,
-                variance_weight=config.get('vcr_variance_weight', 1.0),
-                covariance_weight=config.get('vcr_covariance_weight', 1.0),
-                variance_target=config.get('vcr_variance_target', 1.0),
-            )
-            vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
-
-        # cross_patch_z_anchors is populated after the NaN check below so that
-        # samples with non-finite loss don't corrupt the cross-batch spectral computation.
-
-        # Compute spatial loss
-        spatial_loss_val = torch.tensor(0.0, device=device)
-        if has_spatial:
-            # Extract embeddings at unique coordinate locations
-            z_spatial = extract_at_locations(z_full, unique_coords)  # [num_unique, D]
-
-            spatial_loss_val = contrastive_loss(
-                z_spatial,
-                spatial_pos_pairs,
-                spatial_neg_pairs,
-                pos_weights=pos_weights,
-                neg_weights=neg_weights,
-                temperature=config.get('spatial_temperature', 0.07),
-                similarity='l2',
-            )
-
-            # Collect L2 similarities for diagnostics — matches what the loss computes:
-            # sim(a, b) = -||a - b||^2 / D
-            with torch.no_grad():
-                p_a, p_b = z_spatial[spatial_pos_pairs[:, 0]], z_spatial[spatial_pos_pairs[:, 1]]
-                n_a, n_b = z_spatial[spatial_neg_pairs[:, 0]], z_spatial[spatial_neg_pairs[:, 1]]
-                D = z_spatial.shape[1]
-                all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / D).cpu())
-                all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / D).cpu())
-
-        # --- Phase pair construction (CPU; loss deferred to Pass 2) ---
+        # --- Phase pair construction (CPU; TCN forward deferred to Pass 2) ---
         phase_prep = None
         if phase_sampler is not None and phase_config is not None:
             ysfc_feature = _get_feature('ysfc', batch, i, sample, feature_builder)
@@ -568,13 +463,15 @@ def process_batch(
                 ysfc_spatial_mask = ysfc_mask.all(dim=0)
             else:
                 ysfc_spatial_mask = ysfc_mask
-            phase_mask = combined_mask_cpu & ysfc_spatial_mask
+            phase_mask = combined_mask.cpu() & ysfc_spatial_mask
 
             phase_anchors = phase_sampler(phase_mask, training=training, sample=sample)
 
             if phase_anchors.shape[0] >= 10:
-                phase_spec_at_anchors = extract_at_locations(spec_dist_data_cpu, phase_anchors)
-                ysfc_at_anchors = extract_temporal_at_locations(ysfc_data, phase_anchors).squeeze(-1)
+                phase_spec_at_anchors = extract_at_locations(
+                    spec_dist_data.cpu(), phase_anchors)
+                ysfc_at_anchors = extract_temporal_at_locations(
+                    ysfc_data, phase_anchors).squeeze(-1)
 
                 _t0 = time.perf_counter()
                 phase_pairs, phase_weights, phase_stats = build_phase_pairs(
@@ -591,29 +488,28 @@ def process_batch(
                 all_phase_pair_stats.append(phase_stats)
 
                 phase_prep = {
-                    'phase_anchors':  phase_anchors,
-                    'phase_pairs':    phase_pairs,
-                    'phase_weights':  phase_weights,
+                    'phase_anchors':   phase_anchors,
+                    'phase_pairs':     phase_pairs,
+                    'phase_weights':   phase_weights,
                     'ysfc_at_anchors': ysfc_at_anchors,
                 }
 
-        prep_list.append({
-            'i':                     i,
-            'sample':                sample,
-            'encoder_data':          encoder_data,          # CPU [C,H,W]
-            'anchors':               anchors,               # CPU
-            'unique_coords':         unique_coords,         # CPU
-            'spatial_pos_pairs':     spatial_pos_pairs,     # CPU
-            'spatial_neg_pairs':     spatial_neg_pairs,     # CPU
-            'pos_weights':           pos_weights,           # CPU or None
-            'neg_weights':           neg_weights,           # CPU or None
-            'spec_dist_at_anchors':  spec_dist_at_anchors,  # CPU
-            'spec_dist_data_cpu':    spec_dist_data_cpu,    # CPU (for phase)
-            'combined_mask_cpu':     combined_mask_cpu,     # CPU bool
-            'has_spatial':           has_spatial,
-            'has_spectral':          has_spectral,
-            'phase_prep':            phase_prep,
-        })
+        prep_list[i] = {
+            'sample':             sample,
+            'encoder_data':       encoder_data,        # CPU [C,H,W]
+            'spec_dist_data':     spec_dist_data,      # GPU tensor
+            'combined_mask':      combined_mask,       # GPU bool
+            'anchors':            anchors,
+            'unique_coords':      unique_coords,
+            'spatial_pos_pairs':  spatial_pos_pairs,
+            'spatial_neg_pairs':  spatial_neg_pairs,
+            'pos_weights':        pos_weights,
+            'neg_weights':        neg_weights,
+            'spec_dist_at_anchors': spec_dist_at_anchors,
+            'has_spectral':       has_spectral,
+            'has_spatial':        has_spatial,
+            'phase_prep':         phase_prep,
+        }
 
     # ── BATCHED GPU FORWARD ───────────────────────────────────────────────
     # Chunk the forward pass to bound peak GPU memory. Each chunk processes
