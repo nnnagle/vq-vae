@@ -28,7 +28,7 @@ hardware:
   num_workers: 46
   prefetch_factor: 2
   pin_memory: true
-  enc_chunk_size: 12
+  enc_chunk_size: 16
   
   mixed_precision:
     enabled: true
