@@ -100,6 +100,8 @@ class Conv2DEncoder(nn.Module):
         for i, (out_ch, ks, pad, drop, groups) in enumerate(
             zip(channels, kernel_size, padding, dropout_rate, num_groups)
         ):
+            is_last = (i == num_layers - 1)
+
             # Conv layer
             layers.append(
                 nn.Conv2d(
@@ -114,13 +116,12 @@ class Conv2DEncoder(nn.Module):
             # Normalization (postconv)
             layers.append(nn.GroupNorm(groups, out_ch))
 
-            # Activation
-            if activation == 'relu':
+            # Activation — skipped on final layer so output is unconstrained
+            if activation == 'relu' and not is_last:
                 layers.append(nn.ReLU(inplace=True))
-            # else: no activation
 
             # Dropout (postconv)
-            if drop > 0:
+            if drop > 0 and not is_last:
                 layers.append(nn.Dropout2d(drop))
 
             prev_channels = out_ch
@@ -192,8 +193,10 @@ def build_conv2d_from_config(config: dict) -> Conv2DEncoder:
     dropout_config = config.get('dropout', {})
     if isinstance(dropout_config, dict):
         dropout_rate = dropout_config.get('rate', 0.0)
+    elif isinstance(dropout_config, list):
+        dropout_rate = dropout_config
     else:
-        dropout_rate = 0.0
+        dropout_rate = float(dropout_config) if dropout_config else 0.0
 
     # Normalization
     norm_config = config.get('norm', {})

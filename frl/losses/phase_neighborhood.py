@@ -424,17 +424,6 @@ def build_phase_neighborhood_batch(
     aligned_i_phase = torch.bmm(mapping, sel_phase_i)  # [B_valid, M, D]
     aligned_j_phase = torch.bmm(mapping, sel_phase_j)  # [B_valid, M, D]
 
-    # --- Per-pair demeaning over shared ysfc values ---
-    # Removing the per-pair mean removes the static spectral signature so
-    # that distances reflect temporal trajectory shape only.  Demeaning
-    # here (after alignment to shared ysfc positions) ensures both pixels
-    # are centred on the same set of recovery stages, avoiding baseline
-    # contamination from pre-disturbance values not shared by the pair.
-    shared_mean_i = aligned_i_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    shared_mean_j = aligned_j_spec.mean(dim=1, keepdim=True)  # [B_valid, 1, C]
-    aligned_i_spec = aligned_i_spec - shared_mean_i
-    aligned_j_spec = aligned_j_spec - shared_mean_j
-
     # --- Batched distance matrices ---
     d_ref_self = torch.cdist(aligned_j_spec, aligned_j_spec)         # [B_valid, M, M]
     d_learned_self = torch.cdist(aligned_i_phase, aligned_i_phase)   # [B_valid, M, M]
@@ -575,19 +564,24 @@ def phase_neighborhood_loss(
 
     # --- Distance distribution stats (for tau calibration) -----------------
     with torch.no_grad():
+        _MAX_QUANTILE_ELEMS = 2 ** 23
         def _dist_stats(d: torch.Tensor, mask: torch.Tensor) -> dict:
             vals = d[mask]
             if vals.numel() == 0:
                 return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0}
             finite_vals = vals[torch.isfinite(vals)]
+            q_input = (
+                vals[torch.randperm(vals.numel(), device=vals.device)[:_MAX_QUANTILE_ELEMS]]
+                if vals.numel() > _MAX_QUANTILE_ELEMS else vals
+            )
             return {
                 "mean": vals.mean().item(),
                 "std": vals.std().item(),
                 "min": finite_vals.min().item() if finite_vals.numel() > 0 else 0.0,
                 "max": finite_vals.max().item() if finite_vals.numel() > 0 else 0.0,
-                "q25": torch.quantile(vals, 0.25).item(),
-                "q50": torch.quantile(vals, 0.50).item(),
-                "q75": torch.quantile(vals, 0.75).item(),
+                "q25": torch.quantile(q_input, 0.25).item(),
+                "q50": torch.quantile(q_input, 0.50).item(),
+                "q75": torch.quantile(q_input, 0.75).item(),
             }
         d_ref_self_stats = _dist_stats(batch["d_ref_self"], batch["mask_self"])
         d_ref_cross_stats = _dist_stats(batch["d_ref_cross"], batch["mask_cross"])

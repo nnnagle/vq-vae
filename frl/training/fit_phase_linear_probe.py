@@ -42,8 +42,6 @@ Notes
   training: the type encoder is not trained through the phase pathway).
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 import math

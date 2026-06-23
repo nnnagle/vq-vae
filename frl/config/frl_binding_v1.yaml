@@ -542,9 +542,9 @@ losses:
 
   # Spatial smoothness (coordinate-driven)
   infonce_type_spatial:
-    weight: 1.0
+    weight: 0.5
     type: infonce
-    temperature: 0.07
+    temperature: 0.5
     mask:
       - static_mask.aoi
       - static_mask.forest
@@ -560,7 +560,7 @@ losses:
         type: spatial-knn
         k: 4
         min_distance: 1  # Not self
-        max_distance: 8  # Local neighborhood only
+        max_distance: 4  # Local neighborhood only
 
     negative_strategy:
       candidates: patch
@@ -626,6 +626,17 @@ losses:
     self_similarity_weight: 1.0    # trajectory shape matching
     cross_pixel_weight: 1.0        # shared metric space anchoring
 
+    # Type-projection demeaning of spectral reference features.
+    # SVD reduces z_type to K dimensions; kNN in that space defines the
+    # type-local baseline subtracted from each pixel's spectral trajectory.
+    phase_type_proj_rank: 8        # K: number of SVD components of z_type to retain
+    phase_type_proj_neighbors: 20  # k: nearest neighbors in reduced type space for baseline
+
+    # Frobenius norm of cross-covariance between pre-FiLM h and z_type.
+    # Penalises type information leaking into the phase bottleneck.
+    # Stop-gradient on z_type; active only when phase curriculum is active.
+    phase_type_leakage_weight: 0.01
+
     # Curriculum: ramp in after type encoder stabilises.
     # start_epoch should align with scheduler.phase_warmup so the LR bump
     # coincides with phase loss entering — keeps the two schedules in sync.
@@ -670,7 +681,7 @@ losses:
     delta: 0.5        # min dynamism difference (in whitened feature units) to trigger constraint
 
     curriculum:
-      start_epoch: 50   # same as soft_neighborhood_phase
+      start_epoch: 50
       ramp_epochs: 10
 
   # Margin loss: post-disturbance (ysfc <= low_ysfc_max) embeddings should differ
@@ -687,7 +698,7 @@ losses:
     high_ysfc_min: 5.0    # ysfc >= this → "recovered"
 
     curriculum:
-      start_epoch: 50     # activate together with soft_neighborhood_phase
+      start_epoch: 50
       ramp_epochs: 10
 
   soft_neighborhood_evt:

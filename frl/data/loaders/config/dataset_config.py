@@ -469,6 +469,9 @@ class LossConfig:
     low_ysfc_max: Optional[float] = None   # ysfc <= this → "disturbed" (default 1)
     high_ysfc_min: Optional[float] = None  # ysfc >= this → "recovered" (default 5)
 
+    # --- type-leakage penalty ---
+    phase_type_leakage_weight: float = 0.0  # Frobenius ||cov(h, z_type)||_F penalty weight
+
 
 @dataclass
 class BindingsConfig:
