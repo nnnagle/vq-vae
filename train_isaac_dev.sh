@@ -25,7 +25,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 cd /lustre/isaac24/scratch/nnagle/vq-vae-dev/frl
 python -m training.train_representation \
     --training config/frl_training_v1.yaml \
-    --batch-size 32 \
+    --batch-size 8 \
     --epochs 3 \
     --max-batches 3 \
     --phase-start-epoch 0 \
