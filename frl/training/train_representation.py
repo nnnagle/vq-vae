@@ -499,6 +499,8 @@ def process_batch(
         pos_weights       = prep['pos_weights']
         neg_weights       = prep['neg_weights']
         spec_dist_at_anchors = prep['spec_dist_at_anchors']
+        spec_dist_data_cpu  = prep['spec_dist_data_cpu']
+        combined_mask_cpu   = prep['combined_mask_cpu']
         has_spectral      = prep['has_spectral']
         has_spatial       = prep['has_spatial']
 
