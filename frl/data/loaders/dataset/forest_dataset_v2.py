@@ -19,13 +19,11 @@ from ..config.dataset_config import (
 )
 from ..config.dataset_bindings_parser import DatasetBindingsParser
 from ...sampling.anchor_sampling import sample_anchors_grid_plus_supplement
-from ....utils.spatial import spatial_knn_pairs, spatial_negative_pairs, extract_at_locations
+from utils.spatial import spatial_knn_pairs, spatial_negative_pairs, extract_at_locations
 
 if TYPE_CHECKING:
     from ..builders.feature_builder import FeatureBuilder
 from ..readers.windows import SpatialWindow
-from ...sampling.anchor_sampling import sample_anchors_grid_plus_supplement
-from ....utils.spatial import spatial_knn_pairs, spatial_negative_pairs, extract_at_locations
 
 
 class ForestDatasetV2(Dataset):
