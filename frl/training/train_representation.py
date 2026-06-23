@@ -284,6 +284,13 @@ def process_batch(
 
     batch_size = len(batch['metadata'])
 
+    # ------------------------------------------------------------------
+    # PASS 1 — CPU prep for every sample (anchors, spatial pairs, weights).
+    # The encoder forward is deferred to a single batched call below so the
+    # B sequential [1,C,H,W] forwards become one [B,C,H,W] forward.
+    # ------------------------------------------------------------------
+    prep_list: list[dict | None] = [None] * batch_size
+
     for i in range(batch_size):
         # Extract single sample from batch
         sample = {
@@ -298,8 +305,8 @@ def process_batch(
         encoder_feature = _get_feature(config['type_encoder_feature'], batch, i, sample, feature_builder)
         spec_dist_feature = _get_feature('infonce_type_spectral', batch, i, sample, feature_builder)
 
-        # Convert to tensors
-        encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
+        # Convert to tensors. encoder_data stays on CPU until the batched forward.
+        encoder_data = torch.from_numpy(encoder_feature.data).float()
         spec_dist_data = torch.from_numpy(spec_dist_feature.data).float().to(device)
         mask = torch.from_numpy(encoder_feature.mask).to(device)
 
@@ -308,120 +315,135 @@ def process_batch(
         combined_mask = mask & spec_dist_mask
         t_feature_build += time.perf_counter() - _t0
 
-        # Sample anchor locations — use EVT-stratified sampler when available so
-        # rare forest types are represented for cross-batch kNN pair construction.
+        # Worker-precomputed spatial pairs are only valid when anchors were drawn
+        # by the same grid+supplement sampler. With an EVT-stratified sampler the
+        # anchors differ, so fall back to recomputing on the main process.
+        _spatial_precomputed = (
+            evt_sampler is None
+            and '__spatial_valid' in batch
+            and batch['__spatial_valid'][i] is not None
+            and bool(batch['__spatial_valid'][i].item())
+        )
+
         _t0 = time.perf_counter()
-        if evt_sampler is not None:
-            anchors = evt_sampler(combined_mask, training=training, sample=sample)
+        if _spatial_precomputed:
+            anchors          = batch['__spatial_anchors'][i].to(device)
+            unique_coords    = batch['__spatial_unique_coords'][i].to(device)
+            spatial_pos_pairs = batch['__spatial_pos_pairs'][i].to(device)
+            spatial_neg_pairs = batch['__spatial_neg_pairs'][i].to(device)
+            pos_weights      = batch['__spatial_pos_weights'][i].to(device)
+            neg_weights      = batch['__spatial_neg_weights'][i].to(device)
+            spec_dist_at_anchors = batch['__spatial_spec_dist_at_anchors'][i].to(device)
+
+            n_pos = spatial_pos_pairs.shape[0]
+            n_neg = spatial_neg_pairs.shape[0]
+            if n_pos > 0:
+                all_pos_weights.append(pos_weights.detach().cpu())
+            if n_neg > 0:
+                all_neg_weights.append(neg_weights.detach().cpu())
+            t_anchor_sample += time.perf_counter() - _t0
         else:
-            anchors = sample_anchors_grid_plus_supplement(
+            # Sample anchor locations — use EVT-stratified sampler when available so
+            # rare forest types are represented for cross-batch kNN pair construction.
+            if evt_sampler is not None:
+                anchors = evt_sampler(combined_mask, training=training, sample=sample)
+            else:
+                anchors = sample_anchors_grid_plus_supplement(
+                    combined_mask,
+                    stride=config.get('stride', 16),
+                    border=config.get('border', 16),
+                    jitter_radius=jitter_radius,
+                    supplement_n=config.get('supplement_n', 104),
+                )
+            t_anchor_sample += time.perf_counter() - _t0
+
+            if anchors.shape[0] < 10:
+                continue
+
+            # Extract features at anchor locations
+            # spec_dist_at_anchors collected here; pairs built cross-batch after loop.
+            spec_dist_at_anchors = extract_at_locations(spec_dist_data, anchors)
+
+            # --- Spatial InfoNCE pair generation (offset-based, no full matrix) ---
+            _t0 = time.perf_counter()
+            pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
+                anchors,
                 combined_mask,
-                stride=config.get('stride', 16),
-                border=config.get('border', 16),
-                jitter_radius=jitter_radius,
-                supplement_n=config.get('supplement_n', 104),
+                k=config.get('spatial_positive_k', 4),
+                max_radius=int(config.get('spatial_positive_max_dist', 8)),
             )
-        t_anchor_sample += time.perf_counter() - _t0
 
-        if anchors.shape[0] < 10:
-            continue
+            neg_anchor_idx, neg_neighbor_coords = spatial_negative_pairs(
+                anchors,
+                combined_mask,
+                min_distance=config.get('spatial_negative_min_dist', 16.0),
+                max_distance=config.get('spatial_negative_max_dist', None),
+                n_per_anchor=config.get('spatial_negatives_per_anchor', 4),
+            )
 
-        # Extract features at anchor locations
-        # spec_dist_at_anchors collected here; pairs built cross-batch after loop.
-        encoder_at_anchors = extract_at_locations(encoder_data, anchors)
-        spec_dist_at_anchors = extract_at_locations(spec_dist_data, anchors)
+            # Build coordinate-to-index mapping for spatial loss
+            all_spatial_coords = [anchors]
+            if pos_neighbor_coords.numel() > 0:
+                all_spatial_coords.append(pos_neighbor_coords)
+            if neg_neighbor_coords.numel() > 0:
+                all_spatial_coords.append(neg_neighbor_coords)
 
-        # --- Spatial InfoNCE Loss ---
-        # Use efficient offset-based pair generation (no large distance matrix)
+            all_spatial_coords = torch.cat(all_spatial_coords, dim=0)  # [N+M+K, 2]
 
-        # Get spatial positive pairs (k nearest neighbors within max_radius)
-        _t0 = time.perf_counter()
-        pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
-            anchors,
-            combined_mask,
-            k=config.get('spatial_positive_k', 4),
-            max_radius=int(config.get('spatial_positive_max_dist', 8)),
-        )
+            unique_coords, inverse_indices = torch.unique(
+                all_spatial_coords, dim=0, return_inverse=True
+            )
 
-        # Get spatial negative pairs (random sample from distance range)
-        neg_anchor_idx, neg_neighbor_coords = spatial_negative_pairs(
-            anchors,
-            combined_mask,
-            min_distance=config.get('spatial_negative_min_dist', 16.0),
-            max_distance=config.get('spatial_negative_max_dist', None),
-            n_per_anchor=config.get('spatial_negatives_per_anchor', 4),
-        )
+            n_anchors_spatial = anchors.shape[0]
+            anchor_to_unique = inverse_indices[:n_anchors_spatial]
 
-        # Build coordinate-to-index mapping for spatial loss
-        # Collect all unique coordinates: anchors + positive neighbors + negative neighbors
-        all_spatial_coords = [anchors]
-        if pos_neighbor_coords.numel() > 0:
-            all_spatial_coords.append(pos_neighbor_coords)
-        if neg_neighbor_coords.numel() > 0:
-            all_spatial_coords.append(neg_neighbor_coords)
+            n_pos = pos_neighbor_coords.shape[0] if pos_neighbor_coords.numel() > 0 else 0
+            n_neg = neg_neighbor_coords.shape[0] if neg_neighbor_coords.numel() > 0 else 0
 
-        all_spatial_coords = torch.cat(all_spatial_coords, dim=0)  # [N+M+K, 2]
+            spatial_pos_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+            spatial_neg_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
 
-        # Get unique coordinates
-        unique_coords, inverse_indices = torch.unique(
-            all_spatial_coords, dim=0, return_inverse=True
-        )
+            if n_pos > 0:
+                pos_neighbor_unique = inverse_indices[n_anchors_spatial : n_anchors_spatial + n_pos]
+                pos_anchor_unique = anchor_to_unique[pos_anchor_idx]
+                spatial_pos_pairs = torch.stack([pos_anchor_unique, pos_neighbor_unique], dim=1)
 
-        # Map anchor indices (first N in all_spatial_coords)
-        n_anchors_spatial = anchors.shape[0]
-        anchor_to_unique = inverse_indices[:n_anchors_spatial]
+            if n_neg > 0:
+                neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
+                neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
+                spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
+            t_spatial_pairs += time.perf_counter() - _t0
 
-        # Convert pairs to index into unique_coords
-        n_pos = pos_neighbor_coords.shape[0] if pos_neighbor_coords.numel() > 0 else 0
-        n_neg = neg_neighbor_coords.shape[0] if neg_neighbor_coords.numel() > 0 else 0
+            # --- Spectral weighting for spatial pairs ---
+            _t0 = time.perf_counter()
+            spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
 
-        spatial_pos_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
-        spatial_neg_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+            tau = config.get("spatial_spectral_tau", 1.0)
+            min_w = config.get("spatial_min_w", 0.05)
 
-        if n_pos > 0:
-            # pos_neighbor indices in all_spatial_coords: [n_anchors_spatial : n_anchors_spatial + n_pos]
-            pos_neighbor_unique = inverse_indices[n_anchors_spatial : n_anchors_spatial + n_pos]
-            pos_anchor_unique = anchor_to_unique[pos_anchor_idx]
-            spatial_pos_pairs = torch.stack([pos_anchor_unique, pos_neighbor_unique], dim=1)
+            pos_weights = None
+            neg_weights = None
 
-        if n_neg > 0:
-            # neg_neighbor indices in all_spatial_coords: [n_anchors_spatial + n_pos : ]
-            neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
-            neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
-            spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
-        t_spatial_pairs += time.perf_counter() - _t0
-            
-        # --- Spectral weighting for spatial pairs ---
-        # Use spec_dist_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
-        _t0 = time.perf_counter()
-        spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
+            if spatial_pos_pairs.numel() > 0:
+                dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
+                pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
+                all_pos_weights.append(pos_weights.detach().cpu())
+                all_pos_spec_dists.append(dpos.detach().cpu())
+                dpos_cpu = dpos.detach().cpu()
+                if epoch == 0:
+                    for t in _TAU_SWEEP:
+                        tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
 
-        tau = config.get("spatial_spectral_tau", 1.0)  # tune this
-        min_w = config.get("spatial_min_w", 0.05)
-
-        pos_weights = None
-        neg_weights = None
-
-        if spatial_pos_pairs.numel() > 0:
-            dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
-            pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
-            all_pos_weights.append(pos_weights.detach().cpu())
-            all_pos_spec_dists.append(dpos.detach().cpu())
-            dpos_cpu = dpos.detach().cpu()
-            if epoch == 0:
-                for t in _TAU_SWEEP:
-                    tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
-
-        if spatial_neg_pairs.numel() > 0:
-            dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
-            neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
-            all_neg_weights.append(neg_weights.detach().cpu())
-            all_neg_spec_dists.append(dneg.detach().cpu())
-            dneg_cpu = dneg.detach().cpu()
-            if epoch == 0:
-                for t in _TAU_SWEEP:
-                    tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
-        t_spectral_weights += time.perf_counter() - _t0
+            if spatial_neg_pairs.numel() > 0:
+                dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
+                neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
+                all_neg_weights.append(neg_weights.detach().cpu())
+                all_neg_spec_dists.append(dneg.detach().cpu())
+                dneg_cpu = dneg.detach().cpu()
+                if epoch == 0:
+                    for t in _TAU_SWEEP:
+                        tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
+            t_spectral_weights += time.perf_counter() - _t0
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -431,16 +453,56 @@ def process_batch(
         if not has_spectral and not has_spatial:
             continue
 
-        # Encode the full patch for efficient embedding extraction
-        # encoder_data: [C, H, W] -> [1, C, H, W] -> model -> [1, D, H, W]
+        prep_list[i] = {
+            'sample': sample,
+            'encoder_data': encoder_data,          # CPU [C, H, W]
+            'spec_dist_data': spec_dist_data,       # GPU [C, H, W]
+            'combined_mask': combined_mask,
+            'anchors': anchors,
+            'unique_coords': unique_coords,
+            'spatial_pos_pairs': spatial_pos_pairs,
+            'spatial_neg_pairs': spatial_neg_pairs,
+            'pos_weights': pos_weights,
+            'neg_weights': neg_weights,
+            'spec_dist_at_anchors': spec_dist_at_anchors,
+            'has_spectral': has_spectral,
+            'has_spatial': has_spatial,
+        }
+
+    # ------------------------------------------------------------------
+    # Batched encoder forward — one [B,C,H,W] call instead of B sequential
+    # [1,C,H,W] calls.
+    # ------------------------------------------------------------------
+    valid_prep = [(idx, p) for idx, p in enumerate(prep_list) if p is not None]
+    z_batch = None
+    gate_batch = None
+    if valid_prep:
         _t0 = time.perf_counter()
-        encoder_input_full = encoder_data.unsqueeze(0)
-        z_full, gate = model(encoder_input_full, return_gate=True)  # [1, D, H, W] each
-        z_full = z_full.squeeze(0)  # [D, H, W]
-        gate = gate.squeeze(0)  # [D, H, W]
+        enc_inputs = torch.stack([p['encoder_data'] for _, p in valid_prep]).to(device)
+        z_batch, gate_batch = model(enc_inputs, return_gate=True)  # [Nv, D, H, W] each
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t_gpu_forward += time.perf_counter() - _t0
+
+    # ------------------------------------------------------------------
+    # PASS 2 — per-sample loss computation using the batched embeddings.
+    # ------------------------------------------------------------------
+    for out_idx, (i, prep) in enumerate(valid_prep):
+        sample            = prep['sample']
+        spec_dist_data    = prep['spec_dist_data']
+        combined_mask     = prep['combined_mask']
+        anchors           = prep['anchors']
+        unique_coords     = prep['unique_coords']
+        spatial_pos_pairs = prep['spatial_pos_pairs']
+        spatial_neg_pairs = prep['spatial_neg_pairs']
+        pos_weights       = prep['pos_weights']
+        neg_weights       = prep['neg_weights']
+        spec_dist_at_anchors = prep['spec_dist_at_anchors']
+        has_spectral      = prep['has_spectral']
+        has_spatial       = prep['has_spatial']
+
+        z_full = z_batch[out_idx]      # [D, H, W]
+        gate   = gate_batch[out_idx]   # [D, H, W]
 
         # Collect gate values on CPU — kept for the full epoch, avoid GPU fragmentation
         all_gate_values.append(gate.detach().flatten().cpu())
@@ -1667,6 +1729,47 @@ def main():
     ]
     logger.info(f"Features precomputed in DataLoader workers: {precompute_features}")
 
+    # Spatial pair config — extract the same spatial-InfoNCE parameters that
+    # process_batch() uses (see loss_config below) so DataLoader workers can
+    # precompute anchors, spatial pairs, and spectral weights. Values must match
+    # loss_config exactly; the fallback path in process_batch reproduces these
+    # when a sample has no worker-precomputed pairs.
+    _spc_spectral_cfg = bindings_config.get_loss('infonce_type_spectral')
+    _spc_spatial_cfg = bindings_config.get_loss('infonce_type_spatial')
+    _spc_sampling_cfg = bindings_config.get_sampling_strategy(
+        _spc_spectral_cfg.anchor_population if _spc_spectral_cfg else 'grid-plus-supplement'
+    )
+    _spc_grid = _spc_sampling_cfg.grid if _spc_sampling_cfg and _spc_sampling_cfg.grid else None
+    _spc_supp = _spc_sampling_cfg.supplement if _spc_sampling_cfg else None
+    _spc_pos = (
+        _spc_spatial_cfg.positive_strategy.selection
+        if _spc_spatial_cfg and _spc_spatial_cfg.positive_strategy
+        and _spc_spatial_cfg.positive_strategy.selection else None
+    )
+    _spc_neg = (
+        _spc_spatial_cfg.negative_strategy.selection
+        if _spc_spatial_cfg and _spc_spatial_cfg.negative_strategy
+        and _spc_spatial_cfg.negative_strategy.selection else None
+    )
+    _spc_sw = (
+        _spc_spatial_cfg.spectral_weighting
+        if _spc_spatial_cfg and _spc_spatial_cfg.spectral_weighting else None
+    )
+    spatial_pair_config = {
+        'type_encoder_feature': _type_enc_feat,
+        'stride': _spc_grid.stride if _spc_grid else 16,
+        'border': _spc_grid.exclude_border if _spc_grid else 16,
+        'jitter_radius': _spc_grid.jitter.radius if _spc_grid and _spc_grid.jitter else 4,
+        'supplement_n': _spc_supp.n if _spc_supp else 104,
+        'spatial_positive_k': _spc_pos.k if _spc_pos else 4,
+        'spatial_positive_max_dist': _spc_pos.max_distance if _spc_pos and _spc_pos.max_distance is not None else 8,
+        'spatial_negative_min_dist': _spc_neg.min_distance if _spc_neg and _spc_neg.min_distance is not None else 96.0,
+        'spatial_negative_max_dist': _spc_neg.max_distance if _spc_neg and _spc_neg.max_distance is not None else 192.0,
+        'spatial_negatives_per_anchor': _spc_neg.n_per_anchor if _spc_neg and _spc_neg.n_per_anchor is not None else 16,
+        'spatial_spectral_tau': _spc_sw.tau if _spc_sw else 200,
+        'spatial_min_w': _spc_sw.min_weight if _spc_sw else 0.03,
+    }
+
     # Create train dataset
     logger.info("Creating train dataset...")
     patch_size = training_config.sampling.patch_size
@@ -1689,6 +1792,8 @@ def main():
         sample_number=epoch_cfg.sample_number,
         feature_builder=feature_builder,
         precompute_features=precompute_features,
+        spatial_pair_config=spatial_pair_config,
+        training=True,
     )
     logger.info(
         f"Train dataset has {len(train_dataset.patches)} total patches "
@@ -1717,6 +1822,8 @@ def main():
         debug_window=debug_window,
         feature_builder=feature_builder,
         precompute_features=precompute_features,
+        spatial_pair_config=spatial_pair_config,
+        training=False,
     )
     logger.info(f"Validation dataset has {len(val_dataset)} patches")
 
