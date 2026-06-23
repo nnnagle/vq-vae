@@ -649,8 +649,7 @@ def process_batch(
         t_gpu_forward = time.perf_counter() - _t0
 
     # ── PASS 2: PER-SAMPLE LOSS COMPUTATION ──────────────────────────────
-    for out_idx, (_, prep) in enumerate(valid_prep):
-        i      = prep['i']
+    for out_idx, (i, prep) in enumerate(valid_prep):
         sample = prep['sample']
         z_full = z_batch[out_idx]    # [D, H, W]
         gate   = gate_batch[out_idx]  # [D, H, W]
