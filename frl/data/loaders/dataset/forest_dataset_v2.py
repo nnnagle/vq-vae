@@ -24,6 +24,8 @@ from ....utils.spatial import spatial_knn_pairs, spatial_negative_pairs, extract
 if TYPE_CHECKING:
     from ..builders.feature_builder import FeatureBuilder
 from ..readers.windows import SpatialWindow
+from ...sampling.anchor_sampling import sample_anchors_grid_plus_supplement
+from ....utils.spatial import spatial_knn_pairs, spatial_negative_pairs, extract_at_locations
 
 
 class ForestDatasetV2(Dataset):
