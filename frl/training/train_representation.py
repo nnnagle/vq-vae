@@ -1571,6 +1571,12 @@ def main():
         help='Disable automatic resume from encoder_last.pt even if it exists in the '
              'experiment directory. Starts training fresh from epoch 0.'
     )
+    parser.add_argument(
+        '--phase-start-epoch',
+        type=int,
+        default=None,
+        help='Override curriculum_start_epoch for all phase losses (useful for timing/debug runs)'
+    )
     args = parser.parse_args()
 
     # Parse configs first to get defaults
@@ -2068,6 +2074,13 @@ def main():
             f"curriculum=[start={recovery_disc_config['curriculum_start_epoch']}, "
             f"ramp={recovery_disc_config['curriculum_ramp_epochs']}]"
         )
+
+    # Apply --phase-start-epoch override to all phase curriculum configs
+    if args.phase_start_epoch is not None:
+        for cfg in [phase_config, spread_config, recovery_disc_config]:
+            if cfg is not None:
+                cfg['curriculum_start_epoch'] = args.phase_start_epoch
+        logger.info(f"CLI override: all phase curriculum_start_epoch set to {args.phase_start_epoch}")
 
     # --- EVT soft neighbourhood loss setup ---
     # The EVT-stratified anchor sampler is built whenever the EVT loss config
