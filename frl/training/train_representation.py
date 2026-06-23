@@ -544,9 +544,10 @@ def process_batch(
         spatial_neg_pairs = prep['spatial_neg_pairs'].to(device)
         pos_weights       = prep['pos_weights'].to(device) if prep['pos_weights'] is not None else None
         neg_weights       = prep['neg_weights'].to(device) if prep['neg_weights'] is not None else None
-        has_spatial       = prep['has_spatial']
-        has_spectral      = prep['has_spectral']
-        combined_mask_cpu = prep['combined_mask'].cpu()
+        has_spatial           = prep['has_spatial']
+        has_spectral          = prep['has_spectral']
+        combined_mask_cpu     = prep['combined_mask'].cpu()
+        spec_dist_at_anchors  = prep['spec_dist_at_anchors']  # already on device
 
         # Collect gate values on CPU
         all_gate_values.append(gate.detach().flatten().cpu())
