@@ -118,6 +118,7 @@ class HardwareConfig:
     gpu_ids: List[int] = field(default_factory=lambda: [0])
     num_workers: int = 4
     prefetch_factor: int = 2
+    enc_chunk_size: int = 4
     pin_memory: bool = True
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
@@ -129,6 +130,7 @@ class HardwareConfig:
             gpu_ids=d.get('gpu_ids', [0]),
             num_workers=d.get('num_workers', 4),
             prefetch_factor=d.get('prefetch_factor', 2),
+            enc_chunk_size=d.get('enc_chunk_size', 4),
             pin_memory=d.get('pin_memory', True),
             mixed_precision=mixed_precision
         )

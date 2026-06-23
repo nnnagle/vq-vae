@@ -638,12 +638,22 @@ def process_batch(
         })
 
     # ── BATCHED GPU FORWARD ───────────────────────────────────────────────
+    # Chunk the forward pass to bound peak GPU memory. Each chunk processes
+    # enc_chunk_size samples; results are concatenated before Pass 2.
     valid_prep = [(idx, p) for idx, p in enumerate(prep_list) if p is not None]
     z_batch = gate_batch = None
+    enc_chunk_size = config.get('enc_chunk_size', 4)
     if valid_prep:
-        enc_inputs = torch.stack([p['encoder_data'] for _, p in valid_prep]).to(device)
         _t0 = time.perf_counter()
-        z_batch, gate_batch = model(enc_inputs, return_gate=True)  # [B, D, H, W]
+        z_chunks, gate_chunks = [], []
+        all_enc_inputs = [p['encoder_data'] for _, p in valid_prep]
+        for chunk_start in range(0, len(all_enc_inputs), enc_chunk_size):
+            chunk = torch.stack(all_enc_inputs[chunk_start:chunk_start + enc_chunk_size]).to(device)
+            z_c, gate_c = model(chunk, return_gate=True)
+            z_chunks.append(z_c)
+            gate_chunks.append(gate_c)
+        z_batch = torch.cat(z_chunks, dim=0)
+        gate_batch = torch.cat(gate_chunks, dim=0)
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t_gpu_forward = time.perf_counter() - _t0
@@ -2137,6 +2147,11 @@ def main():
         # Encoder input feature names (from model section of training config)
         'type_encoder_feature': training_config.model_input.type_encoder_feature,
         'phase_encoder_feature': training_config.model_input.phase_encoder_feature,
+
+        # Chunked encoder forward: number of samples per sub-batch to bound peak GPU memory.
+        # enc_chunk_size=1 matches original serial behaviour; larger values are faster
+        # but use more GPU memory proportionally.
+        'enc_chunk_size': training_config.hardware.enc_chunk_size,
     }
 
     # Variance-covariance regularization (optional)
