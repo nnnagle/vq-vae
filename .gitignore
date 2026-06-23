@@ -31,3 +31,4 @@ data/
 runs/
 models/
 out/
+.claude/
