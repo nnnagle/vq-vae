@@ -672,7 +672,7 @@ def process_batch(
         neg_weights       = prep['neg_weights'].to(device) if prep['neg_weights'] is not None else None
         has_spatial       = prep['has_spatial']
         has_spectral      = prep['has_spectral']
-        combined_mask_cpu = prep['combined_mask_cpu']
+        combined_mask_cpu = prep['combined_mask'].cpu()
 
         # Collect gate values on CPU
         all_gate_values.append(gate.detach().flatten().cpu())
