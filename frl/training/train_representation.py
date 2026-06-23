@@ -23,6 +23,7 @@ import argparse
 import logging
 import math
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -211,6 +212,16 @@ def process_batch(
     all_phase_pair_stats = []
     all_phase_loss_stats = []
 
+    # Timing accumulators (seconds)
+    t_feature_build = 0.0
+    t_anchor_sample = 0.0
+    t_spatial_pairs = 0.0
+    t_spectral_weights = 0.0
+    t_gpu_forward = 0.0
+    t_phase_pairs = 0.0
+    t_phase_forward = 0.0
+    t_loss_compute = 0.0
+
     # FiLM data-dependent stats accumulators
     all_film_gamma = []
     all_film_beta = []
@@ -283,6 +294,7 @@ def process_batch(
         sample['metadata'] = batch['metadata'][i]
 
         # Build features
+        _t0 = time.perf_counter()
         encoder_feature = _get_feature(config['type_encoder_feature'], batch, i, sample, feature_builder)
         spec_dist_feature = _get_feature('infonce_type_spectral', batch, i, sample, feature_builder)
 
@@ -294,9 +306,11 @@ def process_batch(
         # Also apply distance feature mask
         spec_dist_mask = torch.from_numpy(spec_dist_feature.mask).to(device)
         combined_mask = mask & spec_dist_mask
+        t_feature_build += time.perf_counter() - _t0
 
         # Sample anchor locations — use EVT-stratified sampler when available so
         # rare forest types are represented for cross-batch kNN pair construction.
+        _t0 = time.perf_counter()
         if evt_sampler is not None:
             anchors = evt_sampler(combined_mask, training=training, sample=sample)
         else:
@@ -307,6 +321,7 @@ def process_batch(
                 jitter_radius=jitter_radius,
                 supplement_n=config.get('supplement_n', 104),
             )
+        t_anchor_sample += time.perf_counter() - _t0
 
         if anchors.shape[0] < 10:
             continue
@@ -320,6 +335,7 @@ def process_batch(
         # Use efficient offset-based pair generation (no large distance matrix)
 
         # Get spatial positive pairs (k nearest neighbors within max_radius)
+        _t0 = time.perf_counter()
         pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
             anchors,
             combined_mask,
@@ -373,17 +389,19 @@ def process_batch(
             neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
             neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
             spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
+        t_spatial_pairs += time.perf_counter() - _t0
             
         # --- Spectral weighting for spatial pairs ---
         # Use spec_dist_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
+        _t0 = time.perf_counter()
         spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
 
         tau = config.get("spatial_spectral_tau", 1.0)  # tune this
         min_w = config.get("spatial_min_w", 0.05)
-        
+
         pos_weights = None
         neg_weights = None
-        
+
         if spatial_pos_pairs.numel() > 0:
             dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
             pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
@@ -403,6 +421,7 @@ def process_batch(
             if epoch == 0:
                 for t in _TAU_SWEEP:
                     tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
+        t_spectral_weights += time.perf_counter() - _t0
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
@@ -414,10 +433,14 @@ def process_batch(
 
         # Encode the full patch for efficient embedding extraction
         # encoder_data: [C, H, W] -> [1, C, H, W] -> model -> [1, D, H, W]
+        _t0 = time.perf_counter()
         encoder_input_full = encoder_data.unsqueeze(0)
         z_full, gate = model(encoder_input_full, return_gate=True)  # [1, D, H, W] each
         z_full = z_full.squeeze(0)  # [D, H, W]
         gate = gate.squeeze(0)  # [D, H, W]
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_gpu_forward += time.perf_counter() - _t0
 
         # Collect gate values on CPU — kept for the full epoch, avoid GPU fragmentation
         all_gate_values.append(gate.detach().flatten().cpu())
@@ -528,6 +551,7 @@ def process_batch(
                 ysfc_at_anchors = ysfc_at_anchors.squeeze(-1)  # [N_phase, T]
 
                 # Build pairs (all CPU)
+                _t0 = time.perf_counter()
                 phase_pairs, phase_weights, phase_stats = build_phase_pairs(
                     spec_features=phase_spec_at_anchors,
                     ysfc=ysfc_at_anchors,
@@ -539,6 +563,7 @@ def process_batch(
                     self_pair_weight=phase_config.get('self_pair_weight', 1.0),
                 )
 
+                t_phase_pairs += time.perf_counter() - _t0
                 all_phase_pair_stats.append(phase_stats)
 
                 # --- Accumulate phase data for cross-batch loss (computed after loop) ---
@@ -563,11 +588,15 @@ def process_batch(
                         )  # [N_phase, z_type_dim]
 
                         # Run phase encoder on anchor pixels only
+                        _t0 = time.perf_counter()
                         z_phase_at_anchors, film_gamma, film_beta, pre_film_h = model.forward_phase_at_locations(
                             phase_ccdc_at_anchors, z_type_at_anchors,
                             return_film=True,
                             return_pre_film=True,
                         )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12], [N_phase, 12, T]
+                        if device.type == 'cuda':
+                            torch.cuda.synchronize()
+                        t_phase_forward += time.perf_counter() - _t0
                         all_film_gamma.append(film_gamma.detach())
                         all_film_beta.append(film_beta.detach())
                         all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())
@@ -610,11 +639,13 @@ def process_batch(
                             )
 
         # Combine per-patch losses (phase losses computed cross-batch after loop)
+        _t0 = time.perf_counter()
         spatial_weight = config.get('spatial_loss_weight', 1.0)
         loss = (spatial_weight * spatial_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
                 + evt_loss_val)
+        t_loss_compute += time.perf_counter() - _t0
 
         # Skip if loss is NaN or Inf (numerical instability)
         if not torch.isfinite(loss):
@@ -670,7 +701,10 @@ def process_batch(
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     spectral_neg_tau_sweep: dict = {}
+    t_cross_spectral = 0.0
+    t_cross_phase = 0.0
     if cross_patch_z_anchors:
+        _t0 = time.perf_counter()
         n_patches = len(cross_patch_z_anchors)
         z_all = torch.cat(cross_patch_z_anchors, dim=0)        # [N_total, D]
         spec_all = torch.cat(cross_patch_spec_features, dim=0) # [N_total, C]
@@ -743,6 +777,9 @@ def process_batch(
         )
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_cross_spectral = time.perf_counter() - _t0
 
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
@@ -825,6 +862,7 @@ def process_batch(
     cross_phase_leakage_val = torch.tensor(0.0, device=device)
 
     if cross_phase_embeddings:
+        _t0 = time.perf_counter()
         Z = torch.cat(cross_phase_z_type, dim=0)           # [N_total, z_type_dim]
         spec_all = torch.cat(cross_phase_spec, dim=0)      # [N_total, T, C]
         z_phase_all = torch.cat(cross_phase_embeddings, dim=0)  # [N_total, T, 12]
@@ -918,6 +956,9 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_cross_phase = time.perf_counter() - _t0
 
     # Average losses over valid samples in batch.
     # Spectral and phase losses are computed globally (cross-patch) and added on top.
@@ -1112,6 +1153,18 @@ def process_batch(
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
         'type_leakage_stats': type_leakage_stats,
+        'timing': {
+            'feature_build':    t_feature_build,
+            'anchor_sample':    t_anchor_sample,
+            'spatial_pairs':    t_spatial_pairs,
+            'spectral_weights': t_spectral_weights,
+            'gpu_forward':      t_gpu_forward,
+            'phase_pairs':      t_phase_pairs,
+            'phase_forward':    t_phase_forward,
+            'loss_compute':     t_loss_compute,
+            'cross_spectral':   t_cross_spectral,
+            'cross_phase':      t_cross_phase,
+        },
     }
 
 
@@ -1209,6 +1262,24 @@ def train_epoch(
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
                 last_film_stats = stats['film_stats']
+
+            if batch_idx == 0 and stats.get('timing'):
+                tm = stats['timing']
+                total_t = sum(tm.values())
+                logger.info(
+                    f"Batch timing (s): "
+                    f"feat={tm['feature_build']:.2f} "
+                    f"anchors={tm['anchor_sample']:.2f} "
+                    f"spat_pairs={tm['spatial_pairs']:.2f} "
+                    f"spec_wts={tm['spectral_weights']:.2f} "
+                    f"gpu_fwd={tm['gpu_forward']:.2f} "
+                    f"phase_pairs={tm['phase_pairs']:.2f} "
+                    f"phase_fwd={tm['phase_forward']:.2f} "
+                    f"loss={tm['loss_compute']:.2f} "
+                    f"cross_spec={tm['cross_spectral']:.2f} "
+                    f"cross_phase={tm['cross_phase']:.2f} "
+                    f"| total={total_t:.2f}"
+                )
 
             if batch_idx % log_interval == 0:
                 ps = stats.get('phase_pair_stats')
