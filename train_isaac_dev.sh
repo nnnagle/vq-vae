@@ -5,7 +5,7 @@
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
 #SBATCH --exclude=clrv1101
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=01:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae-dev/runs/slurm-%j.log
