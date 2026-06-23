@@ -26,5 +26,6 @@ python -m training.train_representation \
     --training config/frl_training_v1.yaml \
     --batch-size 32 \
     --epochs 3 \
+    --max-batches 3 \
     --phase-start-epoch 0 \
     --overwrite

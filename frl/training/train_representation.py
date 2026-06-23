@@ -1185,6 +1185,7 @@ def train_epoch(
     recovery_disc_config: dict | None = None,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
+    max_batches: int | None = None,
 ) -> dict:
     """Run training on entire training set for one epoch."""
     total_loss = 0.0
@@ -1220,6 +1221,8 @@ def train_epoch(
     last_film_stats = None
 
     for batch_idx, batch in enumerate(train_dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         stats = process_batch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
@@ -1576,6 +1579,12 @@ def main():
         type=int,
         default=None,
         help='Override curriculum_start_epoch for all phase losses (useful for timing/debug runs)'
+    )
+    parser.add_argument(
+        '--max-batches',
+        type=int,
+        default=None,
+        help='Stop each epoch after this many batches (useful for timing/debug runs)'
     )
     args = parser.parse_args()
 
@@ -2371,6 +2380,7 @@ def main():
           phase_sampler=phase_sampler, phase_config=phase_config,
           spread_config=spread_config, recovery_disc_config=recovery_disc_config,
           evt_metric=evt_metric, evt_sampler=evt_sampler,
+          max_batches=args.max_batches,
         )
 
         val_stats = validate_epoch(
