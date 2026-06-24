@@ -918,13 +918,15 @@ def process_batch(
             torch.cuda.synchronize()
         cp_timing['cat'] = time.perf_counter() - _t0
 
-        # SVD rank reduction on z_type for stable kNN type baseline
+        # Randomized PCA rank reduction on z_type for stable kNN type baseline.
+        # torch.pca_lowrank uses a randomized algorithm and computes only K components,
+        # making it much faster than full SVD (torch.linalg.svd) for tall narrow matrices.
         _t0 = time.perf_counter()
         K = phase_config.get('phase_type_proj_rank', 8)
         k_nbrs = phase_config.get('phase_type_proj_neighbors', 20)
         Z_c = Z - Z.mean(0, keepdim=True)
-        U, _, _ = torch.linalg.svd(Z_c, full_matrices=False)
-        Z_k = U[:, :K]  # [N_total, K]
+        U, _, _ = torch.pca_lowrank(Z_c, q=K, center=False)
+        Z_k = U  # [N_total, K] — pca_lowrank already returns the top-K left vectors
         if device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['svd'] = time.perf_counter() - _t0
