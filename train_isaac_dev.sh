@@ -2,7 +2,6 @@
 #SBATCH --job-name=frl-dev
 #SBATCH --partition=ai-tenn
 #SBATCH --account=acf-utk0011
-#SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=180G
