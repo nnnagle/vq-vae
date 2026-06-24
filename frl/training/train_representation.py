@@ -2204,67 +2204,58 @@ def main():
 
     # --- EVT soft neighbourhood loss setup ---
     # The EVT-stratified anchor sampler is built whenever the EVT loss config
-    # exists, regardless of loss weight. This allows EVT-stratified anchor
-    # sampling for the spectral kNN even when the EVT loss itself is disabled.
     evt_metric = None
     evt_sampler = None
     evt_loss_cfg = bindings_config.get_loss('soft_neighborhood_evt')
-    if evt_loss_cfg is not None:
+    if evt_loss_cfg is not None and (evt_loss_cfg.weight or 0.0) > 0.0:
         evt_anchor_pop = (
             evt_loss_cfg.anchor_population
             if evt_loss_cfg.anchor_population
             else 'grid-plus-supplement-evt'
         )
         evt_sampler = build_anchor_sampler(bindings_config, evt_anchor_pop)
-
-        if (evt_loss_cfg.weight or 0.0) > 0.0:
-            # EVT code counts come from the shared stats file, at the path:
-            #   stats["evt_class"]["static_categorical.evt"]["counts"]
-            # Keys are string codes, values are integer pixel counts.
-            evt_code_counts = (
-                feature_builder.stats
-                .get("evt_class", {})
-                .get("static_categorical.evt", {})
-                .get("counts", {})
+        # EVT code counts come from the shared stats file, at the path:
+        #   stats["evt_class"]["static_categorical.evt"]["counts"]
+        # Keys are string codes, values are integer pixel counts.
+        evt_code_counts = (
+            feature_builder.stats
+            .get("evt_class", {})
+            .get("static_categorical.evt", {})
+            .get("counts", {})
+        )
+        if not evt_code_counts:
+            raise ValueError(
+                "EVT code counts not found in stats file. "
+                "Run example_compute_stats.py to compute stats first."
             )
-            if not evt_code_counts:
-                raise ValueError(
-                    "EVT code counts not found in stats file. "
-                    "Run example_compute_stats.py to compute stats first."
-                )
-            evt_metric = EvtDiffusionMetric(
-                confusion_csv=evt_loss_cfg.confusion_matrix_path,
-                code_counts=evt_code_counts,
-                min_count=evt_loss_cfg.min_count or 100,
-                min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
-                diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
-                laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
-                binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
-            ).to(device)
-            loss_config['evt_weight'] = evt_loss_cfg.weight
-            loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
-            loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
-            # Restrict inverse-frequency weighting to valid EVT codes only.
-            for spec in evt_sampler.weight_specs:
-                if spec.transform == 'inverse-frequency':
-                    spec.valid_values = evt_metric.valid_codes
-            logger.info(
-                f"EVT soft neighbourhood loss enabled: "
-                f"{evt_metric.n_codes} codes, "
-                f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
-                f"min_count={evt_loss_cfg.min_count or 100}, "
-                f"weight={loss_config['evt_weight']}, "
-                f"tau_ref={loss_config['evt_tau_ref']}, "
-                f"tau_learned={loss_config['evt_tau_learned']}, "
-                f"anchor_population={evt_anchor_pop}"
-            )
-        else:
-            logger.info(
-                f"EVT loss disabled (weight=0) but EVT-stratified anchor sampler "
-                f"active for spectral kNN (population={evt_anchor_pop})"
-            )
+        evt_metric = EvtDiffusionMetric(
+            confusion_csv=evt_loss_cfg.confusion_matrix_path,
+            code_counts=evt_code_counts,
+            min_count=evt_loss_cfg.min_count or 100,
+            min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
+            diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
+            laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
+            binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
+        ).to(device)
+        loss_config['evt_weight'] = evt_loss_cfg.weight
+        loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
+        loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
+        # Restrict inverse-frequency weighting to valid EVT codes only.
+        for spec in evt_sampler.weight_specs:
+            if spec.transform == 'inverse-frequency':
+                spec.valid_values = evt_metric.valid_codes
+        logger.info(
+            f"EVT soft neighbourhood loss enabled: "
+            f"{evt_metric.n_codes} codes, "
+            f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
+            f"min_count={evt_loss_cfg.min_count or 100}, "
+            f"weight={loss_config['evt_weight']}, "
+            f"tau_ref={loss_config['evt_tau_ref']}, "
+            f"tau_learned={loss_config['evt_tau_learned']}, "
+            f"anchor_population={evt_anchor_pop}"
+        )
     else:
-        logger.info("EVT soft neighbourhood loss disabled (not in bindings config)")
+        logger.info("EVT soft neighbourhood loss disabled (weight=0 or not configured)")
 
     # Create scheduler with optional warmup.
     # Must be after phase_config is built so the two-phase branch can read
