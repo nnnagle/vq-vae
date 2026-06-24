@@ -2109,7 +2109,6 @@ def main():
     val_dataset.training = False
     logger.info(
         f"Spatial pair worker precompute: "
-        f"evt_sampler={'set' if evt_sampler is not None else 'None (precompute active)'}, "
         f"train precompute_features={train_dataset.precompute_features}, "
         f"spatial_pair_config_keys={list(_spatial_pair_config.keys())}"
     )
