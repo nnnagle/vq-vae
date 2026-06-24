@@ -905,6 +905,7 @@ def process_batch(
     cross_phase_rd_val = torch.tensor(0.0, device=device)
     cross_phase_leakage_val = torch.tensor(0.0, device=device)
 
+    cp_timing: dict[str, float] = {}
     if cross_phase_embeddings:
         _t0 = time.perf_counter()
         Z = torch.cat(cross_phase_z_type, dim=0)           # [N_total, z_type_dim]
@@ -913,15 +914,23 @@ def process_batch(
         ysfc_all = torch.cat(cross_phase_ysfc, dim=0)      # [N_total, T]
         pairs_all = torch.cat(cross_phase_pairs, dim=0)    # [B_total, 2]
         weights_all = torch.cat(cross_phase_weights, dim=0)  # [B_total]
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['cat'] = time.perf_counter() - _t0
 
         # SVD rank reduction on z_type for stable kNN type baseline
+        _t0 = time.perf_counter()
         K = phase_config.get('phase_type_proj_rank', 8)
         k_nbrs = phase_config.get('phase_type_proj_neighbors', 20)
         Z_c = Z - Z.mean(0, keepdim=True)
         U, _, _ = torch.linalg.svd(Z_c, full_matrices=False)
         Z_k = U[:, :K]  # [N_total, K]
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['svd'] = time.perf_counter() - _t0
 
         # kNN in reduced type space → type-local spectral baseline per pixel
+        _t0 = time.perf_counter()
         sim = Z_k @ Z_k.T  # [N_total, N_total]
         sim.fill_diagonal_(float('-inf'))
         k_nbrs = min(k_nbrs, sim.shape[0] - 1)
@@ -929,8 +938,12 @@ def process_batch(
         S_mean = spec_all.mean(dim=1)                # [N_total, C] — pixel mean over T
         S_hat = S_mean[topk_idx].mean(dim=1)         # [N_total, C] — type-local baseline
         spec_demeaned = spec_all - S_hat.unsqueeze(1)  # [N_total, T, C]
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['knn'] = time.perf_counter() - _t0
 
         # Build aligned distance batch once; reuse for neighborhood + spread losses
+        _t0 = time.perf_counter()
         phase_batch = build_phase_neighborhood_batch(
             spectral_features=spec_demeaned,
             phase_embeddings=z_phase_all,
@@ -938,8 +951,12 @@ def process_batch(
             pair_indices=pairs_all,
             min_overlap=phase_config.get('min_overlap', 3),
         )
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['build_batch'] = time.perf_counter() - _t0
 
         # Phase neighborhood loss
+        _t0 = time.perf_counter()
         p_loss, p_loss_stats = phase_neighborhood_loss(
             spectral_features=spec_demeaned,
             phase_embeddings=z_phase_all,
@@ -954,12 +971,17 @@ def process_batch(
             cross_pixel_weight=phase_config.get('cross_pixel_weight', 1.0),
             _batch=phase_batch,
         )
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['neighborhood_loss'] = time.perf_counter() - _t0
         cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * p_loss
         p_loss_stats['curriculum_w'] = curriculum_w
         all_phase_loss_stats.append(p_loss_stats)
 
         # Phase spread ranking loss
+        cp_timing['spread_loss'] = 0.0
         if spread_config is not None and spread_w > 0.0 and cross_phase_dynamism:
+            _t0 = time.perf_counter()
             dynamism_all = torch.cat(cross_phase_dynamism, dim=0)  # [N_total, C]
             dynamism_ref = dynamism_all.mean(dim=1).to(device)     # [N_total]
             valid_mask = phase_batch['valid_pair_mask']
@@ -975,9 +997,14 @@ def process_batch(
                     delta=spread_config['delta'],
                 )
                 cross_phase_spread_val = spread_config['weight'] * spread_w * spread_loss
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['spread_loss'] = time.perf_counter() - _t0
 
         # Phase recovery discrimination loss
+        cp_timing['rd_loss'] = 0.0
         if recovery_disc_config is not None and rd_w > 0.0:
+            _t0 = time.perf_counter()
             rd_loss, _ = phase_recovery_discrimination_loss(
                 z_phase=z_phase_all,
                 ysfc=ysfc_all,
@@ -986,12 +1013,17 @@ def process_batch(
                 high_ysfc_min=recovery_disc_config['high_ysfc_min'],
             )
             cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['rd_loss'] = time.perf_counter() - _t0
 
         # Frobenius cross-covariance loss: penalise type info in pre-FiLM h.
         # Stop-gradient on Z so only the TCN (h) receives gradient.
         # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
+        cp_timing['leakage'] = 0.0
         leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
         if leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
+            _t0 = time.perf_counter()
             h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
             Z_sg = Z.detach()                                 # stop-grad on z_type
             h_c = h_all - h_all.mean(0, keepdim=True)
@@ -1000,9 +1032,11 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t_cross_phase = time.perf_counter() - _t0
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['leakage'] = time.perf_counter() - _t0
+
+        t_cross_phase = sum(cp_timing.values())
 
     # Average losses over valid samples in batch.
     # Spectral and phase losses are computed globally (cross-patch) and added on top.
@@ -1208,6 +1242,7 @@ def process_batch(
             'loss_compute':     t_loss_compute,
             'cross_spectral':   t_cross_spectral,
             'cross_phase':      t_cross_phase,
+            'cross_phase_detail': cp_timing,
         },
     }
 
@@ -1312,7 +1347,8 @@ def train_epoch(
 
             if batch_idx == 0 and stats.get('timing'):
                 tm = stats['timing']
-                total_t = sum(tm.values())
+                top_keys = [k for k in tm if k != 'cross_phase_detail']
+                total_t = sum(tm[k] for k in top_keys)
                 logger.info(
                     f"Batch timing (s): "
                     f"feat={tm['feature_build']:.2f} "
@@ -1327,6 +1363,19 @@ def train_epoch(
                     f"cross_phase={tm['cross_phase']:.2f} "
                     f"| total={total_t:.2f}"
                 )
+                cp = tm.get('cross_phase_detail', {})
+                if cp:
+                    logger.info(
+                        f"  cross_phase breakdown (s): "
+                        f"cat={cp.get('cat', 0):.2f} "
+                        f"svd={cp.get('svd', 0):.2f} "
+                        f"knn={cp.get('knn', 0):.2f} "
+                        f"build_batch={cp.get('build_batch', 0):.2f} "
+                        f"neighborhood={cp.get('neighborhood_loss', 0):.2f} "
+                        f"spread={cp.get('spread_loss', 0):.2f} "
+                        f"rd={cp.get('rd_loss', 0):.2f} "
+                        f"leakage={cp.get('leakage', 0):.2f}"
+                    )
 
             if batch_idx % log_interval == 0:
                 ps = stats.get('phase_pair_stats')
