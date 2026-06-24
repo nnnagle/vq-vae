@@ -1427,6 +1427,7 @@ def validate_epoch(
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
+    max_batches: int | None = None,
 ) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
@@ -1457,7 +1458,9 @@ def validate_epoch(
     last_film_stats = None
 
     with torch.no_grad():
-        for batch in val_dataloader:
+        for batch_idx, batch in enumerate(val_dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             stats = process_batch(
                 batch, feature_builder, model, device, config,
                 training=False,
@@ -2502,6 +2505,7 @@ def main():
           phase_sampler=phase_sampler, phase_config=phase_config,
           spread_config=spread_config, recovery_disc_config=recovery_disc_config,
           epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
+          max_batches=args.max_batches,
         )
 
         logger.info(f"Epoch {epoch+1}/{num_epochs} complete")
