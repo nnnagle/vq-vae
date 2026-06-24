@@ -240,6 +240,11 @@ class ForestDatasetV2(Dataset):
                 actual_height = min(patch_size, row_end - row)
                 actual_width = min(patch_size, col_end - col)
 
+                # Skip patches that don't fill the full patch size — boundary patches
+                # where the underlying data is smaller cause shape mismatches in collate_fn.
+                if actual_height < patch_size or actual_width < patch_size:
+                    continue
+
                 window = SpatialWindow(
                     row_start=row,
                     col_start=col,
