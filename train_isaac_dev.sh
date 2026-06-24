@@ -19,7 +19,8 @@ export OMP_NUM_THREADS=1
 export CUDA_LAUNCH_BLOCKING=1
 
 echo "Copying Zarr to /dev/shm ($(date))..."
-cp -r /lustre/isaac24/scratch/nnagle/zarr /dev/shm/zarr
+mkdir -p /dev/shm/zarr
+tar -C /lustre/isaac24/scratch/nnagle -cf - zarr | tar -C /dev/shm -xf -
 echo "Zarr copy complete ($(date))"
 export ZARR_ROOT=/dev/shm/zarr
 
