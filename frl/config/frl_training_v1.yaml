@@ -39,7 +39,7 @@ training:
     num_epochs: 400
     mode: number # full/frac/number - use every batch or take a sample
     sample_frac: .1
-    sample_number: 500
+    sample_number: 512
     batch_size: 12
   
   gradient_clip:
