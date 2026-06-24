@@ -240,11 +240,6 @@ class ForestDatasetV2(Dataset):
                 actual_height = min(patch_size, row_end - row)
                 actual_width = min(patch_size, col_end - col)
 
-                # Skip patches that don't fill the full patch size — boundary patches
-                # where the underlying data is smaller cause shape mismatches in collate_fn.
-                if actual_height < patch_size or actual_width < patch_size:
-                    continue
-
                 window = SpatialWindow(
                     row_start=row,
                     col_start=col,
@@ -358,6 +353,20 @@ class ForestDatasetV2(Dataset):
             data, channel_names = self._load_group(group_config, spatial_window)
             result[group_name] = data
             metadata['channel_names'][group_name] = channel_names
+
+        # Pad partial boundary patches to patch_size so collate_fn sees uniform shapes.
+        # Padded pixels are zero (data) and will be excluded by the AOI/forest masks.
+        ph, pw = spatial_window.height, spatial_window.width
+        if ph < self.patch_size or pw < self.patch_size:
+            pad_h = self.patch_size - ph
+            pad_w = self.patch_size - pw
+            for group_name in list(result.keys()):
+                arr = result[group_name]
+                if not isinstance(arr, np.ndarray) or arr.ndim < 2:
+                    continue
+                # arr shape: [..., H, W] — pad the last two dims
+                pad_width = [(0, 0)] * (arr.ndim - 2) + [(0, pad_h), (0, pad_w)]
+                result[group_name] = np.pad(arr, pad_width, mode='constant', constant_values=0)
 
         result['metadata'] = metadata
 
