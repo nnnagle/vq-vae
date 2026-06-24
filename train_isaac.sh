@@ -6,7 +6,7 @@
 #SBATCH --gpus=1
 #SBATCH --exclude=clrv1101
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=600G
+#SBATCH --mem=180G
 #SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
 
@@ -15,13 +15,8 @@ source /sw/isaac/applications/anaconda3/2024.06/rhel8_cascadelake_binary/anacond
 conda activate /nfs/home/nnagle/.conda/envs/frl
 
 export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae:$PYTHONPATH
+export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
 export OMP_NUM_THREADS=1
-
-echo "Copying Zarr to /dev/shm ($(date))..."
-mkdir -p /dev/shm/zarr
-tar -C /lustre/isaac24/scratch/nnagle -cf - zarr | tar -C /dev/shm -xf -
-echo "Zarr copy complete ($(date))"
-export ZARR_ROOT=/dev/shm/zarr
 
 echo "Running on node: $(hostname)"
 echo "GPU info:"
