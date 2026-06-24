@@ -58,6 +58,7 @@ class ForestDatasetV2(Dataset):
         precompute_features: Optional[List[str]] = None,
         spatial_pair_config: Optional[dict] = None,
         training: bool = True,
+        split_block_size: Tuple[int, int] = (4, 4),
     ):
         """Initialize dataset.
 
@@ -76,6 +77,8 @@ class ForestDatasetV2(Dataset):
                 returned dict so they arrive already processed in process_batch().
             precompute_features: List of feature names to precompute. Has no
                 effect if feature_builder is None.
+            split_block_size: (rows, cols) of patches per checkerboard block for
+                train/val/test splitting. Matches block_grid in training yaml.
         """
         self.config = config
         self.split = split
@@ -84,6 +87,7 @@ class ForestDatasetV2(Dataset):
         self.precompute_features: List[str] = precompute_features or []
         self.spatial_pair_config = spatial_pair_config
         self.training = training
+        self.split_block_size = split_block_size
 
         # Open zarr dataset
         self.zarr_path = Path(config.zarr.path)
@@ -269,7 +273,7 @@ class ForestDatasetV2(Dataset):
         # Deterministic split using checkerboard pattern
         # Based on global patch indices (not debug window indices)
         patch_size = self.patch_size
-        block_height, block_width = 4, 4  # 4x4 block grid
+        block_height, block_width = self.split_block_size
 
         split_codes = {'train': 1, 'val': 2, 'test': 3}
         target_code = split_codes[split]

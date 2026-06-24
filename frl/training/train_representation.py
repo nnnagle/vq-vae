@@ -1549,6 +1549,15 @@ def validate_epoch(
         'film_stats': last_film_stats,
     }
 
+def _count_blocks(dataset) -> int:
+    bh, bw = dataset.split_block_size
+    ps = dataset.patch_size
+    blocks = set()
+    for w in dataset.patches:
+        blocks.add((w.row_start // ps // bh, w.col_start // ps // bw))
+    return len(blocks)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train representation encoder')
     parser.add_argument(
@@ -1765,6 +1774,8 @@ def main():
     logger.info("Creating train dataset...")
     patch_size = training_config.sampling.patch_size
     spatial = training_config.spatial_domain
+    _bg = spatial.full_domain.block_grid if spatial.full_domain and spatial.full_domain.block_grid else [4, 4]
+    split_block_size = (int(_bg[0]), int(_bg[1]))
     debug_window = None
     if spatial.debug_mode and spatial.debug_window is not None:
         w = spatial.debug_window
@@ -1785,11 +1796,12 @@ def main():
         precompute_features=precompute_features,
         spatial_pair_config=spatial_pair_config,
         training=True,
+        split_block_size=split_block_size,
     )
     logger.info(
-        f"Train dataset has {len(train_dataset.patches)} total patches "
-        f"(epoch_mode={epoch_cfg.mode}, "
-        f"patches/epoch={len(train_dataset)})"
+        f"Train dataset: {len(train_dataset.patches)} patches "
+        f"({_count_blocks(train_dataset)} blocks of {split_block_size[0]}×{split_block_size[1]} patches) "
+        f"| epoch_mode={epoch_cfg.mode}, patches/epoch={len(train_dataset)}"
     )
 
     n_workers = args.num_workers if args.num_workers is not None else training_config.hardware.num_workers
@@ -1816,8 +1828,12 @@ def main():
         precompute_features=precompute_features,
         spatial_pair_config=spatial_pair_config,
         training=False,
+        split_block_size=split_block_size,
     )
-    logger.info(f"Validation dataset has {len(val_dataset)} patches")
+    logger.info(
+        f"Validation dataset: {len(val_dataset.patches)} patches "
+        f"({_count_blocks(val_dataset)} blocks of {split_block_size[0]}×{split_block_size[1]} patches)"
+    )
 
     val_dataloader = DataLoader(
         val_dataset,
