@@ -324,6 +324,13 @@ def process_batch(
             and batch['__spatial_valid'][i] is not None
             and bool(batch['__spatial_valid'][i].item())
         )
+        if not _spatial_precomputed and i == 0 and epoch == 0:
+            logger.info(
+                f"[precompute diag sample 0] "
+                f"evt_sampler={'set' if evt_sampler is not None else 'None'}, "
+                f"'__spatial_valid' in batch={('__spatial_valid' in batch)}, "
+                f"val[0]={batch['__spatial_valid'][0] if '__spatial_valid' in batch else 'MISSING'}"
+            )
 
         _t0 = time.perf_counter()
         if _spatial_precomputed:
@@ -2100,7 +2107,12 @@ def main():
     train_dataset.training = True
     val_dataset.spatial_pair_config = _spatial_pair_config
     val_dataset.training = False
-    logger.info("Spatial pair construction offloaded to DataLoader workers")
+    logger.info(
+        f"Spatial pair worker precompute: "
+        f"evt_sampler={'set' if evt_sampler is not None else 'None (precompute active)'}, "
+        f"train precompute_features={train_dataset.precompute_features}, "
+        f"spatial_pair_config_keys={list(_spatial_pair_config.keys())}"
+    )
 
     # --- Phase loss pair construction setup ---
     phase_loss_cfg = bindings_config.get_loss('soft_neighborhood_phase')
