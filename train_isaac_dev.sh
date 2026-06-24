@@ -31,6 +31,5 @@ python -m training.train_representation \
     --batch-size 16 \
     --num-workers ${NUM_WORKERS} \
     --epochs 3 \
-    --max-batches 3 \
     --phase-start-epoch 0 \
     --overwrite
