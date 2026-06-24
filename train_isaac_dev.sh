@@ -7,7 +7,7 @@
 #SBATCH --exclude=clrv1101
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=180G
-#SBATCH --time=01:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae-dev/runs/slurm-%j.log
 
 module purge
