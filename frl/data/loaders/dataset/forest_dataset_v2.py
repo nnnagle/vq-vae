@@ -767,6 +767,12 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             result[group_name] = collected
         else:
             arrays = [sample[group_name] for sample in batch]
+            shapes = [a.shape if hasattr(a, 'shape') else np.asarray(a).shape for a in arrays]
+            if len(set(shapes)) > 1:
+                raise ValueError(
+                    f"collate_fn: key '{group_name}' has mismatched shapes across samples: "
+                    + ", ".join(str(s) for s in shapes)
+                )
             stacked = np.stack(arrays, axis=0)  # [B, C, H, W] or [B, C, T, H, W]
             result[group_name] = torch.from_numpy(stacked)
 
