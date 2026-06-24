@@ -1618,6 +1618,12 @@ def main():
         help='Override curriculum_start_epoch for all phase losses (useful for timing/debug runs)'
     )
     parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=None,
+        help='Number of DataLoader worker processes (overrides config)'
+    )
+    parser.add_argument(
         '--max-batches',
         type=int,
         default=None,
@@ -1776,7 +1782,7 @@ def main():
         f"patches/epoch={len(train_dataset)})"
     )
 
-    n_workers = training_config.hardware.num_workers
+    n_workers = args.num_workers if args.num_workers is not None else training_config.hardware.num_workers
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
