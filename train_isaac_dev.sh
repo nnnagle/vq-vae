@@ -21,9 +21,9 @@ echo "Running on node: $(hostname)"
 echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-echo "Copying Zarr to NVMe scratch ($(date))..."
-cp -r /lustre/isaac24/scratch/nnagle/zarr /tmp/zarr
-echo "Zarr copy complete ($(date))"
+echo "Extracting Zarr tar to NVMe scratch ($(date))..."
+tar xf /lustre/isaac24/scratch/nnagle/zarr.tar -C /tmp/
+echo "Zarr extract complete ($(date))"
 export ZARR_ROOT=/tmp/zarr
 
 NUM_WORKERS=$(( SLURM_CPUS_PER_TASK - 2 ))
