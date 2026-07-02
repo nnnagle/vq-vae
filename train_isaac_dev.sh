@@ -23,6 +23,8 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 echo "Extracting Zarr tar to NVMe scratch ($(date))..."
 tar xf /lustre/isaac24/scratch/nnagle/zarr.tar -C /tmp/
+cp /lustre/isaac24/scratch/nnagle/zarr/*.json /tmp/zarr/
+cp /lustre/isaac24/scratch/nnagle/zarr/*.csv /tmp/zarr/
 echo "Zarr extract complete ($(date))"
 export ZARR_ROOT=/tmp/zarr
 
