@@ -311,6 +311,39 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 
 ---
 
+## Training Infrastructure (ISAAC HPC)
+
+### Data
+
+The Zarr archive lives on Lustre at `/lustre/isaac24/scratch/nnagle/zarr/` (284 GB, 3.9M files). A pre-built tar archive is at `/lustre/isaac24/scratch/nnagle/zarr.tar` (269 GB) for fast job-start extraction — use this instead of `cp -r`, which takes 90+ minutes due to Lustre metadata overhead on 3.9M files.
+
+**Tar extraction path quirk:** The tar was built from inside the `zarr/` directory, so it extracts with a double-nested path: `zarr/zarr/va_vae_dataset.zarr/`. After extracting to `/dev/shm/` or `/tmp/`, set `ZARR_ROOT` to `/dev/shm/zarr/zarr` (not `/dev/shm/zarr`).
+
+**Sidecar files:** Stats files (`*.json`, `*.csv`) are not inside the tar — they are copied separately from Lustre after extraction.
+
+### Training Scripts
+
+| Script | Partition | Data location | Purpose |
+|--------|-----------|---------------|---------|
+| `train_isaac.sh` | campus-gpu-large | Lustre (slow) | Original production script |
+| `train_isaac_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Production, auto-resumes |
+| `train_isaac_dev.sh` | campus-gpu-bigmem | `/tmp` (NVMe) | Dev, `--overwrite` |
+| `train_isaac_dev_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Dev, `--overwrite` |
+
+### Performance
+
+~6 min/epoch on V100S with 4 DataLoader workers (`--cpus-per-task=6`). Moving data to RAM did not meaningfully reduce epoch time vs Lustre. The bottleneck is suspected to be CPU-bound Mahalanobis whitening in DataLoader workers, but this has not been profiled — the true cause is unknown. At 6 min/epoch, 200 epochs fits within a 24-hour job.
+
+### SLURM Notes
+
+- **Authorized QOS:** `campus`, `campus-bigmem`, `campus-gpu`, `long`, `long-bigmem`, `long-gpu`
+- **Exclude `clrv1101`** — smaller GPU, included in scripts via `--exclude=clrv1101`
+- **campus-gpu-bigmem** (`ilpa1209`, A40 + NVMe `/tmp`) — frequently in maintenance; use campus-gpu-large as fallback
+- **campus-gpu-large** nodes have 770 GB RAM — enough to hold the zarr in `/dev/shm` with `--mem=500G`
+- **ai-tenn** partition (H100s) requires a separate allocation not currently held
+
+---
+
 ## Known Issues / Gotchas
 
 **Invalid values in boundary/masked patches.**
