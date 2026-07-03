@@ -124,9 +124,11 @@ def _dataloader_worker_init(worker_id: int) -> None:
 # for mean/std/quantile summaries and avoid a multi-second cat+quantile per batch.
 _GATE_STATS_SAMPLES = 4096
 
-# One-shot flag: on the first phase batch, verify that anchor-only temporal
-# feature builds match the old full-grid-then-extract path (should be ~0 diff).
-_FIX5_VERIFIED = False
+# Profiling master switch (set from --profile). When False (default/production)
+# every timing cuda.synchronize() and the per-epoch perf logging are skipped, so
+# training runs with no profiling overhead. --profile turns on the dataloader
+# wait/step split and the per-component step breakdown.
+_PROFILE = False
 
 
 def _get_feature(
@@ -549,7 +551,7 @@ def process_batch(
             'phase_prep':         phase_prep,
         }
 
-    if device.type == 'cuda':
+    if _PROFILE and device.type == 'cuda':
         torch.cuda.synchronize()
     t_pass1 = time.perf_counter() - _t_pass1
 
@@ -570,7 +572,7 @@ def process_batch(
             gate_chunks.append(gate_c)
         z_batch = torch.cat(z_chunks, dim=0)
         gate_batch = torch.cat(gate_chunks, dim=0)
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         t_gpu_forward = time.perf_counter() - _t0
 
@@ -676,16 +678,6 @@ def process_batch(
                     config['phase_encoder_feature'], sample, phase_anchors)   # [N, T, C]
                 t_temporal_build += time.perf_counter() - _t_tb
 
-                # One-time check on real data: anchor-only == full-grid-then-extract.
-                global _FIX5_VERIFIED
-                if not _FIX5_VERIFIED:
-                    _full = _get_feature(config['phase_encoder_feature'], batch, i, sample, feature_builder).data
-                    _ref = extract_temporal_at_locations(
-                        torch.from_numpy(_full).float(), phase_anchors).numpy()  # [N, T, C]
-                    _md = float(np.abs(_ref - phase_ccdc_np).max())
-                    logger.info(f"[fix#5 verify] phase_ccdc anchor-only vs full-grid: max|diff|={_md:.2e} (expect ~0)")
-                    _FIX5_VERIFIED = True
-
                 phase_ccdc_at_anchors = torch.from_numpy(phase_ccdc_np).float().to(device)  # [N, T, C]
                 phase_anchors_dev = phase_anchors.to(device)
                 spec_at_phase_anchors = phase_ccdc_at_anchors
@@ -699,7 +691,7 @@ def process_batch(
                     return_film=True,
                     return_pre_film=True,
                 )
-                if device.type == 'cuda':
+                if _PROFILE and device.type == 'cuda':
                     torch.cuda.synchronize()
                 t_phase_forward += time.perf_counter() - _t0
                 all_film_gamma.append(film_gamma.detach())
@@ -792,7 +784,7 @@ def process_batch(
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
-    if device.type == 'cuda':
+    if _PROFILE and device.type == 'cuda':
         torch.cuda.synchronize()
     t_pass2 = time.perf_counter() - _t_pass2
 
@@ -883,7 +875,7 @@ def process_batch(
         )
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         t_cross_spectral = time.perf_counter() - _t0
 
@@ -976,7 +968,7 @@ def process_batch(
         ysfc_all = torch.cat(cross_phase_ysfc, dim=0)      # [N_total, T]
         pairs_all = torch.cat(cross_phase_pairs, dim=0)    # [B_total, 2]
         weights_all = torch.cat(cross_phase_weights, dim=0)  # [B_total]
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['cat'] = time.perf_counter() - _t0
 
@@ -989,7 +981,7 @@ def process_batch(
         Z_c = Z - Z.mean(0, keepdim=True)
         U, _, _ = torch.pca_lowrank(Z_c, q=K, center=False)
         Z_k = U  # [N_total, K] — pca_lowrank already returns the top-K left vectors
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['svd'] = time.perf_counter() - _t0
 
@@ -1002,7 +994,7 @@ def process_batch(
         S_mean = spec_all.mean(dim=1)                # [N_total, C] — pixel mean over T
         S_hat = S_mean[topk_idx].mean(dim=1)         # [N_total, C] — type-local baseline
         spec_demeaned = spec_all - S_hat.unsqueeze(1)  # [N_total, T, C]
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['knn'] = time.perf_counter() - _t0
 
@@ -1015,7 +1007,7 @@ def process_batch(
             pair_indices=pairs_all,
             min_overlap=phase_config.get('min_overlap', 3),
         )
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['build_batch'] = time.perf_counter() - _t0
 
@@ -1035,7 +1027,7 @@ def process_batch(
             cross_pixel_weight=phase_config.get('cross_pixel_weight', 1.0),
             _batch=phase_batch,
         )
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['neighborhood_loss'] = time.perf_counter() - _t0
         cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * p_loss
@@ -1061,7 +1053,7 @@ def process_batch(
                     delta=spread_config['delta'],
                 )
                 cross_phase_spread_val = spread_config['weight'] * spread_w * spread_loss
-            if device.type == 'cuda':
+            if _PROFILE and device.type == 'cuda':
                 torch.cuda.synchronize()
             cp_timing['spread_loss'] = time.perf_counter() - _t0
 
@@ -1077,7 +1069,7 @@ def process_batch(
                 high_ysfc_min=recovery_disc_config['high_ysfc_min'],
             )
             cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
-            if device.type == 'cuda':
+            if _PROFILE and device.type == 'cuda':
                 torch.cuda.synchronize()
             cp_timing['rd_loss'] = time.perf_counter() - _t0
 
@@ -1096,7 +1088,7 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
-            if device.type == 'cuda':
+            if _PROFILE and device.type == 'cuda':
                 torch.cuda.synchronize()
             cp_timing['leakage'] = time.perf_counter() - _t0
 
@@ -1161,7 +1153,7 @@ def process_batch(
             )
 
         optimizer.step()
-        if device.type == 'cuda':
+        if _PROFILE and device.type == 'cuda':
             torch.cuda.synchronize()
         t_backward += time.perf_counter() - _t0
         mean_loss = mean_loss.item()
@@ -1401,7 +1393,7 @@ def train_epoch(
 
         scheduler.step()
 
-        if batch_idx >= 1 and stats.get('timing'):
+        if _PROFILE and batch_idx >= 1 and stats.get('timing'):
             for _k, _v in stats['timing'].items():
                 if _k == 'cross_phase_detail':
                     continue
@@ -1441,7 +1433,7 @@ def train_epoch(
             if stats.get('film_stats') is not None:
                 last_film_stats = stats['film_stats']
 
-            if batch_idx == 0 and stats.get('timing'):
+            if _PROFILE and batch_idx == 0 and stats.get('timing'):
                 tm = stats['timing']
                 top_keys = [k for k in tm if k != 'cross_phase_detail']
                 total_t = sum(tm[k] for k in top_keys)
@@ -1509,7 +1501,7 @@ def train_epoch(
         n_batches_seen += 1
         _t_fetch = time.perf_counter()
 
-    if n_batches_seen > 0:
+    if _PROFILE and n_batches_seen > 0:
         _wpb = t_wait_total / n_batches_seen
         _spb = t_step_total / n_batches_seen
         _tot = t_wait_total + t_step_total
@@ -1827,7 +1819,20 @@ def main():
         default=None,
         help='Stop each epoch after this many batches (useful for timing/debug runs)'
     )
+    parser.add_argument(
+        '--profile',
+        action='store_true',
+        default=False,
+        help='Enable performance profiling: per-epoch dataloader wait/step split and '
+             'per-component step breakdown. Adds cuda.synchronize() timing barriers, so '
+             'leave off for production runs (default off = no profiling overhead).'
+    )
     args = parser.parse_args()
+
+    global _PROFILE
+    _PROFILE = args.profile
+    if _PROFILE:
+        logger.info("Profiling enabled (--profile): per-epoch wait/step + step breakdown will be logged.")
 
     # Parse configs first to get defaults
     logger.info(f"Loading training config from {args.training}")

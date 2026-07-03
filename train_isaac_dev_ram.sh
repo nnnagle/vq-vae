@@ -19,9 +19,8 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
-# CUDA_LAUNCH_BLOCKING left unset: this run benchmarks dataloader throughput /
-# epoch wall-time. Serialized launches would inflate the measured GPU-forward
-# time and hide dataloader/GPU overlap. (Fix #2 will add the other BLAS caps.)
+# CUDA_LAUNCH_BLOCKING left unset: this dev script profiles throughput, and
+# serialized launches would distort the timing. Debug with it on if needed.
 
 echo "Running on node: $(hostname)"
 echo "GPU info:"
@@ -43,4 +42,5 @@ python -m training.train_representation \
     --num-workers ${NUM_WORKERS} \
     --epochs 5 \
     --phase-start-epoch 1 \
+    --profile \
     --overwrite

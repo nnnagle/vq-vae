@@ -40,4 +40,5 @@ python -m training.train_representation \
     --num-workers ${NUM_WORKERS} \
     --epochs 5 \
     --phase-start-epoch 0 \
+    --profile \
     --overwrite
