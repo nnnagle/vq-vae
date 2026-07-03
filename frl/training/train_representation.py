@@ -124,6 +124,10 @@ def _dataloader_worker_init(worker_id: int) -> None:
 # for mean/std/quantile summaries and avoid a multi-second cat+quantile per batch.
 _GATE_STATS_SAMPLES = 4096
 
+# One-shot flag: on the first phase batch, verify that anchor-only temporal
+# feature builds match the old full-grid-then-extract path (should be ~0 diff).
+_FIX5_VERIFIED = False
+
 
 def _get_feature(
     feature_name: str,
@@ -664,14 +668,28 @@ def process_batch(
                 ysfc_at_anchors = pp['ysfc_at_anchors']
 
                 _t_tb = time.perf_counter()
-                phase_ccdc_feature = _get_feature(config['phase_encoder_feature'], batch, i, sample, feature_builder)
-                phase_ccdc_data = torch.from_numpy(phase_ccdc_feature.data).float().to(device)
+                # Build the temporal feature only at the anchor pixels. Since
+                # normalization/whitening use fixed stats and are pointwise, this
+                # is identical to building the full grid then extracting — at
+                # ~H*W/N less cost. (This is the bulk of the old Pass 2 time.)
+                phase_ccdc_np, _ = feature_builder.build_feature_at_locations(
+                    config['phase_encoder_feature'], sample, phase_anchors)   # [N, T, C]
                 t_temporal_build += time.perf_counter() - _t_tb
 
+                # One-time check on real data: anchor-only == full-grid-then-extract.
+                global _FIX5_VERIFIED
+                if not _FIX5_VERIFIED:
+                    _full = _get_feature(config['phase_encoder_feature'], batch, i, sample, feature_builder).data
+                    _ref = extract_temporal_at_locations(
+                        torch.from_numpy(_full).float(), phase_anchors).numpy()  # [N, T, C]
+                    _md = float(np.abs(_ref - phase_ccdc_np).max())
+                    logger.info(f"[fix#5 verify] phase_ccdc anchor-only vs full-grid: max|diff|={_md:.2e} (expect ~0)")
+                    _FIX5_VERIFIED = True
+
+                phase_ccdc_at_anchors = torch.from_numpy(phase_ccdc_np).float().to(device)  # [N, T, C]
                 phase_anchors_dev = phase_anchors.to(device)
-                phase_ccdc_at_anchors = extract_temporal_at_locations(phase_ccdc_data, phase_anchors_dev)
                 spec_at_phase_anchors = phase_ccdc_at_anchors
-                phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(0, 2, 1)
+                phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(0, 2, 1)  # [N, C, T]
 
                 z_type_at_anchors = extract_at_locations(z_full.detach(), phase_anchors_dev)
 
@@ -717,14 +735,9 @@ def process_batch(
                 # Accumulate dynamism for spread loss
                 if spread_config is not None:
                     _t_tb = time.perf_counter()
-                    dynamism_data = torch.from_numpy(
-                        _get_feature(
-                            'phase_dynamism_supervision', batch, i, sample, feature_builder
-                        ).data
-                    ).float()
-                    cross_phase_dynamism.append(
-                        extract_at_locations(dynamism_data, phase_anchors)
-                    )
+                    dynamism_np, _ = feature_builder.build_feature_at_locations(
+                        'phase_dynamism_supervision', sample, phase_anchors)   # [N, C]
+                    cross_phase_dynamism.append(torch.from_numpy(dynamism_np).float())
                     t_temporal_build += time.perf_counter() - _t_tb
 
         # Combine per-patch losses (phase losses computed cross-batch after loop)
