@@ -16,6 +16,9 @@ conda activate /nfs/home/nnagle/.conda/envs/frl
 
 export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae-dev:$PYTHONPATH
 export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 # CUDA_LAUNCH_BLOCKING left unset: this run benchmarks dataloader throughput /
 # epoch wall-time. Serialized launches would inflate the measured GPU-forward
 # time and hide dataloader/GPU overlap. (Fix #2 will add the other BLAS caps.)

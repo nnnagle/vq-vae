@@ -106,6 +106,19 @@ def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
     return torch.norm(v1 - v2, dim=1)
 
 
+def _dataloader_worker_init(worker_id: int) -> None:
+    """Pin each DataLoader worker to a single compute thread.
+
+    With many workers, an uncapped BLAS/torch thread pool per worker
+    oversubscribes the cores: each worker's numpy/whitening ops slow down, so
+    adding workers stops improving (or even worsens) throughput. The launch
+    scripts set OPENBLAS/MKL/NUMEXPR/OMP _NUM_THREADS=1 before import so the
+    forked workers inherit single-threaded BLAS; this additionally pins torch
+    intra-op threads inside each worker.
+    """
+    torch.set_num_threads(1)
+
+
 def _get_feature(
     feature_name: str,
     batch: dict,
@@ -1301,9 +1314,20 @@ def train_epoch(
     last_phase_loss_stats = None
     last_film_stats = None
 
+    # Split time spent blocked on the dataloader (next(...) starvation) from
+    # time spent in the training step. The per-batch timers inside
+    # process_batch only cover step compute, so this is the only place the
+    # dataloader wait is visible.
+    t_wait_total = 0.0
+    t_step_total = 0.0
+    n_batches_seen = 0
+    _t_fetch = time.perf_counter()
+
     for batch_idx, batch in enumerate(train_dataloader):
         if max_batches is not None and batch_idx >= max_batches:
             break
+        t_wait_total += time.perf_counter() - _t_fetch
+        _t_step = time.perf_counter()
         stats = process_batch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
@@ -1407,6 +1431,21 @@ def train_epoch(
                         f"self={pls['loss_self']:.4f} cross={pls['loss_cross']:.4f}"
                         f"{cw_str}"
                     )
+
+        t_step_total += time.perf_counter() - _t_step
+        n_batches_seen += 1
+        _t_fetch = time.perf_counter()
+
+    if n_batches_seen > 0:
+        _wpb = t_wait_total / n_batches_seen
+        _spb = t_step_total / n_batches_seen
+        _tot = t_wait_total + t_step_total
+        _frac = 100.0 * t_wait_total / max(_tot, 1e-9)
+        logger.info(
+            f"Epoch {epoch+1} dataloader: "
+            f"wait={t_wait_total:.1f}s ({_wpb:.2f}/batch, {_frac:.0f}% of loop) | "
+            f"step={t_step_total:.1f}s ({_spb:.2f}/batch) over {n_batches_seen} batches"
+        )
 
     if total_batches == 0:
         return {
@@ -1864,6 +1903,7 @@ def main():
         prefetch_factor=training_config.hardware.prefetch_factor if n_workers > 0 else None,
         pin_memory=training_config.hardware.pin_memory,
         persistent_workers=n_workers > 0,
+        worker_init_fn=_dataloader_worker_init if n_workers > 0 else None,
         collate_fn=collate_fn,
     )
 
@@ -1894,6 +1934,7 @@ def main():
         prefetch_factor=training_config.hardware.prefetch_factor if n_workers > 0 else None,
         pin_memory=training_config.hardware.pin_memory,
         persistent_workers=n_workers > 0,
+        worker_init_fn=_dataloader_worker_init if n_workers > 0 else None,
         collate_fn=collate_fn,
     )
 

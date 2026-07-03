@@ -17,6 +17,9 @@ conda activate /nfs/home/nnagle/.conda/envs/frl
 export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae:$PYTHONPATH
 export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
 export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 
 echo "Running on node: $(hostname)"
 echo "GPU info:"
