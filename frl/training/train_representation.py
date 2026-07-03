@@ -236,6 +236,7 @@ def process_batch(
     t_phase_forward = 0.0
     t_loss_compute = 0.0
     t_backward = 0.0
+    t_pass1 = 0.0  # whole per-sample feature/pair build loop (superset of feature_build etc.)
     t_pass2 = 0.0  # whole per-sample loss loop (superset of phase_forward+loss_compute)
 
     # FiLM data-dependent stats accumulators
@@ -307,6 +308,7 @@ def process_batch(
     # ------------------------------------------------------------------
     prep_list: list[dict | None] = [None] * batch_size
 
+    _t_pass1 = time.perf_counter()
     for i in range(batch_size):
         # Extract single sample from batch
         _t0 = time.perf_counter()
@@ -535,6 +537,10 @@ def process_batch(
             'has_spatial':        has_spatial,
             'phase_prep':         phase_prep,
         }
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_pass1 = time.perf_counter() - _t_pass1
 
     # ── BATCHED GPU FORWARD ───────────────────────────────────────────────
     # Chunk the forward pass to bound peak GPU memory. Each chunk processes
@@ -1261,6 +1267,7 @@ def process_batch(
         'film_stats': film_stats,
         'type_leakage_stats': type_leakage_stats,
         'timing': {
+            'pass1_total':      t_pass1,
             'sample_build':     t_sample_build,
             'feature_build':    t_feature_build,
             'anchor_sample':    t_anchor_sample,
@@ -1337,6 +1344,7 @@ def train_epoch(
     # dataloader wait is visible.
     t_wait_total = 0.0
     t_step_total = 0.0
+    t_step_steady = 0.0  # step time over steady-state batches only (batch_idx >= 1)
     n_batches_seen = 0
     _t_fetch = time.perf_counter()
     # Per-component step-timing accumulated over steady-state batches (batch 0
@@ -1460,7 +1468,10 @@ def train_epoch(
                         f"{cw_str}"
                     )
 
-        t_step_total += time.perf_counter() - _t_step
+        _step_dt = time.perf_counter() - _t_step
+        t_step_total += _step_dt
+        if batch_idx >= 1:
+            t_step_steady += _step_dt
         n_batches_seen += 1
         _t_fetch = time.perf_counter()
 
@@ -1479,8 +1490,16 @@ def train_epoch(
                 f"{_k}={tm_accum[_k] / tm_n:.2f}"
                 for _k in sorted(tm_accum, key=lambda k: -tm_accum[k])
             )
+            # Disjoint top-level buckets that should tile the whole step. The
+            # unaccounted residual = measured step minus their sum; a large
+            # residual means real work is happening outside every timer.
+            _disjoint = ('pass1_total', 'gpu_forward', 'pass2_total',
+                         'cross_spectral', 'cross_phase', 'backward')
+            _accounted = sum(tm_accum.get(k, 0.0) for k in _disjoint)
+            _resid = (t_step_steady - _accounted) / tm_n
             logger.info(
-                f"Epoch {epoch+1} step breakdown (s/batch, avg over {tm_n} steady-state batches): {_parts}"
+                f"Epoch {epoch+1} step breakdown (s/batch, avg over {tm_n} steady-state batches): "
+                f"{_parts} | step={t_step_steady / tm_n:.2f} unaccounted={_resid:.2f}"
             )
 
     if total_batches == 0:
