@@ -244,6 +244,7 @@ def process_batch(
     t_backward = 0.0
     t_pass1 = 0.0  # whole per-sample feature/pair build loop (superset of feature_build etc.)
     t_pass2 = 0.0  # whole per-sample loss loop (superset of phase_forward+loss_compute)
+    t_temporal_build = 0.0  # subset of pass2: per-sample full-grid phase_ccdc/dynamism builds
 
     # FiLM data-dependent stats accumulators
     all_film_gamma = []
@@ -662,8 +663,10 @@ def process_batch(
                 phase_weights  = pp['phase_weights']
                 ysfc_at_anchors = pp['ysfc_at_anchors']
 
+                _t_tb = time.perf_counter()
                 phase_ccdc_feature = _get_feature(config['phase_encoder_feature'], batch, i, sample, feature_builder)
                 phase_ccdc_data = torch.from_numpy(phase_ccdc_feature.data).float().to(device)
+                t_temporal_build += time.perf_counter() - _t_tb
 
                 phase_anchors_dev = phase_anchors.to(device)
                 phase_ccdc_at_anchors = extract_temporal_at_locations(phase_ccdc_data, phase_anchors_dev)
@@ -713,6 +716,7 @@ def process_batch(
 
                 # Accumulate dynamism for spread loss
                 if spread_config is not None:
+                    _t_tb = time.perf_counter()
                     dynamism_data = torch.from_numpy(
                         _get_feature(
                             'phase_dynamism_supervision', batch, i, sample, feature_builder
@@ -721,6 +725,7 @@ def process_batch(
                     cross_phase_dynamism.append(
                         extract_at_locations(dynamism_data, phase_anchors)
                     )
+                    t_temporal_build += time.perf_counter() - _t_tb
 
         # Combine per-patch losses (phase losses computed cross-batch after loop)
         _t0 = time.perf_counter()
@@ -1292,6 +1297,7 @@ def process_batch(
             'phase_pairs':      t_phase_pairs,
             'phase_forward':    t_phase_forward,
             'loss_compute':     t_loss_compute,
+            'temporal_build':   t_temporal_build,
             'pass2_total':      t_pass2,
             'backward':         t_backward,
             'cross_spectral':   t_cross_spectral,
