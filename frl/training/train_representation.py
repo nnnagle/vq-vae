@@ -236,6 +236,7 @@ def process_batch(
     t_phase_forward = 0.0
     t_loss_compute = 0.0
     t_backward = 0.0
+    t_pass2 = 0.0  # whole per-sample loss loop (superset of phase_forward+loss_compute)
 
     # FiLM data-dependent stats accumulators
     all_film_gamma = []
@@ -557,6 +558,7 @@ def process_batch(
         t_gpu_forward = time.perf_counter() - _t0
 
     # ── PASS 2: PER-SAMPLE LOSS COMPUTATION ──────────────────────────────
+    _t_pass2 = time.perf_counter()
     for out_idx, (i, prep) in enumerate(valid_prep):
         sample = prep['sample']
         z_full = z_batch[out_idx]    # [D, H, W]
@@ -750,6 +752,10 @@ def process_batch(
         n_valid += 1
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_pass2 = time.perf_counter() - _t_pass2
 
     # --- Global Spectral InfoNCE with Cross-Batch kNN ---
     # All anchors from all samples in the batch are pooled into a single
@@ -1264,6 +1270,7 @@ def process_batch(
             'phase_pairs':      t_phase_pairs,
             'phase_forward':    t_phase_forward,
             'loss_compute':     t_loss_compute,
+            'pass2_total':      t_pass2,
             'backward':         t_backward,
             'cross_spectral':   t_cross_spectral,
             'cross_phase':      t_cross_phase,
