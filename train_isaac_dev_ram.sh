@@ -5,7 +5,7 @@
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
 #SBATCH --exclude=clrv1101
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=500G
 #SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae-dev/runs/slurm-%j.log
@@ -16,7 +16,9 @@ conda activate /nfs/home/nnagle/.conda/envs/frl
 
 export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae-dev:$PYTHONPATH
 export OMP_NUM_THREADS=1
-export CUDA_LAUNCH_BLOCKING=1
+# CUDA_LAUNCH_BLOCKING left unset: this run benchmarks dataloader throughput /
+# epoch wall-time. Serialized launches would inflate the measured GPU-forward
+# time and hide dataloader/GPU overlap. (Fix #2 will add the other BLAS caps.)
 
 echo "Running on node: $(hostname)"
 echo "GPU info:"
@@ -37,5 +39,5 @@ python -m training.train_representation \
     --batch-size 16 \
     --num-workers ${NUM_WORKERS} \
     --epochs 5 \
-    --phase-start-epoch 0 \
+    --phase-start-epoch 1 \
     --overwrite
