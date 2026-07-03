@@ -226,6 +226,7 @@ def process_batch(
     all_phase_loss_stats = []
 
     # Timing accumulators (seconds)
+    t_sample_build = 0.0
     t_feature_build = 0.0
     t_anchor_sample = 0.0
     t_spatial_pairs = 0.0
@@ -234,6 +235,7 @@ def process_batch(
     t_phase_pairs = 0.0
     t_phase_forward = 0.0
     t_loss_compute = 0.0
+    t_backward = 0.0
 
     # FiLM data-dependent stats accumulators
     all_film_gamma = []
@@ -306,12 +308,14 @@ def process_batch(
 
     for i in range(batch_size):
         # Extract single sample from batch
+        _t0 = time.perf_counter()
         sample = {
             key: val[i].numpy() if isinstance(val, torch.Tensor) else val[i]
             for key, val in batch.items()
             if key != 'metadata' and not key.startswith('__spatial_')
         }
         sample['metadata'] = batch['metadata'][i]
+        t_sample_build += time.perf_counter() - _t0
 
         # Build features — encoder_data stays CPU for batched forward
         _t0 = time.perf_counter()
@@ -1101,6 +1105,7 @@ def process_batch(
             }
 
         # Backward
+        _t0 = time.perf_counter()
         mean_loss.backward()
 
         # Gradient clipping
@@ -1111,6 +1116,9 @@ def process_batch(
             )
 
         optimizer.step()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_backward += time.perf_counter() - _t0
         mean_loss = mean_loss.item()
         mean_spectral_loss = mean_spectral_loss.item()
         mean_spatial_loss = float(mean_spatial_loss)
@@ -1247,6 +1255,7 @@ def process_batch(
         'film_stats': film_stats,
         'type_leakage_stats': type_leakage_stats,
         'timing': {
+            'sample_build':     t_sample_build,
             'feature_build':    t_feature_build,
             'anchor_sample':    t_anchor_sample,
             'spatial_pairs':    t_spatial_pairs,
@@ -1255,6 +1264,7 @@ def process_batch(
             'phase_pairs':      t_phase_pairs,
             'phase_forward':    t_phase_forward,
             'loss_compute':     t_loss_compute,
+            'backward':         t_backward,
             'cross_spectral':   t_cross_spectral,
             'cross_phase':      t_cross_phase,
             'cross_phase_detail': cp_timing,
@@ -1322,6 +1332,10 @@ def train_epoch(
     t_step_total = 0.0
     n_batches_seen = 0
     _t_fetch = time.perf_counter()
+    # Per-component step-timing accumulated over steady-state batches (batch 0
+    # is skipped: it carries one-time warmup like the cuSOLVER SVD workspace).
+    tm_accum: dict[str, float] = {}
+    tm_n = 0
 
     for batch_idx, batch in enumerate(train_dataloader):
         if max_batches is not None and batch_idx >= max_batches:
@@ -1337,6 +1351,13 @@ def train_epoch(
         )
 
         scheduler.step()
+
+        if batch_idx >= 1 and stats.get('timing'):
+            for _k, _v in stats['timing'].items():
+                if _k == 'cross_phase_detail':
+                    continue
+                tm_accum[_k] = tm_accum.get(_k, 0.0) + _v
+            tm_n += 1
 
         if stats['n_valid'] > 0:
             total_loss += stats['loss']
@@ -1446,6 +1467,14 @@ def train_epoch(
             f"wait={t_wait_total:.1f}s ({_wpb:.2f}/batch, {_frac:.0f}% of loop) | "
             f"step={t_step_total:.1f}s ({_spb:.2f}/batch) over {n_batches_seen} batches"
         )
+        if tm_n > 0:
+            _parts = " ".join(
+                f"{_k}={tm_accum[_k] / tm_n:.2f}"
+                for _k in sorted(tm_accum, key=lambda k: -tm_accum[k])
+            )
+            logger.info(
+                f"Epoch {epoch+1} step breakdown (s/batch, avg over {tm_n} steady-state batches): {_parts}"
+            )
 
     if total_batches == 0:
         return {
