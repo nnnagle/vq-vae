@@ -119,6 +119,12 @@ def _dataloader_worker_init(worker_id: int) -> None:
     torch.set_num_threads(1)
 
 
+# Per-patch cap on gate values kept for the per-epoch distribution diagnostic.
+# The gate tensor is [D,H,W] (~4.2M values); a few thousand samples are plenty
+# for mean/std/quantile summaries and avoid a multi-second cat+quantile per batch.
+_GATE_STATS_SAMPLES = 4096
+
+
 def _get_feature(
     feature_name: str,
     batch: dict,
@@ -581,8 +587,17 @@ def process_batch(
         combined_mask_cpu     = prep['combined_mask'].cpu()
         spec_dist_at_anchors  = prep['spec_dist_at_anchors']  # already on device
 
-        # Collect gate values on CPU
-        all_gate_values.append(gate.detach().flatten().cpu())
+        # Collect gate values on CPU for the per-epoch distribution log.
+        # Subsample: gate is [D,H,W] ~4.2M values/patch, so keeping all of them
+        # meant a 16x4.2M=67M-element cat + randperm(67M) + quantile in
+        # compute_stats *every batch* (~3.5s/batch, and it only feeds a diagnostic
+        # that is frozen at 1.0 during the smoothing curriculum). A few thousand
+        # random values per patch give the same distribution summary for free.
+        _gate_flat = gate.detach().flatten()
+        if _gate_flat.numel() > _GATE_STATS_SAMPLES:
+            _gsub = torch.randint(_gate_flat.numel(), (_GATE_STATS_SAMPLES,), device=_gate_flat.device)
+            _gate_flat = _gate_flat[_gsub]
+        all_gate_values.append(_gate_flat.cpu())
 
         # Extract embeddings at anchor locations
         z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
