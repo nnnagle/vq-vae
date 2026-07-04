@@ -9,6 +9,8 @@
 #SBATCH --mem=180G
 #SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=nnagle@utk.edu
 
 module purge
 source /sw/isaac/applications/anaconda3/2024.06/rhel8_cascadelake_binary/anaconda3-2024.06/etc/profile.d/conda.sh

@@ -9,6 +9,8 @@
 #SBATCH --mem=180G
 #SBATCH --time=08:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=nnagle@utk.edu
 
 # Post-training pipeline: fit the phase linear probe, then run the phase
 # diagnostics (per-EVT recovery curves + EVT-stratified FiLM/variance).
