@@ -34,7 +34,7 @@ cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
 RUN=runs/frl_v0_exp031
 CKPT="$RUN/checkpoints/encoder_last.pt"          # or a specific best checkpoint: ls "$RUN/checkpoints/"
 PROBE="$RUN/checkpoints/phase_linear_probe.pt"   # from fit_phase_linear_probe.py
-EVT_MAP=../data/LF2024_EVT.csv                    # LANDFIRE crosswalk (VALUE/EVT_NAME); adjust to its ISAAC path
+EVT_MAP=/lustre/isaac24/scratch/nnagle/vq-vae/data/LF2024_EVT.csv   # LANDFIRE crosswalk (VALUE/EVT_NAME)
 # -----------------------------------------------------------------------------
 
 # PYTHONPATH=. so `import data...` / `import training...` resolve from the frl/ cwd.
