@@ -61,6 +61,7 @@ from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
 from data.loaders.transforms import inverse_transform
 from models import RepresentationModel
+from utils.sampling import ReservoirSampler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -746,6 +747,16 @@ def _invert_to_original_scale(
 # Evaluation
 # ---------------------------------------------------------------------------
 
+# Spearman ρ² is a rank correlation, so it needs values in memory (unlike
+# R²/MSE, which stream via accumulators). Accumulating all ~900M observations
+# OOMs, so keep a bounded uniform sample per channel in a ReservoirSampler.
+# ReservoirSampler.add() is per-item, so we feed it a *vectorized* per-batch
+# subsample rather than the full batch. ρ² over a ~1M-point sample ≈ the full
+# value.
+_SPEARMAN_RESERVOIR_CAP = 2_000_000   # rows kept per channel for ρ²
+_SPEARMAN_PER_BATCH = 8192            # rows sampled from each batch before add()
+
+
 def evaluate_phase_probe(
     loader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -803,11 +814,13 @@ def evaluate_phase_probe(
     sum_y_orig = torch.zeros(C, dtype=torch.float64)
     sum_y2_orig = torch.zeros(C, dtype=torch.float64)
 
-    # Collect per-channel predictions/targets for Spearman ρ²
-    all_preds_norm = [[] for _ in range(C)]
-    all_targets_norm = [[] for _ in range(C)]
-    all_preds_orig = [[] for _ in range(C)]
-    all_targets_orig = [[] for _ in range(C)]
+    # Bounded reservoir per channel for Spearman ρ². Each row is a paired quad
+    # [pred_norm, target_norm, pred_orig, target_orig] so predictions stay
+    # aligned with their targets across both spaces.
+    spearman_res = [
+        ReservoirSampler(capacity=_SPEARMAN_RESERVOIR_CAP, dim=4, seed=c)
+        for c in range(C)
+    ]
 
     n_obs = 0
 
@@ -866,10 +879,6 @@ def evaluate_phase_probe(
             sum_y += Y_norm.sum(dim=0)
             sum_y2 += (Y_norm * Y_norm).sum(dim=0)
 
-            for c_idx in range(C):
-                all_preds_norm[c_idx].append(P_norm[:, c_idx].float())
-                all_targets_norm[c_idx].append(Y_norm[:, c_idx].float())
-
             # --- Original-space accumulators ---
             P_orig = _invert_to_original_scale(
                 P_norm, inv_whitening, means, transform_specs,
@@ -889,9 +898,19 @@ def evaluate_phase_probe(
             sum_y_orig += Y_orig.sum(dim=0)
             sum_y2_orig += (Y_orig * Y_orig).sum(dim=0)
 
+            # Reservoir-sample paired rows for ρ² (both spaces). Vectorized
+            # per-batch subsample keeps the per-item reservoir add() cheap.
+            _N = P_norm.shape[0]
+            if _N > _SPEARMAN_PER_BATCH:
+                _idx = torch.randint(0, _N, (_SPEARMAN_PER_BATCH,))
+            else:
+                _idx = torch.arange(_N)
             for c_idx in range(C):
-                all_preds_orig[c_idx].append(P_orig[:, c_idx].float())
-                all_targets_orig[c_idx].append(Y_orig[:, c_idx].float())
+                quad = torch.stack([
+                    P_norm[_idx, c_idx], Y_norm[_idx, c_idx],
+                    P_orig[_idx, c_idx], Y_orig[_idx, c_idx],
+                ], dim=1).to(torch.float32).numpy()   # [K, 4]
+                spearman_res[c_idx].add(quad)
 
             # --- Temporal (within-pixel) decomposition ---
             # Split flattened predictions back into [T, N_b, C] per batch item.
@@ -944,12 +963,13 @@ def evaluate_phase_probe(
                 r2_per[ch] = 0.0
         return mse_per, r2_per
 
-    def _compute_spearman(all_p, all_t):
+    def _compute_spearman(reservoirs, col_pred: int, col_target: int):
         spearman_per: Dict[str, float] = {}
         for c_idx, ch in enumerate(target_channels):
-            if all_p[c_idx]:
-                p_cat = torch.cat(all_p[c_idx])
-                t_cat = torch.cat(all_t[c_idx])
+            buf = reservoirs[c_idx].get()   # [filled, 4]
+            if buf.shape[0] > 0:
+                p_cat = torch.from_numpy(buf[:, col_pred])
+                t_cat = torch.from_numpy(buf[:, col_target])
                 spearman_per[ch] = _spearman_rho2(p_cat, t_cat)
             else:
                 spearman_per[ch] = 0.0
@@ -959,8 +979,8 @@ def evaluate_phase_probe(
     mse_per_orig, r2_per_orig = _compute_mse_r2(
         sse_orig, sum_y_orig, sum_y2_orig, n_obs,
     )
-    spearman_per = _compute_spearman(all_preds_norm, all_targets_norm)
-    spearman_per_orig = _compute_spearman(all_preds_orig, all_targets_orig)
+    spearman_per = _compute_spearman(spearman_res, 0, 1)       # cols: pred_norm, target_norm
+    spearman_per_orig = _compute_spearman(spearman_res, 2, 3)  # cols: pred_orig, target_orig
 
     # --- Temporal (within-pixel) R² ---
     r2_temporal: Dict[str, float] = {}
