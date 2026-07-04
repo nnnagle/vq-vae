@@ -36,10 +36,33 @@ cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
 
 # --- edit these for the run you want to analyze ------------------------------
 RUN=runs/frl_v0_exp031
-CKPT="$RUN/checkpoints/encoder_last.pt"          # or a specific best checkpoint: ls "$RUN/checkpoints/"
-PROBE="$RUN/checkpoints/phase_linear_probe.pt"   # written by step 1, consumed by steps 2-3
+CKPT_DIR="$RUN/checkpoints"
+PROBE="$CKPT_DIR/phase_linear_probe.pt"          # written by step 1, consumed by steps 2-3
 EVT_MAP=/lustre/isaac24/scratch/nnagle/vq-vae/data/LF2024_EVT.csv   # LANDFIRE crosswalk (VALUE/EVT_NAME)
+# To pin a specific checkpoint instead of auto-detecting, set e.g.
+#   CKPT="$CKPT_DIR/encoder_best_1_epoch_386.pt"
 # -----------------------------------------------------------------------------
+
+# Auto-detect the best checkpoint: the rank-1 top-k file
+# (encoder_best_1_epoch_*.pt; rank 1 = best val/loss_total, renamed each time a
+# new best is saved). Falls back to encoder_last.pt if top-k tracking hasn't
+# started yet (checkpoint.monitor_start_epoch). Honors a pre-set CKPT.
+if [[ -z "${CKPT:-}" ]]; then
+  shopt -s nullglob
+  _best=( "$CKPT_DIR"/encoder_best_1_epoch_*.pt )
+  shopt -u nullglob
+  if (( ${#_best[@]} )); then
+    CKPT=$(ls -t "${_best[@]}" | head -n1)   # newest, in case a stale rank-1 lingers
+  else
+    CKPT="$CKPT_DIR/encoder_last.pt"
+    echo "No encoder_best_1_epoch_*.pt found; falling back to encoder_last.pt"
+  fi
+fi
+if [[ ! -f "$CKPT" ]]; then
+  echo "ERROR: no usable checkpoint found in $CKPT_DIR" >&2
+  exit 1
+fi
+echo "Using checkpoint: $CKPT"
 
 mkdir -p "$RUN/recovery_curves" "$RUN/evt_diagnostics"
 
