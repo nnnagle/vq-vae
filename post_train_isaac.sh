@@ -25,7 +25,7 @@ set -euo pipefail
 
 # Read the zarr from Lustre (no RAM/NVMe copy needed for a one-off analysis).
 export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
-# BLAS thread caps: the loaders use num_workers=46 from the config.
+# BLAS thread caps: keep each dataloader worker single-threaded.
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -41,6 +41,9 @@ RUN=runs/frl_v0_exp031
 CKPT_DIR="$RUN/checkpoints"
 PROBE="$CKPT_DIR/phase_linear_probe.pt"          # written by step 1, consumed by steps 2-3
 EVT_MAP=/lustre/isaac24/scratch/nnagle/vq-vae/data/LF2024_EVT.csv   # LANDFIRE crosswalk (VALUE/EVT_NAME)
+NWORKERS=16   # dataloader workers for these inference passes. The config's 46 is
+              # tuned for training throughput; that many here buffers ~46x2 full
+              # patches (+pin_memory) and blows host RAM. 16 keeps the GPU fed.
 # To pin a specific checkpoint instead of auto-detecting, set e.g.
 #   CKPT="$CKPT_DIR/encoder_best_1_epoch_386.pt"
 # -----------------------------------------------------------------------------
@@ -80,7 +83,8 @@ else
     --checkpoint "$CKPT" \
     --training   config/frl_training_v1.yaml \
     --bindings   config/frl_binding_v1.yaml \
-    --output     "$PROBE"
+    --output      "$PROBE" \
+    --num-workers "$NWORKERS"
 fi
 
 # --- 2. Per-EVT NBR recovery curves vs ysfc ----------------------------------
@@ -94,6 +98,7 @@ PYTHONPATH=. python training/phase_recovery_curves.py \
   --bindings   config/frl_binding_v1.yaml \
   --evt-map    "$EVT_MAP" \
   --output-dir "$RUN/recovery_curves" \
+  --num-workers "$NWORKERS" \
   || echo "WARN: phase_recovery_curves failed"
 
 # --- 3. EVT-stratified FiLM gamma + z_phase temporal variance ----------------
@@ -105,6 +110,7 @@ PYTHONPATH=. python training/phase_evt_diagnostics.py \
   --evt-map    "$EVT_MAP" \
   --probe      "$PROBE" \
   --output-dir "$RUN/evt_diagnostics" \
+  --num-workers "$NWORKERS" \
   || echo "WARN: phase_evt_diagnostics failed"
 
 echo "=== post-training pipeline complete ($(date)) ==="
