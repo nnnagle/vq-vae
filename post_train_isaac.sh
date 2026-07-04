@@ -69,12 +69,19 @@ echo "Using checkpoint: $CKPT"
 mkdir -p "$RUN/recovery_curves" "$RUN/evt_diagnostics"
 
 # --- 1. Fit the phase linear probe (critical: steps 2-3 need it) -------------
-echo "=== [1/3] fit_phase_linear_probe ($(date)) ==="
-PYTHONPATH=. python training/fit_phase_linear_probe.py \
-  --checkpoint "$CKPT" \
-  --training   config/frl_training_v1.yaml \
-  --bindings   config/frl_binding_v1.yaml \
-  --output     "$PROBE"
+# Skip the (expensive) fit if the probe already exists — makes the job
+# resumable. Set FORCE_REFIT=1 to refit (e.g. after changing CKPT, since the
+# probe is fit to a specific checkpoint).
+if [[ -f "$PROBE" && "${FORCE_REFIT:-0}" != "1" ]]; then
+  echo "=== [1/3] probe exists, skipping fit: $PROBE  (FORCE_REFIT=1 to refit) ==="
+else
+  echo "=== [1/3] fit_phase_linear_probe ($(date)) ==="
+  PYTHONPATH=. python training/fit_phase_linear_probe.py \
+    --checkpoint "$CKPT" \
+    --training   config/frl_training_v1.yaml \
+    --bindings   config/frl_binding_v1.yaml \
+    --output     "$PROBE"
+fi
 
 # --- 2. Per-EVT NBR recovery curves vs ysfc ----------------------------------
 # Diagnostics are guarded with `|| echo WARN` so a failure in one does not
