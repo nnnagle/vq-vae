@@ -88,8 +88,10 @@ else
 fi
 
 # --- 2. Per-EVT NBR recovery curves vs ysfc ----------------------------------
-# Diagnostics are guarded with `|| echo WARN` so a failure in one does not
-# block the other (set -e would otherwise abort the whole job).
+# Diagnostics are guarded so a failure in one doesn't block the other; we
+# record failures in `fail` and exit non-zero at the end, so a broken step
+# triggers SLURM's FAIL email instead of a misleading "completed" one.
+fail=0
 echo "=== [2/3] phase_recovery_curves ($(date)) ==="
 PYTHONPATH=. python training/phase_recovery_curves.py \
   --checkpoint "$CKPT" \
@@ -99,7 +101,7 @@ PYTHONPATH=. python training/phase_recovery_curves.py \
   --evt-map    "$EVT_MAP" \
   --output-dir "$RUN/recovery_curves" \
   --num-workers "$NWORKERS" \
-  || echo "WARN: phase_recovery_curves failed"
+  || { echo "WARN: phase_recovery_curves failed"; fail=1; }
 
 # --- 3. EVT-stratified FiLM gamma + z_phase temporal variance ----------------
 echo "=== [3/3] phase_evt_diagnostics ($(date)) ==="
@@ -111,6 +113,11 @@ PYTHONPATH=. python training/phase_evt_diagnostics.py \
   --probe      "$PROBE" \
   --output-dir "$RUN/evt_diagnostics" \
   --num-workers "$NWORKERS" \
-  || echo "WARN: phase_evt_diagnostics failed"
+  || { echo "WARN: phase_evt_diagnostics failed"; fail=1; }
 
-echo "=== post-training pipeline complete ($(date)) ==="
+if [[ $fail -eq 0 ]]; then
+  echo "=== post-training pipeline complete — all steps OK ($(date)) ==="
+else
+  echo "=== post-training pipeline complete — SOME STEPS FAILED ($(date)) ==="
+fi
+exit $fail
