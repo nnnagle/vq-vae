@@ -45,6 +45,7 @@ Notes
 import argparse
 import logging
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -387,6 +388,18 @@ class ProbePreprocessor:
         )
 
 
+def _subsample_idx(n: int, cap: int) -> torch.Tensor | None:
+    """Random row indices to cap observations per batch (None = keep all).
+
+    The probe is a ridge with only ~D=76 parameters, so it is vastly
+    overdetermined; a few million observations give a statistically identical
+    fit at a fraction of the CPU cost of streaming all ~900M.
+    """
+    if cap and n > cap:
+        return torch.randperm(n)[:cap]
+    return None
+
+
 def _compute_feature_statistics(
     train_loader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -397,6 +410,7 @@ def _compute_feature_statistics(
     design: str,
     interaction_pca_k: int,
     enc_feature_name: str = "type_encoder_input",
+    fit_max_obs_per_batch: int = 0,
 ) -> ProbePreprocessor:
     """Pass 1: compute per-column mean/std and interaction PCA components.
 
@@ -447,6 +461,11 @@ def _compute_feature_statistics(
 
             if zt_flat.shape[0] == 0:
                 continue
+
+            _idx = _subsample_idx(zt_flat.shape[0], fit_max_obs_per_batch)
+            if _idx is not None:
+                zt_flat = zt_flat[_idx]
+                zp_flat = zp_flat[_idx]
 
             X_raw = _build_design_matrix(zt_flat, zp_flat, design).to(
                 torch.float64,
@@ -562,6 +581,7 @@ def fit_phase_probe(
     design: str = "full",
     interaction_pca_k: int = 20,
     enc_feature_name: str = "type_encoder_input",
+    fit_max_obs_per_batch: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, ProbePreprocessor]:
     """Two-pass streaming ridge regression for the phase linear probe.
 
@@ -590,6 +610,7 @@ def fit_phase_probe(
     preprocessor = _compute_feature_statistics(
         train_loader, feature_builder, model, device,
         halo, max_batches_train, design, interaction_pca_k, enc_feature_name,
+        fit_max_obs_per_batch=fit_max_obs_per_batch,
     )
 
     # Pass 2 — ridge regression on preprocessed features
@@ -634,6 +655,12 @@ def fit_phase_probe(
 
             if zt_flat.shape[0] == 0:
                 continue
+
+            _idx = _subsample_idx(zt_flat.shape[0], fit_max_obs_per_batch)
+            if _idx is not None:
+                zt_flat = zt_flat[_idx]
+                zp_flat = zp_flat[_idx]
+                Y = Y[_idx]
 
             n_obs_total += zt_flat.shape[0]
 
@@ -1420,6 +1447,10 @@ def main():
     parser.add_argument("--ridge-lambda", type=float, default=1e-3, help="Ridge penalty λ (weights only)")
     parser.add_argument("--halo", type=int, default=16, help="Pixels from edge to exclude (default: 16)")
     parser.add_argument("--max-batches-train", type=int, default=0, help="Cap batches for fitting (0 = all)")
+    parser.add_argument("--fit-max-obs-per-batch", type=int, default=50_000,
+                        help="Random observations kept per batch for the fit (0 = all). The probe "
+                             "has only ~76 params, so a few M obs give a statistically identical "
+                             "fit far faster than streaming all ~900M.")
     parser.add_argument("--max-batches-eval", type=int, default=0, help="Cap batches for eval (0 = all)")
     parser.add_argument("--output", type=str, default=None, help="Optional path to save fitted probe (.pt)")
     parser.add_argument(
@@ -1439,6 +1470,16 @@ def main():
                         help="DataLoader workers (default: from training config; "
                              "lower for inference to bound host memory)")
     args = parser.parse_args()
+
+    # The heavy fit math (design build, interaction PCA projection, and the
+    # float64 normal-equation matmuls) runs on the CPU. The launch scripts set
+    # *_NUM_THREADS=1 to keep the many dataloader workers from oversubscribing,
+    # but that also throttles this main-process linear algebra to one core.
+    # Give the main process its cores back (workers stay single-threaded via the
+    # env vars, since they use numpy/OpenBLAS, not torch).
+    _n_threads = int(os.environ.get("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
+    torch.set_num_threads(max(1, _n_threads))
+    logger.info(f"Main-process torch CPU threads: {torch.get_num_threads()}")
 
     logger.info(f"Loading bindings config from {args.bindings}")
     bindings_config = DatasetBindingsParser(args.bindings).parse()
@@ -1519,6 +1560,7 @@ def main():
         design=args.design,
         interaction_pca_k=args.interaction_pca_k,
         enc_feature_name=enc_feature_name,
+        fit_max_obs_per_batch=args.fit_max_obs_per_batch,
     )
 
     # Evaluate
