@@ -177,6 +177,61 @@ class FeatureBuilder:
             is_temporal=is_temporal,
         )
 
+    def build_feature_at_locations(
+        self,
+        feature_name: str,
+        sample: Dict[str, Any],
+        coords,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build a feature at a small set of pixel locations only.
+
+        Equivalent to ``build_feature(...)`` followed by extracting the result at
+        ``coords`` — but at ~H*W/N less cost, because normalization and the
+        Mahalanobis whitening use fixed precomputed stats and are applied
+        pointwise per pixel, so they commute with pixel selection. We gather the
+        raw channels at ``coords`` into a fake ``[.., N, 1]`` spatial grid and run
+        the unchanged ``build_feature`` pipeline on ~N pixels instead of the full
+        256x256 grid.
+
+        Args:
+            feature_name: Name of the feature to build.
+            sample: Dataset sample dict (raw group arrays, full grid).
+            coords: ``[N, 2]`` (row, col) locations; torch tensor or ndarray.
+
+        Returns:
+            ``(data, mask)`` in the same layout the callers get from
+            ``extract_at_locations`` / ``extract_temporal_at_locations``:
+              - spatial feature:  data ``[N, C]``,     mask ``[N]``
+              - temporal feature: data ``[N, T, C]``,  mask ``[N, T]``
+        """
+        if hasattr(coords, 'cpu'):
+            coords = coords.cpu().numpy()
+        coords = np.asarray(coords)
+        rows = coords[:, 0].astype(np.intp)
+        cols = coords[:, 1].astype(np.intp)
+
+        # Gather every real dataset group at the N coords, reshaped to a fake
+        # [.., N, 1] spatial grid so build_feature's shape-agnostic pointwise
+        # logic runs unchanged. group arrays are [C, H, W] or [C, T, H, W].
+        reduced: Dict[str, Any] = {'metadata': sample['metadata']}
+        for group in sample['metadata']['channel_names']:
+            arr = sample[group]
+            if arr.ndim == 3:        # [C, H, W] -> [C, N, 1]
+                reduced[group] = arr[:, rows, cols][:, :, None]
+            elif arr.ndim == 4:      # [C, T, H, W] -> [C, T, N, 1]
+                reduced[group] = arr[:, :, rows, cols][:, :, :, None]
+            else:
+                reduced[group] = arr
+
+        fr = self.build_feature(feature_name, reduced)
+        data, mask = fr.data, fr.mask
+        if data.ndim == 3:           # spatial [C, N, 1] -> [N, C]
+            return data[:, :, 0].T.copy(), mask[:, 0].copy()
+        # temporal [C, T, N, 1] -> [N, T, C]
+        data = np.transpose(data[:, :, :, 0], (2, 1, 0)).copy()
+        mask = mask[:, :, 0].T.copy()  # [T, N] -> [N, T]
+        return data, mask
+
     def _extract_channels(
         self,
         sample: Dict[str, Any],

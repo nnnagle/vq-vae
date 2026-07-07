@@ -17,7 +17,6 @@ source /sw/isaac/applications/anaconda3/2024.06/rhel8_cascadelake_binary/anacond
 conda activate /nfs/home/nnagle/.conda/envs/frl
 
 export PYTHONPATH=/lustre/isaac24/scratch/nnagle/vq-vae:$PYTHONPATH
-export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -26,6 +25,13 @@ export NUMEXPR_NUM_THREADS=1
 echo "Running on node: $(hostname)"
 echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+echo "Extracting Zarr tar to RAM ($(date))..."
+tar xf /lustre/isaac24/scratch/nnagle/zarr.tar -C /dev/shm/
+cp /lustre/isaac24/scratch/nnagle/zarr/*.json /dev/shm/zarr/zarr/
+cp /lustre/isaac24/scratch/nnagle/zarr/*.csv /dev/shm/zarr/zarr/
+echo "Zarr extract complete ($(date))"
+export ZARR_ROOT=/dev/shm/zarr/zarr
 
 NUM_WORKERS=$(( SLURM_CPUS_PER_TASK - 2 ))
 

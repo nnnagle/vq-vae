@@ -18,6 +18,8 @@ from ..config.dataset_config import (
     ChannelConfig,
 )
 from ..config.dataset_bindings_parser import DatasetBindingsParser
+from ...sampling.anchor_sampling import sample_anchors_grid_plus_supplement
+from utils.spatial import spatial_knn_pairs, spatial_negative_pairs, extract_at_locations
 
 if TYPE_CHECKING:
     from ..builders.feature_builder import FeatureBuilder
@@ -54,6 +56,9 @@ class ForestDatasetV2(Dataset):
         debug_window: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None,
         feature_builder: Optional['FeatureBuilder'] = None,
         precompute_features: Optional[List[str]] = None,
+        spatial_pair_config: Optional[dict] = None,
+        training: bool = True,
+        split_block_size: Tuple[int, int] = (4, 4),
     ):
         """Initialize dataset.
 
@@ -72,12 +77,17 @@ class ForestDatasetV2(Dataset):
                 returned dict so they arrive already processed in process_batch().
             precompute_features: List of feature names to precompute. Has no
                 effect if feature_builder is None.
+            split_block_size: (rows, cols) of patches per checkerboard block for
+                train/val/test splitting. Matches block_grid in training yaml.
         """
         self.config = config
         self.split = split
         self.patch_size = patch_size
         self.feature_builder = feature_builder
         self.precompute_features: List[str] = precompute_features or []
+        self.spatial_pair_config = spatial_pair_config
+        self.training = training
+        self.split_block_size = split_block_size
 
         # Open zarr dataset
         self.zarr_path = Path(config.zarr.path)
@@ -263,7 +273,7 @@ class ForestDatasetV2(Dataset):
         # Deterministic split using checkerboard pattern
         # Based on global patch indices (not debug window indices)
         patch_size = self.patch_size
-        block_height, block_width = 4, 4  # 4x4 block grid
+        block_height, block_width = self.split_block_size
 
         split_codes = {'train': 1, 'val': 2, 'test': 3}
         target_code = split_codes[split]
@@ -344,6 +354,20 @@ class ForestDatasetV2(Dataset):
             result[group_name] = data
             metadata['channel_names'][group_name] = channel_names
 
+        # Pad partial boundary patches to patch_size so collate_fn sees uniform shapes.
+        # Padded pixels are zero (data) and will be excluded by the AOI/forest masks.
+        ph, pw = spatial_window.height, spatial_window.width
+        if ph < self.patch_size or pw < self.patch_size:
+            pad_h = self.patch_size - ph
+            pad_w = self.patch_size - pw
+            for group_name in list(result.keys()):
+                arr = result[group_name]
+                if not isinstance(arr, np.ndarray) or arr.ndim < 2:
+                    continue
+                # arr shape: [..., H, W] — pad the last two dims
+                pad_width = [(0, 0)] * (arr.ndim - 2) + [(0, pad_h), (0, pad_w)]
+                result[group_name] = np.pad(arr, pad_width, mode='constant', constant_values=0)
+
         result['metadata'] = metadata
 
         if self.feature_builder is not None and self.precompute_features:
@@ -351,6 +375,104 @@ class ForestDatasetV2(Dataset):
                 fr = self.feature_builder.build_feature(feat_name, result)
                 result[f'__feat_{feat_name}_data'] = fr.data
                 result[f'__feat_{feat_name}_mask'] = fr.mask
+
+        if self.spatial_pair_config is not None and self.feature_builder is not None:
+            spc = self.spatial_pair_config
+            enc_feat_name = spc.get('type_encoder_feature', 'type_encoder_input')
+            enc_data_key = f'__feat_{enc_feat_name}_data'
+            enc_mask_key = f'__feat_{enc_feat_name}_mask'
+            spec_data_key = '__feat_infonce_type_spectral_data'
+            spec_mask_key = '__feat_infonce_type_spectral_mask'
+
+            if enc_data_key in result and spec_data_key in result:
+                enc_mask = result[enc_mask_key]
+                spec_mask = result[spec_mask_key]
+
+                # Collapse channel dim if present ([C,H,W] → [H,W])
+                enc_mask_t = torch.from_numpy(enc_mask).bool()
+                if enc_mask_t.ndim == 3:
+                    enc_mask_t = enc_mask_t.all(dim=0)
+                spec_mask_t = torch.from_numpy(spec_mask).bool()
+                if spec_mask_t.ndim == 3:
+                    spec_mask_t = spec_mask_t.all(dim=0)
+                combined_mask = enc_mask_t & spec_mask_t
+
+                jitter_radius = spc.get('jitter_radius', 4) if self.training else 0
+                anchors = sample_anchors_grid_plus_supplement(
+                    combined_mask,
+                    stride=spc.get('stride', 16),
+                    border=spc.get('border', 16),
+                    jitter_radius=jitter_radius,
+                    supplement_n=spc.get('supplement_n', 104),
+                )
+
+                if anchors.shape[0] < 10:
+                    result['__spatial_valid'] = np.array(False)
+                else:
+                    pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
+                        anchors, combined_mask,
+                        k=spc.get('spatial_positive_k', 4),
+                        max_radius=int(spc.get('spatial_positive_max_dist', 8)),
+                    )
+                    neg_anchor_idx, neg_neighbor_coords = spatial_negative_pairs(
+                        anchors, combined_mask,
+                        min_distance=spc.get('spatial_negative_min_dist', 16.0),
+                        max_distance=spc.get('spatial_negative_max_dist', None),
+                        n_per_anchor=spc.get('spatial_negatives_per_anchor', 4),
+                    )
+
+                    all_coords = [anchors]
+                    if pos_neighbor_coords.numel() > 0:
+                        all_coords.append(pos_neighbor_coords)
+                    if neg_neighbor_coords.numel() > 0:
+                        all_coords.append(neg_neighbor_coords)
+                    all_coords_cat = torch.cat(all_coords, dim=0)
+                    unique_coords, inverse_indices = torch.unique(all_coords_cat, dim=0, return_inverse=True)
+
+                    n_anc = anchors.shape[0]
+                    anchor_to_unique = inverse_indices[:n_anc]
+                    n_pos = pos_neighbor_coords.shape[0] if pos_neighbor_coords.numel() > 0 else 0
+                    n_neg = neg_neighbor_coords.shape[0] if neg_neighbor_coords.numel() > 0 else 0
+
+                    spatial_pos_pairs = torch.zeros((0, 2), dtype=torch.long)
+                    spatial_neg_pairs = torch.zeros((0, 2), dtype=torch.long)
+
+                    if n_pos > 0:
+                        pos_nb_uniq = inverse_indices[n_anc:n_anc + n_pos]
+                        spatial_pos_pairs = torch.stack([anchor_to_unique[pos_anchor_idx], pos_nb_uniq], dim=1)
+
+                    if n_neg > 0:
+                        neg_nb_uniq = inverse_indices[n_anc + n_pos:]
+                        spatial_neg_pairs = torch.stack([anchor_to_unique[neg_anchor_idx], neg_nb_uniq], dim=1)
+
+                    spec_dist_t = torch.from_numpy(result[spec_data_key]).float()
+                    spec_dist_unique = extract_at_locations(spec_dist_t, unique_coords)
+                    spec_dist_at_anchors = extract_at_locations(spec_dist_t, anchors)
+
+                    tau = spc.get('spatial_spectral_tau', 1.0)
+                    min_w = spc.get('spatial_min_w', 0.05)
+
+                    pos_weights = torch.ones(max(n_pos, 1))
+                    neg_weights = torch.ones(max(n_neg, 1))
+
+                    if n_pos > 0:
+                        dpos = torch.norm(spec_dist_unique[spatial_pos_pairs[:, 0]] - spec_dist_unique[spatial_pos_pairs[:, 1]], dim=1)
+                        pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
+
+                    if n_neg > 0:
+                        dneg = torch.norm(spec_dist_unique[spatial_neg_pairs[:, 0]] - spec_dist_unique[spatial_neg_pairs[:, 1]], dim=1)
+                        neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
+
+                    result['__spatial_valid'] = np.array(True)
+                    result['__spatial_anchors'] = anchors.numpy()
+                    result['__spatial_unique_coords'] = unique_coords.numpy()
+                    result['__spatial_pos_pairs'] = spatial_pos_pairs.numpy()
+                    result['__spatial_neg_pairs'] = spatial_neg_pairs.numpy()
+                    result['__spatial_pos_weights'] = pos_weights.numpy()
+                    result['__spatial_neg_weights'] = neg_weights.numpy()
+                    result['__spatial_spec_dist_at_anchors'] = spec_dist_at_anchors.numpy()
+            else:
+                result['__spatial_valid'] = np.array(False)
 
         return result
 
@@ -632,16 +754,41 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(batch) == 0:
         return {}
 
-    # Get all group names (excluding metadata)
-    group_names = [k for k in batch[0].keys() if k != 'metadata']
+    # Get all group names (excluding metadata). Use the union across samples
+    # because optional __spatial_* keys are only present on valid samples.
+    group_names = []
+    for sample in batch:
+        for k in sample.keys():
+            if k != 'metadata' and k not in group_names:
+                group_names.append(k)
 
     result = {}
 
     # Stack each group
     for group_name in group_names:
-        arrays = [sample[group_name] for sample in batch]
-        stacked = np.stack(arrays, axis=0)  # [B, C, H, W] or [B, C, T, H, W]
-        result[group_name] = torch.from_numpy(stacked)
+        if group_name.startswith('__spatial_'):
+            # Variable-length per sample — collect as list of tensors.
+            # Samples that did not produce spatial pairs use None as a placeholder.
+            collected = []
+            for sample in batch:
+                a = sample.get(group_name, None)
+                if a is None:
+                    collected.append(None)
+                elif isinstance(a, np.ndarray):
+                    collected.append(torch.from_numpy(a))
+                else:
+                    collected.append(torch.tensor(a))
+            result[group_name] = collected
+        else:
+            arrays = [sample[group_name] for sample in batch]
+            shapes = [a.shape if hasattr(a, 'shape') else np.asarray(a).shape for a in arrays]
+            if len(set(shapes)) > 1:
+                raise ValueError(
+                    f"collate_fn: key '{group_name}' has mismatched shapes across samples: "
+                    + ", ".join(str(s) for s in shapes)
+                )
+            stacked = np.stack(arrays, axis=0)  # [B, C, H, W] or [B, C, T, H, W]
+            result[group_name] = torch.from_numpy(stacked)
 
     # Collect metadata
     result['metadata'] = [sample['metadata'] for sample in batch]

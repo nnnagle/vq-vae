@@ -170,7 +170,7 @@ The phase loss uses **curriculum learning** — it is **zero for the first N epo
 
 **When adding a new `_get_feature()` call in `process_batch()`, also add the feature name to the `precompute_features` list in `setup_training()`.** Omitting it won't break training, but the feature will be built in the main process and the speedup won't apply.
 
-**Only add spatial (2D) features to `precompute_features` — not temporal ones.** Temporal features like `ysfc` and `phase_encoder_feature` are `[C, T, H, W]` arrays. Stacking them across a full batch (e.g. 32 samples × 22 channels × 15 years × 256×256 pixels) causes OOM. These features are only accessed at ~100–200 anchor pixel locations in `process_batch()`, so the full-grid whitening is wasted work anyway; leave them on the fallback path.
+**Only add spatial (2D) features to `precompute_features` — not temporal ones.** Temporal features like `ysfc` and `phase_encoder_feature` are `[C, T, H, W]` arrays; stacking them across a full batch (e.g. 32 samples × 22 channels × 15 years × 256×256 pixels) causes OOM, so they are not precomputed in workers. They are consumed only at ~100–300 anchor pixel locations in `process_batch()`, so instead of building the full grid and extracting, build them **only at the anchor coords** via `FeatureBuilder.build_feature_at_locations(name, sample, coords)`. Because normalization and Mahalanobis whitening use fixed precomputed stats and are pointwise per pixel, this is bit-identical to the full-grid build (verified, `max|diff|=0`) at ~H·W/N (~230×) less cost. Building these features full-grid per sample in the main process used to be the dominant training-step cost — see Performance.
 
 ### Optimizer Setup
 
@@ -308,6 +308,44 @@ The codebase is flexible with no rigid extension conventions.
 model = RepresentationModel.from_checkpoint(path, freeze=True)
 head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 ```
+
+---
+
+## Training Infrastructure (ISAAC HPC)
+
+### Data
+
+The Zarr archive lives on Lustre at `/lustre/isaac24/scratch/nnagle/zarr/` (284 GB, 3.9M files). A pre-built tar archive is at `/lustre/isaac24/scratch/nnagle/zarr.tar` (269 GB) for fast job-start extraction — use this instead of `cp -r`, which takes 90+ minutes due to Lustre metadata overhead on 3.9M files.
+
+**Tar extraction path quirk:** The tar was built from inside the `zarr/` directory, so it extracts with a double-nested path: `zarr/zarr/va_vae_dataset.zarr/`. After extracting to `/dev/shm/` or `/tmp/`, set `ZARR_ROOT` to `/dev/shm/zarr/zarr` (not `/dev/shm/zarr`).
+
+**Sidecar files:** Stats files (`*.json`, `*.csv`) are not inside the tar — they are copied separately from Lustre after extraction.
+
+### Training Scripts
+
+| Script | Partition | Data location | Purpose |
+|--------|-----------|---------------|---------|
+| `train_isaac.sh` | campus-gpu-large | Lustre (slow) | Original production script |
+| `train_isaac_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Production, auto-resumes |
+| `train_isaac_dev.sh` | campus-gpu-bigmem | `/tmp` (NVMe) | Dev, `--overwrite` |
+| `train_isaac_dev_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Dev, `--overwrite` |
+
+### Performance
+
+The per-batch training step was reduced ~6× (~6.85s → ~1.1s/batch, phase-active dev config), taking epoch time from >10 min (earlier sessions) to ~1 min. The bottleneck was **not** the dataloader or the Mahalanobis whitening, as previously assumed — moving data to RAM never helped because the pipeline was never I/O-bound. The real costs were in the main process and were found with `--profile` (per-epoch dataloader wait/step split + per-component step breakdown; off by default so it adds no `cuda.synchronize()` overhead):
+
+1. **A per-batch gate-value diagnostic** — `compute_stats(all_gate_values)` ran `cat` + `randperm` + `quantile` over ~67M values *every batch* (~3.5s), feeding a log line printed only once per epoch (and frozen at 1.0 during the smoothing curriculum). Fixed by subsampling to `_GATE_STATS_SAMPLES` (4096) values per patch.
+2. **Per-sample full-grid temporal feature builds** — `phase_ccdc`/`phase_dynamism_supervision` were normalized over the entire `[C,T,256,256]` grid per sample, then read at only ~280 anchor pixels (~2.4s/batch when the phase curriculum is active). Fixed with `build_feature_at_locations()` (anchor-only; see Feature Precomputation note).
+
+Supporting changes: `OPENBLAS/MKL/NUMEXPR/OMP_NUM_THREADS=1` in the launch scripts (uncapped BLAS thread pools oversubscribe cores across many workers), a per-worker `torch.set_num_threads(1)` `worker_init_fn`, and `train_isaac_ram.sh` now uses `--cpus-per-task=48` (→46 workers, matching `num_workers` in the config). At ~1.1s/batch, the old 4 workers would re-starve the loop. Re-measure after any change with `--profile` (already enabled in the `*_dev*.sh` scripts); production scripts run without it.
+
+### SLURM Notes
+
+- **Authorized QOS:** `campus`, `campus-bigmem`, `campus-gpu`, `long`, `long-bigmem`, `long-gpu`
+- **Exclude `clrv1101`** — smaller GPU, included in scripts via `--exclude=clrv1101`
+- **campus-gpu-bigmem** (`ilpa1209`, A40 + NVMe `/tmp`) — frequently in maintenance; use campus-gpu-large as fallback
+- **campus-gpu-large** nodes have 770 GB RAM — enough to hold the zarr in `/dev/shm` with `--mem=500G`
+- **ai-tenn** partition (H100s) requires a separate allocation not currently held
 
 ---
 

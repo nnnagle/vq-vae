@@ -117,9 +117,11 @@ class HardwareConfig:
     device: str = "cuda"
     gpu_ids: List[int] = field(default_factory=lambda: [0])
     num_workers: int = 4
+    prefetch_factor: int = 2
+    enc_chunk_size: int = 4
     pin_memory: bool = True
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
-    
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'HardwareConfig':
         mixed_precision = MixedPrecisionConfig.from_dict(d.get('mixed_precision', {}))
@@ -127,6 +129,8 @@ class HardwareConfig:
             device=d.get('device', 'cuda'),
             gpu_ids=d.get('gpu_ids', [0]),
             num_workers=d.get('num_workers', 4),
+            prefetch_factor=d.get('prefetch_factor', 2),
+            enc_chunk_size=d.get('enc_chunk_size', 4),
             pin_memory=d.get('pin_memory', True),
             mixed_precision=mixed_precision
         )

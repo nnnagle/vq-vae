@@ -9,7 +9,7 @@ config:
   model_path: config/frl_repr_model_v1.yaml
   
 run:
-  experiment_name: frl_v0_exp030
+  experiment_name: frl_v0_exp031
   run_root: runs
   ckpt_dir: checkpoints
   log_dir: logs
@@ -25,8 +25,10 @@ run:
 hardware:
   device: cuda
   gpu_ids: [0]
-  num_workers: 4
+  num_workers: 46
+  prefetch_factor: 2
   pin_memory: true
+  enc_chunk_size: 16
   
   mixed_precision:
     enabled: true
@@ -37,7 +39,7 @@ training:
     num_epochs: 400
     mode: number # full/frac/number - use every batch or take a sample
     sample_frac: .1
-    sample_number: 500
+    sample_number: 512
     batch_size: 12
   
   gradient_clip:

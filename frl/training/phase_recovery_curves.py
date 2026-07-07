@@ -450,6 +450,9 @@ def main() -> None:
                         help="Cap batches processed (0 = all; for quick tests)")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers (default: from training config; "
+                             "lower for inference to bound host memory)")
     args = parser.parse_args()
 
     # --- Config ---
@@ -498,7 +501,7 @@ def main() -> None:
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=training_config.hardware.num_workers,
+        num_workers=(args.num_workers if args.num_workers is not None else training_config.hardware.num_workers),
         pin_memory=training_config.hardware.pin_memory,
         collate_fn=collate_fn,
     )

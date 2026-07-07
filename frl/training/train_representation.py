@@ -23,6 +23,7 @@ import argparse
 import logging
 import math
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -103,6 +104,31 @@ def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
     v1 = a[pairs[:, 0]]
     v2 = a[pairs[:, 1]]
     return torch.norm(v1 - v2, dim=1)
+
+
+def _dataloader_worker_init(worker_id: int) -> None:
+    """Pin each DataLoader worker to a single compute thread.
+
+    With many workers, an uncapped BLAS/torch thread pool per worker
+    oversubscribes the cores: each worker's numpy/whitening ops slow down, so
+    adding workers stops improving (or even worsens) throughput. The launch
+    scripts set OPENBLAS/MKL/NUMEXPR/OMP _NUM_THREADS=1 before import so the
+    forked workers inherit single-threaded BLAS; this additionally pins torch
+    intra-op threads inside each worker.
+    """
+    torch.set_num_threads(1)
+
+
+# Per-patch cap on gate values kept for the per-epoch distribution diagnostic.
+# The gate tensor is [D,H,W] (~4.2M values); a few thousand samples are plenty
+# for mean/std/quantile summaries and avoid a multi-second cat+quantile per batch.
+_GATE_STATS_SAMPLES = 4096
+
+# Profiling master switch (set from --profile). When False (default/production)
+# every timing cuda.synchronize() and the per-epoch perf logging are skipped, so
+# training runs with no profiling overhead. --profile turns on the dataloader
+# wait/step split and the per-component step breakdown.
+_PROFILE = False
 
 
 def _get_feature(
@@ -211,6 +237,21 @@ def process_batch(
     all_phase_pair_stats = []
     all_phase_loss_stats = []
 
+    # Timing accumulators (seconds)
+    t_sample_build = 0.0
+    t_feature_build = 0.0
+    t_anchor_sample = 0.0
+    t_spatial_pairs = 0.0
+    t_spectral_weights = 0.0
+    t_gpu_forward = 0.0
+    t_phase_pairs = 0.0
+    t_phase_forward = 0.0
+    t_loss_compute = 0.0
+    t_backward = 0.0
+    t_pass1 = 0.0  # whole per-sample feature/pair build loop (superset of feature_build etc.)
+    t_pass2 = 0.0  # whole per-sample loss loop (superset of phase_forward+loss_compute)
+    t_temporal_build = 0.0  # subset of pass2: per-sample full-grid phase_ccdc/dynamism builds
+
     # FiLM data-dependent stats accumulators
     all_film_gamma = []
     all_film_beta = []
@@ -273,261 +314,206 @@ def process_batch(
 
     batch_size = len(batch['metadata'])
 
+    # ------------------------------------------------------------------
+    # PASS 1 — CPU prep for every sample (anchors, spatial pairs, weights).
+    # The encoder forward is deferred to a single batched call below so the
+    # B sequential [1,C,H,W] forwards become one [B,C,H,W] forward.
+    # ------------------------------------------------------------------
+    prep_list: list[dict | None] = [None] * batch_size
+
+    _t_pass1 = time.perf_counter()
     for i in range(batch_size):
         # Extract single sample from batch
+        _t0 = time.perf_counter()
         sample = {
             key: val[i].numpy() if isinstance(val, torch.Tensor) else val[i]
             for key, val in batch.items()
-            if key != 'metadata'
+            if key != 'metadata' and not key.startswith('__spatial_')
         }
         sample['metadata'] = batch['metadata'][i]
+        t_sample_build += time.perf_counter() - _t0
 
-        # Build features
+        # Build features — encoder_data stays CPU for batched forward
+        _t0 = time.perf_counter()
         encoder_feature = _get_feature(config['type_encoder_feature'], batch, i, sample, feature_builder)
         spec_dist_feature = _get_feature('infonce_type_spectral', batch, i, sample, feature_builder)
 
-        # Convert to tensors
-        encoder_data = torch.from_numpy(encoder_feature.data).float().to(device)
+        # Convert to tensors. encoder_data stays on CPU until the batched forward.
+        encoder_data = torch.from_numpy(encoder_feature.data).float()
         spec_dist_data = torch.from_numpy(spec_dist_feature.data).float().to(device)
         mask = torch.from_numpy(encoder_feature.mask).to(device)
 
         # Also apply distance feature mask
         spec_dist_mask = torch.from_numpy(spec_dist_feature.mask).to(device)
         combined_mask = mask & spec_dist_mask
+        t_feature_build += time.perf_counter() - _t0
 
-        # Sample anchor locations — use EVT-stratified sampler when available so
-        # rare forest types are represented for cross-batch kNN pair construction.
-        if evt_sampler is not None:
-            anchors = evt_sampler(combined_mask, training=training, sample=sample)
-        else:
-            anchors = sample_anchors_grid_plus_supplement(
-                combined_mask,
-                stride=config.get('stride', 16),
-                border=config.get('border', 16),
-                jitter_radius=jitter_radius,
-                supplement_n=config.get('supplement_n', 104),
+        # Worker-precomputed spatial pairs are only valid when anchors were drawn
+        # by the same grid+supplement sampler. With an EVT-stratified sampler the
+        # anchors differ, so fall back to recomputing on the main process.
+        _spatial_precomputed = (
+            evt_sampler is None
+            and '__spatial_valid' in batch
+            and batch['__spatial_valid'][i] is not None
+            and bool(batch['__spatial_valid'][i].item())
+        )
+        if not _spatial_precomputed and i == 0 and epoch == 0:
+            logger.info(
+                f"[precompute diag sample 0] "
+                f"evt_sampler={'set' if evt_sampler is not None else 'None'}, "
+                f"'__spatial_valid' in batch={('__spatial_valid' in batch)}, "
+                f"val[0]={batch['__spatial_valid'][0] if '__spatial_valid' in batch else 'MISSING'}"
             )
 
-        if anchors.shape[0] < 10:
-            continue
+        _t0 = time.perf_counter()
+        if _spatial_precomputed:
+            anchors          = batch['__spatial_anchors'][i].to(device)
+            unique_coords    = batch['__spatial_unique_coords'][i].to(device)
+            spatial_pos_pairs = batch['__spatial_pos_pairs'][i].to(device)
+            spatial_neg_pairs = batch['__spatial_neg_pairs'][i].to(device)
+            pos_weights      = batch['__spatial_pos_weights'][i].to(device)
+            neg_weights      = batch['__spatial_neg_weights'][i].to(device)
+            spec_dist_at_anchors = batch['__spatial_spec_dist_at_anchors'][i].to(device)
 
-        # Extract features at anchor locations
-        # spec_dist_at_anchors collected here; pairs built cross-batch after loop.
-        encoder_at_anchors = extract_at_locations(encoder_data, anchors)
-        spec_dist_at_anchors = extract_at_locations(spec_dist_data, anchors)
+            n_pos = spatial_pos_pairs.shape[0]
+            n_neg = spatial_neg_pairs.shape[0]
+            if n_pos > 0:
+                all_pos_weights.append(pos_weights.detach().cpu())
+            if n_neg > 0:
+                all_neg_weights.append(neg_weights.detach().cpu())
+            t_anchor_sample += time.perf_counter() - _t0
+        else:
+            # Sample anchor locations — use EVT-stratified sampler when available so
+            # rare forest types are represented for cross-batch kNN pair construction.
+            if evt_sampler is not None:
+                anchors = evt_sampler(combined_mask, training=training, sample=sample)
+            else:
+                anchors = sample_anchors_grid_plus_supplement(
+                    combined_mask,
+                    stride=config.get('stride', 16),
+                    border=config.get('border', 16),
+                    jitter_radius=jitter_radius,
+                    supplement_n=config.get('supplement_n', 104),
+                )
+            t_anchor_sample += time.perf_counter() - _t0
 
-        # --- Spatial InfoNCE Loss ---
-        # Use efficient offset-based pair generation (no large distance matrix)
+            if anchors.shape[0] < 10:
+                continue
 
-        # Get spatial positive pairs (k nearest neighbors within max_radius)
-        pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
-            anchors,
-            combined_mask,
-            k=config.get('spatial_positive_k', 4),
-            max_radius=int(config.get('spatial_positive_max_dist', 8)),
-        )
+            # Extract features at anchor locations
+            # spec_dist_at_anchors collected here; pairs built cross-batch after loop.
+            spec_dist_at_anchors = extract_at_locations(spec_dist_data, anchors)
 
-        # Get spatial negative pairs (random sample from distance range)
-        neg_anchor_idx, neg_neighbor_coords = spatial_negative_pairs(
-            anchors,
-            combined_mask,
-            min_distance=config.get('spatial_negative_min_dist', 16.0),
-            max_distance=config.get('spatial_negative_max_dist', None),
-            n_per_anchor=config.get('spatial_negatives_per_anchor', 4),
-        )
+            # --- Spatial InfoNCE pair generation (offset-based, no full matrix) ---
+            _t0 = time.perf_counter()
+            pos_anchor_idx, pos_neighbor_coords = spatial_knn_pairs(
+                anchors,
+                combined_mask,
+                k=config.get('spatial_positive_k', 4),
+                max_radius=int(config.get('spatial_positive_max_dist', 8)),
+            )
 
-        # Build coordinate-to-index mapping for spatial loss
-        # Collect all unique coordinates: anchors + positive neighbors + negative neighbors
-        all_spatial_coords = [anchors]
-        if pos_neighbor_coords.numel() > 0:
-            all_spatial_coords.append(pos_neighbor_coords)
-        if neg_neighbor_coords.numel() > 0:
-            all_spatial_coords.append(neg_neighbor_coords)
+            neg_anchor_idx, neg_neighbor_coords = spatial_negative_pairs(
+                anchors,
+                combined_mask,
+                min_distance=config.get('spatial_negative_min_dist', 16.0),
+                max_distance=config.get('spatial_negative_max_dist', None),
+                n_per_anchor=config.get('spatial_negatives_per_anchor', 4),
+            )
 
-        all_spatial_coords = torch.cat(all_spatial_coords, dim=0)  # [N+M+K, 2]
+            # Build coordinate-to-index mapping for spatial loss
+            all_spatial_coords = [anchors]
+            if pos_neighbor_coords.numel() > 0:
+                all_spatial_coords.append(pos_neighbor_coords)
+            if neg_neighbor_coords.numel() > 0:
+                all_spatial_coords.append(neg_neighbor_coords)
 
-        # Get unique coordinates
-        unique_coords, inverse_indices = torch.unique(
-            all_spatial_coords, dim=0, return_inverse=True
-        )
+            all_spatial_coords = torch.cat(all_spatial_coords, dim=0)  # [N+M+K, 2]
 
-        # Map anchor indices (first N in all_spatial_coords)
-        n_anchors_spatial = anchors.shape[0]
-        anchor_to_unique = inverse_indices[:n_anchors_spatial]
+            unique_coords, inverse_indices = torch.unique(
+                all_spatial_coords, dim=0, return_inverse=True
+            )
 
-        # Convert pairs to index into unique_coords
-        n_pos = pos_neighbor_coords.shape[0] if pos_neighbor_coords.numel() > 0 else 0
-        n_neg = neg_neighbor_coords.shape[0] if neg_neighbor_coords.numel() > 0 else 0
+            n_anchors_spatial = anchors.shape[0]
+            anchor_to_unique = inverse_indices[:n_anchors_spatial]
 
-        spatial_pos_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
-        spatial_neg_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+            n_pos = pos_neighbor_coords.shape[0] if pos_neighbor_coords.numel() > 0 else 0
+            n_neg = neg_neighbor_coords.shape[0] if neg_neighbor_coords.numel() > 0 else 0
 
-        if n_pos > 0:
-            # pos_neighbor indices in all_spatial_coords: [n_anchors_spatial : n_anchors_spatial + n_pos]
-            pos_neighbor_unique = inverse_indices[n_anchors_spatial : n_anchors_spatial + n_pos]
-            pos_anchor_unique = anchor_to_unique[pos_anchor_idx]
-            spatial_pos_pairs = torch.stack([pos_anchor_unique, pos_neighbor_unique], dim=1)
+            spatial_pos_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+            spatial_neg_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
 
-        if n_neg > 0:
-            # neg_neighbor indices in all_spatial_coords: [n_anchors_spatial + n_pos : ]
-            neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
-            neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
-            spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
-            
-        # --- Spectral weighting for spatial pairs ---
-        # Use spec_dist_data (Mahalanobis space) to measure spectral similarity at spatial coordinates
-        spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
+            if n_pos > 0:
+                pos_neighbor_unique = inverse_indices[n_anchors_spatial : n_anchors_spatial + n_pos]
+                pos_anchor_unique = anchor_to_unique[pos_anchor_idx]
+                spatial_pos_pairs = torch.stack([pos_anchor_unique, pos_neighbor_unique], dim=1)
 
-        tau = config.get("spatial_spectral_tau", 1.0)  # tune this
-        min_w = config.get("spatial_min_w", 0.05)
-        
-        pos_weights = None
-        neg_weights = None
-        
-        if spatial_pos_pairs.numel() > 0:
-            dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
-            pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
-            all_pos_weights.append(pos_weights.detach().cpu())
-            all_pos_spec_dists.append(dpos.detach().cpu())
-            dpos_cpu = dpos.detach().cpu()
-            if epoch == 0:
-                for t in _TAU_SWEEP:
-                    tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
+            if n_neg > 0:
+                neg_neighbor_unique = inverse_indices[n_anchors_spatial + n_pos :]
+                neg_anchor_unique = anchor_to_unique[neg_anchor_idx]
+                spatial_neg_pairs = torch.stack([neg_anchor_unique, neg_neighbor_unique], dim=1)
+            t_spatial_pairs += time.perf_counter() - _t0
 
-        if spatial_neg_pairs.numel() > 0:
-            dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
-            neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
-            all_neg_weights.append(neg_weights.detach().cpu())
-            all_neg_spec_dists.append(dneg.detach().cpu())
-            dneg_cpu = dneg.detach().cpu()
-            if epoch == 0:
-                for t in _TAU_SWEEP:
-                    tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
+            # --- Spectral weighting for spatial pairs ---
+            _t0 = time.perf_counter()
+            spec_dist_unique = extract_at_locations(spec_dist_data, unique_coords)  # [Nuniq, Cdist]
+
+            tau = config.get("spatial_spectral_tau", 1.0)
+            min_w = config.get("spatial_min_w", 0.05)
+
+            pos_weights = None
+            neg_weights = None
+
+            if spatial_pos_pairs.numel() > 0:
+                dpos = pair_l2(spec_dist_unique, spatial_pos_pairs)
+                pos_weights = torch.exp(-dpos / tau).clamp(min=min_w, max=1.0)
+                all_pos_weights.append(pos_weights.detach().cpu())
+                all_pos_spec_dists.append(dpos.detach().cpu())
+                dpos_cpu = dpos.detach().cpu()
+                if epoch == 0:
+                    for t in _TAU_SWEEP:
+                        tau_sweep_pos[t].append(torch.exp(-dpos_cpu / t).clamp(min=min_w, max=1.0))
+
+            if spatial_neg_pairs.numel() > 0:
+                dneg = pair_l2(spec_dist_unique, spatial_neg_pairs)
+                neg_weights = (1.0 - torch.exp(-dneg / tau)).clamp(min=min_w, max=1.0)
+                all_neg_weights.append(neg_weights.detach().cpu())
+                all_neg_spec_dists.append(dneg.detach().cpu())
+                dneg_cpu = dneg.detach().cpu()
+                if epoch == 0:
+                    for t in _TAU_SWEEP:
+                        tau_sweep_neg[t].append((1.0 - torch.exp(-dneg_cpu / t)).clamp(min=min_w, max=1.0))
+            t_spectral_weights += time.perf_counter() - _t0
 
         # Check if we have valid pairs for losses
         # Spectral: pairs are built cross-batch after the loop; just need valid anchors.
         has_spectral = spec_dist_at_anchors.shape[0] > 0
-        has_spatial = spatial_pos_pairs.shape[0] > 0 and spatial_neg_pairs.shape[0] > 0
+        has_spatial  = spatial_pos_pairs.shape[0] > 0 and spatial_neg_pairs.shape[0] > 0
 
         if not has_spectral and not has_spatial:
-            continue
+            continue  # prep_list[i] stays None
 
-        # Encode the full patch for efficient embedding extraction
-        # encoder_data: [C, H, W] -> [1, C, H, W] -> model -> [1, D, H, W]
-        encoder_input_full = encoder_data.unsqueeze(0)
-        z_full, gate = model(encoder_input_full, return_gate=True)  # [1, D, H, W] each
-        z_full = z_full.squeeze(0)  # [D, H, W]
-        gate = gate.squeeze(0)  # [D, H, W]
-
-        # Collect gate values on CPU — kept for the full epoch, avoid GPU fragmentation
-        all_gate_values.append(gate.detach().flatten().cpu())
-
-        # Extract embeddings at anchor locations for spectral loss
-        z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
-
-        # EVT soft neighbourhood loss
-        evt_loss_val = torch.tensor(0.0, device=device)
-        if evt_metric is not None:
-            evt_feature = _get_feature('evt_class', batch, i, sample, feature_builder)
-            evt_data = torch.from_numpy(evt_feature.data).long().to(device)  # [1, H, W]
-            if evt_sampler is not None:
-                # Draw EVT-stratified anchors (oversamples rare EVT codes)
-                evt_anchors = evt_sampler(combined_mask, training=training, sample=sample)
-                z_evt = extract_at_locations(z_full, evt_anchors)   # [M, D]
-                evt_at_anchors = extract_at_locations(evt_data, evt_anchors).squeeze(1)  # [M]
-            else:
-                z_evt = z_anchors
-                evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)  # [N]
-            evt_raw, evt_diag = evt_soft_neighborhood_loss(
-                z_evt,
-                evt_at_anchors,
-                evt_metric,
-                tau_ref=config.get('evt_tau_ref', 0.5),
-                tau_learned=config.get('evt_tau_learned', 0.5),
-            )
-            all_evt_diag.append(evt_diag)
-            evt_loss_val = config.get('evt_weight', 0.0) * evt_raw
-
-        # Compute variance-covariance regularization on type embeddings
-        vcr_loss_val = torch.tensor(0.0, device=device)
-        if config.get('vcr_enabled', False) and z_anchors.shape[0] >= 2:
-            vcr_total, _, _ = variance_covariance_loss(
-                z_anchors,
-                variance_weight=config.get('vcr_variance_weight', 1.0),
-                covariance_weight=config.get('vcr_covariance_weight', 1.0),
-                variance_target=config.get('vcr_variance_target', 1.0),
-            )
-            vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
-
-        # cross_patch_z_anchors is populated after the NaN check below so that
-        # samples with non-finite loss don't corrupt the cross-batch spectral computation.
-
-        # Compute spatial loss
-        spatial_loss_val = torch.tensor(0.0, device=device)
-        if has_spatial:
-            # Extract embeddings at unique coordinate locations
-            z_spatial = extract_at_locations(z_full, unique_coords)  # [num_unique, D]
-
-            spatial_loss_val = contrastive_loss(
-                z_spatial,
-                spatial_pos_pairs,
-                spatial_neg_pairs,
-                pos_weights=pos_weights,
-                neg_weights=neg_weights,
-                temperature=config.get('spatial_temperature', 0.07),
-                similarity='l2',
-            )
-
-            # Collect L2 similarities for diagnostics — matches what the loss computes:
-            # sim(a, b) = -||a - b||^2 / D
-            with torch.no_grad():
-                p_a, p_b = z_spatial[spatial_pos_pairs[:, 0]], z_spatial[spatial_pos_pairs[:, 1]]
-                n_a, n_b = z_spatial[spatial_neg_pairs[:, 0]], z_spatial[spatial_neg_pairs[:, 1]]
-                D = z_spatial.shape[1]
-                all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / D).cpu())
-                all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / D).cpu())
-
-        # --- Phase pair construction + loss ---
-        # Pair construction (kNN + overlap) runs on CPU.
-        # Loss computation runs on GPU (requires gradients through phase encoder).
-        phase_loss_val = torch.tensor(0.0, device=device)
-        phase_spread_loss_val = torch.tensor(0.0, device=device)
-        phase_recovery_disc_loss_val = torch.tensor(0.0, device=device)
-        phase_vcr_loss_val = torch.tensor(0.0, device=device)
+        # --- Phase pair construction (CPU; TCN forward deferred to Pass 2) ---
+        phase_prep = None
         if phase_sampler is not None and phase_config is not None:
-            # Build ysfc feature via FeatureBuilder (returns numpy)
             ysfc_feature = _get_feature('ysfc', batch, i, sample, feature_builder)
             ysfc_data = torch.from_numpy(ysfc_feature.data).float()
-            # ysfc_data: [1, T, H, W] (single channel, CPU)
-
-            # Combined mask for phase anchors: encoder mask AND ysfc validity
             ysfc_mask = torch.from_numpy(ysfc_feature.mask)
-            # ysfc_mask is [T, H, W] for temporal; collapse to [H, W]
             if ysfc_mask.ndim == 3:
-                ysfc_spatial_mask = ysfc_mask.all(dim=0)  # valid across all timesteps
+                ysfc_spatial_mask = ysfc_mask.all(dim=0)
             else:
                 ysfc_spatial_mask = ysfc_mask
             phase_mask = combined_mask.cpu() & ysfc_spatial_mask
 
-            # Sample separate anchors for phase loss
-            phase_anchors = phase_sampler(
-                phase_mask, training=training, sample=sample
-            )
+            phase_anchors = phase_sampler(phase_mask, training=training, sample=sample)
 
             if phase_anchors.shape[0] >= 10:
-                # Extract spectral features at phase anchors (CPU for kNN + weights)
                 phase_spec_at_anchors = extract_at_locations(
-                    spec_dist_data.cpu(), phase_anchors
-                )  # [N_phase, C]
-
-                # Extract ysfc time series at phase anchors
-                # ysfc_data is [1, T, H, W]; squeeze channel dim for extraction
+                    spec_dist_data.cpu(), phase_anchors)
                 ysfc_at_anchors = extract_temporal_at_locations(
-                    ysfc_data, phase_anchors
-                )  # [N_phase, T, 1]
-                ysfc_at_anchors = ysfc_at_anchors.squeeze(-1)  # [N_phase, T]
+                    ysfc_data, phase_anchors).squeeze(-1)
 
-                # Build pairs (all CPU)
+                _t0 = time.perf_counter()
                 phase_pairs, phase_weights, phase_stats = build_phase_pairs(
                     spec_features=phase_spec_at_anchors,
                     ysfc=ysfc_at_anchors,
@@ -538,83 +524,222 @@ def process_batch(
                     sigma=phase_config.get('sigma', 5.0),
                     self_pair_weight=phase_config.get('self_pair_weight', 1.0),
                 )
-
+                t_phase_pairs += time.perf_counter() - _t0
                 all_phase_pair_stats.append(phase_stats)
 
-                # --- Accumulate phase data for cross-batch loss (computed after loop) ---
-                if phase_pairs.shape[0] > 0 and curriculum_w > 0.0:
-                        # Build phase_ccdc temporal feature
-                        phase_ccdc_feature = _get_feature(config['phase_encoder_feature'], batch, i, sample, feature_builder)
-                        phase_ccdc_data = torch.from_numpy(
-                            phase_ccdc_feature.data
-                        ).float().to(device)
+                phase_prep = {
+                    'phase_anchors':   phase_anchors,
+                    'phase_pairs':     phase_pairs,
+                    'phase_weights':   phase_weights,
+                    'ysfc_at_anchors': ysfc_at_anchors,
+                }
 
-                        # Extract only anchor pixel time-series (avoid dense TCN)
-                        phase_anchors_dev = phase_anchors.to(device)
-                        phase_ccdc_at_anchors = extract_temporal_at_locations(
-                            phase_ccdc_data, phase_anchors_dev
-                        )  # [N_phase, T, C]
-                        spec_at_phase_anchors = phase_ccdc_at_anchors  # [N_phase, T, C]
-                        phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(0, 2, 1)  # [N_phase, C, T]
+        prep_list[i] = {
+            'sample':             sample,
+            'encoder_data':       encoder_data,        # CPU [C,H,W]
+            'spec_dist_data':     spec_dist_data,      # GPU tensor
+            'combined_mask':      combined_mask,       # GPU bool
+            'anchors':            anchors,
+            'unique_coords':      unique_coords,
+            'spatial_pos_pairs':  spatial_pos_pairs,
+            'spatial_neg_pairs':  spatial_neg_pairs,
+            'pos_weights':        pos_weights,
+            'neg_weights':        neg_weights,
+            'spec_dist_at_anchors': spec_dist_at_anchors,
+            'has_spectral':       has_spectral,
+            'has_spatial':        has_spatial,
+            'phase_prep':         phase_prep,
+        }
 
-                        # Extract z_type at anchor locations (stop-grad)
-                        z_type_at_anchors = extract_at_locations(
-                            z_full.detach(), phase_anchors_dev
-                        )  # [N_phase, z_type_dim]
+    if _PROFILE and device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_pass1 = time.perf_counter() - _t_pass1
 
-                        # Run phase encoder on anchor pixels only
-                        z_phase_at_anchors, film_gamma, film_beta, pre_film_h = model.forward_phase_at_locations(
-                            phase_ccdc_at_anchors, z_type_at_anchors,
-                            return_film=True,
-                            return_pre_film=True,
-                        )  # [N_phase, T, 12], [N_phase, 12], [N_phase, 12], [N_phase, 12, T]
-                        all_film_gamma.append(film_gamma.detach())
-                        all_film_beta.append(film_beta.detach())
-                        all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())
-                        all_z_type_at_phase.append(z_type_at_anchors.detach())
-                        cross_phase_h.append(pre_film_h.mean(dim=2))  # [N, zp] non-detached for Frobenius
+    # ── BATCHED GPU FORWARD ───────────────────────────────────────────────
+    # Chunk the forward pass to bound peak GPU memory. Each chunk processes
+    # enc_chunk_size samples; results are concatenated before Pass 2.
+    valid_prep = [(idx, p) for idx, p in enumerate(prep_list) if p is not None]
+    z_batch = gate_batch = None
+    enc_chunk_size = config.get('enc_chunk_size', 4)
+    if valid_prep:
+        _t0 = time.perf_counter()
+        z_chunks, gate_chunks = [], []
+        all_enc_inputs = [p['encoder_data'] for _, p in valid_prep]
+        for chunk_start in range(0, len(all_enc_inputs), enc_chunk_size):
+            chunk = torch.stack(all_enc_inputs[chunk_start:chunk_start + enc_chunk_size]).to(device)
+            z_c, gate_c = model(chunk, return_gate=True)
+            z_chunks.append(z_c)
+            gate_chunks.append(gate_c)
+        z_batch = torch.cat(z_chunks, dim=0)
+        gate_batch = torch.cat(gate_chunks, dim=0)
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_gpu_forward = time.perf_counter() - _t0
 
-                        # Phase VCR: prevent dimensional collapse in z_phase (per-patch)
-                        phase_vcr_cfg = config.get('phase_vcr_config')
-                        if phase_vcr_cfg is not None:
-                            z_phase_flat = z_phase_at_anchors.reshape(-1, 12)
-                            pvcr_total, _, _ = variance_covariance_loss(
-                                z_phase_flat,
-                                variance_weight=phase_vcr_cfg.get('variance_weight', 1.0),
-                                covariance_weight=phase_vcr_cfg.get('covariance_weight', 1.0),
-                                variance_target=phase_vcr_cfg.get('variance_target', 1.0),
-                            )
-                            phase_vcr_loss_val = phase_vcr_cfg.get('weight', 0.1) * curriculum_w * pvcr_total
-                        else:
-                            phase_vcr_loss_val = torch.tensor(0.0, device=device)
+    # ── PASS 2: PER-SAMPLE LOSS COMPUTATION ──────────────────────────────
+    _t_pass2 = time.perf_counter()
+    for out_idx, (i, prep) in enumerate(valid_prep):
+        sample = prep['sample']
+        z_full = z_batch[out_idx]    # [D, H, W]
+        gate   = gate_batch[out_idx]  # [D, H, W]
 
-                        # Accumulate for cross-batch phase loss (offset pair indices)
-                        ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
-                        cross_phase_z_type.append(z_type_at_anchors)
-                        cross_phase_spec.append(spec_at_phase_anchors)
-                        cross_phase_embeddings.append(z_phase_at_anchors)
-                        cross_phase_ysfc.append(ysfc_at_anchors_gpu)
-                        cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
-                        cross_phase_weights.append(phase_weights.to(device))
-                        cross_phase_n_offset += z_type_at_anchors.shape[0]
+        anchors           = prep['anchors'].to(device)
+        unique_coords     = prep['unique_coords'].to(device)
+        spatial_pos_pairs = prep['spatial_pos_pairs'].to(device)
+        spatial_neg_pairs = prep['spatial_neg_pairs'].to(device)
+        pos_weights       = prep['pos_weights'].to(device) if prep['pos_weights'] is not None else None
+        neg_weights       = prep['neg_weights'].to(device) if prep['neg_weights'] is not None else None
+        has_spatial           = prep['has_spatial']
+        has_spectral          = prep['has_spectral']
+        combined_mask_cpu     = prep['combined_mask'].cpu()
+        spec_dist_at_anchors  = prep['spec_dist_at_anchors']  # already on device
 
-                        # Accumulate dynamism for spread loss
-                        if spread_config is not None:
-                            dynamism_data = torch.from_numpy(
-                                _get_feature(
-                                    'phase_dynamism_supervision', batch, i, sample, feature_builder
-                                ).data
-                            ).float()
-                            cross_phase_dynamism.append(
-                                extract_at_locations(dynamism_data, phase_anchors)
-                            )
+        # Collect gate values on CPU for the per-epoch distribution log.
+        # Subsample: gate is [D,H,W] ~4.2M values/patch, so keeping all of them
+        # meant a 16x4.2M=67M-element cat + randperm(67M) + quantile in
+        # compute_stats *every batch* (~3.5s/batch, and it only feeds a diagnostic
+        # that is frozen at 1.0 during the smoothing curriculum). A few thousand
+        # random values per patch give the same distribution summary for free.
+        _gate_flat = gate.detach().flatten()
+        if _gate_flat.numel() > _GATE_STATS_SAMPLES:
+            _gsub = torch.randint(_gate_flat.numel(), (_GATE_STATS_SAMPLES,), device=_gate_flat.device)
+            _gate_flat = _gate_flat[_gsub]
+        all_gate_values.append(_gate_flat.cpu())
+
+        # Extract embeddings at anchor locations
+        z_anchors = extract_at_locations(z_full, anchors)  # [num_anchors, D]
+
+        # EVT soft neighbourhood loss
+        evt_loss_val = torch.tensor(0.0, device=device)
+        if evt_metric is not None:
+            evt_feature = _get_feature('evt_class', batch, i, sample, feature_builder)
+            evt_data = torch.from_numpy(evt_feature.data).long().to(device)
+            if evt_sampler is not None:
+                evt_anchors = evt_sampler(combined_mask_cpu.to(device), training=training, sample=sample)
+                z_evt = extract_at_locations(z_full, evt_anchors)
+                evt_at_anchors = extract_at_locations(evt_data, evt_anchors).squeeze(1)
+            else:
+                z_evt = z_anchors
+                evt_at_anchors = extract_at_locations(evt_data, anchors).squeeze(1)
+            evt_raw, evt_diag = evt_soft_neighborhood_loss(
+                z_evt, evt_at_anchors, evt_metric,
+                tau_ref=config.get('evt_tau_ref', 0.5),
+                tau_learned=config.get('evt_tau_learned', 0.5),
+            )
+            all_evt_diag.append(evt_diag)
+            evt_loss_val = config.get('evt_weight', 0.0) * evt_raw
+
+        # Variance-covariance regularization
+        vcr_loss_val = torch.tensor(0.0, device=device)
+        if config.get('vcr_enabled', False) and z_anchors.shape[0] >= 2:
+            vcr_total, _, _ = variance_covariance_loss(
+                z_anchors,
+                variance_weight=config.get('vcr_variance_weight', 1.0),
+                covariance_weight=config.get('vcr_covariance_weight', 1.0),
+                variance_target=config.get('vcr_variance_target', 1.0),
+            )
+            vcr_loss_val = config.get('vcr_weight', 0.1) * vcr_total
+
+        # Spatial loss
+        spatial_loss_val = torch.tensor(0.0, device=device)
+        if has_spatial:
+            z_spatial = extract_at_locations(z_full, unique_coords)
+            spatial_loss_val = contrastive_loss(
+                z_spatial, spatial_pos_pairs, spatial_neg_pairs,
+                pos_weights=pos_weights, neg_weights=neg_weights,
+                temperature=config.get('spatial_temperature', 0.07),
+                similarity='l2',
+            )
+            with torch.no_grad():
+                p_a, p_b = z_spatial[spatial_pos_pairs[:, 0]], z_spatial[spatial_pos_pairs[:, 1]]
+                n_a, n_b = z_spatial[spatial_neg_pairs[:, 0]], z_spatial[spatial_neg_pairs[:, 1]]
+                D = z_spatial.shape[1]
+                all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / D).cpu())
+                all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / D).cpu())
+
+        # Phase encoder (needs z_type from z_full — must stay in Pass 2)
+        phase_loss_val = torch.tensor(0.0, device=device)
+        phase_spread_loss_val = torch.tensor(0.0, device=device)
+        phase_recovery_disc_loss_val = torch.tensor(0.0, device=device)
+        phase_vcr_loss_val = torch.tensor(0.0, device=device)
+        pp = prep['phase_prep']
+        if pp is not None and pp['phase_pairs'].shape[0] > 0 and curriculum_w > 0.0:
+                phase_anchors  = pp['phase_anchors']
+                phase_pairs    = pp['phase_pairs']
+                phase_weights  = pp['phase_weights']
+                ysfc_at_anchors = pp['ysfc_at_anchors']
+
+                _t_tb = time.perf_counter()
+                # Build the temporal feature only at the anchor pixels. Since
+                # normalization/whitening use fixed stats and are pointwise, this
+                # is identical to building the full grid then extracting — at
+                # ~H*W/N less cost. (This is the bulk of the old Pass 2 time.)
+                phase_ccdc_np, _ = feature_builder.build_feature_at_locations(
+                    config['phase_encoder_feature'], sample, phase_anchors)   # [N, T, C]
+                t_temporal_build += time.perf_counter() - _t_tb
+
+                phase_ccdc_at_anchors = torch.from_numpy(phase_ccdc_np).float().to(device)  # [N, T, C]
+                phase_anchors_dev = phase_anchors.to(device)
+                spec_at_phase_anchors = phase_ccdc_at_anchors
+                phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(0, 2, 1)  # [N, C, T]
+
+                z_type_at_anchors = extract_at_locations(z_full.detach(), phase_anchors_dev)
+
+                _t0 = time.perf_counter()
+                z_phase_at_anchors, film_gamma, film_beta, pre_film_h = model.forward_phase_at_locations(
+                    phase_ccdc_at_anchors, z_type_at_anchors,
+                    return_film=True,
+                    return_pre_film=True,
+                )
+                if _PROFILE and device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t_phase_forward += time.perf_counter() - _t0
+                all_film_gamma.append(film_gamma.detach())
+                all_film_beta.append(film_beta.detach())
+                all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())
+                all_z_type_at_phase.append(z_type_at_anchors.detach())
+                cross_phase_h.append(pre_film_h.mean(dim=2))
+
+                # Phase VCR: prevent dimensional collapse in z_phase (per-patch)
+                phase_vcr_cfg = config.get('phase_vcr_config')
+                if phase_vcr_cfg is not None:
+                    z_phase_flat = z_phase_at_anchors.reshape(-1, 12)
+                    pvcr_total, _, _ = variance_covariance_loss(
+                        z_phase_flat,
+                        variance_weight=phase_vcr_cfg.get('variance_weight', 1.0),
+                        covariance_weight=phase_vcr_cfg.get('covariance_weight', 1.0),
+                        variance_target=phase_vcr_cfg.get('variance_target', 1.0),
+                    )
+                    phase_vcr_loss_val = phase_vcr_cfg.get('weight', 0.1) * curriculum_w * pvcr_total
+                else:
+                    phase_vcr_loss_val = torch.tensor(0.0, device=device)
+
+                # Accumulate for cross-batch phase loss (offset pair indices)
+                ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
+                cross_phase_z_type.append(z_type_at_anchors)
+                cross_phase_spec.append(spec_at_phase_anchors)
+                cross_phase_embeddings.append(z_phase_at_anchors)
+                cross_phase_ysfc.append(ysfc_at_anchors_gpu)
+                cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
+                cross_phase_weights.append(phase_weights.to(device))
+                cross_phase_n_offset += z_type_at_anchors.shape[0]
+
+                # Accumulate dynamism for spread loss
+                if spread_config is not None:
+                    _t_tb = time.perf_counter()
+                    dynamism_np, _ = feature_builder.build_feature_at_locations(
+                        'phase_dynamism_supervision', sample, phase_anchors)   # [N, C]
+                    cross_phase_dynamism.append(torch.from_numpy(dynamism_np).float())
+                    t_temporal_build += time.perf_counter() - _t_tb
 
         # Combine per-patch losses (phase losses computed cross-batch after loop)
+        _t0 = time.perf_counter()
         spatial_weight = config.get('spatial_loss_weight', 1.0)
         loss = (spatial_weight * spatial_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
                 + evt_loss_val)
+        t_loss_compute += time.perf_counter() - _t0
 
         # Skip if loss is NaN or Inf (numerical instability)
         if not torch.isfinite(loss):
@@ -659,6 +784,10 @@ def process_batch(
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
+    if _PROFILE and device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_pass2 = time.perf_counter() - _t_pass2
+
     # --- Global Spectral InfoNCE with Cross-Batch kNN ---
     # All anchors from all samples in the batch are pooled into a single
     # N_total × N_total spectral distance matrix. Positive pairs are mutual
@@ -670,7 +799,10 @@ def process_batch(
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     spectral_neg_tau_sweep: dict = {}
+    t_cross_spectral = 0.0
+    t_cross_phase = 0.0
     if cross_patch_z_anchors:
+        _t0 = time.perf_counter()
         n_patches = len(cross_patch_z_anchors)
         z_all = torch.cat(cross_patch_z_anchors, dim=0)        # [N_total, D]
         spec_all = torch.cat(cross_patch_spec_features, dim=0) # [N_total, C]
@@ -743,6 +875,9 @@ def process_batch(
         )
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_cross_spectral = time.perf_counter() - _t0
 
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
                    'q25': 0.0, 'q50': 0.0, 'q75': 0.0}
@@ -824,22 +959,34 @@ def process_batch(
     cross_phase_rd_val = torch.tensor(0.0, device=device)
     cross_phase_leakage_val = torch.tensor(0.0, device=device)
 
+    cp_timing: dict[str, float] = {}
     if cross_phase_embeddings:
+        _t0 = time.perf_counter()
         Z = torch.cat(cross_phase_z_type, dim=0)           # [N_total, z_type_dim]
         spec_all = torch.cat(cross_phase_spec, dim=0)      # [N_total, T, C]
         z_phase_all = torch.cat(cross_phase_embeddings, dim=0)  # [N_total, T, 12]
         ysfc_all = torch.cat(cross_phase_ysfc, dim=0)      # [N_total, T]
         pairs_all = torch.cat(cross_phase_pairs, dim=0)    # [B_total, 2]
         weights_all = torch.cat(cross_phase_weights, dim=0)  # [B_total]
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['cat'] = time.perf_counter() - _t0
 
-        # SVD rank reduction on z_type for stable kNN type baseline
+        # Randomized PCA rank reduction on z_type for stable kNN type baseline.
+        # torch.pca_lowrank uses a randomized algorithm and computes only K components,
+        # making it much faster than full SVD (torch.linalg.svd) for tall narrow matrices.
+        _t0 = time.perf_counter()
         K = phase_config.get('phase_type_proj_rank', 8)
         k_nbrs = phase_config.get('phase_type_proj_neighbors', 20)
         Z_c = Z - Z.mean(0, keepdim=True)
-        U, _, _ = torch.linalg.svd(Z_c, full_matrices=False)
-        Z_k = U[:, :K]  # [N_total, K]
+        U, _, _ = torch.pca_lowrank(Z_c, q=K, center=False)
+        Z_k = U  # [N_total, K] — pca_lowrank already returns the top-K left vectors
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['svd'] = time.perf_counter() - _t0
 
         # kNN in reduced type space → type-local spectral baseline per pixel
+        _t0 = time.perf_counter()
         sim = Z_k @ Z_k.T  # [N_total, N_total]
         sim.fill_diagonal_(float('-inf'))
         k_nbrs = min(k_nbrs, sim.shape[0] - 1)
@@ -847,8 +994,12 @@ def process_batch(
         S_mean = spec_all.mean(dim=1)                # [N_total, C] — pixel mean over T
         S_hat = S_mean[topk_idx].mean(dim=1)         # [N_total, C] — type-local baseline
         spec_demeaned = spec_all - S_hat.unsqueeze(1)  # [N_total, T, C]
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['knn'] = time.perf_counter() - _t0
 
         # Build aligned distance batch once; reuse for neighborhood + spread losses
+        _t0 = time.perf_counter()
         phase_batch = build_phase_neighborhood_batch(
             spectral_features=spec_demeaned,
             phase_embeddings=z_phase_all,
@@ -856,8 +1007,12 @@ def process_batch(
             pair_indices=pairs_all,
             min_overlap=phase_config.get('min_overlap', 3),
         )
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['build_batch'] = time.perf_counter() - _t0
 
         # Phase neighborhood loss
+        _t0 = time.perf_counter()
         p_loss, p_loss_stats = phase_neighborhood_loss(
             spectral_features=spec_demeaned,
             phase_embeddings=z_phase_all,
@@ -872,12 +1027,17 @@ def process_batch(
             cross_pixel_weight=phase_config.get('cross_pixel_weight', 1.0),
             _batch=phase_batch,
         )
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        cp_timing['neighborhood_loss'] = time.perf_counter() - _t0
         cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * p_loss
         p_loss_stats['curriculum_w'] = curriculum_w
         all_phase_loss_stats.append(p_loss_stats)
 
         # Phase spread ranking loss
+        cp_timing['spread_loss'] = 0.0
         if spread_config is not None and spread_w > 0.0 and cross_phase_dynamism:
+            _t0 = time.perf_counter()
             dynamism_all = torch.cat(cross_phase_dynamism, dim=0)  # [N_total, C]
             dynamism_ref = dynamism_all.mean(dim=1).to(device)     # [N_total]
             valid_mask = phase_batch['valid_pair_mask']
@@ -893,9 +1053,14 @@ def process_batch(
                     delta=spread_config['delta'],
                 )
                 cross_phase_spread_val = spread_config['weight'] * spread_w * spread_loss
+            if _PROFILE and device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['spread_loss'] = time.perf_counter() - _t0
 
         # Phase recovery discrimination loss
+        cp_timing['rd_loss'] = 0.0
         if recovery_disc_config is not None and rd_w > 0.0:
+            _t0 = time.perf_counter()
             rd_loss, _ = phase_recovery_discrimination_loss(
                 z_phase=z_phase_all,
                 ysfc=ysfc_all,
@@ -904,12 +1069,17 @@ def process_batch(
                 high_ysfc_min=recovery_disc_config['high_ysfc_min'],
             )
             cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
+            if _PROFILE and device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['rd_loss'] = time.perf_counter() - _t0
 
         # Frobenius cross-covariance loss: penalise type info in pre-FiLM h.
         # Stop-gradient on Z so only the TCN (h) receives gradient.
         # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
+        cp_timing['leakage'] = 0.0
         leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
         if leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
+            _t0 = time.perf_counter()
             h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
             Z_sg = Z.detach()                                 # stop-grad on z_type
             h_c = h_all - h_all.mean(0, keepdim=True)
@@ -918,6 +1088,11 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
+            if _PROFILE and device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['leakage'] = time.perf_counter() - _t0
+
+        t_cross_phase = sum(cp_timing.values())
 
     # Average losses over valid samples in batch.
     # Spectral and phase losses are computed globally (cross-patch) and added on top.
@@ -967,6 +1142,7 @@ def process_batch(
             }
 
         # Backward
+        _t0 = time.perf_counter()
         mean_loss.backward()
 
         # Gradient clipping
@@ -977,6 +1153,9 @@ def process_batch(
             )
 
         optimizer.step()
+        if _PROFILE and device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_backward += time.perf_counter() - _t0
         mean_loss = mean_loss.item()
         mean_spectral_loss = mean_spectral_loss.item()
         mean_spatial_loss = float(mean_spatial_loss)
@@ -1112,6 +1291,24 @@ def process_batch(
         'phase_loss_stats': aggregate_phase_loss_stats(all_phase_loss_stats),
         'film_stats': film_stats,
         'type_leakage_stats': type_leakage_stats,
+        'timing': {
+            'pass1_total':      t_pass1,
+            'sample_build':     t_sample_build,
+            'feature_build':    t_feature_build,
+            'anchor_sample':    t_anchor_sample,
+            'spatial_pairs':    t_spatial_pairs,
+            'spectral_weights': t_spectral_weights,
+            'gpu_forward':      t_gpu_forward,
+            'phase_pairs':      t_phase_pairs,
+            'phase_forward':    t_phase_forward,
+            'loss_compute':     t_loss_compute,
+            'temporal_build':   t_temporal_build,
+            'pass2_total':      t_pass2,
+            'backward':         t_backward,
+            'cross_spectral':   t_cross_spectral,
+            'cross_phase':      t_cross_phase,
+            'cross_phase_detail': cp_timing,
+        },
     }
 
 
@@ -1132,6 +1329,7 @@ def train_epoch(
     recovery_disc_config: dict | None = None,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
+    max_batches: int | None = None,
 ) -> dict:
     """Run training on entire training set for one epoch."""
     total_loss = 0.0
@@ -1166,7 +1364,25 @@ def train_epoch(
     last_phase_loss_stats = None
     last_film_stats = None
 
+    # Split time spent blocked on the dataloader (next(...) starvation) from
+    # time spent in the training step. The per-batch timers inside
+    # process_batch only cover step compute, so this is the only place the
+    # dataloader wait is visible.
+    t_wait_total = 0.0
+    t_step_total = 0.0
+    t_step_steady = 0.0  # step time over steady-state batches only (batch_idx >= 1)
+    n_batches_seen = 0
+    _t_fetch = time.perf_counter()
+    # Per-component step-timing accumulated over steady-state batches (batch 0
+    # is skipped: it carries one-time warmup like the cuSOLVER SVD workspace).
+    tm_accum: dict[str, float] = {}
+    tm_n = 0
+
     for batch_idx, batch in enumerate(train_dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        t_wait_total += time.perf_counter() - _t_fetch
+        _t_step = time.perf_counter()
         stats = process_batch(
             batch, feature_builder, model, device, config,
             training=True, optimizer=optimizer,
@@ -1176,6 +1392,13 @@ def train_epoch(
         )
 
         scheduler.step()
+
+        if _PROFILE and batch_idx >= 1 and stats.get('timing'):
+            for _k, _v in stats['timing'].items():
+                if _k == 'cross_phase_detail':
+                    continue
+                tm_accum[_k] = tm_accum.get(_k, 0.0) + _v
+            tm_n += 1
 
         if stats['n_valid'] > 0:
             total_loss += stats['loss']
@@ -1210,6 +1433,38 @@ def train_epoch(
             if stats.get('film_stats') is not None:
                 last_film_stats = stats['film_stats']
 
+            if _PROFILE and batch_idx == 0 and stats.get('timing'):
+                tm = stats['timing']
+                top_keys = [k for k in tm if k != 'cross_phase_detail']
+                total_t = sum(tm[k] for k in top_keys)
+                logger.info(
+                    f"Batch timing (s): "
+                    f"feat={tm['feature_build']:.2f} "
+                    f"anchors={tm['anchor_sample']:.2f} "
+                    f"spat_pairs={tm['spatial_pairs']:.2f} "
+                    f"spec_wts={tm['spectral_weights']:.2f} "
+                    f"gpu_fwd={tm['gpu_forward']:.2f} "
+                    f"phase_pairs={tm['phase_pairs']:.2f} "
+                    f"phase_fwd={tm['phase_forward']:.2f} "
+                    f"loss={tm['loss_compute']:.2f} "
+                    f"cross_spec={tm['cross_spectral']:.2f} "
+                    f"cross_phase={tm['cross_phase']:.2f} "
+                    f"| total={total_t:.2f}"
+                )
+                cp = tm.get('cross_phase_detail', {})
+                if cp:
+                    logger.info(
+                        f"  cross_phase breakdown (s): "
+                        f"cat={cp.get('cat', 0):.2f} "
+                        f"svd={cp.get('svd', 0):.2f} "
+                        f"knn={cp.get('knn', 0):.2f} "
+                        f"build_batch={cp.get('build_batch', 0):.2f} "
+                        f"neighborhood={cp.get('neighborhood_loss', 0):.2f} "
+                        f"spread={cp.get('spread_loss', 0):.2f} "
+                        f"rd={cp.get('rd_loss', 0):.2f} "
+                        f"leakage={cp.get('leakage', 0):.2f}"
+                    )
+
             if batch_idx % log_interval == 0:
                 ps = stats.get('phase_pair_stats')
                 pls = stats.get('phase_loss_stats')
@@ -1238,6 +1493,40 @@ def train_epoch(
                         f"self={pls['loss_self']:.4f} cross={pls['loss_cross']:.4f}"
                         f"{cw_str}"
                     )
+
+        _step_dt = time.perf_counter() - _t_step
+        t_step_total += _step_dt
+        if batch_idx >= 1:
+            t_step_steady += _step_dt
+        n_batches_seen += 1
+        _t_fetch = time.perf_counter()
+
+    if _PROFILE and n_batches_seen > 0:
+        _wpb = t_wait_total / n_batches_seen
+        _spb = t_step_total / n_batches_seen
+        _tot = t_wait_total + t_step_total
+        _frac = 100.0 * t_wait_total / max(_tot, 1e-9)
+        logger.info(
+            f"Epoch {epoch+1} dataloader: "
+            f"wait={t_wait_total:.1f}s ({_wpb:.2f}/batch, {_frac:.0f}% of loop) | "
+            f"step={t_step_total:.1f}s ({_spb:.2f}/batch) over {n_batches_seen} batches"
+        )
+        if tm_n > 0:
+            _parts = " ".join(
+                f"{_k}={tm_accum[_k] / tm_n:.2f}"
+                for _k in sorted(tm_accum, key=lambda k: -tm_accum[k])
+            )
+            # Disjoint top-level buckets that should tile the whole step. The
+            # unaccounted residual = measured step minus their sum; a large
+            # residual means real work is happening outside every timer.
+            _disjoint = ('pass1_total', 'gpu_forward', 'pass2_total',
+                         'cross_spectral', 'cross_phase', 'backward')
+            _accounted = sum(tm_accum.get(k, 0.0) for k in _disjoint)
+            _resid = (t_step_steady - _accounted) / tm_n
+            logger.info(
+                f"Epoch {epoch+1} step breakdown (s/batch, avg over {tm_n} steady-state batches): "
+                f"{_parts} | step={t_step_steady / tm_n:.2f} unaccounted={_resid:.2f}"
+            )
 
     if total_batches == 0:
         return {
@@ -1309,6 +1598,7 @@ def validate_epoch(
     epoch: int = 0,
     evt_metric: EvtDiffusionMetric | None = None,
     evt_sampler: AnchorSampler | None = None,
+    max_batches: int | None = None,
 ) -> dict:
     """Run validation on entire validation set."""
     total_loss = 0.0
@@ -1339,7 +1629,9 @@ def validate_epoch(
     last_film_stats = None
 
     with torch.no_grad():
-        for batch in val_dataloader:
+        for batch_idx, batch in enumerate(val_dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             stats = process_batch(
                 batch, feature_builder, model, device, config,
                 training=False,
@@ -1428,6 +1720,15 @@ def validate_epoch(
         'film_stats': last_film_stats,
     }
 
+def _count_blocks(dataset) -> int:
+    bh, bw = dataset.split_block_size
+    ps = dataset.patch_size
+    blocks = set()
+    for w in dataset.patches:
+        blocks.add((w.row_start // ps // bh, w.col_start // ps // bw))
+    return len(blocks)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train representation encoder')
     parser.add_argument(
@@ -1500,7 +1801,38 @@ def main():
         help='Disable automatic resume from encoder_last.pt even if it exists in the '
              'experiment directory. Starts training fresh from epoch 0.'
     )
+    parser.add_argument(
+        '--phase-start-epoch',
+        type=int,
+        default=None,
+        help='Override curriculum_start_epoch for all phase losses (useful for timing/debug runs)'
+    )
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=None,
+        help='Number of DataLoader worker processes (overrides config)'
+    )
+    parser.add_argument(
+        '--max-batches',
+        type=int,
+        default=None,
+        help='Stop each epoch after this many batches (useful for timing/debug runs)'
+    )
+    parser.add_argument(
+        '--profile',
+        action='store_true',
+        default=False,
+        help='Enable performance profiling: per-epoch dataloader wait/step split and '
+             'per-component step breakdown. Adds cuda.synchronize() timing barriers, so '
+             'leave off for production runs (default off = no profiling overhead).'
+    )
     args = parser.parse_args()
+
+    global _PROFILE
+    _PROFILE = args.profile
+    if _PROFILE:
+        logger.info("Profiling enabled (--profile): per-epoch wait/step + step breakdown will be logged.")
 
     # Parse configs first to get defaults
     logger.info(f"Loading training config from {args.training}")
@@ -1581,10 +1913,53 @@ def main():
     ]
     logger.info(f"Features precomputed in DataLoader workers: {precompute_features}")
 
+    # Spatial pair config — extract the same spatial-InfoNCE parameters that
+    # process_batch() uses (see loss_config below) so DataLoader workers can
+    # precompute anchors, spatial pairs, and spectral weights. Values must match
+    # loss_config exactly; the fallback path in process_batch reproduces these
+    # when a sample has no worker-precomputed pairs.
+    _spc_spectral_cfg = bindings_config.get_loss('infonce_type_spectral')
+    _spc_spatial_cfg = bindings_config.get_loss('infonce_type_spatial')
+    _spc_sampling_cfg = bindings_config.get_sampling_strategy(
+        _spc_spectral_cfg.anchor_population if _spc_spectral_cfg else 'grid-plus-supplement'
+    )
+    _spc_grid = _spc_sampling_cfg.grid if _spc_sampling_cfg and _spc_sampling_cfg.grid else None
+    _spc_supp = _spc_sampling_cfg.supplement if _spc_sampling_cfg else None
+    _spc_pos = (
+        _spc_spatial_cfg.positive_strategy.selection
+        if _spc_spatial_cfg and _spc_spatial_cfg.positive_strategy
+        and _spc_spatial_cfg.positive_strategy.selection else None
+    )
+    _spc_neg = (
+        _spc_spatial_cfg.negative_strategy.selection
+        if _spc_spatial_cfg and _spc_spatial_cfg.negative_strategy
+        and _spc_spatial_cfg.negative_strategy.selection else None
+    )
+    _spc_sw = (
+        _spc_spatial_cfg.spectral_weighting
+        if _spc_spatial_cfg and _spc_spatial_cfg.spectral_weighting else None
+    )
+    spatial_pair_config = {
+        'type_encoder_feature': _type_enc_feat,
+        'stride': _spc_grid.stride if _spc_grid else 16,
+        'border': _spc_grid.exclude_border if _spc_grid else 16,
+        'jitter_radius': _spc_grid.jitter.radius if _spc_grid and _spc_grid.jitter else 4,
+        'supplement_n': _spc_supp.n if _spc_supp else 104,
+        'spatial_positive_k': _spc_pos.k if _spc_pos else 4,
+        'spatial_positive_max_dist': _spc_pos.max_distance if _spc_pos and _spc_pos.max_distance is not None else 8,
+        'spatial_negative_min_dist': _spc_neg.min_distance if _spc_neg and _spc_neg.min_distance is not None else 96.0,
+        'spatial_negative_max_dist': _spc_neg.max_distance if _spc_neg and _spc_neg.max_distance is not None else 192.0,
+        'spatial_negatives_per_anchor': _spc_neg.n_per_anchor if _spc_neg and _spc_neg.n_per_anchor is not None else 16,
+        'spatial_spectral_tau': _spc_sw.tau if _spc_sw else 200,
+        'spatial_min_w': _spc_sw.min_weight if _spc_sw else 0.03,
+    }
+
     # Create train dataset
     logger.info("Creating train dataset...")
     patch_size = training_config.sampling.patch_size
     spatial = training_config.spatial_domain
+    _bg = spatial.full_domain.block_grid if spatial.full_domain and spatial.full_domain.block_grid else [4, 4]
+    split_block_size = (int(_bg[0]), int(_bg[1]))
     debug_window = None
     if spatial.debug_mode and spatial.debug_window is not None:
         w = spatial.debug_window
@@ -1603,21 +1978,26 @@ def main():
         sample_number=epoch_cfg.sample_number,
         feature_builder=feature_builder,
         precompute_features=precompute_features,
+        spatial_pair_config=spatial_pair_config,
+        training=True,
+        split_block_size=split_block_size,
     )
     logger.info(
-        f"Train dataset has {len(train_dataset.patches)} total patches "
-        f"(epoch_mode={epoch_cfg.mode}, "
-        f"patches/epoch={len(train_dataset)})"
+        f"Train dataset: {len(train_dataset.patches)} patches "
+        f"({_count_blocks(train_dataset)} blocks of {split_block_size[0]}×{split_block_size[1]} patches) "
+        f"| epoch_mode={epoch_cfg.mode}, patches/epoch={len(train_dataset)}"
     )
 
-    n_workers = training_config.hardware.num_workers
+    n_workers = args.num_workers if args.num_workers is not None else training_config.hardware.num_workers
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=n_workers,
+        prefetch_factor=training_config.hardware.prefetch_factor if n_workers > 0 else None,
         pin_memory=training_config.hardware.pin_memory,
         persistent_workers=n_workers > 0,
+        worker_init_fn=_dataloader_worker_init if n_workers > 0 else None,
         collate_fn=collate_fn,
     )
 
@@ -1631,16 +2011,24 @@ def main():
         debug_window=debug_window,
         feature_builder=feature_builder,
         precompute_features=precompute_features,
+        spatial_pair_config=spatial_pair_config,
+        training=False,
+        split_block_size=split_block_size,
     )
-    logger.info(f"Validation dataset has {len(val_dataset)} patches")
+    logger.info(
+        f"Validation dataset: {len(val_dataset.patches)} patches "
+        f"({_count_blocks(val_dataset)} blocks of {split_block_size[0]}×{split_block_size[1]} patches)"
+    )
 
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=n_workers,
+        prefetch_factor=training_config.hardware.prefetch_factor if n_workers > 0 else None,
         pin_memory=training_config.hardware.pin_memory,
         persistent_workers=n_workers > 0,
+        worker_init_fn=_dataloader_worker_init if n_workers > 0 else None,
         collate_fn=collate_fn,
     )
 
@@ -1852,6 +2240,11 @@ def main():
         # Encoder input feature names (from model section of training config)
         'type_encoder_feature': training_config.model_input.type_encoder_feature,
         'phase_encoder_feature': training_config.model_input.phase_encoder_feature,
+
+        # Chunked encoder forward: number of samples per sub-batch to bound peak GPU memory.
+        # enc_chunk_size=1 matches original serial behaviour; larger values are faster
+        # but use more GPU memory proportionally.
+        'enc_chunk_size': training_config.hardware.enc_chunk_size,
     }
 
     # Variance-covariance regularization (optional)
@@ -1903,6 +2296,26 @@ def main():
         f"temp={loss_config['spatial_temperature']}), "
         f"weights(spectral={loss_config['spectral_loss_weight']}, spatial={loss_config['spatial_loss_weight']}), "
         f"cross_patch_neg_k={loss_config.get('cross_patch_negatives_per_anchor', 8)}"
+    )
+
+    # Pass spatial pair config to datasets so workers precompute pairs.
+    # Workers are not spawned until the training loop starts, so setting
+    # these attributes after DataLoader construction is safe.
+    _spatial_pair_config = {k: loss_config[k] for k in [
+        'stride', 'border', 'jitter_radius', 'supplement_n',
+        'spatial_positive_k', 'spatial_positive_max_dist',
+        'spatial_negative_min_dist', 'spatial_negative_max_dist',
+        'spatial_negatives_per_anchor', 'spatial_spectral_tau', 'spatial_min_w',
+    ]}
+    _spatial_pair_config['type_encoder_feature'] = loss_config['type_encoder_feature']
+    train_dataset.spatial_pair_config = _spatial_pair_config
+    train_dataset.training = True
+    val_dataset.spatial_pair_config = _spatial_pair_config
+    val_dataset.training = False
+    logger.info(
+        f"Spatial pair worker precompute: "
+        f"train precompute_features={train_dataset.precompute_features}, "
+        f"spatial_pair_config_keys={list(_spatial_pair_config.keys())}"
     )
 
     # --- Phase loss pair construction setup ---
@@ -1998,69 +2411,67 @@ def main():
             f"ramp={recovery_disc_config['curriculum_ramp_epochs']}]"
         )
 
+    # Apply --phase-start-epoch override to all phase curriculum configs
+    if args.phase_start_epoch is not None:
+        for cfg in [phase_config, spread_config, recovery_disc_config]:
+            if cfg is not None:
+                cfg['curriculum_start_epoch'] = args.phase_start_epoch
+        logger.info(f"CLI override: all phase curriculum_start_epoch set to {args.phase_start_epoch}")
+
     # --- EVT soft neighbourhood loss setup ---
     # The EVT-stratified anchor sampler is built whenever the EVT loss config
-    # exists, regardless of loss weight. This allows EVT-stratified anchor
-    # sampling for the spectral kNN even when the EVT loss itself is disabled.
     evt_metric = None
     evt_sampler = None
     evt_loss_cfg = bindings_config.get_loss('soft_neighborhood_evt')
-    if evt_loss_cfg is not None:
+    if evt_loss_cfg is not None and (evt_loss_cfg.weight or 0.0) > 0.0:
         evt_anchor_pop = (
             evt_loss_cfg.anchor_population
             if evt_loss_cfg.anchor_population
             else 'grid-plus-supplement-evt'
         )
         evt_sampler = build_anchor_sampler(bindings_config, evt_anchor_pop)
-
-        if (evt_loss_cfg.weight or 0.0) > 0.0:
-            # EVT code counts come from the shared stats file, at the path:
-            #   stats["evt_class"]["static_categorical.evt"]["counts"]
-            # Keys are string codes, values are integer pixel counts.
-            evt_code_counts = (
-                feature_builder.stats
-                .get("evt_class", {})
-                .get("static_categorical.evt", {})
-                .get("counts", {})
+        # EVT code counts come from the shared stats file, at the path:
+        #   stats["evt_class"]["static_categorical.evt"]["counts"]
+        # Keys are string codes, values are integer pixel counts.
+        evt_code_counts = (
+            feature_builder.stats
+            .get("evt_class", {})
+            .get("static_categorical.evt", {})
+            .get("counts", {})
+        )
+        if not evt_code_counts:
+            raise ValueError(
+                "EVT code counts not found in stats file. "
+                "Run example_compute_stats.py to compute stats first."
             )
-            if not evt_code_counts:
-                raise ValueError(
-                    "EVT code counts not found in stats file. "
-                    "Run example_compute_stats.py to compute stats first."
-                )
-            evt_metric = EvtDiffusionMetric(
-                confusion_csv=evt_loss_cfg.confusion_matrix_path,
-                code_counts=evt_code_counts,
-                min_count=evt_loss_cfg.min_count or 100,
-                min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
-                diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
-                laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
-                binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
-            ).to(device)
-            loss_config['evt_weight'] = evt_loss_cfg.weight
-            loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
-            loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
-            # Restrict inverse-frequency weighting to valid EVT codes only.
-            for spec in evt_sampler.weight_specs:
-                if spec.transform == 'inverse-frequency':
-                    spec.valid_values = evt_metric.valid_codes
-            logger.info(
-                f"EVT soft neighbourhood loss enabled: "
-                f"{evt_metric.n_codes} codes, "
-                f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
-                f"min_count={evt_loss_cfg.min_count or 100}, "
-                f"weight={loss_config['evt_weight']}, "
-                f"tau_ref={loss_config['evt_tau_ref']}, "
-                f"tau_learned={loss_config['evt_tau_learned']}, "
-                f"anchor_population={evt_anchor_pop}"
-            )
-        else:
-            logger.info(
-                f"EVT loss disabled (weight=0) but EVT-stratified anchor sampler "
-                f"active for spectral kNN (population={evt_anchor_pop})"
-            )
+        evt_metric = EvtDiffusionMetric(
+            confusion_csv=evt_loss_cfg.confusion_matrix_path,
+            code_counts=evt_code_counts,
+            min_count=evt_loss_cfg.min_count or 100,
+            min_confusion_samples=evt_loss_cfg.min_confusion_samples or 30,
+            diffusion_steps=evt_loss_cfg.diffusion_steps or 2,
+            laplace_smoothing=evt_loss_cfg.laplace_smoothing or 0.0,
+            binary_threshold=evt_loss_cfg.binary_threshold or 0.0,
+        ).to(device)
+        loss_config['evt_weight'] = evt_loss_cfg.weight
+        loss_config['evt_tau_ref'] = evt_loss_cfg.tau_ref or 0.5
+        loss_config['evt_tau_learned'] = evt_loss_cfg.tau_learned or 0.5
+        # Restrict inverse-frequency weighting to valid EVT codes only.
+        for spec in evt_sampler.weight_specs:
+            if spec.transform == 'inverse-frequency':
+                spec.valid_values = evt_metric.valid_codes
+        logger.info(
+            f"EVT soft neighbourhood loss enabled: "
+            f"{evt_metric.n_codes} codes, "
+            f"diffusion_steps={evt_loss_cfg.diffusion_steps or 2}, "
+            f"min_count={evt_loss_cfg.min_count or 100}, "
+            f"weight={loss_config['evt_weight']}, "
+            f"tau_ref={loss_config['evt_tau_ref']}, "
+            f"tau_learned={loss_config['evt_tau_learned']}, "
+            f"anchor_population={evt_anchor_pop}"
+        )
     else:
-        logger.info("EVT soft neighbourhood loss disabled (not in bindings config)")
+        logger.info("EVT soft neighbourhood loss disabled (weight=0 or not configured)")
 
     # Create scheduler with optional warmup.
     # Must be after phase_config is built so the two-phase branch can read
@@ -2287,6 +2698,7 @@ def main():
           phase_sampler=phase_sampler, phase_config=phase_config,
           spread_config=spread_config, recovery_disc_config=recovery_disc_config,
           evt_metric=evt_metric, evt_sampler=evt_sampler,
+          max_batches=args.max_batches,
         )
 
         val_stats = validate_epoch(
@@ -2295,6 +2707,7 @@ def main():
           phase_sampler=phase_sampler, phase_config=phase_config,
           spread_config=spread_config, recovery_disc_config=recovery_disc_config,
           epoch=epoch, evt_metric=evt_metric, evt_sampler=evt_sampler,
+          max_batches=args.max_batches,
         )
 
         logger.info(f"Epoch {epoch+1}/{num_epochs} complete")

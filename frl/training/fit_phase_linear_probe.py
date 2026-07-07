@@ -45,6 +45,7 @@ Notes
 import argparse
 import logging
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -61,6 +62,7 @@ from data.loaders.dataset.forest_dataset_v2 import ForestDatasetV2, collate_fn
 from data.loaders.builders.feature_builder import FeatureBuilder
 from data.loaders.transforms import inverse_transform
 from models import RepresentationModel
+from utils.sampling import ReservoirSampler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -386,6 +388,18 @@ class ProbePreprocessor:
         )
 
 
+def _subsample_idx(n: int, cap: int) -> torch.Tensor | None:
+    """Random row indices to cap observations per batch (None = keep all).
+
+    The probe is a ridge with only ~D=76 parameters, so it is vastly
+    overdetermined; a few million observations give a statistically identical
+    fit at a fraction of the CPU cost of streaming all ~900M.
+    """
+    if cap and n > cap:
+        return torch.randperm(n)[:cap]
+    return None
+
+
 def _compute_feature_statistics(
     train_loader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -396,6 +410,7 @@ def _compute_feature_statistics(
     design: str,
     interaction_pca_k: int,
     enc_feature_name: str = "type_encoder_input",
+    fit_max_obs_per_batch: int = 0,
 ) -> ProbePreprocessor:
     """Pass 1: compute per-column mean/std and interaction PCA components.
 
@@ -446,6 +461,11 @@ def _compute_feature_statistics(
 
             if zt_flat.shape[0] == 0:
                 continue
+
+            _idx = _subsample_idx(zt_flat.shape[0], fit_max_obs_per_batch)
+            if _idx is not None:
+                zt_flat = zt_flat[_idx]
+                zp_flat = zp_flat[_idx]
 
             X_raw = _build_design_matrix(zt_flat, zp_flat, design).to(
                 torch.float64,
@@ -561,6 +581,7 @@ def fit_phase_probe(
     design: str = "full",
     interaction_pca_k: int = 20,
     enc_feature_name: str = "type_encoder_input",
+    fit_max_obs_per_batch: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, ProbePreprocessor]:
     """Two-pass streaming ridge regression for the phase linear probe.
 
@@ -589,6 +610,7 @@ def fit_phase_probe(
     preprocessor = _compute_feature_statistics(
         train_loader, feature_builder, model, device,
         halo, max_batches_train, design, interaction_pca_k, enc_feature_name,
+        fit_max_obs_per_batch=fit_max_obs_per_batch,
     )
 
     # Pass 2 — ridge regression on preprocessed features
@@ -633,6 +655,12 @@ def fit_phase_probe(
 
             if zt_flat.shape[0] == 0:
                 continue
+
+            _idx = _subsample_idx(zt_flat.shape[0], fit_max_obs_per_batch)
+            if _idx is not None:
+                zt_flat = zt_flat[_idx]
+                zp_flat = zp_flat[_idx]
+                Y = Y[_idx]
 
             n_obs_total += zt_flat.shape[0]
 
@@ -746,6 +774,16 @@ def _invert_to_original_scale(
 # Evaluation
 # ---------------------------------------------------------------------------
 
+# Spearman ρ² is a rank correlation, so it needs values in memory (unlike
+# R²/MSE, which stream via accumulators). Accumulating all ~900M observations
+# OOMs, so keep a bounded uniform sample per channel in a ReservoirSampler.
+# ReservoirSampler.add() is per-item, so we feed it a *vectorized* per-batch
+# subsample rather than the full batch. ρ² over a ~1M-point sample ≈ the full
+# value.
+_SPEARMAN_RESERVOIR_CAP = 2_000_000   # rows kept per channel for ρ²
+_SPEARMAN_PER_BATCH = 8192            # rows sampled from each batch before add()
+
+
 def evaluate_phase_probe(
     loader: DataLoader,
     feature_builder: FeatureBuilder,
@@ -803,11 +841,13 @@ def evaluate_phase_probe(
     sum_y_orig = torch.zeros(C, dtype=torch.float64)
     sum_y2_orig = torch.zeros(C, dtype=torch.float64)
 
-    # Collect per-channel predictions/targets for Spearman ρ²
-    all_preds_norm = [[] for _ in range(C)]
-    all_targets_norm = [[] for _ in range(C)]
-    all_preds_orig = [[] for _ in range(C)]
-    all_targets_orig = [[] for _ in range(C)]
+    # Bounded reservoir per channel for Spearman ρ². Each row is a paired quad
+    # [pred_norm, target_norm, pred_orig, target_orig] so predictions stay
+    # aligned with their targets across both spaces.
+    spearman_res = [
+        ReservoirSampler(capacity=_SPEARMAN_RESERVOIR_CAP, dim=4, seed=c)
+        for c in range(C)
+    ]
 
     n_obs = 0
 
@@ -866,10 +906,6 @@ def evaluate_phase_probe(
             sum_y += Y_norm.sum(dim=0)
             sum_y2 += (Y_norm * Y_norm).sum(dim=0)
 
-            for c_idx in range(C):
-                all_preds_norm[c_idx].append(P_norm[:, c_idx].float())
-                all_targets_norm[c_idx].append(Y_norm[:, c_idx].float())
-
             # --- Original-space accumulators ---
             P_orig = _invert_to_original_scale(
                 P_norm, inv_whitening, means, transform_specs,
@@ -889,9 +925,19 @@ def evaluate_phase_probe(
             sum_y_orig += Y_orig.sum(dim=0)
             sum_y2_orig += (Y_orig * Y_orig).sum(dim=0)
 
+            # Reservoir-sample paired rows for ρ² (both spaces). Vectorized
+            # per-batch subsample keeps the per-item reservoir add() cheap.
+            _N = P_norm.shape[0]
+            if _N > _SPEARMAN_PER_BATCH:
+                _idx = torch.randint(0, _N, (_SPEARMAN_PER_BATCH,))
+            else:
+                _idx = torch.arange(_N)
             for c_idx in range(C):
-                all_preds_orig[c_idx].append(P_orig[:, c_idx].float())
-                all_targets_orig[c_idx].append(Y_orig[:, c_idx].float())
+                quad = torch.stack([
+                    P_norm[_idx, c_idx], Y_norm[_idx, c_idx],
+                    P_orig[_idx, c_idx], Y_orig[_idx, c_idx],
+                ], dim=1).to(torch.float32).numpy()   # [K, 4]
+                spearman_res[c_idx].add(quad)
 
             # --- Temporal (within-pixel) decomposition ---
             # Split flattened predictions back into [T, N_b, C] per batch item.
@@ -944,12 +990,13 @@ def evaluate_phase_probe(
                 r2_per[ch] = 0.0
         return mse_per, r2_per
 
-    def _compute_spearman(all_p, all_t):
+    def _compute_spearman(reservoirs, col_pred: int, col_target: int):
         spearman_per: Dict[str, float] = {}
         for c_idx, ch in enumerate(target_channels):
-            if all_p[c_idx]:
-                p_cat = torch.cat(all_p[c_idx])
-                t_cat = torch.cat(all_t[c_idx])
+            buf = reservoirs[c_idx].get()   # [filled, 4]
+            if buf.shape[0] > 0:
+                p_cat = torch.from_numpy(buf[:, col_pred])
+                t_cat = torch.from_numpy(buf[:, col_target])
                 spearman_per[ch] = _spearman_rho2(p_cat, t_cat)
             else:
                 spearman_per[ch] = 0.0
@@ -959,8 +1006,8 @@ def evaluate_phase_probe(
     mse_per_orig, r2_per_orig = _compute_mse_r2(
         sse_orig, sum_y_orig, sum_y2_orig, n_obs,
     )
-    spearman_per = _compute_spearman(all_preds_norm, all_targets_norm)
-    spearman_per_orig = _compute_spearman(all_preds_orig, all_targets_orig)
+    spearman_per = _compute_spearman(spearman_res, 0, 1)       # cols: pred_norm, target_norm
+    spearman_per_orig = _compute_spearman(spearman_res, 2, 3)  # cols: pred_orig, target_orig
 
     # --- Temporal (within-pixel) R² ---
     r2_temporal: Dict[str, float] = {}
@@ -1400,6 +1447,10 @@ def main():
     parser.add_argument("--ridge-lambda", type=float, default=1e-3, help="Ridge penalty λ (weights only)")
     parser.add_argument("--halo", type=int, default=16, help="Pixels from edge to exclude (default: 16)")
     parser.add_argument("--max-batches-train", type=int, default=0, help="Cap batches for fitting (0 = all)")
+    parser.add_argument("--fit-max-obs-per-batch", type=int, default=50_000,
+                        help="Random observations kept per batch for the fit (0 = all). The probe "
+                             "has only ~76 params, so a few M obs give a statistically identical "
+                             "fit far faster than streaming all ~900M.")
     parser.add_argument("--max-batches-eval", type=int, default=0, help="Cap batches for eval (0 = all)")
     parser.add_argument("--output", type=str, default=None, help="Optional path to save fitted probe (.pt)")
     parser.add_argument(
@@ -1415,7 +1466,20 @@ def main():
         help="Apply variance inflation to original-scale predictions "
              "(rescale per channel to match observed dynamic range)",
     )
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers (default: from training config; "
+                             "lower for inference to bound host memory)")
     args = parser.parse_args()
+
+    # The heavy fit math (design build, interaction PCA projection, and the
+    # float64 normal-equation matmuls) runs on the CPU. The launch scripts set
+    # *_NUM_THREADS=1 to keep the many dataloader workers from oversubscribing,
+    # but that also throttles this main-process linear algebra to one core.
+    # Give the main process its cores back (workers stay single-threaded via the
+    # env vars, since they use numpy/OpenBLAS, not torch).
+    _n_threads = int(os.environ.get("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
+    torch.set_num_threads(max(1, _n_threads))
+    logger.info(f"Main-process torch CPU threads: {torch.get_num_threads()}")
 
     logger.info(f"Loading bindings config from {args.bindings}")
     bindings_config = DatasetBindingsParser(args.bindings).parse()
@@ -1443,7 +1507,7 @@ def main():
         train_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=training_config.hardware.num_workers,
+        num_workers=(args.num_workers if args.num_workers is not None else training_config.hardware.num_workers),
         pin_memory=training_config.hardware.pin_memory,
         collate_fn=collate_fn,
     )
@@ -1461,7 +1525,7 @@ def main():
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=training_config.hardware.num_workers,
+        num_workers=(args.num_workers if args.num_workers is not None else training_config.hardware.num_workers),
         pin_memory=training_config.hardware.pin_memory,
         collate_fn=collate_fn,
     )
@@ -1496,6 +1560,7 @@ def main():
         design=args.design,
         interaction_pca_k=args.interaction_pca_k,
         enc_feature_name=enc_feature_name,
+        fit_max_obs_per_batch=args.fit_max_obs_per_batch,
     )
 
     # Evaluate
