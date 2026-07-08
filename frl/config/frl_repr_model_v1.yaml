@@ -58,11 +58,18 @@ spatial_conv:
 # ================================================================
 # Type projection head (SimCLR-style)
 # ================================================================
-# Applied between z_type and InfoNCE losses during training.
+# Applied between z_type and the spectral InfoNCE loss during training.
 # Discarded at inference — z_type is used directly downstream.
-# VICReg operates on raw z_type (not projected) to guard backbone.
+# VICReg and spatial InfoNCE operate on raw z_type (not projected).
+#
+# frl_v0_exp032: DISABLED. Ablation removing the projection head from the
+# spectral loss, so spectral InfoNCE operates directly on raw z_type (48-dim)
+# like the spatial loss already does. When disabled, model.project_type() is an
+# identity map. Spectral temperature (0.07) is left unchanged for a clean
+# single-variable comparison against exp031; watch the epoch-0 neg-tau sweep and
+# early spectral loss to confirm it stays calibrated at the raw-z_type scale.
 type_projection:
-  enabled: true
+  enabled: false
   hidden_dim: 48      # matches z_type_dim; single bottleneck layer
   output_dim: 8       # small: spectral data has ~3-4 significant PCs
   l2_normalize: true
