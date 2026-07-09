@@ -799,6 +799,7 @@ def process_batch(
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     spectral_neg_tau_sweep: dict = {}
+    spectral_sim_stats: dict | None = None
     t_cross_spectral = 0.0
     t_cross_phase = 0.0
     if cross_patch_z_anchors:
@@ -873,6 +874,21 @@ def process_batch(
             similarity='l2',
             neg_weights=neg_weights,
         )
+        # Kernel-sizing diagnostic: pos/neg similarity in the same -||a-b||^2/D
+        # units the softmax sees. After the exp032 projection-head removal the
+        # spectral loss runs on raw z_type (D=z_type_dim), so the gap between
+        # these means and the spectral temperature reveals whether the exp(sim/T)
+        # kernel is saturated (gap/T >> the spatial loss's healthy ~2-3).
+        if global_pos.numel() > 0 and global_neg.numel() > 0:
+            with torch.no_grad():
+                _Dspec = z_all.shape[1]
+                _sp = -(z_all[global_pos[:, 0]] - z_all[global_pos[:, 1]]).pow(2).sum(1) / _Dspec
+                _sn = -(z_all[global_neg[:, 0]] - z_all[global_neg[:, 1]]).pow(2).sum(1) / _Dspec
+                spectral_sim_stats = {
+                    'pos_mean': _sp.mean().item(), 'pos_std': _sp.std().item(),
+                    'neg_mean': _sn.mean().item(), 'neg_std': _sn.std().item(),
+                    'temperature': float(config.get('temperature', 0.07)),
+                }
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
         if _PROFILE and device.type == 'cuda':
@@ -1276,6 +1292,7 @@ def process_batch(
         'neg_weight_stats': compute_stats(all_neg_weights),
         'pos_sim_stats': compute_stats(all_pos_sims),
         'neg_sim_stats': compute_stats(all_neg_sims),
+        'spectral_sim_stats': spectral_sim_stats,
         'pos_spec_dist_stats': compute_stats(all_pos_spec_dists),
         'neg_spec_dist_stats': compute_stats(all_neg_spec_dists),
         'tau_sweep': {
@@ -1360,6 +1377,7 @@ def train_epoch(
     last_pos_spec_dist_stats = empty_stats
     last_neg_spec_dist_stats = empty_stats
     last_tau_sweep: dict = {}
+    last_spectral_sim_stats = None
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1428,6 +1446,7 @@ def train_epoch(
             last_pos_spec_dist_stats = stats.get('pos_spec_dist_stats', empty_stats)
             last_neg_spec_dist_stats = stats.get('neg_spec_dist_stats', empty_stats)
             last_tau_sweep = stats.get('tau_sweep', {})
+            last_spectral_sim_stats = stats.get('spectral_sim_stats')
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
@@ -1538,6 +1557,7 @@ def train_epoch(
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'pos_sim_stats': empty_stats, 'neg_sim_stats': empty_stats,
+            'spectral_sim_stats': None,
             'pos_spec_dist_stats': empty_stats, 'neg_spec_dist_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
@@ -1580,6 +1600,7 @@ def train_epoch(
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'tau_sweep': last_tau_sweep,
         'spectral_neg_tau_sweep': locals().get('spectral_neg_tau_sweep', {}),
+        'spectral_sim_stats': last_spectral_sim_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -1624,6 +1645,7 @@ def validate_epoch(
     last_neg_sim_stats = empty_stats
     last_pos_spec_dist_stats = empty_stats
     last_neg_spec_dist_stats = empty_stats
+    last_spectral_sim_stats = None
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -1660,6 +1682,7 @@ def validate_epoch(
                 last_neg_weight_stats = stats['neg_weight_stats']
                 last_pos_sim_stats = stats.get('pos_sim_stats', empty_stats)
                 last_neg_sim_stats = stats.get('neg_sim_stats', empty_stats)
+                last_spectral_sim_stats = stats.get('spectral_sim_stats')
                 last_phase_pair_stats = stats.get('phase_pair_stats')
                 last_phase_loss_stats = stats.get('phase_loss_stats')
                 if stats.get('film_stats') is not None:
@@ -1680,6 +1703,7 @@ def validate_epoch(
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
+            'spectral_sim_stats': None,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
         }
@@ -1715,6 +1739,7 @@ def validate_epoch(
         'neg_sim_stats': last_neg_sim_stats,
         'pos_spec_dist_stats': last_pos_spec_dist_stats,
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
+        'spectral_sim_stats': last_spectral_sim_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -2817,6 +2842,18 @@ def main():
                 f"  Spatial sims: pos={fmt_stats(ps)} | "
                 f"neg mean={ns.get('mean', 0.0):.4f} | "
                 f"gap={gap:.4f} | eff_confusers={eff_confusers}/{train_stats.get('spatial_neg_pairs', '?')}"
+            )
+        sss = train_stats.get('spectral_sim_stats')
+        if sss is not None:
+            _T = sss.get('temperature', 0.07) or 0.07
+            _gap = sss['pos_mean'] - sss['neg_mean']
+            _spw = loss_config.get('spectral_loss_weight', 1.0)
+            _raw_spec = (train_stats.get('spectral_loss', 0.0) / _spw) if _spw > 0 else 0.0
+            logger.info(
+                f"  Spectral sims: pos_mean={sss['pos_mean']:.4f}±{sss['pos_std']:.4f} | "
+                f"neg mean={sss['neg_mean']:.4f} | gap={_gap:.4f} | "
+                f"gap/T={_gap / _T:.1f} (T={_T:g}) | "
+                f"eff_confusers={2.718 ** _raw_spec:.1f}/{train_stats.get('spectral_neg_pairs', '?')}"
             )
         logger.info(
             f"  Pairs/batch: "
