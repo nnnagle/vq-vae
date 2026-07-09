@@ -504,7 +504,13 @@ losses:
   infonce_type_spectral:
     weight: 1.0
     type: infonce
-    temperature: 0.07
+    # exp033: raised 0.07 -> 0.5 for the projection-head-free run. Without the
+    # head the spectral loss runs on raw 48-dim z_type (like the spatial loss),
+    # where 0.07 saturated the exp(sim/T) kernel (exp032 eff_confusers ~1.1).
+    # 0.5 matches the spatial loss, which is well-calibrated on the same raw
+    # z_type geometry (gap/T ~2.5). Confirm via the "Spectral sims" log line:
+    # target gap/T ~2-3; retune if it lands outside that band.
+    temperature: 0.5
     mask:
       - static_mask.aoi
       - static_mask.forest
