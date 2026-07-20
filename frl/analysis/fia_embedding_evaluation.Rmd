@@ -180,10 +180,16 @@ plot_cond_data_max <- cond_data %>%
 
 ### Join to a single regression frame
 
+Every downstream analysis (linear probes, kNN imputation, forest-type
+classification) is restricted to plots with a **known forest type**: rows with a
+missing `FORTYPCD` are dropped here at the source, so the whole report runs on the
+same forest-type population.
+
 ```{r reg-data}
 reg_data <- plot_cond_data_avg %>%
   left_join(plot_cond_data_max, by = "PLT_CN") %>%
   inner_join(emb_data, by = c("PLT_CN" = "CN")) %>%
+  filter(!is.na(FORTYPCD)) %>%                     # only plots with a forest type
   mutate(FORTYPGRP = as.factor(substr(FORTYPCD, 1, 2)))
 
 ```
@@ -237,11 +243,6 @@ data.frame(
   emb   = c(r2(form_emb_type), r2(form_emb_phase), r2(form_emb_all)),
   inp   = c(r2(form_inp_type), r2(form_inp_phase), r2(form_inp_all))
 )
-
-# also on ALL plots (including unknown forest type)
-c(emb_all_allplots = summary(lm(form_emb_all, data = reg_data))$adj.r.squared,
-  inp_all_allplots = summary(lm(form_inp_all, data = reg_data))$adj.r.squared)
-
 ```
 
 ## 2. k-Nearest-Neighbor imputation of BALIVE
