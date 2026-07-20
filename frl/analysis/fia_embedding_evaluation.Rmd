@@ -1,0 +1,960 @@
+---
+title: "FIA Embedding Evaluation: Learned Embeddings vs. Raw Inputs"
+subtitle: "BALIVE regression and FORTYPCD classification on Virginia FIA plots"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  reticulate_python: "/home/nnagle/miniconda3/envs/r-tf/bin/python"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi = 110
+)
+```
+
+## Overview
+
+This report is a **downstream evaluation** of the FoR-EST representation model. It
+is *not* part of model training. It answers the core scientific question the
+project exists to answer:
+
+> Do the learned per-pixel embeddings (`z_type`, `z_phase`) beat the **raw
+> satellite/CCDC inputs** (`x_type`, `x_phase`) for predicting real forest
+> attributes measured on the ground by the USFS Forest Inventory and Analysis
+> (FIA) program?
+
+Two targets are evaluated:
+
+- **`BALIVE`** — live tree basal area (sq ft/acre), a continuous target for
+  regression / k-nearest-neighbor imputation.
+- **`FORTYPCD`** — forest type code, a categorical target for classification.
+
+The comparison recurs throughout — **`emb`** (learned embeddings) vs. **`inp`**
+(raw inputs) — using linear probes, k-nearest-neighbor imputation (with metric
+tuning), and forest-type classifiers. Because the model produces two separate
+embeddings (`z_type` = *what kind of forest*, `z_phase` = *temporal recovery
+dynamics*), the two blocks are handled and weighted separately throughout,
+mirroring the dual-pathway architecture.
+
+> **Note on the embedding source.** These are `frl_v0_exp033` embeddings. The
+> project's `CLAUDE.md` declares the model "complete" as of `exp017`, so this is
+> post-completion validation work on a later checkpoint — evaluation, not
+> development.
+
+Key paths and the target state are exposed as **knit parameters** (see the YAML
+header): `params$emb_csv`, `params$fiadb`, `params$statecd`.
+
+## Environment
+
+```{r reticulate}
+# Point reticulate at the conda env that carries TensorFlow/Keras.
+Sys.setenv(RETICULATE_PYTHON = params$reticulate_python)
+
+library(reticulate)
+py_config()
+```
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(FNN)      # get.knnx() for k-nearest-neighbor imputation
+library(nnet)     # multinom() for the multinomial forest-type baseline
+```
+
+## Data assembly
+
+### Load embeddings
+
+The embeddings CSV is written by `frl/training/embed_locations.py`. `CN`/`ID` are
+huge FIA control numbers; they are read as **character** and stripped of any
+trailing `.0` so they are not mangled by float parsing.
+
+```{r load-embeddings}
+emb_data <- read_csv(
+  params$emb_csv,
+  col_types = cols(CN = "c", ID = "c")   # read as text, don't parse
+) %>%
+  mutate(
+    CN = sub("\\.0$", "", CN),           # "1279297123456789.0" -> "1279297123456789"
+    ID = sub("\\.0$", "", ID)
+  )
+```
+
+Column families in the embeddings file:
+
+| Prefix          | Meaning                                             | Block   |
+|-----------------|-----------------------------------------------------|---------|
+| `x_type_*`      | raw input features (structure/species/density)      | input   |
+| `x_phase_dm_*`  | raw input temporal-dynamics features                | input   |
+| `z_type_*` (48) | learned **type** embedding                          | emb     |
+| `z_phase_*` (8) | learned **phase** (recovery-dynamics) embedding     | emb     |
+
+### Pull FIA ground truth (COND table)
+
+```{r fia-cond}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+cond_data <- dbGetQuery(
+  con,
+  sprintf(
+    "SELECT PLT_CN, STATECD, FORTYPCD, FLDSZCD, CONDPROP_UNADJ,
+            BALIVE, LIVE_CANOPY_CVR_PCT, NBR_LIVE_STEMS
+       FROM COND
+      WHERE STATECD='%s'",
+    params$statecd
+  )
+)
+```
+
+### Reduce multi-condition plots to one row per plot
+
+FIA plots can span multiple conditions. We collapse two ways:
+
+- **area-weighted average** of `BALIVE` and canopy cover (weighted by
+  `CONDPROP_UNADJ`, the condition's area proportion), and
+- the **dominant condition's** `FORTYPCD` (largest area proportion).
+
+```{r plot-reduce}
+plot_cond_data_avg <- cond_data %>%
+  semi_join(emb_data, by = c("PLT_CN" = "CN")) %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(
+    BALIVE              = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ),
+    LIVE_CANOPY_CVR_PCT = sum(LIVE_CANOPY_CVR_PCT * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ)
+  ) %>%
+  ungroup()
+
+plot_cond_data_max <- cond_data %>%
+  semi_join(emb_data, by = c("PLT_CN" = "CN")) %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  slice_max(order_by = CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(PLT_CN, FORTYPCD)
+```
+
+### Join to a single regression frame
+
+```{r reg-data}
+reg_data <- plot_cond_data_avg %>%
+  left_join(plot_cond_data_max, by = "PLT_CN") %>%
+  inner_join(emb_data, by = c("PLT_CN" = "CN")) %>%
+  mutate(FORTYPGRP = as.factor(substr(FORTYPCD, 1, 2)))
+```
+
+### Feature-block name vectors
+
+```{r feature-vars}
+inp_type_vars  <- paste0("x_type_",     seq(0, 32))
+inp_phase_vars <- paste0("x_phase_dm_", seq(0, 12))
+emb_type_vars  <- paste0("z_type_",     seq(0, 47))
+emb_phase_vars <- paste0("z_phase_",    seq(0, 7))
+```
+
+## 1. Linear probes (OLS)
+
+How much of `BALIVE` is *linearly* recoverable from each representation? Adjusted
+R² is the headline. This is the classic linear-probe comparison: raw inputs vs.
+embeddings, type-only vs. phase-only vs. combined.
+
+```{r lm-formulas}
+form_inp_type <- as.formula(paste("BALIVE ~", paste(inp_type_vars, collapse = " + ")))
+form_inp_phase <- as.formula(paste("BALIVE ~", paste(inp_phase_vars, collapse = " + ")))
+form_inp_all  <- as.formula(paste("BALIVE ~", paste(c(inp_type_vars, inp_phase_vars), collapse = " + ")))
+
+form_emb_type <- as.formula(paste("BALIVE ~", paste(emb_type_vars, collapse = " + ")))
+form_emb_phase <- as.formula(paste("BALIVE ~", paste(emb_phase_vars, collapse = " + ")))
+form_emb_all  <- as.formula(paste("BALIVE ~", paste(c(emb_type_vars, emb_phase_vars), collapse = " + ")))
+
+# rows with a known forest type
+rd <- reg_data[!is.na(reg_data$FORTYPCD), ]
+```
+
+```{r lm-fits}
+summary(lm(form_inp_type,  data = rd))
+summary(lm(form_inp_phase, data = rd))
+summary(lm(form_inp_all,   data = rd))
+
+summary(lm(form_emb_phase, data = rd))
+summary(lm(form_emb_all,   data = rd))
+summary(lm(form_emb_type,  data = rd))
+```
+
+### Adjusted-R² summary table
+
+```{r lm-r2}
+r2 <- function(form, data = rd) summary(lm(form, data = data))$adj.r.squared
+
+data.frame(
+  block = c("type", "phase", "all"),
+  emb   = c(r2(form_emb_type), r2(form_emb_phase), r2(form_emb_all)),
+  inp   = c(r2(form_inp_type), r2(form_inp_phase), r2(form_inp_all))
+)
+
+# also on ALL plots (including unknown forest type)
+c(emb_all_allplots = summary(lm(form_emb_all, data = reg_data))$adj.r.squared,
+  inp_all_allplots = summary(lm(form_inp_all, data = reg_data))$adj.r.squared)
+```
+
+## 2. k-Nearest-Neighbor imputation of BALIVE
+
+This is the most scientifically honest test for the project's stated goal: the
+embedding is explicitly designed as a **metric space** for kNN-style
+post-stratification and small-area estimation, not for linear models.
+
+### Split by the model's train/val/test assignment
+
+```{r knn-splits}
+AnnDat_train <- reg_data[which(reg_data$split == "train" & !is.na(reg_data$FORTYPCD)), ]
+AnnDat_val   <- reg_data[which(reg_data$split == "val"   & !is.na(reg_data$FORTYPCD)), ]
+AnnDat_test  <- reg_data[which(reg_data$split == "test"  & !is.na(reg_data$FORTYPCD)), ]
+```
+
+### Block-wise population L2 normalization
+
+`z_type` is deliberately *unconstrained in magnitude* (per the architecture),
+while `z_phase` lives on a smaller scale. To put them on comparable footing
+before concatenation, each block is divided by its **mean training L2 norm** and
+then row-normalized — separately.
+
+```{r pop-l2}
+l2_norm      <- function(x) sqrt(rowSums(x^2))
+l2_normalize <- function(x) x / l2_norm(x)
+
+pop_l2_normalize <- function(train_block, val_block, test_block) {
+  mean_train_norm <- mean(l2_norm(train_block), na.rm = TRUE)
+  list(
+    train = l2_normalize(train_block / mean_train_norm),
+    val   = l2_normalize(val_block   / mean_train_norm),
+    test  = l2_normalize(test_block  / mean_train_norm)
+  )
+}
+
+type_emb  <- pop_l2_normalize(AnnDat_train[, emb_type_vars],
+                              AnnDat_val[,   emb_type_vars],
+                              AnnDat_test[,  emb_type_vars])
+phase_emb <- pop_l2_normalize(AnnDat_train[, emb_phase_vars],
+                              AnnDat_val[,   emb_phase_vars],
+                              AnnDat_test[,  emb_phase_vars])
+```
+
+### kNN prediction helper
+
+`BALIVE` of a plot is imputed as the **mean BALIVE of its k train neighbors**.
+Train-on-train drops the self-match.
+
+```{r knn-helper}
+knn_balive <- function(nn, balive_source, drop_self = FALSE) {
+  idx <- if (drop_self) nn$nn.index[, -1] else nn$nn.index
+  rowMeans(matrix(balive_source[idx], nrow = nrow(nn$nn.index)), na.rm = TRUE)
+}
+
+mse <- function(actual, predicted) mean((actual - predicted)^2, na.rm = TRUE)
+```
+
+### Baseline kNN (k = 10), embeddings vs. inputs
+
+```{r knn-baseline}
+emb_train <- cbind(type_emb$train, phase_emb$train)
+emb_val   <- cbind(type_emb$val,   phase_emb$val)
+emb_test  <- cbind(type_emb$test,  phase_emb$test)
+
+nn_emb_train <- get.knnx(data = emb_train, query = emb_train, k = 11)
+nn_emb_val   <- get.knnx(data = emb_train, query = emb_val,   k = 10)
+nn_emb_test  <- get.knnx(data = emb_train, query = emb_test,  k = 10)
+
+nn_inp_train <- get.knnx(data = AnnDat_train[, c(inp_type_vars, inp_phase_vars)],
+                         query = AnnDat_train[, c(inp_type_vars, inp_phase_vars)], k = 11)
+nn_inp_val   <- get.knnx(data = AnnDat_train[, c(inp_type_vars, inp_phase_vars)],
+                         query = AnnDat_val[,   c(inp_type_vars, inp_phase_vars)], k = 10)
+nn_inp_test  <- get.knnx(data = AnnDat_train[, c(inp_type_vars, inp_phase_vars)],
+                         query = AnnDat_test[,  c(inp_type_vars, inp_phase_vars)], k = 10)
+
+pred_emb_train <- knn_balive(nn_emb_train, AnnDat_train$BALIVE, drop_self = TRUE)
+pred_emb_val   <- knn_balive(nn_emb_val,   AnnDat_train$BALIVE, drop_self = FALSE)
+pred_emb_test  <- knn_balive(nn_emb_test,  AnnDat_train$BALIVE, drop_self = FALSE)
+
+pred_inp_train <- knn_balive(nn_inp_train, AnnDat_train$BALIVE, drop_self = TRUE)
+pred_inp_val   <- knn_balive(nn_inp_val,   AnnDat_train$BALIVE, drop_self = FALSE)
+pred_inp_test  <- knn_balive(nn_inp_test,  AnnDat_train$BALIVE, drop_self = FALSE)
+
+data.frame(
+  split   = c("train", "val", "test"),
+  mse_emb = c(mse(AnnDat_train$BALIVE, pred_emb_train),
+              mse(AnnDat_val$BALIVE,   pred_emb_val),
+              mse(AnnDat_test$BALIVE,  pred_emb_test)),
+  mse_inp = c(mse(AnnDat_train$BALIVE, pred_inp_train),
+              mse(AnnDat_val$BALIVE,   pred_inp_val),
+              mse(AnnDat_test$BALIVE,  pred_inp_test))
+)
+```
+
+## 3. Tuning the type-vs-phase scale, then sweeping k
+
+Because type and phase are separate blocks, a scalar weight `w` on the phase
+block controls how much the recovery-dynamics signal contributes to the distance
+metric. `w` is chosen to minimize **validation** MSE — separately for embeddings
+and inputs (inputs use a 2× grid because they sit on a different scale).
+
+```{r w-sweep-emb}
+k <- 150
+w_grid <- seq(0.5, 6, by = 0.25)
+
+mse_w <- sapply(w_grid, function(w) {
+  emb_train_w <- cbind(type_emb$train, w * phase_emb$train)
+  emb_val_w   <- cbind(type_emb$val,   w * phase_emb$val)
+  nn_w <- get.knnx(data = emb_train_w, query = emb_val_w, k = k)
+  mse(AnnDat_val$BALIVE, knn_balive(nn_w, AnnDat_train$BALIVE, drop_self = FALSE))
+})
+w_opt <- w_grid[which.min(mse_w)]
+data.frame(w = w_grid, mse_val = mse_w)
+cat("Optimal w (embedding):", w_opt, "\n")
+```
+
+```{r w-sweep-inp}
+w_grid_inp <- w_grid * 2
+mse_w_inp <- sapply(w_grid_inp, function(w) {
+  inp_train_w <- cbind(AnnDat_train[, inp_type_vars], w * AnnDat_train[, inp_phase_vars])
+  inp_val_w   <- cbind(AnnDat_val[,   inp_type_vars], w * AnnDat_val[,   inp_phase_vars])
+  nn_w <- get.knnx(data = inp_train_w, query = inp_val_w, k = k)
+  mse(AnnDat_val$BALIVE, knn_balive(nn_w, AnnDat_train$BALIVE, drop_self = FALSE))
+})
+w_opt_inp <- w_grid_inp[which.min(mse_w_inp)]
+data.frame(w = w_grid_inp, mse_val = mse_w_inp)
+cat("Optimal w (input):", w_opt_inp, "\n")
+```
+
+### k-sweep with per-k phase-weight re-optimization
+
+For each neighborhood size k, the phase weight is re-optimized on val, then every
+split is predicted from the **train** reference set. MSE is decomposed into
+bias² + variance. The headline question: *at each k, does the embedding metric
+give lower test error than raw inputs?*
+
+```{r k-sweep}
+w_grid     <- seq(0.5, 6, by = 0.25)
+w_grid_inp <- w_grid * 2
+k_grid     <- c(10, 15, 20, 30, 50, 75, 100, 150, 200, 250)
+
+metrics <- function(actual, predicted) {
+  resid <- predicted - actual
+  resid <- resid[!is.na(resid)]
+  bias  <- mean(resid)
+  m     <- mean(resid^2)
+  mae   <- mean(abs(resid))
+  c(mse = m, mae = mae, bias = bias, variance = m - bias^2)
+}
+
+optimize_w <- function(k, type_train, phase_train, type_val, phase_val,
+                       bal_train, bal_val, w_candidates) {
+  mse_w <- sapply(w_candidates, function(w) {
+    tr <- cbind(type_train, w * phase_train)
+    va <- cbind(type_val,   w * phase_val)
+    nn <- get.knnx(data = tr, query = va, k = k)
+    mse(bal_val, knn_balive(nn, bal_train, drop_self = FALSE))
+  })
+  w_candidates[which.min(mse_w)]
+}
+
+results_k <- list()
+for (k in k_grid) {
+  w_opt_emb <- optimize_w(k, type_emb$train, phase_emb$train, type_emb$val, phase_emb$val,
+                          AnnDat_train$BALIVE, AnnDat_val$BALIVE, w_grid)
+  w_opt_inp <- optimize_w(k, AnnDat_train[, inp_type_vars], AnnDat_train[, inp_phase_vars],
+                          AnnDat_val[, inp_type_vars], AnnDat_val[, inp_phase_vars],
+                          AnnDat_train$BALIVE, AnnDat_val$BALIVE, w_grid_inp)
+  cat(sprintf("k = %-3d  optimal w:  emb = %.2f   inp = %.2f\n", k, w_opt_emb, w_opt_inp))
+
+  emb_train <- cbind(type_emb$train, w_opt_emb * phase_emb$train)
+  emb_val   <- cbind(type_emb$val,   w_opt_emb * phase_emb$val)
+  emb_test  <- cbind(type_emb$test,  w_opt_emb * phase_emb$test)
+  inp_train <- cbind(AnnDat_train[, inp_type_vars], w_opt_inp * AnnDat_train[, inp_phase_vars])
+  inp_val   <- cbind(AnnDat_val[,   inp_type_vars], w_opt_inp * AnnDat_val[,   inp_phase_vars])
+  inp_test  <- cbind(AnnDat_test[,  inp_type_vars], w_opt_inp * AnnDat_test[,  inp_phase_vars])
+
+  pred_emb_train <- knn_balive(get.knnx(emb_train, emb_train, k = k + 1), AnnDat_train$BALIVE, drop_self = TRUE)
+  pred_emb_val   <- knn_balive(get.knnx(emb_train, emb_val,   k = k),     AnnDat_train$BALIVE, drop_self = FALSE)
+  pred_emb_test  <- knn_balive(get.knnx(emb_train, emb_test,  k = k),     AnnDat_train$BALIVE, drop_self = FALSE)
+  pred_inp_train <- knn_balive(get.knnx(inp_train, inp_train, k = k + 1), AnnDat_train$BALIVE, drop_self = TRUE)
+  pred_inp_val   <- knn_balive(get.knnx(inp_train, inp_val,   k = k),     AnnDat_train$BALIVE, drop_self = FALSE)
+  pred_inp_test  <- knn_balive(get.knnx(inp_train, inp_test,  k = k),     AnnDat_train$BALIVE, drop_self = FALSE)
+
+  results_k[[length(results_k) + 1]] <- do.call(rbind, list(
+    data.frame(k = k, rep = "emb", w = w_opt_emb, split = "train", t(metrics(AnnDat_train$BALIVE, pred_emb_train))),
+    data.frame(k = k, rep = "emb", w = w_opt_emb, split = "val",   t(metrics(AnnDat_val$BALIVE,   pred_emb_val))),
+    data.frame(k = k, rep = "emb", w = w_opt_emb, split = "test",  t(metrics(AnnDat_test$BALIVE,  pred_emb_test))),
+    data.frame(k = k, rep = "inp", w = w_opt_inp, split = "train", t(metrics(AnnDat_train$BALIVE, pred_inp_train))),
+    data.frame(k = k, rep = "inp", w = w_opt_inp, split = "val",   t(metrics(AnnDat_val$BALIVE,   pred_inp_val))),
+    data.frame(k = k, rep = "inp", w = w_opt_inp, split = "test",  t(metrics(AnnDat_test$BALIVE,  pred_inp_test)))
+  ))
+}
+
+results_final <- do.call(rbind, results_k)
+results_final[, c("mse", "mae", "bias", "variance")] <-
+  round(results_final[, c("mse", "mae", "bias", "variance")], 1)
+rownames(results_final) <- NULL
+results_final <- results_final[order(results_final$rep, results_final$split, results_final$k), ]
+results_final
+```
+
+### Headline test-error comparisons by k
+
+`delta_pct < 0` means the embedding wins.
+
+```{r headline-tables}
+headline <- function(metric) {
+  tw <- reshape(subset(results_final, split == "test", c("k", "rep", metric)),
+                idvar = "k", timevar = "rep", direction = "wide")
+  names(tw) <- sub(paste0("^", metric, "\\."), paste0(metric, "_"), names(tw))
+  tw$delta_pct <- round(100 * (tw[[paste0(metric, "_emb")]] - tw[[paste0(metric, "_inp")]]) /
+                          tw[[paste0(metric, "_inp")]], 1)
+  tw
+}
+
+cat("Test MSE by k (delta_pct < 0 = embedding wins):\n"); headline("mse")
+cat("Test MAE by k (delta_pct < 0 = embedding wins):\n"); headline("mae")
+cat("Test Var by k (delta_pct < 0 = embedding wins):\n"); headline("variance")
+```
+
+## 4. Where in neighbor space does the embedding win?
+
+A direct probe of the distance metric **by scale**, independent of the kNN
+averaging step. Query = test, reference = train. For the r-th nearest neighbor,
+how close is its BALIVE to the query's? The `gap = input − embedding` curve shows
+at what neighbor rank the embedding's structure is most advantageous.
+
+```{r perrank-setup}
+R_max        <- 150
+w_emb        <- 1.00
+w_inp        <- 2.00      # k=50 optimum region; inp metric is w-sensitive
+ranks_report <- c(1, 5, 10, 25, 50, 75, 100, 150)
+
+bal_train <- AnnDat_train$BALIVE
+bal_test  <- AnnDat_test$BALIVE
+
+emb_ref <- cbind(type_emb$train, w_emb * phase_emb$train)
+emb_qry <- cbind(type_emb$test,  w_emb * phase_emb$test)
+inp_ref <- cbind(AnnDat_train[, inp_type_vars], w_inp * AnnDat_train[, inp_phase_vars])
+inp_qry <- cbind(AnnDat_test[,  inp_type_vars], w_inp * AnnDat_test[,  inp_phase_vars])
+
+nn_emb <- get.knnx(data = emb_ref, query = emb_qry, k = R_max)$nn.index
+nn_inp <- get.knnx(data = inp_ref, query = inp_qry, k = R_max)$nn.index
+
+absdelta_by_rank <- function(nn_index, bal_ref, bal_query) {
+  neigh_bal <- matrix(bal_ref[nn_index], nrow = nrow(nn_index))
+  abs(neigh_bal - bal_query)
+}
+ad_emb <- absdelta_by_rank(nn_emb, bal_train, bal_test)
+ad_inp <- absdelta_by_rank(nn_inp, bal_train, bal_test)
+```
+
+```{r perrank-tables}
+perrank <- data.frame(rank = 1:R_max,
+                      emb = colMeans(ad_emb, na.rm = TRUE),
+                      inp = colMeans(ad_inp, na.rm = TRUE))
+perrank$gap       <- perrank$inp - perrank$emb
+perrank$delta_pct <- round(100 * (perrank$emb - perrank$inp) / perrank$inp, 1)
+
+M       <- matrix(0, R_max, R_max); M[upper.tri(M, diag = TRUE)] <- 1
+cummean <- function(ad) colMeans(sweep(ad %*% M, 2, 1:R_max, "/"), na.rm = TRUE)
+cumulative <- data.frame(rank = 1:R_max, emb = cummean(ad_emb), inp = cummean(ad_inp))
+cumulative$delta_pct <- round(100 * (cumulative$emb - cumulative$inp) / cumulative$inp, 1)
+
+cat("Per-rank mean |dBALIVE| to the r-th neighbor:\n")
+round(perrank[perrank$rank %in% ranks_report, c("rank", "emb", "inp", "gap", "delta_pct")], 2)
+
+cat("Cumulative mean |dBALIVE| within the first-r neighborhood:\n")
+round(cumulative[cumulative$rank %in% ranks_report, ], 2)
+
+peak <- perrank$rank[which.max(perrank$gap)]
+cat(sprintf("Embedding advantage (per-rank gap) is largest at rank %d (%.2f sq ft/acre).\n",
+            peak, max(perrank$gap)))
+```
+
+```{r perrank-plot, fig.width=11, fig.height=5}
+op <- par(mfrow = c(1, 2), mar = c(4.2, 4.2, 3, 1))
+plot(perrank$rank, perrank$emb, type = "l", col = "steelblue", lwd = 2,
+     ylim = range(perrank$emb, perrank$inp),
+     xlab = "neighbor rank r", ylab = "mean |dBALIVE| to query (sq ft/acre)",
+     main = "r-th neighbor homogeneity")
+lines(perrank$rank, perrank$inp, col = "firebrick", lwd = 2)
+legend("topleft", c("embedding", "input"), col = c("steelblue", "firebrick"), lwd = 2, bty = "n")
+
+plot(perrank$rank, perrank$gap, type = "l", col = "darkgreen", lwd = 2,
+     xlab = "neighbor rank r", ylab = "input - embedding |dBALIVE| (>0 = emb better)",
+     main = "advantage by scale")
+abline(h = 0, lty = 3); abline(v = peak, lty = 2, col = "grey50")
+par(op)
+```
+
+### Banded (5-rank) paired advantage ± 2 SE
+
+```{r banded, fig.width=11, fig.height=5}
+band_w <- 5
+band   <- (seq_len(R_max) - 1L) %/% band_w + 1L
+band_emb <- tapply(colMeans(ad_emb, na.rm = TRUE), band, mean)
+band_inp <- tapply(colMeans(ad_inp, na.rm = TRUE), band, mean)
+
+D <- ad_inp - ad_emb   # >0 = embedding better, paired per query
+band_stats <- as.data.frame(t(sapply(sort(unique(band)), function(b) {
+  cols      <- which(band == b)
+  per_query <- rowMeans(D[, cols, drop = FALSE], na.rm = TRUE)
+  n  <- sum(is.finite(per_query))
+  c(mid = mean(cols), gap = mean(per_query, na.rm = TRUE),
+    se = sd(per_query, na.rm = TRUE) / sqrt(n))
+})))
+band_stats$delta_pct <- round(100 * (band_emb - band_inp) / band_inp, 2)
+band_stats$sig       <- ifelse(abs(band_stats$gap) > 2 * band_stats$se, "*", "")
+
+round(band_stats[, c("mid", "gap", "se", "delta_pct")], 3)
+cat("bands where embedding is >2 SE better:",
+    paste0(round(band_stats$mid[band_stats$sig == "*" & band_stats$gap > 0]), collapse = ", "), "\n")
+
+op <- par(mfrow = c(1, 2), mar = c(4.2, 4.6, 3, 1))
+plot(band_stats$mid, band_emb, type = "o", pch = 16, col = "steelblue", lwd = 2,
+     ylim = range(band_emb, band_inp),
+     xlab = "neighbor rank (5-rank bands)", ylab = "mean |dBALIVE| (sq ft/acre)",
+     main = "banded homogeneity")
+lines(band_stats$mid, band_inp, type = "o", pch = 16, col = "firebrick", lwd = 2)
+legend("topleft", c("embedding", "input"), col = c("steelblue", "firebrick"),
+       lwd = 2, pch = 16, bty = "n")
+with(band_stats, {
+  plot(mid, gap, type = "o", pch = 16, col = "darkgreen", lwd = 2,
+       ylim = range(gap - 2 * se, gap + 2 * se, 0),
+       xlab = "neighbor rank (5-rank bands)",
+       ylab = "input - embedding |dBALIVE| (>0 = emb better)",
+       main = "paired advantage +/- 2 SE")
+  arrows(mid, gap - 2 * se, mid, gap + 2 * se, angle = 90, code = 3, length = 0.03, col = "darkgreen")
+  abline(h = 0, lty = 3)
+})
+par(op)
+```
+
+## 5. Per-stratum error (zero class + positive deciles)
+
+`BALIVE` is ~31% zeros. Stratifying into a zero class plus deciles of the
+positive values shows *where in the distribution* the embedding wins, and whether
+that advantage grows with k (the "regression to the mean" bias plot).
+
+```{r per-stratum, fig.width=11, fig.height=5}
+k_lo <- 50 ; w_emb_lo <- 1.00; w_inp_lo <- 3.50
+k_hi <- 250; w_emb_hi <- 0.75; w_inp_hi <- 2.00
+
+bal_train <- AnnDat_train$BALIVE
+bal_test  <- AnnDat_test$BALIVE
+fin <- is.finite(bal_test)
+
+q_full <- quantile(bal_test[fin], probs = seq(0, 1, 0.1), na.rm = TRUE)
+edges  <- c(0, unique(q_full[q_full > 0]))
+nbin   <- length(edges) - 1
+strat  <- rep(NA_integer_, length(bal_test))
+strat[fin & bal_test == 0] <- 0L
+strat[fin & bal_test  > 0] <- findInterval(bal_test[fin & bal_test > 0], edges,
+                                           rightmost.closed = TRUE, all.inside = TRUE)
+S_levels <- 0:nbin
+S_label  <- c("zero", paste0("d", (10 - nbin + 1):10))
+
+predict_knn <- function(type_tr, phase_tr, type_te, phase_te, w, k) {
+  ref <- cbind(type_tr, w * phase_tr)
+  qry <- cbind(type_te, w * phase_te)
+  knn_balive(get.knnx(data = ref, query = qry, k = k), bal_train, drop_self = FALSE)
+}
+P <- function(w, k, emb) if (emb)
+  predict_knn(type_emb$train, phase_emb$train, type_emb$test, phase_emb$test, w, k) else
+    predict_knn(AnnDat_train[, inp_type_vars], AnnDat_train[, inp_phase_vars],
+                AnnDat_test[,  inp_type_vars], AnnDat_test[,  inp_phase_vars], w, k)
+
+pred_emb_lo <- P(w_emb_lo, k_lo, TRUE); pred_inp_lo <- P(w_inp_lo, k_lo, FALSE)
+pred_emb_hi <- P(w_emb_hi, k_hi, TRUE); pred_inp_hi <- P(w_inp_hi, k_hi, FALSE)
+
+stratum_stats <- function(p) {
+  r <- p - bal_test; g <- factor(strat, levels = S_levels)
+  data.frame(bal_mean = as.numeric(tapply(bal_test, g, mean, na.rm = TRUE)),
+             rmse     = sqrt(as.numeric(tapply(r, g, function(x) mean(x^2, na.rm = TRUE)))),
+             bias     = as.numeric(tapply(r, g, mean, na.rm = TRUE)))
+}
+compare_k <- function(pe, pi, klab) {
+  se <- stratum_stats(pe); si <- stratum_stats(pi)
+  data.frame(k = klab, stratum = S_label, bal_mean = round(se$bal_mean, 1),
+             n = as.integer(table(factor(strat, levels = S_levels))),
+             rmse_emb = round(se$rmse, 1), rmse_inp = round(si$rmse, 1),
+             rmse_dpct = round(100 * (se$rmse - si$rmse) / si$rmse, 1),
+             bias_emb = round(se$bias, 1), bias_inp = round(si$bias, 1))
+}
+tab_lo <- compare_k(pred_emb_lo, pred_inp_lo, k_lo)
+tab_hi <- compare_k(pred_emb_hi, pred_inp_hi, k_hi)
+
+cat(sprintf("=== per-stratum, k = %d (w_emb=%.2f, w_inp=%.2f) ===\n", k_lo, w_emb_lo, w_inp_lo)); tab_lo
+cat(sprintf("=== per-stratum, k = %d (w_emb=%.2f, w_inp=%.2f) ===\n", k_hi, w_emb_hi, w_inp_hi)); tab_hi
+
+grow <- data.frame(stratum = S_label, bal_mean = tab_lo$bal_mean,
+                   dpct_k50 = tab_lo$rmse_dpct, dpct_k250 = tab_hi$rmse_dpct,
+                   change = round(tab_hi$rmse_dpct - tab_lo$rmse_dpct, 1))
+cat("=== emb RMSE advantage by stratum: does it grow from k=50 to k=250? ===\n"); grow
+
+op <- par(mfrow = c(1, 2), mar = c(4.4, 4.4, 3, 1))
+plot(tab_lo$bal_mean, tab_lo$rmse_dpct, type = "o", pch = 16, col = "steelblue", lwd = 2,
+     ylim = range(tab_lo$rmse_dpct, tab_hi$rmse_dpct, 0),
+     xlab = "stratum mean BALIVE (x=0 = zero class)",
+     ylab = "emb RMSE advantage %  (<0 = emb better)", main = "Where the embedding wins")
+lines(tab_hi$bal_mean, tab_hi$rmse_dpct, type = "o", pch = 16, col = "darkorange", lwd = 2)
+abline(h = 0, lty = 3)
+legend("bottomleft", c(paste0("k=", k_lo), paste0("k=", k_hi)),
+       col = c("steelblue", "darkorange"), lwd = 2, pch = 16, bty = "n")
+plot(tab_hi$bal_mean, tab_hi$bias_inp, type = "o", pch = 16, col = "firebrick", lwd = 2,
+     ylim = range(tab_hi$bias_emb, tab_hi$bias_inp, 0),
+     xlab = "stratum mean BALIVE (x=0 = zero class)",
+     ylab = sprintf("mean residual (pred-actual), k=%d", k_hi), main = "Regression to the mean")
+lines(tab_hi$bal_mean, tab_hi$bias_emb, type = "o", pch = 16, col = "steelblue", lwd = 2)
+abline(h = 0, lty = 3)
+legend("topright", c("embedding", "input"), col = c("steelblue", "firebrick"),
+       lwd = 2, pch = 16, bty = "n")
+par(op)
+```
+
+## 6. Recovery-stage (ysfc) structure
+
+`z_phase` was designed to encode recovery stage (years-since-fast-change, `ysfc`).
+These diagnostics stress-test that pathway.
+
+### BALIVE distribution by ysfc recovery class
+
+```{r ysfc-hist, fig.width=11, fig.height=7}
+bal  <- c(AnnDat_train$BALIVE, AnnDat_test$BALIVE)
+ysfc <- c(AnnDat_train$ysfc,   AnnDat_test$ysfc)
+if (exists("AnnDat_val")) { bal <- c(bal, AnnDat_val$BALIVE); ysfc <- c(ysfc, AnnDat_val$ysfc) }
+
+brks <- c(-Inf, 1, 5, 15, 32, Inf)
+labs <- c("recent (0-1)", "young (2-5)", "mid (6-15)", "mature (16-32)", "stable (33+)")
+cls  <- cut(ysfc, brks, labels = labs)
+ok   <- is.finite(bal) & !is.na(cls); bal <- bal[ok]; cls <- cls[ok]
+
+xmax   <- ceiling(quantile(bal, 0.995, na.rm = TRUE) / 10) * 10
+brks_h <- seq(0, xmax, by = 10)
+bal_cl <- pmin(bal, xmax)
+pal    <- c("#d73027", "#fc8d59", "#fee08b", "#91cf60", "#1a9850")
+
+op <- par(mfrow = c(2, 3), mar = c(4, 4, 2.5, 1), oma = c(0, 0, 2, 0))
+for (i in seq_along(labs)) {
+  b <- bal_cl[cls == labs[i]]
+  hist(b, breaks = brks_h, freq = FALSE, col = pal[i], border = "grey40",
+       xlab = "BALIVE (sq ft/acre)", main = sprintf("%s  (n=%d)", labs[i], length(b)))
+  abline(v = median(b), col = "black", lwd = 2, lty = 2)
+  legend("topright", bty = "n", cex = 0.85, legend = c(
+    sprintf("%%zero = %.0f%%", 100 * mean(b == 0)),
+    sprintf("median = %.0f", median(b)),
+    sprintf("mean = %.0f",   mean(b))))
+}
+dens <- lapply(labs, function(L) density(bal_cl[cls == L], from = 0))
+plot(NA, xlim = c(0, xmax), ylim = c(0, max(sapply(dens, function(d) max(d$y)))),
+     xlab = "BALIVE (sq ft/acre)", ylab = "density", main = "all classes")
+for (i in seq_along(labs)) lines(dens[[i]], col = pal[i], lwd = 2)
+legend("topright", labs, col = pal, lwd = 2, bty = "n", cex = 0.8)
+mtext("BALIVE distribution by years-since-fast-change class", outer = TRUE, cex = 1.1, font = 2)
+par(op)
+```
+
+### ysfc neighborhood coherence
+
+Do an embedding's kNN neighbors share the query's recovery class? Purity, lift
+over base rate (controls for the dominant stable class), and within-neighborhood
+ysfc spread — emb vs. inp.
+
+```{r ysfc-coherence, fig.width=13, fig.height=5}
+k <- 25; w_emb <- 2.00; w_inp <- 3.50
+
+brks <- c(-Inf, 2, 5, 10, 20, Inf)
+labs <- c("recent(0-2)", "young(3-5)", "mid(6-10)", "mature(11-19)", "stable(20+)")
+ysfc_train <- AnnDat_train$ysfc; ysfc_test <- AnnDat_test$ysfc
+cls_train <- cut(ysfc_train, brks, labels = labs)
+cls_test  <- cut(ysfc_test,  brks, labels = labs)
+
+nn_emb <- get.knnx(cbind(type_emb$train, w_emb * phase_emb$train),
+                   cbind(type_emb$test,  w_emb * phase_emb$test), k = k)$nn.index
+nn_inp <- get.knnx(cbind(AnnDat_train[, inp_type_vars], w_inp * AnnDat_train[, inp_phase_vars]),
+                   cbind(AnnDat_test[,  inp_type_vars], w_inp * AnnDat_test[,  inp_phase_vars]), k = k)$nn.index
+
+nb_table <- function(nn_index) {
+  qrep <- rep(cls_test, times = ncol(nn_index))
+  ncls <- cls_train[as.vector(nn_index)]
+  table(query = qrep, neighbor = ncls)
+}
+tab_emb <- nb_table(nn_emb); tab_inp <- nb_table(nn_inp)
+
+report <- function(tab) {
+  p_same <- diag(prop.table(tab, 1))
+  base   <- colSums(tab) / sum(tab)
+  rbind(purity = round(p_same, 3), lift = round(p_same / base, 2))
+}
+cat("== EMBEDDING ==\n"); report(tab_emb)
+cat("== INPUT ==\n");     report(tab_inp)
+
+nb_sd <- function(nn_index) apply(matrix(ysfc_train[nn_index], nrow = nrow(nn_index)), 1, sd, na.rm = TRUE)
+sd_emb <- tapply(nb_sd(nn_emb), cls_test, mean, na.rm = TRUE)
+sd_inp <- tapply(nb_sd(nn_inp), cls_test, mean, na.rm = TRUE)
+
+pal <- c("#d73027", "#fc8d59", "#fee08b", "#91cf60", "#1a9850")
+op <- par(mfrow = c(1, 3), mar = c(6, 4, 3, 1))
+mosaicplot(tab_emb, color = pal, las = 2, cex.axis = 0.7,
+           main = sprintf("Embedding (k=%d)", k), xlab = "query class", ylab = "neighbor class")
+mosaicplot(tab_inp, color = pal, las = 2, cex.axis = 0.7,
+           main = sprintf("Input (k=%d)", k), xlab = "query class", ylab = "neighbor class")
+barplot(rbind(embedding = sd_emb, input = sd_inp), beside = TRUE, las = 2,
+        col = c("steelblue", "firebrick"), ylab = "mean within-neighborhood ysfc SD (yrs)",
+        main = "Neighbor ysfc spread")
+legend("topright", c("embedding", "input"), fill = c("steelblue", "firebrick"), bty = "n")
+par(op)
+```
+
+### BALIVE distribution + zero-inflated strata
+
+```{r balive-strata, fig.width=9, fig.height=5}
+bal_train <- AnnDat_train$BALIVE
+bal_test  <- AnnDat_test$BALIVE
+fin <- is.finite(bal_test)
+
+cat(sprintf("BALIVE == 0:  test %.1f%%   train %.1f%%\n",
+            100 * mean(bal_test[fin] == 0), 100 * mean(bal_train[is.finite(bal_train)] == 0)))
+
+edges <- unique(quantile(bal_test[fin & bal_test > 0], probs = seq(0, 1, 0.1), na.rm = TRUE))
+nbin  <- length(edges) - 1
+assign_strata <- function(x) {
+  f <- is.finite(x); s <- rep(NA_integer_, length(x))
+  s[f & x == 0] <- 0L
+  s[f & x  > 0] <- findInterval(x[f & x > 0], edges, rightmost.closed = TRUE, all.inside = TRUE)
+  s
+}
+strat       <- assign_strata(bal_test)
+strat_train <- assign_strata(bal_train)
+
+data.frame(
+  stratum = c("zero", paste0("pos_d", 1:nbin)),
+  lower   = round(c(0, edges[1:nbin]), 1),
+  upper   = round(c(0, edges[2:(nbin + 1)]), 1),
+  mean    = round(as.numeric(tapply(bal_test, strat, mean, na.rm = TRUE)), 1),
+  n_test  = as.integer(table(factor(strat,       levels = 0:nbin))),
+  n_train = as.integer(table(factor(strat_train, levels = 0:nbin))))
+
+op <- par(mar = c(4.4, 4.4, 3, 1))
+h <- hist(bal_test[fin & bal_test > 0], breaks = 50, plot = FALSE)
+ymax <- max(h$density) * 1.15; p0 <- mean(bal_test[fin] == 0)
+plot(h, freq = FALSE, col = "grey88", border = "grey70",
+     xlim = c(0, max(bal_test[fin])), ylim = c(0, ymax), xlab = "BALIVE (sq ft/acre)",
+     main = sprintf("BALIVE: %.0f%% zeros + positive-value deciles", 100 * p0))
+abline(v = edges[2:nbin], col = "steelblue", lwd = 1.3, lty = 2)
+arrows(0, 0, 0, ymax * 0.9, col = "firebrick", lwd = 3, length = 0)
+text(0, ymax * 0.95, sprintf("zeros %.0f%%", 100 * p0), col = "firebrick", pos = 4, cex = 0.9)
+lines(density(bal_train[is.finite(bal_train) & bal_train > 0]), col = "darkorange", lwd = 2)
+legend("topright", c("test positive (hist)", "train positive (density)", "decile cut", "zeros"),
+       col = c("grey70", "darkorange", "steelblue", "firebrick"),
+       lwd = c(6, 2, 1.3, 3), lty = c(1, 1, 2, 1), bty = "n")
+par(op)
+```
+
+## 7. Forest-type (FORTYPCD) recovery
+
+A good metric for basal area should also keep neighbors within-forest-type
+without being told to — the "soft stratification" the embedding is meant to
+provide. These reuse the **final BALIVE kNN neighborhoods** (`nn_emb_*`,
+`nn_inp_*`) from the k=150 baseline.
+
+### kNN majority-vote classification
+
+```{r fortyp-knn}
+knn_mode <- function(nn, label_source, drop_self = FALSE) {
+  idx <- if (drop_self) nn$nn.index[, -1, drop = FALSE] else nn$nn.index
+  nbr <- matrix(label_source[idx], nrow = nrow(idx))
+  apply(nbr, 1, function(row) {
+    tab <- table(row)
+    if (length(tab) == 0) return(NA_real_)
+    as.numeric(names(tab)[which.max(tab)])
+  })
+}
+acc <- function(actual, predicted) mean(actual == predicted, na.rm = TRUE)
+
+ftype_train <- AnnDat_train$FORTYPCD
+
+fortypcd_results <- data.frame(
+  split   = c("train", "val", "test"),
+  acc_emb = c(acc(AnnDat_train$FORTYPCD, knn_mode(nn_emb_train, ftype_train, drop_self = TRUE)),
+              acc(AnnDat_val$FORTYPCD,   knn_mode(nn_emb_val,   ftype_train)),
+              acc(AnnDat_test$FORTYPCD,  knn_mode(nn_emb_test,  ftype_train))),
+  acc_inp = c(acc(AnnDat_train$FORTYPCD, knn_mode(nn_inp_train, ftype_train, drop_self = TRUE)),
+              acc(AnnDat_val$FORTYPCD,   knn_mode(nn_inp_val,   ftype_train)),
+              acc(AnnDat_test$FORTYPCD,  knn_mode(nn_inp_test,  ftype_train)))
+)
+base_rate <- max(prop.table(table(AnnDat_train$FORTYPCD)))
+cat(sprintf("Majority-class baseline (train): %.3f\n", base_rate))
+fortypcd_results
+```
+
+### Neighbor forest-type purity
+
+```{r fortyp-purity}
+knn_purity <- function(nn, query_labels, ref_labels, drop_self = FALSE) {
+  idx <- if (drop_self) nn$nn.index[, -1, drop = FALSE] else nn$nn.index
+  nbr <- matrix(ref_labels[idx], nrow = nrow(idx))
+  rowMeans(nbr == query_labels, na.rm = TRUE)
+}
+purity_results <- data.frame(
+  split      = c("train", "val", "test"),
+  purity_emb = c(mean(knn_purity(nn_emb_train, AnnDat_train$FORTYPCD, ftype_train, drop_self = TRUE), na.rm = TRUE),
+                 mean(knn_purity(nn_emb_val,   AnnDat_val$FORTYPCD,   ftype_train), na.rm = TRUE),
+                 mean(knn_purity(nn_emb_test,  AnnDat_test$FORTYPCD,  ftype_train), na.rm = TRUE)),
+  purity_inp = c(mean(knn_purity(nn_inp_train, AnnDat_train$FORTYPCD, ftype_train, drop_self = TRUE), na.rm = TRUE),
+                 mean(knn_purity(nn_inp_val,   AnnDat_val$FORTYPCD,   ftype_train), na.rm = TRUE),
+                 mean(knn_purity(nn_inp_test,  AnnDat_test$FORTYPCD,  ftype_train), na.rm = TRUE))
+)
+rand_purity <- sum(prop.table(table(AnnDat_train$FORTYPCD))^2)
+cat(sprintf("Random-neighbor purity floor: %.3f\n", rand_purity))
+purity_results
+```
+
+### Multinomial logit on 2-digit forest-type groups
+
+Restricted to plots where the embedding pixel sits exactly at the plot location
+(`PLT_CN == ID`), and to type groups with more than 10 plots.
+
+```{r multinom}
+reg_data <- reg_data %>% mutate(FORTYP_2 = as.factor(substr(FORTYPCD, 1, 2)))
+
+form_fortyp_inp_typ <- as.formula(paste("FORTYP_2 ~", paste(inp_type_vars, collapse = " + ")))
+form_fortyp_emb_typ <- as.formula(paste("FORTYP_2 ~", paste(emb_type_vars, collapse = " + ")))
+
+reg_data_typ <- reg_data %>% filter(PLT_CN == ID)
+forest_types <- table(reg_data_typ$FORTYP_2)
+reg_data_typ <- reg_data_typ %>%
+  mutate(FORTYP_2 = if_else(FORTYP_2 %in% names(forest_types[forest_types > 10]), FORTYP_2, NA),
+         FORTYP_2 = as.factor(as.character(FORTYP_2)))
+
+mod_fortypcd_inp <- multinom(form_fortyp_inp_typ, data = reg_data_typ, maxit = 1000)
+pred_inp <- predict(mod_fortypcd_inp, newdata = reg_data_typ)
+ok <- !is.na(reg_data_typ$FORTYP_2) & !is.na(pred_inp)
+cat(sprintf("Input multinom accuracy: %.3f\n", mean(pred_inp[ok] == reg_data_typ$FORTYP_2[ok])))
+
+mod_fortypcd_emb <- multinom(form_fortyp_emb_typ, data = reg_data_typ, maxit = 1000)
+pred_emb <- predict(mod_fortypcd_emb, newdata = reg_data_typ)
+# NOTE: original script reused the `pred_inp` mask here; corrected to `pred_emb`.
+ok <- !is.na(reg_data_typ$FORTYP_2) & !is.na(pred_emb)
+cat(sprintf("Embedding multinom accuracy: %.3f\n", mean(pred_emb[ok] == reg_data_typ$FORTYP_2[ok])))
+```
+
+## 8. Shallow neural-net forest-type classifier
+
+A stronger nonlinear probe than the linear/multinomial baselines: a single
+32-unit hidden layer classifying the 2-digit forest-type group from `z_type`
+vs. `x_type`. TensorFlow/Keras via `reticulate`.
+
+```{r keras-setup}
+library(keras3)
+library(tensorflow)
+tensorflow::tf_config()
+
+xvars <- emb_type_vars
+
+dat <- reg_data_typ %>%
+  dplyr::select(FORTYP_2, split, all_of(xvars)) %>% na.omit()
+dat_inp <- reg_data_typ %>%
+  dplyr::select(FORTYP_2, split, all_of(inp_type_vars)) %>% na.omit()
+
+X     <- scale(as.matrix(dat[, xvars]))
+X_inp <- scale(as.matrix(dat_inp[, inp_type_vars]))
+y <- as.integer(dat$FORTYP_2) - 1
+
+train_idx <- dat$split == "train"; val_idx <- dat$split == "val"; test_idx <- dat$split == "test"
+X_train <- X[train_idx, ]; X_val <- X[val_idx, ]; X_test <- X[test_idx, ]
+X_inp_train <- X_inp[train_idx, ]; X_inp_val <- X_inp[val_idx, ]; X_inp_test <- X_inp[test_idx, ]
+y_train <- y[train_idx]; y_val <- y[val_idx]; y_test <- y[test_idx]
+n_classes <- length(levels(dat$FORTYP_2))
+```
+
+```{r keras-models}
+make_model <- function(input_dim) {
+  keras_model_sequential(layers = list(
+    keras_input(shape = input_dim),
+    layer_dense(units = 32, activation = "relu"),
+    layer_dropout(rate = 0.0),
+    layer_dense(units = n_classes, activation = "softmax")
+  ))
+}
+model     <- make_model(ncol(X))
+model_inp <- make_model(ncol(X_inp))
+
+model     |> compile(optimizer = optimizer_adam(learning_rate = 0.0005),
+                     loss = "sparse_categorical_crossentropy", metrics = "accuracy")
+model_inp |> compile(optimizer = optimizer_adam(learning_rate = 0.0005),
+                     loss = "sparse_categorical_crossentropy", metrics = "accuracy")
+```
+
+```{r keras-fit}
+history <- model |> fit(
+  X_train, y_train, epochs = 100, batch_size = 32,
+  validation_data = list(X_val, y_val),
+  callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 40,
+                                           restore_best_weights = TRUE)))
+history_inp <- model_inp |> fit(
+  X_inp_train, y_train, epochs = 100, batch_size = 64,
+  validation_data = list(X_inp_val, y_val),
+  callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 10,
+                                           restore_best_weights = TRUE)))
+```
+
+```{r keras-eval}
+cat("Embedding NN -- train:\n"); model |> evaluate(X_train, y_train)
+cat("Embedding NN -- test:\n");  model |> evaluate(X_test, y_test)
+cat("Input NN -- test:\n");      model_inp |> evaluate(X_inp_test, y_test)
+
+val_acc <- function(m, Xv) mean((max.col(predict(m, Xv)) - 1L) == y_val)
+cat(sprintf("Embedding NN val acc: %.3f\n", val_acc(model,     X_val)))
+cat(sprintf("Input NN     val acc: %.3f\n", val_acc(model_inp, X_inp_val)))
+```
+
+### kNN forest-type sanity check on the scaled type features
+
+```{r keras-knn}
+get_mode <- function(x) { ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
+
+nn_emb <- get.knnx(data = X_train,     query = X_train,     k = 5)
+nn_inp <- get.knnx(data = X_inp_train, query = X_inp_train, k = 5)
+
+knn_emb <- matrix(y_train[nn_emb$nn.index], nrow = nrow(nn_emb$nn.index))[, -1]
+knn_inp <- matrix(y_train[nn_inp$nn.index], nrow = nrow(nn_inp$nn.index))[, -1]
+
+cat(sprintf("kNN(emb) train acc: %.3f\n", mean(apply(knn_emb, 1, get_mode) == y_train)))
+cat(sprintf("kNN(inp) train acc: %.3f\n", mean(apply(knn_inp, 1, get_mode) == y_train)))
+```
+
+## Cleanup
+
+```{r cleanup}
+dbDisconnect(con)
+```
+
+## Interpretation
+
+Across all three probe families — linear, kNN imputation, and forest-type
+classification — this report is one sustained head-to-head benchmark of **learned
+embeddings vs. raw satellite inputs** on held-out Virginia FIA plots. It is the
+empirical justification for the project's premise: that the embedding is a better
+*distance metric* for FIA post-stratification and small-area estimation than the
+raw features. The recurring `type`/`phase` block split, separate normalization,
+and phase-weight tuning mirror the dual-pathway `z_type`/`z_phase` architecture,
+and the ysfc-coherence diagnostics specifically stress-test the phase pathway.
