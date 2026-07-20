@@ -574,9 +574,21 @@ par(op)
 
 ## 5. Per-stratum error (zero class + positive deciles)
 
-`BALIVE` is ~31% zeros. Stratifying into a zero class plus deciles of the
-positive values shows *where in the distribution* the embedding wins, and whether
-that advantage grows with k (the "regression to the mean" bias plot).
+Stratifying into a zero class plus deciles of the positive values shows *where in
+the distribution* the embedding wins, and whether that advantage grows with k
+(the "regression to the mean" bias plot).
+
+> **Caveat on this evaluation set.** In this VA / `exp033` FIA sample `BALIVE` is
+> only **~1% zeros** (see the distribution plot in Section 6), so the zero
+> stratum holds barely a dozen test plots — any per-stratum result *at the zero
+> class* is noise-dominated and should not be read as a headline. (An earlier
+> comment here claimed ~31% zeros; that figure came from a different pixel
+> population and does not hold for these plot locations.) A second caveat: the
+> `w_inp_*` phase weights below are **hardcoded**, not the val-tuned optima from
+> Section 3 (which land near `w_inp ≈ 9–11`). The input baseline here therefore
+> runs at a sub-optimal phase weight, so the per-stratum emb-vs-inp gap is
+> indicative of *where* the two differ, not a fully fair magnitude — re-run with
+> the tuned weights before quoting the stratum percentages.
 
 ```{r per-stratum, fig.width=11, fig.height=5}
 k_lo <- 50 ; w_emb_lo <- 1.00; w_inp_lo <- 3.50
@@ -976,9 +988,79 @@ dbDisconnect(con)
 
 Across all three probe families — linear, kNN imputation, and forest-type
 classification — this report is one sustained head-to-head benchmark of **learned
-embeddings vs. raw satellite inputs** on held-out Virginia FIA plots. It is the
-empirical justification for the project's premise: that the embedding is a better
-*distance metric* for FIA post-stratification and small-area estimation than the
-raw features. The recurring `type`/`phase` block split, separate normalization,
-and phase-weight tuning mirror the dual-pathway `z_type`/`z_phase` architecture,
-and the ysfc-coherence diagnostics specifically stress-test the phase pathway.
+embeddings vs. raw satellite inputs** on held-out Virginia FIA plots, testing the
+project's premise that the embedding is a better *distance metric* for FIA
+post-stratification and small-area estimation than the raw features. The recurring
+`type`/`phase` block split, separate normalization, and phase-weight tuning mirror
+the dual-pathway `z_type`/`z_phase` architecture, and the ysfc-coherence
+diagnostics stress-test the phase pathway.
+
+The honest read of the results is more textured than "the embedding wins," and the
+figures carry most of the nuance. What follows is grounded in the run shown above;
+exact percentages shift with the phase-weight grid and the forest-type granularity
+(full `FORTYPCD` vs. 2-digit group), but the qualitative findings are stable.
+
+### What the figures actually show
+
+- **The kNN win is real but modest and scale-broad, not scale-peaked.** The raw
+  per-rank homogeneity curve (Section 4, left figure) is too jagged to trust on
+  its own — the "peak at rank ~33" rides on that noise. The **banded** version is
+  the trustworthy one: after 5-rank smoothing the embedding's neighbors are
+  persistently ~1–2 sq ft/acre more BALIVE-homogeneous than the input's across the
+  *entire* rank range, most bands clearing ±2 SE. Notably this per-neighbor
+  advantage **does not decay at large neighborhoods**, even though the kNN
+  *prediction* MSE advantage does shrink with `k` (Section 3). Those are different
+  quantities: averaging `k` neighbors converges the prediction to a local mean
+  regardless of how tight the individual neighbors are, so homogeneity and
+  prediction-MSE need not track.
+
+- **The advantage is localized, and it is a variance win, not a bias win**
+  (Section 5). The "Where the embedding wins" panel is *not* a uniform win: the
+  embedding is better at the low-BALIVE end, crosses over around mean-BALIVE ≈ 65,
+  and is **distinctly worse (≈ +15–25% RMSE) in the mid-productive range**
+  (~110–135 sq ft), before recovering at the top. The companion "regression to the
+  mean" panel shows the emb and inp residual curves almost superimposed — both
+  over-predict low BALIVE and under-predict high BALIVE by nearly the same amount.
+  So wherever the embedding wins at the low end, it wins by **lower variance**, not
+  by resisting shrinkage. (Read this together with the Section-5 caveats: the zero
+  stratum is ~a dozen plots, and the input baseline runs at a hardcoded,
+  sub-optimal phase weight.)
+
+- **The recovery signal is real and BALIVE-relevant — this is the strongest
+  positive result** (Section 6, distribution-by-ysfc figure). BALIVE rises
+  smoothly and monotonically with recovery stage (recent → young → mid → mature →
+  stable), and the all-classes overlay is a clean left-to-right march. This is the
+  mechanism behind the low-BALIVE win: low-basal-area plots are the
+  recently-disturbed ones, exactly what the phase pathway is built to encode.
+
+- **But the phase pathway does *not* yield tighter recovery-stage neighborhoods
+  here** (Section 6, ysfc-coherence figure). The two mosaics are visually
+  near-identical (both dominated by the ~78% stable block), matching the tied
+  purity/lift numbers. The tell is the right-hand barplot: **within-neighborhood
+  ysfc spread is *higher* (worse) for the embedding on every disturbed class** —
+  recent, young, mid, mature. The embedding gets the coarse recovery class right a
+  hair more often, yet its disturbed-plot neighborhoods span a *wider* range of
+  recovery stage than the raw inputs. The "z_phase gives coherent recovery
+  neighborhoods" story does not hold in this sample.
+
+- **Forest type is a near-tie** (Section 7). The BALIVE-optimal neighborhoods
+  respect forest type about as well as the raw inputs do — the embedding is
+  marginally ahead on kNN accuracy and purity, marginally behind on the
+  multinomial probe. The "soft stratification" is present but not a differentiator.
+
+- **No distribution-shift artifact** (Section 6, distribution + deciles figure):
+  the test-positive histogram tracks the train-positive density, so the kNN
+  reference set is representative of what it predicts.
+
+### Bottom line
+
+For the stated goal — kNN-style post-stratification and identifying
+poorly-sampled / disturbed forest conditions — the embedding delivers a **small,
+real, and well-placed improvement**: a few-percent reduction in kNN imputation
+error concentrated in the **low / recently-disturbed** end of the BALIVE
+distribution, mechanistically tied to the recovery signal the phase pathway
+encodes. It is **not** a uniform improvement: it is roughly neutral-to-worse in
+the mid-productive range, a variance win rather than a bias win, a near-tie on
+forest type, and — despite exp017's recovery-discrimination loss — it does not
+produce metrically tighter ysfc neighborhoods than the raw inputs in this
+evaluation. Those last two points are the natural targets for the next iteration.
