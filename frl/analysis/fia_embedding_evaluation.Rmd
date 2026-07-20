@@ -885,8 +885,6 @@ Restricted to plots where the embedding pixel sits exactly at the plot location
 (`PLT_CN == ID`), and to type groups with more than 10 plots.
 
 ```{r multinom}
-reg_data <- reg_data %>% mutate(FORTYP_2 = as.factor(substr(FORTYPCD, 1, 2)))
-
 form_fortyp_inp_typ <- as.formula(paste("FORTYPGRP ~", paste(inp_type_vars, collapse = " + ")))
 form_fortyp_emb_typ <- as.formula(paste("FORTYPGRP ~", paste(emb_type_vars, collapse = " + ")))
 
