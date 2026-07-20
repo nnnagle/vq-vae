@@ -113,7 +113,12 @@ plot's center pixel):
 **Key asymmetry that motivates the kNN preprocessing below.** The `x_*` inputs
 arrive *already normalized/whitened* (roughly unit-scale per channel), whereas
 the `z_*` embeddings are written **raw** — and `z_type` in particular is
-magnitude-unconstrained. That is why Section 2 applies a block-wise population L2
+magnitude-unconstrained. Note *where* the normalization lives: the DataLoader
+worker normalizes only the encoder **inputs** (`FeatureBuilder.build_feature`);
+the `z_*` embeddings are the model's **outputs**, computed downstream of the
+DataLoader, and never pass through it. Neither the type forward pass (no output
+L2-norm) nor the phase pass (raw post-FiLM `gamma·h + beta`) normalizes them.
+That is why Section 2 applies a block-wise population L2
 normalization to the `z` blocks only, and feeds the `x` blocks to kNN as-is: the
 inputs already sit on a comparable scale, the embeddings do not. The one further
 transform this report adds on top is the scalar phase-weight `w` (Section 3),
