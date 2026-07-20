@@ -101,28 +101,34 @@ Column families in the embeddings file, and the preprocessing each one already
 carries (all applied inside `frl/training/embed_locations.py`, sampled at the
 plot's center pixel):
 
-| Prefix          | Block | Preprocessing baked into the value                                                                                                                                  |
-|-----------------|-------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `x_type_*`      | input | **Model-input normalization** via `FeatureBuilder.build_feature` — the *same* transform the encoder was trained on (z-score / robust-IQR / clamp / Mahalanobis whitening, per the binding config). Atemporal; taken at the center pixel. |
-| `x_phase_*`     | input | Same `FeatureBuilder` normalization, taken at the plot's **measurement year** (no temporal centering). *Not used below.*                                            |
-| `x_phase_dm_*`  | input | The normalized phase input **temporally demeaned** — the per-channel mean over all years is subtracted *before* extracting the measurement year. This is what the report uses as `inp_phase_vars`. |
-| `z_type_*` (48) | emb   | **Raw model output**, center pixel — *no* L2 normalization (the type pathway leaves magnitude unconstrained by design).                                             |
-| `z_phase_*` (8) | emb   | **Post-FiLM** phase embedding at the measurement year (conditioned on `z_type` via FiLM). Written raw.                                                              |
-| `g_type_*`      | emb   | SimCLR projection head applied to `z_type` (`g(h)`). Present in the file but not used in this report.                                                               |
+The inputs are **not raw** despite the `x_` prefix: they carry whatever
+`FeatureBuilder.build_feature` applied in the DataLoader worker — the *same*
+transform the encoder was trained on. Crucially, the two input blocks are
+normalized **differently**, controlled by whether the binding config gives the
+feature a `covariance` block (`frl_binding_v1.yaml`):
 
-**Key asymmetry that motivates the kNN preprocessing below.** The `x_*` inputs
-arrive *already normalized/whitened* (roughly unit-scale per channel), whereas
-the `z_*` embeddings are written **raw** — and `z_type` in particular is
-magnitude-unconstrained. Note *where* the normalization lives: the DataLoader
-worker normalizes only the encoder **inputs** (`FeatureBuilder.build_feature`);
-the `z_*` embeddings are the model's **outputs**, computed downstream of the
-DataLoader, and never pass through it. Neither the type forward pass (no output
-L2-norm) nor the phase pass (raw post-FiLM `gamma·h + beta`) normalizes them.
-That is why Section 2 applies a block-wise population L2
-normalization to the `z` blocks only, and feeds the `x` blocks to kNN as-is: the
-inputs already sit on a comparable scale, the embeddings do not. The one further
+| Prefix          | Block | Preprocessing baked into the value                                                                                                                                                                                                                     |
+|-----------------|-------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `x_type_*`      | input | **Mahalanobis-whitened** (`type_encoder_input` has `covariance: calculate: true`): log pre-transforms on skewed channels → center → multiply by the whitening matrix (Cholesky of inverse covariance). Euclidean distance here **equals Mahalanobis distance** in the original space, so the block is centered *and decorrelated across channels*. Whitening subsumes the per-channel z-score/robust-IQR labels — they are not separately applied. Atemporal, center pixel. |
+| `x_phase_*`     | input | Per-channel path (`phase_ccdc` has **no** covariance): mostly **z-score** (mean/std, clamp ±6), `temporal_position` left identity, `spectral_velocity` log-then-z-score. **Not whitened / not decorrelated.** Taken at the measurement year. *Not used below.* |
+| `x_phase_dm_*`  | input | Same per-channel z-score as `x_phase`, then **temporally demeaned** (per-channel mean over all years subtracted before extracting the measurement year). This is what the report uses as `inp_phase_vars`.                                                |
+| `z_type_*` (48) | emb   | **Raw model output**, center pixel — *no* L2 normalization (the type pathway leaves magnitude unconstrained by design).                                                                                                                                |
+| `z_phase_*` (8) | emb   | **Post-FiLM** phase embedding at the measurement year (conditioned on `z_type` via FiLM). Written raw.                                                                                                                                                 |
+| `g_type_*`      | emb   | SimCLR projection head applied to `z_type` (`g(h)`). Present in the file but not used in this report.                                                                                                                                                  |
+
+**Where the normalization lives, and why the kNN preprocessing below is
+asymmetric.** The DataLoader worker normalizes only the encoder **inputs**; the
+`z_*` embeddings are the model's **outputs**, computed downstream of the
+DataLoader and never passed through it (neither the type forward pass nor the raw
+post-FiLM `gamma·h + beta` phase pass applies any output normalization). So the
+`x_*` blocks already sit on a comparable, model-ready scale while the `z_*`
+blocks — `z_type` especially — do not. That is why Section 2 applies a block-wise
+population L2 normalization to the `z` blocks only and feeds the `x` blocks to
+kNN as-is. Note the consequence for the distance metric: `x_type` is *already
+whitened*, so unmodified Euclidean kNN on it is exactly Mahalanobis kNN, whereas
+`x_phase` is only per-channel scaled (not decorrelated). The one further
 transform this report adds on top is the scalar phase-weight `w` (Section 3),
-which retunes the type-vs-phase balance in the distance metric.
+which retunes the type-vs-phase balance.
 
 ### Pull FIA ground truth (COND table)
 
