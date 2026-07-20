@@ -26,6 +26,7 @@ knitr::opts_chunk$set(
   fig.height = 5,
   dpi = 110
 )
+
 ```
 
 ## Overview
@@ -76,6 +77,7 @@ library(DBI)
 library(RSQLite)
 library(FNN)      # get.knnx() for k-nearest-neighbor imputation
 library(nnet)     # multinom() for the multinomial forest-type baseline
+
 ```
 
 ## Data assembly
@@ -145,6 +147,7 @@ cond_data <- dbGetQuery(
     params$statecd
   )
 )
+
 ```
 
 ### Reduce multi-condition plots to one row per plot
@@ -182,6 +185,7 @@ reg_data <- plot_cond_data_avg %>%
   left_join(plot_cond_data_max, by = "PLT_CN") %>%
   inner_join(emb_data, by = c("PLT_CN" = "CN")) %>%
   mutate(FORTYPGRP = as.factor(substr(FORTYPCD, 1, 2)))
+
 ```
 
 ### Feature-block name vectors
@@ -210,6 +214,7 @@ form_emb_all  <- as.formula(paste("BALIVE ~", paste(c(emb_type_vars, emb_phase_v
 
 # rows with a known forest type
 rd <- reg_data[!is.na(reg_data$FORTYPCD), ]
+
 ```
 
 ```{r lm-fits}
@@ -236,6 +241,7 @@ data.frame(
 # also on ALL plots (including unknown forest type)
 c(emb_all_allplots = summary(lm(form_emb_all, data = reg_data))$adj.r.squared,
   inp_all_allplots = summary(lm(form_inp_all, data = reg_data))$adj.r.squared)
+
 ```
 
 ## 2. k-Nearest-Neighbor imputation of BALIVE
@@ -278,6 +284,7 @@ type_emb  <- pop_l2_normalize(AnnDat_train[, emb_type_vars],
 phase_emb <- pop_l2_normalize(AnnDat_train[, emb_phase_vars],
                               AnnDat_val[,   emb_phase_vars],
                               AnnDat_test[,  emb_phase_vars])
+
 ```
 
 ### kNN prediction helper
@@ -329,6 +336,7 @@ data.frame(
               mse(AnnDat_val$BALIVE,   pred_inp_val),
               mse(AnnDat_test$BALIVE,  pred_inp_test))
 )
+
 ```
 
 ## 3. Tuning the type-vs-phase scale, then sweeping k
@@ -364,6 +372,7 @@ mse_w_inp <- sapply(w_grid_inp, function(w) {
 w_opt_inp <- w_grid_inp[which.min(mse_w_inp)]
 data.frame(w = w_grid_inp, mse_val = mse_w_inp)
 cat("Optimal w (input):", w_opt_inp, "\n")
+
 ```
 
 ### k-sweep with per-k phase-weight re-optimization
@@ -374,8 +383,8 @@ bias² + variance. The headline question: *at each k, does the embedding metric
 give lower test error than raw inputs?*
 
 ```{r k-sweep}
-w_grid     <- seq(0.5, 6, by = 0.25)
-w_grid_inp <- w_grid * 2
+w_grid     <- seq(0.5, 1.3, by = 0.1)
+w_grid_inp <- seq(8,14,by=.5)
 k_grid     <- c(10, 15, 20, 30, 50, 75, 100, 150, 200, 250)
 
 metrics <- function(actual, predicted) {
@@ -456,6 +465,7 @@ headline <- function(metric) {
 cat("Test MSE by k (delta_pct < 0 = embedding wins):\n"); headline("mse")
 cat("Test MAE by k (delta_pct < 0 = embedding wins):\n"); headline("mae")
 cat("Test Var by k (delta_pct < 0 = embedding wins):\n"); headline("variance")
+
 ```
 
 ## 4. Where in neighbor space does the embedding win?
@@ -511,6 +521,7 @@ round(cumulative[cumulative$rank %in% ranks_report, ], 2)
 peak <- perrank$rank[which.max(perrank$gap)]
 cat(sprintf("Embedding advantage (per-rank gap) is largest at rank %d (%.2f sq ft/acre).\n",
             peak, max(perrank$gap)))
+
 ```
 
 ```{r perrank-plot, fig.width=11, fig.height=5}
@@ -570,6 +581,7 @@ with(band_stats, {
   abline(h = 0, lty = 3)
 })
 par(op)
+
 ```
 
 ## 5. Per-stratum error (zero class + positive deciles)
@@ -706,6 +718,7 @@ for (i in seq_along(labs)) lines(dens[[i]], col = pal[i], lwd = 2)
 legend("topright", labs, col = pal, lwd = 2, bty = "n", cex = 0.8)
 mtext("BALIVE distribution by years-since-fast-change class", outer = TRUE, cex = 1.1, font = 2)
 par(op)
+
 ```
 
 ### ysfc neighborhood coherence
@@ -803,6 +816,7 @@ legend("topright", c("test positive (hist)", "train positive (density)", "decile
        col = c("grey70", "darkorange", "steelblue", "firebrick"),
        lwd = c(6, 2, 1.3, 3), lty = c(1, 1, 2, 1), bty = "n")
 par(op)
+
 ```
 
 ## 7. Forest-type (FORTYPCD) recovery
@@ -826,18 +840,18 @@ knn_mode <- function(nn, label_source, drop_self = FALSE) {
 }
 acc <- function(actual, predicted) mean(actual == predicted, na.rm = TRUE)
 
-ftype_train <- AnnDat_train$FORTYPCD
+ftype_train <- AnnDat_train$FORTYPGRP
 
 fortypcd_results <- data.frame(
   split   = c("train", "val", "test"),
-  acc_emb = c(acc(AnnDat_train$FORTYPCD, knn_mode(nn_emb_train, ftype_train, drop_self = TRUE)),
-              acc(AnnDat_val$FORTYPCD,   knn_mode(nn_emb_val,   ftype_train)),
-              acc(AnnDat_test$FORTYPCD,  knn_mode(nn_emb_test,  ftype_train))),
-  acc_inp = c(acc(AnnDat_train$FORTYPCD, knn_mode(nn_inp_train, ftype_train, drop_self = TRUE)),
-              acc(AnnDat_val$FORTYPCD,   knn_mode(nn_inp_val,   ftype_train)),
-              acc(AnnDat_test$FORTYPCD,  knn_mode(nn_inp_test,  ftype_train)))
+  acc_emb = c(acc(AnnDat_train$FORTYPGRP, knn_mode(nn_emb_train, ftype_train, drop_self = TRUE)),
+              acc(AnnDat_val$FORTYPGRP,   knn_mode(nn_emb_val,   ftype_train)),
+              acc(AnnDat_test$FORTYPGRP,  knn_mode(nn_emb_test,  ftype_train))),
+  acc_inp = c(acc(AnnDat_train$FORTYPGRP, knn_mode(nn_inp_train, ftype_train, drop_self = TRUE)),
+              acc(AnnDat_val$FORTYPGRP,   knn_mode(nn_inp_val,   ftype_train)),
+              acc(AnnDat_test$FORTYPGRP,  knn_mode(nn_inp_test,  ftype_train)))
 )
-base_rate <- max(prop.table(table(AnnDat_train$FORTYPCD)))
+base_rate <- max(prop.table(table(AnnDat_train$FORTYPGRP)))
 cat(sprintf("Majority-class baseline (train): %.3f\n", base_rate))
 fortypcd_results
 ```
@@ -852,16 +866,17 @@ knn_purity <- function(nn, query_labels, ref_labels, drop_self = FALSE) {
 }
 purity_results <- data.frame(
   split      = c("train", "val", "test"),
-  purity_emb = c(mean(knn_purity(nn_emb_train, AnnDat_train$FORTYPCD, ftype_train, drop_self = TRUE), na.rm = TRUE),
-                 mean(knn_purity(nn_emb_val,   AnnDat_val$FORTYPCD,   ftype_train), na.rm = TRUE),
-                 mean(knn_purity(nn_emb_test,  AnnDat_test$FORTYPCD,  ftype_train), na.rm = TRUE)),
-  purity_inp = c(mean(knn_purity(nn_inp_train, AnnDat_train$FORTYPCD, ftype_train, drop_self = TRUE), na.rm = TRUE),
-                 mean(knn_purity(nn_inp_val,   AnnDat_val$FORTYPCD,   ftype_train), na.rm = TRUE),
-                 mean(knn_purity(nn_inp_test,  AnnDat_test$FORTYPCD,  ftype_train), na.rm = TRUE))
+  purity_emb = c(mean(knn_purity(nn_emb_train, AnnDat_train$FORTYPGRP, ftype_train, drop_self = TRUE), na.rm = TRUE),
+                 mean(knn_purity(nn_emb_val,   AnnDat_val$FORTYPGRP,   ftype_train), na.rm = TRUE),
+                 mean(knn_purity(nn_emb_test,  AnnDat_test$FORTYPGRP,  ftype_train), na.rm = TRUE)),
+  purity_inp = c(mean(knn_purity(nn_inp_train, AnnDat_train$FORTYPGRP, ftype_train, drop_self = TRUE), na.rm = TRUE),
+                 mean(knn_purity(nn_inp_val,   AnnDat_val$FORTYPGRP,   ftype_train), na.rm = TRUE),
+                 mean(knn_purity(nn_inp_test,  AnnDat_test$FORTYPGRP,  ftype_train), na.rm = TRUE))
 )
-rand_purity <- sum(prop.table(table(AnnDat_train$FORTYPCD))^2)
+rand_purity <- sum(prop.table(table(AnnDat_train$FORTYPGRP))^2)
 cat(sprintf("Random-neighbor purity floor: %.3f\n", rand_purity))
 purity_results
+
 ```
 
 ### Multinomial logit on 2-digit forest-type groups
@@ -872,111 +887,27 @@ Restricted to plots where the embedding pixel sits exactly at the plot location
 ```{r multinom}
 reg_data <- reg_data %>% mutate(FORTYP_2 = as.factor(substr(FORTYPCD, 1, 2)))
 
-form_fortyp_inp_typ <- as.formula(paste("FORTYP_2 ~", paste(inp_type_vars, collapse = " + ")))
-form_fortyp_emb_typ <- as.formula(paste("FORTYP_2 ~", paste(emb_type_vars, collapse = " + ")))
+form_fortyp_inp_typ <- as.formula(paste("FORTYPGRP ~", paste(inp_type_vars, collapse = " + ")))
+form_fortyp_emb_typ <- as.formula(paste("FORTYPGRP ~", paste(emb_type_vars, collapse = " + ")))
 
 reg_data_typ <- reg_data %>% filter(PLT_CN == ID)
-forest_types <- table(reg_data_typ$FORTYP_2)
+forest_types <- table(reg_data_typ$FORTYPGRP)
 reg_data_typ <- reg_data_typ %>%
-  mutate(FORTYP_2 = if_else(FORTYP_2 %in% names(forest_types[forest_types > 10]), FORTYP_2, NA),
-         FORTYP_2 = as.factor(as.character(FORTYP_2)))
+  mutate(FORTYPGRP = if_else(FORTYPGRP %in% names(forest_types[forest_types > 10]), FORTYPGRP, NA),
+         FORTYPGRP = as.factor(as.character(FORTYPGRP)))
 
 mod_fortypcd_inp <- multinom(form_fortyp_inp_typ, data = reg_data_typ, maxit = 1000)
 pred_inp <- predict(mod_fortypcd_inp, newdata = reg_data_typ)
-ok <- !is.na(reg_data_typ$FORTYP_2) & !is.na(pred_inp)
-cat(sprintf("Input multinom accuracy: %.3f\n", mean(pred_inp[ok] == reg_data_typ$FORTYP_2[ok])))
+ok <- !is.na(reg_data_typ$FORTYPGRP) & !is.na(pred_inp)
+cat(sprintf("Input multinom accuracy: %.3f\n", mean(pred_inp[ok] == reg_data_typ$FORTYPGRP[ok])))
 
 mod_fortypcd_emb <- multinom(form_fortyp_emb_typ, data = reg_data_typ, maxit = 1000)
 pred_emb <- predict(mod_fortypcd_emb, newdata = reg_data_typ)
 # NOTE: original script reused the `pred_inp` mask here; corrected to `pred_emb`.
-ok <- !is.na(reg_data_typ$FORTYP_2) & !is.na(pred_emb)
-cat(sprintf("Embedding multinom accuracy: %.3f\n", mean(pred_emb[ok] == reg_data_typ$FORTYP_2[ok])))
+ok <- !is.na(reg_data_typ$FORTYPGRP) & !is.na(pred_emb)
+cat(sprintf("Embedding multinom accuracy: %.3f\n", mean(pred_emb[ok] == reg_data_typ$FORTYPGRP[ok])))
 ```
 
-## 8. Shallow neural-net forest-type classifier
-
-A stronger nonlinear probe than the linear/multinomial baselines: a single
-32-unit hidden layer classifying the 2-digit forest-type group from `z_type`
-vs. `x_type`. TensorFlow/Keras via `reticulate`.
-
-```{r keras-setup}
-library(keras3)
-library(tensorflow)
-tensorflow::tf_config()
-
-xvars <- emb_type_vars
-
-dat <- reg_data_typ %>%
-  dplyr::select(FORTYP_2, split, all_of(xvars)) %>% na.omit()
-dat_inp <- reg_data_typ %>%
-  dplyr::select(FORTYP_2, split, all_of(inp_type_vars)) %>% na.omit()
-
-X     <- scale(as.matrix(dat[, xvars]))
-X_inp <- scale(as.matrix(dat_inp[, inp_type_vars]))
-y <- as.integer(dat$FORTYP_2) - 1
-
-train_idx <- dat$split == "train"; val_idx <- dat$split == "val"; test_idx <- dat$split == "test"
-X_train <- X[train_idx, ]; X_val <- X[val_idx, ]; X_test <- X[test_idx, ]
-X_inp_train <- X_inp[train_idx, ]; X_inp_val <- X_inp[val_idx, ]; X_inp_test <- X_inp[test_idx, ]
-y_train <- y[train_idx]; y_val <- y[val_idx]; y_test <- y[test_idx]
-n_classes <- length(levels(dat$FORTYP_2))
-```
-
-```{r keras-models}
-make_model <- function(input_dim) {
-  keras_model_sequential(layers = list(
-    keras_input(shape = input_dim),
-    layer_dense(units = 32, activation = "relu"),
-    layer_dropout(rate = 0.0),
-    layer_dense(units = n_classes, activation = "softmax")
-  ))
-}
-model     <- make_model(ncol(X))
-model_inp <- make_model(ncol(X_inp))
-
-model     |> compile(optimizer = optimizer_adam(learning_rate = 0.0005),
-                     loss = "sparse_categorical_crossentropy", metrics = "accuracy")
-model_inp |> compile(optimizer = optimizer_adam(learning_rate = 0.0005),
-                     loss = "sparse_categorical_crossentropy", metrics = "accuracy")
-```
-
-```{r keras-fit}
-history <- model |> fit(
-  X_train, y_train, epochs = 100, batch_size = 32,
-  validation_data = list(X_val, y_val),
-  callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 40,
-                                           restore_best_weights = TRUE)))
-history_inp <- model_inp |> fit(
-  X_inp_train, y_train, epochs = 100, batch_size = 64,
-  validation_data = list(X_inp_val, y_val),
-  callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 10,
-                                           restore_best_weights = TRUE)))
-```
-
-```{r keras-eval}
-cat("Embedding NN -- train:\n"); model |> evaluate(X_train, y_train)
-cat("Embedding NN -- test:\n");  model |> evaluate(X_test, y_test)
-cat("Input NN -- test:\n");      model_inp |> evaluate(X_inp_test, y_test)
-
-val_acc <- function(m, Xv) mean((max.col(predict(m, Xv)) - 1L) == y_val)
-cat(sprintf("Embedding NN val acc: %.3f\n", val_acc(model,     X_val)))
-cat(sprintf("Input NN     val acc: %.3f\n", val_acc(model_inp, X_inp_val)))
-```
-
-### kNN forest-type sanity check on the scaled type features
-
-```{r keras-knn}
-get_mode <- function(x) { ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
-
-nn_emb <- get.knnx(data = X_train,     query = X_train,     k = 5)
-nn_inp <- get.knnx(data = X_inp_train, query = X_inp_train, k = 5)
-
-knn_emb <- matrix(y_train[nn_emb$nn.index], nrow = nrow(nn_emb$nn.index))[, -1]
-knn_inp <- matrix(y_train[nn_inp$nn.index], nrow = nrow(nn_inp$nn.index))[, -1]
-
-cat(sprintf("kNN(emb) train acc: %.3f\n", mean(apply(knn_emb, 1, get_mode) == y_train)))
-cat(sprintf("kNN(inp) train acc: %.3f\n", mean(apply(knn_inp, 1, get_mode) == y_train)))
-```
 
 ## Cleanup
 
