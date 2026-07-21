@@ -108,8 +108,16 @@ tcc <- rast(params$tcc)
 pts     <- vect(fia_locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
 pts_aea <- project(pts, crs(tcc))
 
-vals <- extract(tcc, pts_aea, ID = FALSE)   # nearest cell (categorical-safe)
+vals <- extract(tcc, pts_aea, ID = FALSE)   # nearest cell
 names(vals) <- "tcc"                        # drop the long raster layer name
+
+# The science-TCC raster carries a categorical attribute table, so `extract`
+# returns a FACTOR with levels "0".."100","254","255" -- not numbers. Recover the
+# numeric percent via as.character() first (as.numeric() on a factor would give
+# level indices, not values), then blank out the nodata codes: 254 = non-
+# processing area, 255 = fill, and anything > 100 is not a canopy-cover percent.
+vals$tcc <- as.numeric(as.character(vals$tcc))
+vals$tcc[vals$tcc > 100] <- NA_real_
 
 fia_merged <- bind_cols(fia_locs, vals)
 ```
