@@ -210,24 +210,31 @@ km <- kmeans(Z, centers = 4, nstart = 25)
 analysis$emb_km <- factor(km$cluster, labels = paste0("K", 1:4))
 
 # --- Embedding strata, SUPERVISED: quantile bins of a cross-fit BALIVE read-out
-# Out-of-fold OLS of BALIVE on the full embedding (type + phase), then equal-count
-# quantile bins -- the learned analog of "a BALIVE-correlated covariate binned
-# into 4," matched to how TCC is used.
+# Out-of-fold OLS of BALIVE on the embedding, then equal-count quantile bins --
+# the learned analog of "a BALIVE-correlated covariate binned into 4," matched to
+# how TCC is used. Two versions, on the SAME folds: the full embedding
+# (type + phase) and z_type only, to isolate the phase pathway's contribution.
 set.seed(1)
-folds    <- sample(rep(1:5, length.out = nrow(analysis)))
-form_bal <- reformulate(emb_vars, response = "BALIVE")
-oof      <- numeric(nrow(analysis))
-for (f in 1:5) {
-  fit <- lm(form_bal, data = analysis[folds != f, ])
-  oof[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
-}
-analysis$emb_score <- oof
-analysis$emb_sup   <- factor(dplyr::ntile(oof, 4), labels = paste0("S", 1:4))
+folds <- sample(rep(1:5, length.out = nrow(analysis)))
 
-cat("TCC fixed-bin counts:\n");               print(table(analysis$tcc_stratum))
-cat("\nTCC quartile counts:\n");               print(table(analysis$tcc_q))
-cat("\nEmbedding k-means (unsup) counts:\n");  print(table(analysis$emb_km))
-cat("\nEmbedding supervised (OOF) counts:\n"); print(table(analysis$emb_sup))
+oof_score <- function(vars) {                       # leakage-free BALIVE read-out
+  form <- reformulate(vars, response = "BALIVE")
+  s <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    s[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  s
+}
+
+analysis$emb_sup      <- factor(dplyr::ntile(oof_score(emb_vars),      4), labels = paste0("S",  1:4))
+analysis$emb_sup_type <- factor(dplyr::ntile(oof_score(emb_type_vars), 4), labels = paste0("St", 1:4))
+
+cat("TCC fixed-bin counts:\n");                     print(table(analysis$tcc_stratum))
+cat("\nTCC quartile counts:\n");                     print(table(analysis$tcc_q))
+cat("\nEmbedding k-means (unsup) counts:\n");        print(table(analysis$emb_km))
+cat("\nEmbedding supervised type+phase counts:\n");  print(table(analysis$emb_sup))
+cat("\nEmbedding supervised type-only counts:\n");   print(table(analysis$emb_sup_type))
 ```
 
 ## Within-stratum variance of BALIVE
@@ -254,21 +261,24 @@ the sub-stratification made `BALIVE` more homogeneous within cells — i.e. a mo
 efficient post-stratified estimator.
 
 ```{r headline}
-v_unit <- pooled_within(analysis, "UNITCD")
-v_tcc  <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
-v_tccq <- pooled_within(analysis, c("UNITCD", "tcc_q"))
-v_km   <- pooled_within(analysis, c("UNITCD", "emb_km"))
-v_sup  <- pooled_within(analysis, c("UNITCD", "emb_sup"))
+v_unit  <- pooled_within(analysis, "UNITCD")
+v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
+v_tccq  <- pooled_within(analysis, c("UNITCD", "tcc_q"))
+v_km    <- pooled_within(analysis, c("UNITCD", "emb_km"))
+v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
+v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 
+vv <- c(v_unit, v_tcc, v_tccq, v_km, v_supt, v_sup)
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       "UNITCD x TCC fixed bins (4)",
                       "UNITCD x TCC quartiles (4)",
                       "UNITCD x embedding k-means (4, unsup)",
-                      "UNITCD x embedding supervised (4, OOF)"),
-  within_var      = round(c(v_unit, v_tcc, v_tccq, v_km, v_sup), 1),
-  within_sd       = round(sqrt(c(v_unit, v_tcc, v_tccq, v_km, v_sup)), 2),
-  pct_of_baseline = round(100 * c(v_unit, v_tcc, v_tccq, v_km, v_sup) / v_unit, 1)
+                      "UNITCD x embedding supervised type-only (4, OOF)",
+                      "UNITCD x embedding supervised type+phase (4, OOF)"),
+  within_var      = round(vv, 1),
+  within_sd       = round(sqrt(vv), 2),
+  pct_of_baseline = round(100 * vv / v_unit, 1)
 )
 ```
 
