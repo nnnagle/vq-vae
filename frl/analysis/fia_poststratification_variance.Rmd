@@ -50,7 +50,10 @@ minimize. Both stratifications get **4 strata** and are crossed with `UNITCD`, s
 the comparison is like-for-like.
 
 - **TCC strata:** canopy-cover bins `0–10, 11–48, 49–85, 86–100`.
-- **Embedding strata:** 4 regions of `z_type` space via k-means.
+- **Embedding strata:** two variants — unsupervised k-means on `z_type`, and a
+  supervised (out-of-fold) BALIVE read-out of the embedding binned into 4. The
+  supervised one is the fair analog to TCC (a single BALIVE-correlated covariate
+  binned into 4); k-means tests whether raw embedding *geometry* stratifies BALIVE.
 
 The baseline is `UNITCD`-only (no sub-stratification); TCC and embedding are
 judged by how far below that baseline they push the residual `BALIVE` variance.
@@ -145,7 +148,9 @@ balive_plot <- cond_data %>%
 ### Embeddings (z_type block)
 
 ```{r embeddings}
-emb_type_vars <- paste0("z_type_", 0:47)
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)   # full embedding for the supervised score
 
 emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
   mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
@@ -163,7 +168,7 @@ plots**.
 analysis <- fia_merged %>%
   select(CN, UNITCD, tcc) %>%
   inner_join(balive_plot, by = c("CN" = "PLT_CN")) %>%
-  inner_join(select(emb_data, CN, all_of(emb_type_vars)), by = "CN") %>%
+  inner_join(select(emb_data, CN, all_of(emb_vars)), by = "CN") %>%
   filter(!is.na(UNITCD), !is.na(BALIVE), !is.na(tcc), tcc >= 0, tcc <= 100)
 
 cat(sprintf("plots in analysis frame: %d across %d survey units\n",
@@ -172,20 +177,50 @@ cat(sprintf("plots in analysis frame: %d across %d survey units\n",
 
 ## Define the 4-way stratifications
 
+TCC is a single **BALIVE-correlated** axis (canopy cover ≈ a structural proxy for
+basal area) cut into 4 ordered bins, so its strata are naturally homogeneous in
+BALIVE. An unsupervised k-means on the embedding is *not* comparable: it splits
+the 48-D space along its highest-variance directions — forest type/species — which
+need not align with BALIVE magnitude. We therefore report **two** embedding
+stratifications:
+
+- **k-means (unsupervised):** 4 regions of `z_type` geometry, agnostic to BALIVE.
+  A reference for "does raw embedding geometry stratify BALIVE?"
+- **supervised (the fair analog to TCC):** a single BALIVE-predictive score read
+  out of the embedding, cut into 4 quantile bins. The score is an **out-of-fold**
+  (5-fold) linear fit of BALIVE on the full embedding, so every plot is scored by
+  a model that never saw it — no in-sample optimism that TCC also never gets.
+
 ```{r strata}
 # --- TCC strata: canopy-cover percent bins ----------------------------------
 analysis <- analysis %>%
   mutate(tcc_stratum = cut(tcc, breaks = c(-Inf, 10, 48, 85, Inf),
                            labels = c("0-10", "11-48", "49-85", "86-100")))
 
-# --- Embedding strata: 4 regions of z_type space (k-means on standardized dims)
+# --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type space -------
 set.seed(1)
 Z  <- scale(as.matrix(analysis[, emb_type_vars]))
 km <- kmeans(Z, centers = 4, nstart = 25)
-analysis$emb_stratum <- factor(km$cluster, labels = paste0("E", 1:4))
+analysis$emb_km <- factor(km$cluster, labels = paste0("K", 1:4))
 
-cat("TCC stratum counts:\n");        print(table(analysis$tcc_stratum))
-cat("\nEmbedding stratum counts:\n"); print(table(analysis$emb_stratum))
+# --- Embedding strata, SUPERVISED: quantile bins of a cross-fit BALIVE read-out
+# Out-of-fold OLS of BALIVE on the full embedding (type + phase), then equal-count
+# quantile bins -- the learned analog of "a BALIVE-correlated covariate binned
+# into 4," matched to how TCC is used.
+set.seed(1)
+folds    <- sample(rep(1:5, length.out = nrow(analysis)))
+form_bal <- reformulate(emb_vars, response = "BALIVE")
+oof      <- numeric(nrow(analysis))
+for (f in 1:5) {
+  fit <- lm(form_bal, data = analysis[folds != f, ])
+  oof[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+}
+analysis$emb_score <- oof
+analysis$emb_sup   <- factor(dplyr::ntile(oof, 4), labels = paste0("S", 1:4))
+
+cat("TCC stratum counts:\n");                 print(table(analysis$tcc_stratum))
+cat("\nEmbedding k-means (unsup) counts:\n");  print(table(analysis$emb_km))
+cat("\nEmbedding supervised (OOF) counts:\n"); print(table(analysis$emb_sup))
 ```
 
 ## Within-stratum variance of BALIVE
@@ -214,13 +249,16 @@ efficient post-stratified estimator.
 ```{r headline}
 v_unit <- pooled_within(analysis, "UNITCD")
 v_tcc  <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
-v_emb  <- pooled_within(analysis, c("UNITCD", "emb_stratum"))
+v_km   <- pooled_within(analysis, c("UNITCD", "emb_km"))
+v_sup  <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 
 data.frame(
-  stratification  = c("UNITCD only (baseline)", "UNITCD x TCC (4)", "UNITCD x embedding (4)"),
-  within_var      = round(c(v_unit, v_tcc, v_emb), 1),
-  within_sd       = round(sqrt(c(v_unit, v_tcc, v_emb)), 2),
-  pct_of_baseline = round(100 * c(v_unit, v_tcc, v_emb) / v_unit, 1)
+  stratification  = c("UNITCD only (baseline)", "UNITCD x TCC (4)",
+                      "UNITCD x embedding k-means (4, unsup)",
+                      "UNITCD x embedding supervised (4, OOF)"),
+  within_var      = round(c(v_unit, v_tcc, v_km, v_sup), 1),
+  within_sd       = round(sqrt(c(v_unit, v_tcc, v_km, v_sup)), 2),
+  pct_of_baseline = round(100 * c(v_unit, v_tcc, v_km, v_sup) / v_unit, 1)
 )
 ```
 
@@ -237,13 +275,14 @@ per_unit <- analysis %>%
     n         = nrow(.x),
     var_total = var(.x$BALIVE),
     var_tcc   = pooled_within(.x, "tcc_stratum"),
-    var_emb   = pooled_within(.x, "emb_stratum")
+    var_km    = pooled_within(.x, "emb_km"),
+    var_emb   = pooled_within(.x, "emb_sup")   # supervised = the fair contender
   )) %>%
   ungroup() %>%
   mutate(tcc_ratio = round(var_tcc / var_total, 3),
          emb_ratio = round(var_emb / var_total, 3),
          winner    = if_else(var_emb < var_tcc, "embedding", "tcc"),
-         across(c(var_total, var_tcc, var_emb), ~ round(.x, 1)))
+         across(c(var_total, var_tcc, var_km, var_emb), ~ round(.x, 1)))
 per_unit
 ```
 
@@ -259,12 +298,12 @@ cell_tcc <- analysis %>%
             var_balive = round(var(BALIVE), 1), .groups = "drop")
 
 cell_emb <- analysis %>%
-  group_by(UNITCD, emb_stratum) %>%
+  group_by(UNITCD, emb_sup) %>%
   summarize(n = n(), mean_balive = round(mean(BALIVE), 1),
             var_balive = round(var(BALIVE), 1), .groups = "drop")
 
 cat("=== BALIVE within (UNITCD x TCC stratum) ===\n"); cell_tcc
-cat("\n=== BALIVE within (UNITCD x embedding stratum) ===\n"); cell_emb
+cat("\n=== BALIVE within (UNITCD x embedding supervised stratum) ===\n"); cell_emb
 ```
 
 ### Visual: within-stratum SD by unit
@@ -279,9 +318,10 @@ plot(seq_len(nrow(per_unit)), sqrt(per_unit$var_total), type = "n",
 axis(1, at = seq_len(nrow(per_unit)), labels = per_unit$UNITCD)
 points(seq_len(nrow(per_unit)), sqrt(per_unit$var_total), pch = 1,  col = "grey50", cex = 1.4)
 points(seq_len(nrow(per_unit)), sqrt(per_unit$var_tcc),   pch = 16, col = "firebrick", cex = 1.4)
+points(seq_len(nrow(per_unit)), sqrt(per_unit$var_km),    pch = 4,  col = "grey40",    cex = 1.2)
 points(seq_len(nrow(per_unit)), sqrt(per_unit$var_emb),   pch = 16, col = "steelblue", cex = 1.4)
-legend("topright", c("unstratified", "TCC (4)", "embedding (4)"),
-       pch = c(1, 16, 16), col = c("grey50", "firebrick", "steelblue"), bty = "n")
+legend("topright", c("unstratified", "TCC (4)", "embedding k-means (4)", "embedding supervised (4)"),
+       pch = c(1, 16, 4, 16), col = c("grey50", "firebrick", "grey40", "steelblue"), bty = "n")
 par(op)
 ```
 
@@ -301,10 +341,18 @@ dbDisconnect(con)
 - **Like-for-like.** Both schemes use exactly 4 strata on the same plots, crossed
   with `UNITCD`. Giving the embedding more clusters would trivially lower variance
   (more, smaller cells), so 4-vs-4 is the fair comparison.
-- **Embedding representation.** Strata are k-means on standardized `z_type` (the
-  "what kind of forest" block) — the natural analog to a structural variable like
-  TCC. To test the temporal pathway too, append `z_phase_0..7` to `emb_type_vars`
-  (optionally block-normalized as in the evaluation report) and re-run.
+- **Why two embedding stratifications.** Unsupervised k-means splits the embedding
+  along its highest-variance directions (forest type/species), which need not align
+  with BALIVE — so it is expected to stratify BALIVE weakly, and is kept only as a
+  geometry reference. The supervised quantile stratifier is the fair comparison to
+  TCC. It is *not* circular: the score is fit **out-of-fold**, and post-stratification
+  by definition uses a target-correlated covariate — TCC is simply one whose
+  correlation is built in rather than learned. If TCC still wins, that is a real
+  result: canopy cover is a near-direct structural measurement of basal area, while
+  the embedding was trained for forest-type similarity, not BALIVE regression.
+- **Combining them** (e.g. TCC × embedding, or embedding strata *within* TCC bins)
+  is the natural next step if you want the embedding to add resolution on top of the
+  structural signal TCC already captures.
 - **Not design-based (yet).** This uses the proportional-allocation approximation
   `W_h ≈ n_h/n`. `POP_STRATUM` (pulled above) carries FIA's official
   area-expansion factors; a fully design-based variance would weight strata by
