@@ -192,10 +192,16 @@ stratifications:
   a model that never saw it — no in-sample optimism that TCC also never gets.
 
 ```{r strata}
-# --- TCC strata: canopy-cover percent bins ----------------------------------
+# --- TCC strata: fixed canopy-cover percent bins (domain-standard) ----------
 analysis <- analysis %>%
   mutate(tcc_stratum = cut(tcc, breaks = c(-Inf, 10, 48, 85, Inf),
                            labels = c("0-10", "11-48", "49-85", "86-100")))
+
+# --- TCC strata: equal-count quartiles (fairness control) -------------------
+# Bins TCC the SAME way emb_sup bins its score (ntile), so a TCC-vs-embedding
+# comparison isolates the covariate, not the binning scheme. In forested VA the
+# fixed bins above are lopsided (few low-canopy plots), which handicaps them.
+analysis$tcc_q <- factor(dplyr::ntile(analysis$tcc, 4), labels = paste0("T", 1:4))
 
 # --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type space -------
 set.seed(1)
@@ -218,7 +224,8 @@ for (f in 1:5) {
 analysis$emb_score <- oof
 analysis$emb_sup   <- factor(dplyr::ntile(oof, 4), labels = paste0("S", 1:4))
 
-cat("TCC stratum counts:\n");                 print(table(analysis$tcc_stratum))
+cat("TCC fixed-bin counts:\n");               print(table(analysis$tcc_stratum))
+cat("\nTCC quartile counts:\n");               print(table(analysis$tcc_q))
 cat("\nEmbedding k-means (unsup) counts:\n");  print(table(analysis$emb_km))
 cat("\nEmbedding supervised (OOF) counts:\n"); print(table(analysis$emb_sup))
 ```
@@ -249,16 +256,19 @@ efficient post-stratified estimator.
 ```{r headline}
 v_unit <- pooled_within(analysis, "UNITCD")
 v_tcc  <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
+v_tccq <- pooled_within(analysis, c("UNITCD", "tcc_q"))
 v_km   <- pooled_within(analysis, c("UNITCD", "emb_km"))
 v_sup  <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 
 data.frame(
-  stratification  = c("UNITCD only (baseline)", "UNITCD x TCC (4)",
+  stratification  = c("UNITCD only (baseline)",
+                      "UNITCD x TCC fixed bins (4)",
+                      "UNITCD x TCC quartiles (4)",
                       "UNITCD x embedding k-means (4, unsup)",
                       "UNITCD x embedding supervised (4, OOF)"),
-  within_var      = round(c(v_unit, v_tcc, v_km, v_sup), 1),
-  within_sd       = round(sqrt(c(v_unit, v_tcc, v_km, v_sup)), 2),
-  pct_of_baseline = round(100 * c(v_unit, v_tcc, v_km, v_sup) / v_unit, 1)
+  within_var      = round(c(v_unit, v_tcc, v_tccq, v_km, v_sup), 1),
+  within_sd       = round(sqrt(c(v_unit, v_tcc, v_tccq, v_km, v_sup)), 2),
+  pct_of_baseline = round(100 * c(v_unit, v_tcc, v_tccq, v_km, v_sup) / v_unit, 1)
 )
 ```
 
