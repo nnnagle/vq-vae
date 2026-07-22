@@ -1,6 +1,6 @@
 ---
 title: "FIA Removals Post-Stratification: TCC vs Embedding"
-subtitle: "Within-stratum variance of removed live basal area by survey unit, Virginia FIA plots"
+subtitle: "Within-stratum variance of removed volume by survey unit, Virginia FIA plots"
 author: "FoR-EST project"
 date: "`r Sys.Date()`"
 output:
@@ -16,7 +16,7 @@ params:
   tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
   fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
   statecd: "51"
-  yr_start: 2017     # T2 measurement window (inclusive) -- the "current" remeasured plots
+  yr_start: 2017     # measurement window (inclusive) for the remeasured plots
   yr_end:   2023
 ---
 
@@ -29,28 +29,30 @@ knitr::opts_chunk$set(
 
 ## Overview
 
-A **removals** post-stratification analysis, parallel to the BALIVE one. The key
-simplification (thanks to how FIA records trees): we do **not** difference two
-measurements. Each tree at its measurement already carries `STATUSCD`, where
-**`3 = cut and removed`** *since the previous visit*. So we just:
+A **removals** post-stratification analysis, parallel to the BALIVE one, using
+FIA's own GRM removal volumes — no plot-to-plot differencing.
 
 1. Take the **remeasured plots** whose measurement falls in `[yr_start, yr_end]`
-   (removals are only defined where there was a prior visit — `PREV_PLT_CN` not
-   null).
-2. Pull their trees and aggregate the **removed** ones (`STATUSCD = 3`) into a
-   per-plot **removed live basal area** (sq ft/acre), annualized by the plot's
-   remeasurement period `REMPER`.
-3. Stratify by **TCC** and by the **embedding (at that measurement)**, and compare
+   (`PREV_PLT_CN` not null).
+2. Per plot, sum FIA's per-tree removal volume × annual removal expansion from
+   **`TREE_GRM_COMPONENT`**:
+
+   $$\texttt{remv\_cfgs} = \sum_{\text{trees}} \texttt{REMVCFGS\_FOREST} \times
+     \texttt{SUBP\_TPAREMV\_UNADJ\_GS\_FOREST}$$
+
+   giving **annual per-acre removed merchantable growing-stock volume**
+   (cu ft/acre/yr). (`REMVCFAL_FOREST`/`REMVBFSL_FOREST` give all-live sound cu ft
+   and sawtimber board ft — see Notes to switch.)
+3. Stratify by **TCC** and by the **embedding (at that measurement)** and compare
    the within-stratum variance of removals, within each survey unit (`UNITCD`).
 
-> **This is true GRM-style removals** (harvest / cut), not net change — a tree is
-> counted only if FIA flagged it cut. Contrast the earlier "BALIVE difference"
-> idea, which nets in growth and mortality and needs a plot-to-plot link; this
-> needs neither.
+> **This is true GRM removals** — cut **and** land-use diversion — at the plot,
+> already annualized (`SUBP_TPAREMV_UNADJ_*` is per-year, so we do **not** divide
+> by `REMPER`). Trees that were not removed contribute 0 (their `TPAREMV` is 0).
 
 Why the embedding should shine here: removals = harvest = a **fast disturbance
 event**, exactly what the phase pathway (`z_phase`, conditioned on
-years-since-fast-change) is built to detect. A single-date TCC snapshot barely
+years-since-fast-change) is built to detect; a single-date TCC snapshot barely
 encodes *whether a cut happened*.
 
 ```{r libraries}
@@ -69,50 +71,47 @@ con <- dbConnect(RSQLite::SQLite(), params$fiadb)
 
 plots <- dbGetQuery(
   con,
-  sprintf("SELECT CN, PREV_PLT_CN, UNITCD, INVYR, MEASYEAR, REMPER
+  sprintf("SELECT CN, PREV_PLT_CN, UNITCD, INVYR
              FROM PLOT
             WHERE STATECD='%s' AND INVYR BETWEEN %d AND %d",
           params$statecd, params$yr_start, params$yr_end)
 ) %>%
   mutate(CN = as.character(CN), PREV_PLT_CN = as.character(PREV_PLT_CN)) %>%
-  filter(!is.na(PREV_PLT_CN), !is.na(REMPER), REMPER > 0)   # remeasured only
+  filter(!is.na(PREV_PLT_CN))                    # remeasured only (removals defined)
 
 cat(sprintf("remeasured plots in [%d, %d]: %d\n",
             params$yr_start, params$yr_end, nrow(plots)))
 ```
 
-### Removed basal area per plot (from the TREE table, no linking)
+### Removed volume per plot (TREE_GRM_COMPONENT)
 
-Basal area of one tree (sq ft) = `0.005454 * DIA^2` (DIA in inches); scaled to a
-per-acre contribution by `TPA_UNADJ`. We aggregate in SQL and also count removed
-trees with vs without a `DIA`, so we can see whether `DIA` is populated for cut
-trees (if not, switch the size source to `TREE_GRM_MIDPT` — see Notes).
+Sum FIA's per-tree removal volume × annual removal TPA. We restrict the (national)
+GRM table to our plots via a temporary join table, and compute all three removal
+bases (GS cu ft, AL sound cu ft, SL board ft) so the response is easy to swap.
+`SUBP_TPAREMV_UNADJ_*` is already annual, so **no `REMPER` division**.
 
 ```{r removals}
+# push the plot CNs into a temp table so the big GRM table is filtered by join
+dbWriteTable(con, "tmp_plots", tibble(PLT_CN = plots$CN),
+             temporary = TRUE, overwrite = TRUE)
+
 remv <- dbGetQuery(
   con,
-  sprintf(
-    "SELECT PLT_CN,
-            SUM(CASE WHEN STATUSCD=3 THEN 0.005454*DIA*DIA*TPA_UNADJ ELSE 0 END) AS remv_ba,
-            SUM(CASE WHEN STATUSCD=3 THEN 1 ELSE 0 END)                          AS remv_n,
-            SUM(CASE WHEN STATUSCD=3 AND DIA IS NOT NULL THEN 1 ELSE 0 END)      AS remv_n_wdia
-       FROM TREE
-      WHERE STATECD='%s'
-      GROUP BY PLT_CN",
-    params$statecd
-  )
+  "SELECT g.PLT_CN,
+          SUM(g.REMVCFGS_FOREST * g.SUBP_TPAREMV_UNADJ_GS_FOREST) AS remv_cfgs,
+          SUM(g.REMVCFAL_FOREST * g.SUBP_TPAREMV_UNADJ_AL_FOREST) AS remv_cfal,
+          SUM(g.REMVBFSL_FOREST * g.SUBP_TPAREMV_UNADJ_SL_FOREST) AS remv_bfsl
+     FROM TREE_GRM_COMPONENT g
+     JOIN tmp_plots t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN"
 ) %>%
   mutate(PLT_CN = as.character(PLT_CN))
-
-# DIA-coverage diagnostic for removed trees
-tot <- remv %>% summarize(n = sum(remv_n), n_wdia = sum(remv_n_wdia))
-cat(sprintf("removed trees: %d total, %.1f%% with a non-null DIA\n",
-            tot$n, 100 * tot$n_wdia / max(tot$n, 1)))
+# NOTE: if TREE_GRM_COMPONENT lacks PLT_CN in your build, join TREE on
+# g.TRE_CN = TREE.CN to recover TREE.PLT_CN.
 
 plots <- plots %>%
   left_join(remv, by = c("CN" = "PLT_CN")) %>%
-  mutate(remv_ba     = coalesce(remv_ba, 0),          # no removed trees -> 0
-         remv_ba_ann = remv_ba / REMPER)              # sq ft/acre/yr
+  mutate(across(c(remv_cfgs, remv_cfal, remv_bfsl), ~ coalesce(.x, 0)))  # no cut trees -> 0
 ```
 
 ### TCC at the plot location
@@ -152,24 +151,24 @@ emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
 
 ```{r assemble}
 analysis <- plots %>%
-  select(CN, UNITCD, REMPER, remv_ba, remv_ba_ann) %>%
+  select(CN, UNITCD, remv_cfgs, remv_cfal, remv_bfsl) %>%
   inner_join(tcc_by_cn, by = "CN") %>%
   inner_join(select(emb_data, CN, all_of(emb_vars)), by = "CN") %>%
-  filter(!is.na(UNITCD), !is.na(remv_ba_ann), !is.na(tcc), tcc >= 0, tcc <= 100)
+  filter(!is.na(UNITCD), !is.na(remv_cfgs), !is.na(tcc), tcc >= 0, tcc <= 100)
 
 cat(sprintf("plots in analysis frame: %d across %d survey units\n",
             nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
-cat(sprintf("plots with any removal: %.1f%%\n", 100 * mean(analysis$remv_ba_ann > 0)))
-summary(analysis$remv_ba_ann)
+cat(sprintf("plots with any GS removal: %.1f%%\n", 100 * mean(analysis$remv_cfgs > 0)))
+summary(analysis$remv_cfgs)
 ```
 
 ## Define the stratifications
 
-Response for the supervised embedding score is `remv_ba_ann`. Everything else
-mirrors the BALIVE post-stratification report.
+Response for the supervised embedding score is `remv_cfgs` (annual per-acre GS
+removed volume). Everything else mirrors the BALIVE post-stratification report.
 
 ```{r strata}
-resp <- "remv_ba_ann"
+resp <- "remv_cfgs"
 
 # --- TCC strata: fixed canopy bins + equal-count quartiles ------------------
 analysis <- analysis %>%
@@ -271,10 +270,10 @@ Mean removals by stratum shows how peaked each scheme is.
 ```{r plot-conc, fig.width=11, fig.height=5}
 op <- par(mfrow = c(1, 2), mar = c(4.4, 4.6, 3, 1))
 barplot(tapply(analysis[[resp]], analysis$tcc_stratum, mean), col = "firebrick",
-        las = 2, ylab = "mean removed BA (sq ft/acre/yr)",
+        las = 2, ylab = "mean removed GS volume (cu ft/acre/yr)",
         main = "Mean removals by TCC stratum")
 barplot(tapply(analysis[[resp]], analysis$emb_sup, mean), col = "steelblue",
-        las = 2, ylab = "mean removed BA (sq ft/acre/yr)",
+        las = 2, ylab = "mean removed GS volume (cu ft/acre/yr)",
         main = "Mean removals by embedding stratum")
 par(op)
 ```
@@ -287,23 +286,25 @@ dbDisconnect(con)
 
 ## Notes
 
-- **Removed-tree size source.** We compute removed BA from `TREE.DIA` at the
-  measurement; the diagnostic above reports what fraction of `STATUSCD=3` trees
-  have a non-null `DIA`. If that fraction is low, switch the size source to the
-  GRM midpoint: join `TREE_GRM_COMPONENT` (`SUBP_TPAREMV_UNADJ_*`, component
-  `LIKE 'CUT%%'`/`'DIVERSION%%'`) x `TREE_GRM_MIDPT` (`DIA`/`VOLCFNET` at period
-  midpoint). That is FIA's own removals size and also needs no manual linking.
-- **Land-use diversions.** `STATUSCD=3` is cut/removed; land-use *diversions*
-  (forest -> non-forest) are handled in the GRM `COMPONENT` codes, not `STATUSCD`.
-  If you want full removals (cut + diversion), use the GRM route above.
-- **Unadjusted per-acre.** `remv_ba` uses `TPA_UNADJ` without the `POP_STRATUM`
-  `ADJ_FACTOR_*`; fine for a *strata efficiency* comparison (adjustment is ~constant
-  within design), not for an official population estimate.
+- **Which removal basis.** `remv_cfgs` = merchantable growing-stock cu ft
+  (`REMVCFGS_FOREST` x `SUBP_TPAREMV_UNADJ_GS_FOREST`). Swap `resp` to `remv_cfal`
+  (all-live sound cu ft) or `remv_bfsl` (sawtimber board ft) — both are already
+  computed on the analysis frame.
+- **Already annual.** `SUBP_TPAREMV_UNADJ_*` is a per-year expansion, so the
+  product is annual per-acre removals; do **not** divide by `REMPER`.
+- **Full removals.** GRM `REMV` includes cut **and** land-use diversion, so this
+  is complete removals, not cut-only.
+- **PLT_CN join.** If `TREE_GRM_COMPONENT` in your build has no `PLT_CN` column,
+  join `TREE` on `g.TRE_CN = TREE.CN` to recover `TREE.PLT_CN`.
+- **Unadjusted per-acre.** Uses `SUBP_TPAREMV_UNADJ_*` without the `POP_STRATUM`
+  `ADJ_FACTOR_*`; fine for a *strata efficiency* comparison, not an official
+  population estimate. (Also SUBP only — if you need micro/macroplot removals, add
+  the `MICR_`/`MACR_` TPAREMV terms.)
 - **Heavy zero-inflation.** Removals are ~0 on most plots; variance lives in the
-  few cut plots. Also consider a **harvest-incidence** response
-  (`as.integer(remv_ba_ann > 0)`) to stratify *occurrence* separately from
+  few cut plots. Consider a **harvest-incidence** response
+  (`as.integer(remv_cfgs > 0)`) to stratify *occurrence* separately from
   magnitude — often the more stratifiable signal, and a natural fit for `z_phase`.
 - **Expected result.** Because removals is a disturbance signal, expect the
-  embedding (esp. `type+phase`) to beat TCC by a wider margin than it did for
-  BALIVE, and the `type-only` vs `type+phase` gap to be large — the phase pathway
-  is doing the work.
+  embedding (esp. `type+phase`) to beat TCC by a wider margin than for BALIVE, and
+  the `type-only` vs `type+phase` gap to be large — the phase pathway is doing the
+  work.
