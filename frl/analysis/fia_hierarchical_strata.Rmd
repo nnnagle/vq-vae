@@ -231,6 +231,77 @@ data.frame(
 )
 ```
 
+## Removals evaluation (multi-target test)
+
+Now score the **same fine-bin structure** on **removals** (annual per-acre removed
+growing-stock volume), aggregated two ways:
+
+1. **BALIVE-aggregated strata applied to removals** — the transfer / "one
+   stratification for many targets" case (this is the `stratum` from Step 4).
+2. **Removals-aggregated strata** — re-run the fine-bin -> `K` merge with **mean
+   removals** as the clustering feature.
+
+Removals come from `TREE_GRM_COMPONENT` and are only defined on remeasured plots,
+so this runs on that subset (`ar`). Reference rows: TCC and a flat OOF removals
+probe.
+
+```{r removals-pull}
+dbWriteTable(con, "tmp_plots", tibble(PLT_CN = analysis$PLT_CN),
+             temporary = TRUE, overwrite = TRUE)
+remv <- dbGetQuery(
+  con,
+  "SELECT g.PLT_CN,
+          SUM(g.REMVCFGS_FOREST * g.SUBP_TPAREMV_UNADJ_GS_FOREST) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_plots t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+# (if TREE_GRM_COMPONENT lacks PLT_CN, join TREE on g.TRE_CN = TREE.CN)
+
+analysis <- analysis %>% left_join(remv, by = "PLT_CN")
+ar <- analysis %>% filter(!is.na(remv_cfgs))       # remeasured plots (removals defined)
+cat(sprintf("remeasured plots with removals: %d (%.1f%% with any removal)\n",
+            nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
+```
+
+```{r removals-strata}
+K <- min(params$K_strata, dplyr::n_distinct(ar$fine_bin))
+
+# (2) hierarchical strata re-aggregated by REMOVALS (same fine bins, new merge)
+bin_remv <- ar %>% group_by(fine_bin) %>%
+  summarize(mean_remv = mean(remv_cfgs), .groups = "drop")
+hc_r <- hclust(dist(scale(bin_remv$mean_remv)), method = "ward.D2")
+bin_remv$stratum_remv <- factor(cutree(hc_r, k = K))
+ar$stratum_remv <- bin_remv$stratum_remv[match(ar$fine_bin, bin_remv$fine_bin)]
+
+# reference: flat OOF removals probe + TCC, both DH-binned
+set.seed(2)
+fr <- sample(rep(1:5, length.out = nrow(ar)))
+oofr <- numeric(nrow(ar)); formr <- reformulate(emb_vars, "remv_cfgs")
+for (f in 1:5) { fit <- lm(formr, ar[fr != f, ]); oofr[fr == f] <- predict(fit, ar[fr == f, ]) }
+ar$remv_flat <- dh_strata(oofr,   params$K_strata)
+ar$tcc_dh    <- dh_strata(ar$tcc, params$K_strata)
+```
+
+```{r removals-eval}
+vr_unit <- pooled_within(ar, "UNITCD",                    y = "remv_cfgs")
+vr_tcc  <- pooled_within(ar, c("UNITCD", "tcc_dh"),       y = "remv_cfgs")
+vr_bal  <- pooled_within(ar, c("UNITCD", "stratum"),      y = "remv_cfgs")  # BALIVE-agg (transfer)
+vr_rem  <- pooled_within(ar, c("UNITCD", "stratum_remv"), y = "remv_cfgs")  # removals-agg
+vr_flat <- pooled_within(ar, c("UNITCD", "remv_flat"),    y = "remv_cfgs")
+
+vr <- c(vr_unit, vr_tcc, vr_bal, vr_rem, vr_flat)
+data.frame(
+  stratification  = c("UNITCD only (baseline)",
+                      sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                      sprintf("UNITCD x hierarchical, BALIVE-aggregated (%d)", params$K_strata),
+                      sprintf("UNITCD x hierarchical, removals-aggregated (%d)", params$K_strata),
+                      sprintf("UNITCD x flat removals supervised (%d)", params$K_strata)),
+  within_var      = round(vr, 2),
+  within_sd       = round(sqrt(vr), 3),
+  pct_of_baseline = round(100 * vr / vr_unit, 1)
+)
+```
+
 ## Cleanup
 
 ```{r cleanup}
