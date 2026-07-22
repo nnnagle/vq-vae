@@ -16,8 +16,8 @@ params:
   tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
   fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
   statecd: "51"
-  k_type: 20                 # number of z_type bins
-  phase_subdivide_frac: 0.5  # fraction of type bins (highest phase variability) to split
+  k_type: 20                  # number of z_type bins
+  phase_subdivide_frac: 0.25  # fraction of type bins (highest phase variability) to split
   k_phase: 3                 # phase sub-groups per subdivided bin
   K_strata: 5                # final number of strata
 ---
@@ -34,11 +34,11 @@ knitr::opts_chunk$set(
 A **hierarchical, structure-aware** stratification of the embedding space for
 estimating BALIVE:
 
-1. **~`r params$k_type` type bins** — k-means on `z_type`.
+1. **~`r params$k_type` type bins** — Ward agglomerative clustering on `z_type`.
 2. **Phase variability per bin** — within each type bin, the spread of `z_phase`;
    rank bins by it.
 3. **Subdivide the most-variable bins** — the top `r round(100*params$phase_subdivide_frac)`%
-   each split into `r params$k_phase` phase sub-groups (k-means on `z_phase`);
+   each split into `r params$k_phase` phase sub-groups (Ward on `z_phase`);
    the rest stay whole. -> "fine bins".
 4. **Aggregate to `r params$K_strata` strata** — Ward hierarchical clustering of
    the fine bins on their **mean BALIVE**, cut to `r params$K_strata`.
@@ -113,9 +113,18 @@ cat(sprintf("forested plots: %d across %d survey units\n",
 ## Step 1 - Type bins
 
 ```{r type-bins}
-set.seed(1)
+# Ward agglomerative clustering (replaces k-means). Ward minimizes within-cluster
+# variance -- the stratification objective -- and gives one nested hierarchy.
+# dist() is O(n^2) (~200 MB at ~7k plots); fastcluster does it faster/leaner.
+ward <- function(X, k) {
+  d  <- dist(X)
+  hc <- if (requireNamespace("fastcluster", quietly = TRUE))
+          fastcluster::hclust(d, method = "ward.D2") else hclust(d, method = "ward.D2")
+  cutree(hc, k = k)
+}
+
 Zt <- scale(as.matrix(analysis[, emb_type_vars]))
-analysis$type_bin <- factor(kmeans(Zt, centers = params$k_type, nstart = 20)$cluster)
+analysis$type_bin <- factor(ward(Zt, params$k_type))
 table(analysis$type_bin)
 ```
 
@@ -148,12 +157,10 @@ sub-groups; others keep a single sub-group.
 
 ```{r subdivide}
 analysis$phase_sub <- 1L
-set.seed(1)
 for (b in sub_bins) {
   idx <- which(analysis$type_bin == b)
   if (length(idx) >= 10 * params$k_phase) {         # enough points to split
-    analysis$phase_sub[idx] <- kmeans(Zp[idx, , drop = FALSE],
-                                      centers = params$k_phase, nstart = 10)$cluster
+    analysis$phase_sub[idx] <- ward(Zp[idx, , drop = FALSE], params$k_phase)   # Ward on z_phase
   }
 }
 analysis$fine_bin <- interaction(analysis$type_bin, analysis$phase_sub, drop = TRUE)
