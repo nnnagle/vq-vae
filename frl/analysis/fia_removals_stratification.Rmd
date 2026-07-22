@@ -124,13 +124,18 @@ bounded by standing volume.
 ```{r balive}
 cond_data <- dbGetQuery(
   con,
-  sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE FROM COND WHERE STATECD='%s'",
+  sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, FORTYPCD FROM COND WHERE STATECD='%s'",
           params$statecd)
-)
+) %>%
+  mutate(PLT_CN = as.character(PLT_CN))
 balive <- cond_data %>%
-  mutate(PLT_CN = as.character(PLT_CN), BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
   group_by(PLT_CN) %>%
   summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+# dominant-condition forest type (Forest Class); NA = nonforest plot -> excluded
+fortyp <- cond_data %>%
+  group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(PLT_CN, FORTYPCD)
 ```
 
 ### TCC at the plot location
@@ -173,9 +178,10 @@ analysis <- plots %>%
   select(CN, UNITCD, remv_cfgs, remv_cfal, remv_bfsl) %>%
   left_join(balive, by = c("CN" = "PLT_CN")) %>%
   mutate(BALIVE = coalesce(BALIVE, 0)) %>%
+  inner_join(fortyp, by = c("CN" = "PLT_CN")) %>%   # forested plots only
   inner_join(tcc_by_cn, by = "CN") %>%
   inner_join(select(emb_data, CN, all_of(emb_vars)), by = "CN") %>%
-  filter(!is.na(UNITCD), !is.na(remv_cfgs), !is.na(tcc), tcc >= 0, tcc <= 100)
+  filter(!is.na(FORTYPCD), !is.na(UNITCD), !is.na(remv_cfgs), !is.na(tcc), tcc >= 0, tcc <= 100)
 
 cat(sprintf("plots in analysis frame: %d across %d survey units\n",
             nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))

@@ -68,12 +68,17 @@ emb_phase_vars <- paste0("z_phase_", 0:7)
 
 con <- dbConnect(RSQLite::SQLite(), params$fiadb)
 cond_data <- dbGetQuery(
-  con, sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE FROM COND WHERE STATECD='%s'",
-               params$statecd))
+  con, sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, FORTYPCD FROM COND WHERE STATECD='%s'",
+               params$statecd)) %>%
+  mutate(PLT_CN = as.character(PLT_CN))
 balive <- cond_data %>%
-  mutate(PLT_CN = as.character(PLT_CN), BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
   group_by(PLT_CN) %>%
   summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+# dominant-condition forest type (Forest Class); NA = nonforest plot
+fortyp <- cond_data %>%
+  group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(PLT_CN, FORTYPCD)
 
 emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
   mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
@@ -83,6 +88,7 @@ fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
   mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID))
 
 base <- balive %>%
+  inner_join(fortyp, by = "PLT_CN") %>%
   inner_join(select(emb_data, CN, all_of(c(emb_type_vars, emb_phase_vars))),
              by = c("PLT_CN" = "CN")) %>%
   inner_join(select(fia_locs, CN, UNITCD, LON_ACTUAL, LAT_ACTUAL),
@@ -97,8 +103,10 @@ tv <- extract(tcc, pts_aea, ID = FALSE)[[1]]
 tv <- as.numeric(as.character(tv)); tv[tv > 100] <- NA_real_
 base$tcc <- tv
 
-analysis <- base %>% filter(!is.na(tcc), tcc >= 0, tcc <= 100)
-cat(sprintf("plots: %d across %d survey units\n",
+# Forested plots only (Forest Class not NA): a 0 removal on a forested plot is
+# data; a nonforest plot is not part of the population.
+analysis <- base %>% filter(!is.na(FORTYPCD), !is.na(tcc), tcc >= 0, tcc <= 100)
+cat(sprintf("forested plots: %d across %d survey units\n",
             nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
 ```
 
@@ -241,25 +249,28 @@ growing-stock volume), aggregated two ways:
 2. **Removals-aggregated strata** — re-run the fine-bin -> `K` merge with **mean
    removals** as the clustering feature.
 
-Removals come from `TREE_GRM_COMPONENT` and are only defined on remeasured plots,
-so this runs on that subset (`ar`). Reference rows: TCC and a flat OOF removals
-probe.
+The population is **forested** plots (already filtered above): a 0 removal on a
+forested plot is real data, a nonforest plot is not in the population. Removals
+also require **remeasurement** to be observed, so we keep forested plots that are
+present in the GRM table (`ar`); their removal is 0 if no tree was cut.
 
 ```{r removals-pull}
 dbWriteTable(con, "tmp_plots", tibble(PLT_CN = analysis$PLT_CN),
              temporary = TRUE, overwrite = TRUE)
+# COALESCE *inside* the SUM: a remeasured plot with only survivor trees would
+# otherwise sum all-NULL -> NULL and be mistaken for "no data". Here it returns 0.
 remv <- dbGetQuery(
   con,
   "SELECT g.PLT_CN,
-          SUM(g.REMVCFGS_FOREST * g.SUBP_TPAREMV_UNADJ_GS_FOREST) AS remv_cfgs
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
      FROM TREE_GRM_COMPONENT g JOIN tmp_plots t ON g.PLT_CN = t.PLT_CN
     GROUP BY g.PLT_CN") %>%
   mutate(PLT_CN = as.character(PLT_CN))
 # (if TREE_GRM_COMPONENT lacks PLT_CN, join TREE on g.TRE_CN = TREE.CN)
 
-analysis <- analysis %>% left_join(remv, by = "PLT_CN")
-ar <- analysis %>% filter(!is.na(remv_cfgs))       # remeasured plots (removals defined)
-cat(sprintf("remeasured plots with removals: %d (%.1f%% with any removal)\n",
+# forested (analysis) AND remeasured (in GRM); zero-removal forested plots kept as 0
+ar <- analysis %>% inner_join(remv, by = "PLT_CN")
+cat(sprintf("forested remeasured plots: %d (%.1f%% with any removal)\n",
             nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
 ```
 
