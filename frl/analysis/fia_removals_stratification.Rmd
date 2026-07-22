@@ -1,0 +1,309 @@
+---
+title: "FIA Removals Post-Stratification: TCC vs Embedding"
+subtitle: "Within-stratum variance of removed live basal area by survey unit, Virginia FIA plots"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  yr_start: 2017     # T2 measurement window (inclusive) -- the "current" remeasured plots
+  yr_end:   2023
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110
+)
+```
+
+## Overview
+
+A **removals** post-stratification analysis, parallel to the BALIVE one. The key
+simplification (thanks to how FIA records trees): we do **not** difference two
+measurements. Each tree at its measurement already carries `STATUSCD`, where
+**`3 = cut and removed`** *since the previous visit*. So we just:
+
+1. Take the **remeasured plots** whose measurement falls in `[yr_start, yr_end]`
+   (removals are only defined where there was a prior visit — `PREV_PLT_CN` not
+   null).
+2. Pull their trees and aggregate the **removed** ones (`STATUSCD = 3`) into a
+   per-plot **removed live basal area** (sq ft/acre), annualized by the plot's
+   remeasurement period `REMPER`.
+3. Stratify by **TCC** and by the **embedding (at that measurement)**, and compare
+   the within-stratum variance of removals, within each survey unit (`UNITCD`).
+
+> **This is true GRM-style removals** (harvest / cut), not net change — a tree is
+> counted only if FIA flagged it cut. Contrast the earlier "BALIVE difference"
+> idea, which nets in growth and mortality and needs a plot-to-plot link; this
+> needs neither.
+
+Why the embedding should shine here: removals = harvest = a **fast disturbance
+event**, exactly what the phase pathway (`z_phase`, conditioned on
+years-since-fast-change) is built to detect. A single-date TCC snapshot barely
+encodes *whether a cut happened*.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
+```
+
+## Data assembly
+
+### Remeasured plots in the window
+
+```{r plots}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+plots <- dbGetQuery(
+  con,
+  sprintf("SELECT CN, PREV_PLT_CN, UNITCD, INVYR, MEASYEAR, REMPER
+             FROM PLOT
+            WHERE STATECD='%s' AND INVYR BETWEEN %d AND %d",
+          params$statecd, params$yr_start, params$yr_end)
+) %>%
+  mutate(CN = as.character(CN), PREV_PLT_CN = as.character(PREV_PLT_CN)) %>%
+  filter(!is.na(PREV_PLT_CN), !is.na(REMPER), REMPER > 0)   # remeasured only
+
+cat(sprintf("remeasured plots in [%d, %d]: %d\n",
+            params$yr_start, params$yr_end, nrow(plots)))
+```
+
+### Removed basal area per plot (from the TREE table, no linking)
+
+Basal area of one tree (sq ft) = `0.005454 * DIA^2` (DIA in inches); scaled to a
+per-acre contribution by `TPA_UNADJ`. We aggregate in SQL and also count removed
+trees with vs without a `DIA`, so we can see whether `DIA` is populated for cut
+trees (if not, switch the size source to `TREE_GRM_MIDPT` — see Notes).
+
+```{r removals}
+remv <- dbGetQuery(
+  con,
+  sprintf(
+    "SELECT PLT_CN,
+            SUM(CASE WHEN STATUSCD=3 THEN 0.005454*DIA*DIA*TPA_UNADJ ELSE 0 END) AS remv_ba,
+            SUM(CASE WHEN STATUSCD=3 THEN 1 ELSE 0 END)                          AS remv_n,
+            SUM(CASE WHEN STATUSCD=3 AND DIA IS NOT NULL THEN 1 ELSE 0 END)      AS remv_n_wdia
+       FROM TREE
+      WHERE STATECD='%s'
+      GROUP BY PLT_CN",
+    params$statecd
+  )
+) %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+
+# DIA-coverage diagnostic for removed trees
+tot <- remv %>% summarize(n = sum(remv_n), n_wdia = sum(remv_n_wdia))
+cat(sprintf("removed trees: %d total, %.1f%% with a non-null DIA\n",
+            tot$n, 100 * tot$n_wdia / max(tot$n, 1)))
+
+plots <- plots %>%
+  left_join(remv, by = c("CN" = "PLT_CN")) %>%
+  mutate(remv_ba     = coalesce(remv_ba, 0),          # no removed trees -> 0
+         remv_ba_ann = remv_ba / REMPER)              # sq ft/acre/yr
+```
+
+### TCC at the plot location
+
+Science-TCC is categorical, so `extract` returns a factor — coerce to numeric and
+NA the nodata codes (>100).
+
+```{r tcc}
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID))
+
+locs <- fia_locs %>% filter(CN %in% plots$CN) %>% distinct(CN, .keep_all = TRUE)
+
+tcc     <- rast(params$tcc)
+pts     <- vect(locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+pts_aea <- project(pts, crs(tcc))
+vals <- extract(tcc, pts_aea, ID = FALSE); names(vals) <- "tcc"
+vals$tcc <- as.numeric(as.character(vals$tcc))
+vals$tcc[vals$tcc > 100] <- NA_real_
+
+tcc_by_cn <- tibble(CN = locs$CN, tcc = vals$tcc)
+```
+
+### Embedding at the measurement
+
+```{r embeddings}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)
+
+emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  distinct(CN, .keep_all = TRUE)
+```
+
+### One analysis frame
+
+```{r assemble}
+analysis <- plots %>%
+  select(CN, UNITCD, REMPER, remv_ba, remv_ba_ann) %>%
+  inner_join(tcc_by_cn, by = "CN") %>%
+  inner_join(select(emb_data, CN, all_of(emb_vars)), by = "CN") %>%
+  filter(!is.na(UNITCD), !is.na(remv_ba_ann), !is.na(tcc), tcc >= 0, tcc <= 100)
+
+cat(sprintf("plots in analysis frame: %d across %d survey units\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
+cat(sprintf("plots with any removal: %.1f%%\n", 100 * mean(analysis$remv_ba_ann > 0)))
+summary(analysis$remv_ba_ann)
+```
+
+## Define the stratifications
+
+Response for the supervised embedding score is `remv_ba_ann`. Everything else
+mirrors the BALIVE post-stratification report.
+
+```{r strata}
+resp <- "remv_ba_ann"
+
+# --- TCC strata: fixed canopy bins + equal-count quartiles ------------------
+analysis <- analysis %>%
+  mutate(tcc_stratum = cut(tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                           labels = c("0-10", "11-48", "49-85", "86-100")))
+analysis$tcc_q <- factor(dplyr::ntile(analysis$tcc, 4), labels = paste0("T", 1:4))
+
+# --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type ------------
+set.seed(1)
+Z  <- scale(as.matrix(analysis[, emb_type_vars]))
+km <- kmeans(Z, centers = 4, nstart = 25)
+analysis$emb_km <- factor(km$cluster, labels = paste0("K", 1:4))
+
+# --- Embedding strata, SUPERVISED: OOF read-out of removals, quartile-binned -
+set.seed(1)
+folds <- sample(rep(1:5, length.out = nrow(analysis)))
+oof_score <- function(vars) {
+  form <- reformulate(vars, response = resp)
+  s <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    s[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  s
+}
+analysis$emb_sup_type <- factor(dplyr::ntile(oof_score(emb_type_vars), 4), labels = paste0("St", 1:4))
+analysis$emb_sup      <- factor(dplyr::ntile(oof_score(emb_vars),      4), labels = paste0("S",  1:4))
+analysis$emb_tcc_sup  <- factor(dplyr::ntile(oof_score(c(emb_vars, "tcc")), 4), labels = paste0("C", 1:4))
+
+cat("TCC fixed-bin counts:\n");                    print(table(analysis$tcc_stratum))
+cat("\nEmbedding supervised type+phase counts:\n"); print(table(analysis$emb_sup))
+```
+
+## Within-stratum variance of removals
+
+```{r within-var-fn}
+pooled_within <- function(df, groups, y = resp) {
+  g <- df %>%
+    group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+```
+
+### Headline: overall pooled within-stratum variance
+
+Lower `within_var` / `pct_of_baseline < 100` = more homogeneous strata = a more
+efficient post-stratified estimator of removals.
+
+```{r headline}
+v_unit  <- pooled_within(analysis, "UNITCD")
+v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
+v_tccq  <- pooled_within(analysis, c("UNITCD", "tcc_q"))
+v_km    <- pooled_within(analysis, c("UNITCD", "emb_km"))
+v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
+v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
+v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
+
+vv <- c(v_unit, v_tcc, v_tccq, v_km, v_supt, v_sup, v_ct)
+data.frame(
+  stratification  = c("UNITCD only (baseline)",
+                      "UNITCD x TCC fixed bins (4)",
+                      "UNITCD x TCC quartiles (4)",
+                      "UNITCD x embedding k-means (4, unsup)",
+                      "UNITCD x embedding supervised type-only (4, OOF)",
+                      "UNITCD x embedding supervised type+phase (4, OOF)",
+                      "UNITCD x TCC + embedding supervised (4, OOF)"),
+  within_var      = round(vv, 2),
+  within_sd       = round(sqrt(vv), 3),
+  pct_of_baseline = round(100 * vv / v_unit, 1)
+)
+```
+
+### Per survey unit
+
+```{r per-unit}
+per_unit <- analysis %>%
+  group_by(UNITCD) %>%
+  group_modify(~ tibble(
+    n         = nrow(.x),
+    pct_cut   = round(100 * mean(.x[[resp]] > 0), 1),
+    var_total = var(.x[[resp]]),
+    var_tcc   = pooled_within(.x, "tcc_stratum"),
+    var_emb   = pooled_within(.x, "emb_sup")
+  )) %>%
+  ungroup() %>%
+  mutate(tcc_ratio = round(var_tcc / var_total, 3),
+         emb_ratio = round(var_emb / var_total, 3),
+         winner    = if_else(var_emb < var_tcc, "embedding", "tcc"),
+         across(c(var_total, var_tcc, var_emb), ~ round(.x, 2)))
+per_unit
+```
+
+### Does each stratifier concentrate the harvested plots?
+
+For a rare, zero-inflated event, a good stratifier puts the cut plots together.
+Mean removals by stratum shows how peaked each scheme is.
+
+```{r plot-conc, fig.width=11, fig.height=5}
+op <- par(mfrow = c(1, 2), mar = c(4.4, 4.6, 3, 1))
+barplot(tapply(analysis[[resp]], analysis$tcc_stratum, mean), col = "firebrick",
+        las = 2, ylab = "mean removed BA (sq ft/acre/yr)",
+        main = "Mean removals by TCC stratum")
+barplot(tapply(analysis[[resp]], analysis$emb_sup, mean), col = "steelblue",
+        las = 2, ylab = "mean removed BA (sq ft/acre/yr)",
+        main = "Mean removals by embedding stratum")
+par(op)
+```
+
+## Cleanup
+
+```{r cleanup}
+dbDisconnect(con)
+```
+
+## Notes
+
+- **Removed-tree size source.** We compute removed BA from `TREE.DIA` at the
+  measurement; the diagnostic above reports what fraction of `STATUSCD=3` trees
+  have a non-null `DIA`. If that fraction is low, switch the size source to the
+  GRM midpoint: join `TREE_GRM_COMPONENT` (`SUBP_TPAREMV_UNADJ_*`, component
+  `LIKE 'CUT%%'`/`'DIVERSION%%'`) x `TREE_GRM_MIDPT` (`DIA`/`VOLCFNET` at period
+  midpoint). That is FIA's own removals size and also needs no manual linking.
+- **Land-use diversions.** `STATUSCD=3` is cut/removed; land-use *diversions*
+  (forest -> non-forest) are handled in the GRM `COMPONENT` codes, not `STATUSCD`.
+  If you want full removals (cut + diversion), use the GRM route above.
+- **Unadjusted per-acre.** `remv_ba` uses `TPA_UNADJ` without the `POP_STRATUM`
+  `ADJ_FACTOR_*`; fine for a *strata efficiency* comparison (adjustment is ~constant
+  within design), not for an official population estimate.
+- **Heavy zero-inflation.** Removals are ~0 on most plots; variance lives in the
+  few cut plots. Also consider a **harvest-incidence** response
+  (`as.integer(remv_ba_ann > 0)`) to stratify *occurrence* separately from
+  magnitude — often the more stratifiable signal, and a natural fit for `z_phase`.
+- **Expected result.** Because removals is a disturbance signal, expect the
+  embedding (esp. `type+phase`) to beat TCC by a wider margin than it did for
+  BALIVE, and the `type-only` vs `type+phase` gap to be large — the phase pathway
+  is doing the work.
