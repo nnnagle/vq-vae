@@ -326,6 +326,18 @@ oof_dh <- function(df, y, vars, K) {
   for (f in 1:5) { fit <- lm(form, d[folds != f, ]); s[folds == f] <- predict(fit, d[folds == f, ]) }
   dh_strata(s, K)
 }
+# response-by-stratum boxplots for a named list of stratifications (one facet each)
+strata_boxplot <- function(df, y, schemes, ylab = y) {
+  long <- dplyr::bind_rows(lapply(names(schemes), function(nm)
+    tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]])))
+  long$scheme <- factor(long$scheme, levels = names(schemes))
+  ggplot(long, aes(x = stratum, y = log1p(val))) +
+    geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+    facet_wrap(~ scheme, scales = "free_x", nrow = 1) +
+    labs(x = "stratum", y = paste0("log1p(", ylab, ")")) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
 ```
 
 ### Fine bins: EVT type clusters -> phase subdivision
@@ -430,6 +442,19 @@ Fine bin -> stratum mapping (removals):
 
 ```{r strat-removals-map}
 show_map(ar, "remv_cfgs")
+```
+
+Removals by stratum for each scheme (`log1p` axis — removals are zero-inflated,
+so a scheme separates well when some strata lift off the zero floor):
+
+```{r strat-removals-box, fig.width=11, fig.height=4}
+strata_boxplot(ar, "remv_cfgs", list(
+  "TCC FIA fixed"  = cut(ar$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                         labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"         = dh_strata(ar$tcc, params$K_strata),
+  "EVT type/phase" = agg_by(ar$fine_bin, ar$remv_cfgs, params$K_strata),
+  "flat probe"     = oof_dh(ar, "remv_cfgs", emb_vars, params$K_strata)),
+  ylab = "removals")
 ```
 
 ```{r strat-cleanup}
@@ -695,6 +720,19 @@ resp_table_c(ar_c, "remv_cfgs")
 
 ```{r c-strat-removals-map}
 show_map_c(ar_c, "remv_cfgs")
+```
+
+Removals by stratum for each scheme (`log1p` axis; the constrained method's
+non-Tree plots are pooled into the single `N` stratum):
+
+```{r c-strat-removals-box, fig.width=11, fig.height=4}
+strata_boxplot(ar_c, "remv_cfgs", list(
+  "TCC FIA fixed"   = cut(ar_c$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                          labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"          = dh_strata(ar_c$tcc, params$K_strata),
+  "EVT constrained" = agg_macro(ar_c, "remv_cfgs"),
+  "flat probe"      = oof_dh(ar_c, "remv_cfgs", emb_vars, params$K_strata)),
+  ylab = "removals")
 ```
 
 ## Notes
