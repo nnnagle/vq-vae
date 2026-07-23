@@ -1,6 +1,6 @@
 ---
-title: "EVT-cohesive Type Clustering"
-subtitle: "z_type clusters that map each EVT to a single cluster (one-to-many EVT->cluster)"
+title: "EVT-trained Type Segmentation"
+subtitle: "z_type segments trained on EVT, plots assigned by embedding location"
 author: "FoR-EST project"
 date: "`r Sys.Date()`"
 output:
@@ -31,23 +31,21 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
 
 ## Overview
 
-Cluster the **type** embedding `z_type` so the clustering is (as much as possible)
-a **one-to-many** map from EVT to cluster: several EVTs may share a cluster, but a
-single EVT should not be split across clusters.
+**Segment** the type embedding `z_type` using EVT as supervision, then assign each
+plot to a segment by **its own location in `z_type`** — not by its EVT label.
 
-The clean way to guarantee that is to cluster at the **EVT level**:
+1. Represent each EVT by its **centroid** in standardized `z_type` (reliable EVTs,
+   `n >= min_evt_n`; rare EVTs attach to the nearest).
+2. **Ward-cluster the EVT centroids** into `K` groups — EVT trains *which regions
+   of the embedding form*.
+3. Compute each group's centroid from its plots and **assign every plot to the
+   nearest group centroid** — a Voronoi segmentation of `z_type` space.
 
-1. Represent each EVT by its **centroid** in standardized `z_type` space.
-2. **Ward-cluster the EVT centroids** into `K` groups (reliable EVTs only, i.e.
-   `n >= min_evt_n`; rare EVTs are assigned to the nearest cluster afterward).
-3. Assign every plot to **its EVT's** cluster.
-
-Because clusters are unions of whole EVTs, every EVT maps to exactly one cluster
-**by construction** (clustering *completeness* = 1). EVT is an external vegetation
-label, independent of the FIA response variables, so this is supervision that
-cannot leak into BALIVE/removals. The interesting question it answers: **does
-`z_type` naturally respect EVT boundaries?** — measured by how much the EVT
-constraint costs vs a free clustering.
+So the segment boundaries are learned from EVT, but plots land in bins by *where
+they sit* in the embedding; an EVT may split across bins if its plots are
+embedding-diverse. EVT is external to the FIA responses, so this supervision
+cannot leak into BALIVE/volume/removals. Diagnostics report how cohesive EVTs
+remain and how compact the segmentation is vs a free k-means.
 
 ```{r libraries}
 library(tidyverse)
@@ -90,13 +88,21 @@ cl_big <- cutree(hc, k = K)                              # named by big EVT
 clcent <- t(sapply(sort(unique(cl_big)),
                    function(k) colMeans(cent_big[cl_big == k, , drop = FALSE])))
 
-# assign every EVT: big keep their cut; rare -> nearest cluster centroid
-nearest <- function(v) which.min(colSums((t(clcent) - v)^2))
-evt_cluster <- vapply(rownames(cent), function(e)
-  if (e %in% big) cl_big[[e]] else nearest(cent[e, ]), integer(1))
-names(evt_cluster) <- rownames(cent)
+# EVT -> group map (the EVT-trained grouping): big EVTs from the Ward cut, rare
+# EVTs attached to the nearest EVT-centroid cluster.
+nearest_c <- function(v) which.min(colSums((t(clcent) - v)^2))
+evt_group <- vapply(rownames(cent), function(e)
+  if (e %in% big) cl_big[[e]] else nearest_c(cent[e, ]), integer(1))
+names(evt_group) <- rownames(cent)
 
-emb$type_cluster <- factor(evt_cluster[evt])
+# Segment z_type: group centroids computed from the plots (seeded by the EVT
+# grouping), then assign EVERY PLOT to the nearest group centroid by its own
+# z_type location. An EVT may split across segments.
+grp0 <- evt_group[evt]
+glev <- sort(unique(grp0))
+gc   <- t(sapply(glev, function(g) colMeans(Z[grp0 == g, , drop = FALSE])))
+d2   <- sapply(seq_len(nrow(gc)), function(k) rowSums(sweep(Z, 2, gc[k, ], "-")^2))
+emb$type_cluster <- factor(glev[max.col(-d2, ties.method = "first")])
 
 # dendrogram of the big EVTs, boxed by cluster
 op <- par(mar = c(6, 4, 3, 1))
@@ -106,15 +112,18 @@ rect.hclust(hc, k = K, border = 2:(K + 1))
 par(op)
 ```
 
-## Verify the one-to-many property
+## EVT cohesion under location-based assignment
+
+How much do EVTs stay together now that plots are assigned by embedding location?
+(High = `z_type` respects EVT; an EVT splits only when its plots are
+embedding-diverse.)
 
 ```{r verify}
 tab <- table(evt = evt, cluster = emb$type_cluster)
-per_evt_clusters <- rowSums(tab > 0)                    # clusters each EVT appears in
-cat(sprintf("EVTs mapping to exactly one cluster: %d / %d (%.1f%%)\n",
-            sum(per_evt_clusters == 1), length(per_evt_clusters),
-            100 * mean(per_evt_clusters == 1)))
-stopifnot(all(per_evt_clusters == 1))                   # true by construction
+cat(sprintf("EVT cohesion (plot-weighted: plots in their EVT's modal segment): %.3f\n",
+            sum(apply(tab, 1, max)) / sum(tab)))
+cat(sprintf("EVTs entirely within one segment: %d / %d (%.1f%%)\n",
+            sum(rowSums(tab > 0) == 1), nrow(tab), 100 * mean(rowSums(tab > 0) == 1)))
 ```
 
 ## Cluster composition
@@ -132,12 +141,13 @@ emb %>%
   arrange(desc(n_plots))
 ```
 
-## Does z_type respect EVT? (cost of the constraint)
+## Does z_type respect EVT? (segmentation compactness)
 
-Compare within-cluster `z_type` dispersion of the EVT-cohesive clustering to a
+Compare within-segment `z_type` dispersion of the EVT-trained segmentation to a
 **free** k-means at the same `K` (which minimizes it). Ratio near 1 means the
-embedding already separates EVTs cleanly, so forcing EVT-cohesion costs almost
-nothing; a large ratio means the constraint fights the embedding.
+EVT-trained segments are almost as tight as unconstrained clusters — i.e. `z_type`
+already separates EVTs cleanly; a large ratio means the EVT supervision pulls the
+segments away from the embedding's natural structure.
 
 ```{r compactness}
 tot_within <- function(cl) {
@@ -152,37 +162,40 @@ km <- kmeans(Z, centers = K, nstart = 10)
 w_evt <- tot_within(emb$type_cluster)
 w_km  <- tot_within(km$cluster)
 data.frame(
-  clustering = c("EVT-cohesive (this)", "free k-means (same K)"),
+  clustering = c("EVT-trained segmentation (this)", "free k-means (same K)"),
   within_var = round(c(w_evt, w_km), 3),
   ratio_to_kmeans = round(c(w_evt / w_km, 1), 3)
 )
 
-# homogeneity: how EVT-mixed are the clusters (low is expected -- many EVTs/cluster)
+# homogeneity: how EVT-coherent the segments are (higher = each segment ~ few EVTs)
 homogeneity <- 1 - sum(apply(tab, 2, function(col) {
   p <- col[col > 0] / sum(col); -sum(p * log(p))
 }) * colSums(tab)) / sum(tab) /
   ( -sum((rowSums(tab)/sum(tab)) * log(rowSums(tab)/sum(tab))) )
-cat(sprintf("completeness (EVT -> one cluster): 1.000 (by construction)\n"))
-cat(sprintf("homogeneity  (cluster -> one EVT): %.3f (higher = clusters are EVT-coherent)\n",
+cat(sprintf("homogeneity (segment -> one EVT): %.3f (higher = segments are EVT-coherent)\n",
             homogeneity))
 ```
 
-## EVT -> cluster map
+## EVT -> segment map
 
-The full assignment (join `evt` -> `type_cluster` onto any plot table to use these
-as type strata).
+Each EVT's **modal** segment and its **cohesion** (fraction of the EVT's plots in
+that segment). Cohesion < 1 means the EVT split across segments under
+location-based assignment.
 
 ```{r map}
 # LANDFIRE EVT lookup: VALUE (the EVT code) -> EVT_NAME
 evt_lookup <- read_csv(params$evt_table, show_col_types = FALSE) %>%
   select(VALUE, EVT_NAME)
 
-evt_map <- tibble(VALUE = as.integer(names(evt_cluster)),
-                  n_plots = as.integer(evt_n[names(evt_cluster)]),
-                  type_cluster = as.integer(evt_cluster),
-                  atom = names(evt_cluster) %in% big) %>%
+evt_map <- emb %>%
+  group_by(VALUE = evt) %>%
+  summarize(n_plots  = n(),
+            cluster  = as.integer(names(sort(table(type_cluster), decreasing = TRUE))[1]),
+            cohesion = round(max(table(type_cluster)) / n(), 3),
+            .groups  = "drop") %>%
+  mutate(VALUE = as.integer(VALUE)) %>%
   left_join(evt_lookup, by = "VALUE") %>%
-  select(VALUE, EVT_NAME, n_plots, type_cluster, atom) %>%
+  select(VALUE, EVT_NAME, n_plots, type_cluster = cluster, cohesion) %>%
   arrange(type_cluster, desc(n_plots))
 evt_map
 ```
@@ -190,7 +203,7 @@ evt_map
 ## Stratification: BALIVE, Volume, and Removals vs TCC
 
 Build the fine bins as **EVT type clusters, then phase-subdivided**: take the
-`r params$K` EVT-cohesive clusters, and split the top
+`r params$K` EVT-trained type segments, and split the top
 `r round(100*params$phase_subdivide_frac)`% (by within-cluster `z_phase` spread)
 into `r params$k_phase` phase sub-groups each (Ward on `z_phase`) — the same
 type->phase refinement as the geometry hierarchical script, but with EVT-based
@@ -317,6 +330,13 @@ for (b in sub_cl) {
 analysis$fine_bin <- interaction(analysis$type_cluster, analysis$phase_sub, drop = TRUE)
 cat(sprintf("fine bins: %d (from %d type clusters, %d phase-subdivided)\n",
             nlevels(analysis$fine_bin), n_cl, length(sub_cl)))
+
+# type clusters ranked by within-cluster z_phase variance, flagged if subdivided
+tibble(type_cluster = names(pvar),
+       n            = as.integer(table(analysis$type_cluster)[names(pvar)]),
+       phase_var    = round(as.numeric(pvar), 3),
+       subdivided   = names(pvar) %in% sub_cl) %>%
+  arrange(desc(phase_var))
 ```
 
 ### Removals population (forested + remeasured)
@@ -373,15 +393,17 @@ dbDisconnect(con)
 
 ## Notes
 
-- **Guaranteed one-to-many.** Clustering at the EVT level makes completeness = 1
-  exactly; `homogeneity` is informational (clusters intentionally pool EVTs).
+- **EVT-trained, location-assigned.** EVT groups define the segment centroids;
+  each plot is then assigned by nearest centroid in `z_type`, so an EVT may split
+  across segments. The `EVT cohesion` diagnostic reports how much they stay
+  together (high if `z_type` respects EVT).
 - **The compactness ratio is the headline diagnostic.** Near 1.0 = `z_type`
-  already encodes EVT structure (the model learned vegetation type), so
-  EVT-cohesive strata are also embedding-compact. Far above 1 = EVTs are smeared
-  across the embedding and the constraint is expensive.
-- **Rare EVTs** (`n < min_evt_n`) are assigned to the nearest cluster centroid, so
-  they still map one-to-one to a cluster; raise `min_evt_n` to treat more of them
-  as noise-assigned rather than clustering atoms.
+  already encodes EVT structure (the model learned vegetation type), so the
+  EVT-trained segments are almost as tight as free clusters. Far above 1 = EVTs
+  are smeared across the embedding and the supervision is expensive.
+- **Rare EVTs** (`n < min_evt_n`) only seed the *grouping* via the nearest
+  EVT-centroid cluster; their plots, like all plots, are then assigned by
+  location. Raise `min_evt_n` to keep noisier EVT centroids out of the grouping.
 - **Choosing K.** Read it off the dendrogram; `K` is a param. Unweighted centroids
   give rare and common EVTs equal say in the grouping -- weight `cent_big` rows by
   `sqrt(n)` if you want common EVTs to dominate the merges.
