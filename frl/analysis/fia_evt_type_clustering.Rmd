@@ -328,17 +328,35 @@ oof_dh <- function(df, y, vars, K) {
   dh_strata(s, K)
 }
 # response-by-stratum boxplots for a named list of stratifications (one facet each)
-strata_boxplot <- function(df, y, schemes, ylab = y) {
+strata_boxplot <- function(df, y, schemes, ylab = y, logy = FALSE) {
   long <- dplyr::bind_rows(lapply(names(schemes), function(nm)
     tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]])))
   long$scheme <- factor(long$scheme, levels = names(schemes))
-  ggplot(long, aes(x = stratum, y = log1p(val))) +
+  long$yval   <- if (logy) log1p(long$val) else long$val
+  ggplot(long, aes(x = stratum, y = yval)) +
     geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
     facet_wrap(~ scheme, scales = "free_x", nrow = 1) +
-    labs(x = "stratum", y = paste0("log1p(", ylab, ")")) +
+    labs(x = "stratum", y = if (logy) paste0("log1p(", ylab, ")") else ylab) +
     theme_bw(base_size = 10) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
 }
+# per-stratum n / mean / sd for a named list of stratifications
+strata_summary <- function(df, y, schemes) {
+  dplyr::bind_rows(lapply(names(schemes), function(nm)
+    tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]]) %>%
+      group_by(scheme, stratum) %>%
+      summarize(n = dplyr::n(), mean = round(mean(val), 3), sd = round(sd(val), 3),
+                .groups = "drop"))) %>%
+    mutate(scheme = factor(scheme, levels = names(schemes))) %>%
+    arrange(scheme, stratum)
+}
+# the four stratifications compared for the ORIGINAL (location-based) method
+schemes_o <- function(df, y) list(
+  "TCC FIA fixed"  = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                         labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"         = dh_strata(df$tcc, params$K_strata),
+  "EVT type/phase" = agg_by(df$fine_bin, df[[y]], params$K_strata),
+  "flat probe"     = oof_dh(df, y, emb_vars, params$K_strata))
 ```
 
 ### Fine bins: EVT type clusters -> phase subdivision
@@ -421,6 +439,19 @@ Fine bin -> stratum mapping (BALIVE):
 show_map(analysis, "BALIVE")
 ```
 
+Strata sizes, mean, and SD (BALIVE):
+
+```{r strat-balive-strata}
+sch_bal <- schemes_o(analysis, "BALIVE")
+strata_summary(analysis, "BALIVE", sch_bal)
+```
+
+Distribution of BALIVE within each stratum:
+
+```{r strat-balive-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis, "BALIVE", sch_bal, ylab = "BALIVE")
+```
+
 #### Standing live volume
 
 ```{r strat-volume}
@@ -431,6 +462,19 @@ Fine bin -> stratum mapping (volume):
 
 ```{r strat-volume-map}
 show_map(analysis, "volume")
+```
+
+Strata sizes, mean, and SD (volume):
+
+```{r strat-volume-strata}
+sch_vol <- schemes_o(analysis, "volume")
+strata_summary(analysis, "volume", sch_vol)
+```
+
+Distribution of volume within each stratum:
+
+```{r strat-volume-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis, "volume", sch_vol, ylab = "volume")
 ```
 
 #### Removals
@@ -445,17 +489,18 @@ Fine bin -> stratum mapping (removals):
 show_map(ar, "remv_cfgs")
 ```
 
+Strata sizes, mean, and SD (removals):
+
+```{r strat-removals-strata}
+sch_rmv <- schemes_o(ar, "remv_cfgs")
+strata_summary(ar, "remv_cfgs", sch_rmv)
+```
+
 Removals by stratum for each scheme (`log1p` axis — removals are zero-inflated,
 so a scheme separates well when some strata lift off the zero floor):
 
 ```{r strat-removals-box, fig.width=11, fig.height=4}
-strata_boxplot(ar, "remv_cfgs", list(
-  "TCC FIA fixed"  = cut(ar$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
-                         labels = c("0-10", "11-48", "49-85", "86-100")),
-  "TCC DH"         = dh_strata(ar$tcc, params$K_strata),
-  "EVT type/phase" = agg_by(ar$fine_bin, ar$remv_cfgs, params$K_strata),
-  "flat probe"     = oof_dh(ar, "remv_cfgs", emb_vars, params$K_strata)),
-  ylab = "removals")
+strata_boxplot(ar, "remv_cfgs", sch_rmv, ylab = "removals", logy = TRUE)
 ```
 
 ```{r strat-cleanup}
@@ -684,6 +729,13 @@ resp_table_c <- function(df, y, vars = emb_vars) {
     within_sd  = round(sqrt(vv), 3),
     pct_of_baseline = round(100 * vv / vv[1], 1))
 }
+# the four stratifications compared for the CONSTRAINED method
+schemes_c <- function(df, y) list(
+  "TCC FIA fixed"   = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                          labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"          = dh_strata(df$tcc, params$K_strata),
+  "EVT constrained" = agg_macro(df, y),
+  "flat probe"      = oof_dh(df, y, emb_vars, params$K_strata))
 ```
 
 ```{r c-removals-pop}
@@ -703,6 +755,19 @@ resp_table_c(analysis_c, "BALIVE")
 show_map_c(analysis_c, "BALIVE")
 ```
 
+Strata sizes, mean, and SD (BALIVE):
+
+```{r c-strat-balive-strata}
+sch_bal_c <- schemes_c(analysis_c, "BALIVE")
+strata_summary(analysis_c, "BALIVE", sch_bal_c)
+```
+
+Distribution of BALIVE within each stratum:
+
+```{r c-strat-balive-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis_c, "BALIVE", sch_bal_c, ylab = "BALIVE")
+```
+
 ### Standing live volume (constrained)
 
 ```{r c-strat-volume}
@@ -711,6 +776,19 @@ resp_table_c(analysis_c, "volume")
 
 ```{r c-strat-volume-map}
 show_map_c(analysis_c, "volume")
+```
+
+Strata sizes, mean, and SD (volume):
+
+```{r c-strat-volume-strata}
+sch_vol_c <- schemes_c(analysis_c, "volume")
+strata_summary(analysis_c, "volume", sch_vol_c)
+```
+
+Distribution of volume within each stratum:
+
+```{r c-strat-volume-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis_c, "volume", sch_vol_c, ylab = "volume")
 ```
 
 ### Removals (constrained)
@@ -723,17 +801,18 @@ resp_table_c(ar_c, "remv_cfgs")
 show_map_c(ar_c, "remv_cfgs")
 ```
 
+Strata sizes, mean, and SD (removals):
+
+```{r c-strat-removals-strata}
+sch_rmv_c <- schemes_c(ar_c, "remv_cfgs")
+strata_summary(ar_c, "remv_cfgs", sch_rmv_c)
+```
+
 Removals by stratum for each scheme (`log1p` axis; the constrained method's
 non-Tree plots are pooled into the single `N` stratum):
 
 ```{r c-strat-removals-box, fig.width=11, fig.height=4}
-strata_boxplot(ar_c, "remv_cfgs", list(
-  "TCC FIA fixed"   = cut(ar_c$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
-                          labels = c("0-10", "11-48", "49-85", "86-100")),
-  "TCC DH"          = dh_strata(ar_c$tcc, params$K_strata),
-  "EVT constrained" = agg_macro(ar_c, "remv_cfgs"),
-  "flat probe"      = oof_dh(ar_c, "remv_cfgs", emb_vars, params$K_strata)),
-  ylab = "removals")
+strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
 ```
 
 ## Notes
