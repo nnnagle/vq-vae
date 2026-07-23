@@ -12,8 +12,13 @@ output:
     df_print: paged
 params:
   emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
-  K: 20            # number of type clusters
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  K: 20            # number of type clusters (EVT-cohesive fine bins)
   min_evt_n: 20    # min plots for an EVT to be a clustering atom; smaller -> nearest cluster
+  K_strata: 5      # final strata after supervised aggregation
 ---
 
 ```{r setup, include=FALSE}
@@ -43,6 +48,9 @@ constraint costs vs a free clustering.
 
 ```{r libraries}
 library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
 ```
 
 ## Load and per-EVT centroids
@@ -150,7 +158,7 @@ homogeneity <- 1 - sum(apply(tab, 2, function(col) {
 }) * colSums(tab)) / sum(tab) /
   ( -sum((rowSums(tab)/sum(tab)) * log(rowSums(tab)/sum(tab))) )
 cat(sprintf("completeness (EVT -> one cluster): 1.000 (by construction)\n"))
-cat(sprintf("homogeneity  (cluster -> one EVT): %.3f (low expected; clusters pool EVTs)\n",
+cat(sprintf("homogeneity  (cluster -> one EVT): %.3f (higher = clusters are EVT-coherent)\n",
             homogeneity))
 ```
 
@@ -166,6 +174,134 @@ evt_map <- tibble(evt = as.integer(names(evt_cluster)),
                   atom = names(evt_cluster) %in% big) %>%
   arrange(type_cluster, desc(n_plots))
 evt_map
+```
+
+## Stratification: BALIVE and standing Volume vs TCC
+
+Use the EVT-cohesive clusters as **fine bins**, aggregate them into `K_strata`
+strata by Ward on the cluster-mean response (the "subsequent supervised
+hierarchical clustering"), and compare within-stratum SD of the response against
+TCC and a flat `z_type` probe, by survey unit -- as in the other scripts. Two
+stock responses: **BALIVE** and **standing live net volume** (cu ft/acre).
+Restricted to forested plots.
+
+```{r strat-data}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+cond <- dbGetQuery(con, sprintf(
+  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, FORTYPCD FROM COND WHERE STATECD='%s'",
+  params$statecd)) %>% mutate(PLT_CN = as.character(PLT_CN))
+balive <- cond %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+fortyp <- cond %>%
+  group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(PLT_CN, FORTYPCD)
+
+# standing LIVE net cu ft volume per acre (STATUSCD=1); big TREE table filtered by join
+dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, overwrite = TRUE)
+vol <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(CASE WHEN g.STATUSCD=1 THEN COALESCE(g.VOLCFNET,0)*COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS volume
+     FROM TREE g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN))
+```
+
+```{r strat-tcc}
+locs <- fia_locs %>% filter(CN %in% emb$CN) %>% distinct(CN, .keep_all = TRUE)
+tccr <- rast(params$tcc)
+pts  <- vect(locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+tv   <- extract(tccr, project(pts, crs(tccr)), ID = FALSE)[[1]]
+tv   <- as.numeric(as.character(tv)); tv[tv > 100] <- NA_real_
+tcc_by_cn <- tibble(CN = locs$CN, tcc = tv)
+```
+
+```{r strat-assemble}
+analysis <- emb %>%
+  select(CN, type_cluster, all_of(emb_type_vars)) %>%
+  inner_join(balive, by = c("CN" = "PLT_CN")) %>%
+  left_join(vol,     by = c("CN" = "PLT_CN")) %>%
+  inner_join(fortyp, by = c("CN" = "PLT_CN")) %>%
+  inner_join(select(fia_locs, CN, UNITCD), by = "CN") %>%
+  inner_join(tcc_by_cn, by = "CN") %>%
+  mutate(volume = coalesce(volume, 0)) %>%
+  filter(!is.na(FORTYPCD), !is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)
+cat(sprintf("forested plots with covariates: %d across %d units\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
+```
+
+```{r strat-helpers}
+pooled_within <- function(df, groups, y) {
+  g <- df %>% group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+dh_strata <- function(x, K, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(factor(rep(1L, length(x))))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  bnd <- sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+  factor(findInterval(x, c(-Inf, bnd, Inf)))
+}
+# aggregate EVT clusters -> K strata by Ward on cluster-mean response (supervised)
+agg_by <- function(cluster, y, K) {
+  d  <- tibble(cl = cluster, my = y) %>% group_by(cl) %>%
+        summarize(my = mean(my), .groups = "drop")
+  Kk <- min(K, nrow(d))
+  d$s <- cutree(hclust(dist(scale(d$my)), method = "ward.D2"), Kk)
+  factor(d$s[match(cluster, d$cl)])
+}
+# flat z_type OOF supervised probe -> DH bins (type-only, matched to the EVT clustering)
+oof_dh <- function(y, K) {
+  set.seed(1); folds <- sample(rep(1:5, length.out = nrow(analysis)))
+  d <- analysis %>% mutate(y_resp = .data[[y]])
+  form <- reformulate(emb_type_vars, "y_resp"); s <- numeric(nrow(analysis))
+  for (f in 1:5) { fit <- lm(form, d[folds != f, ]); s[folds == f] <- predict(fit, d[folds == f, ]) }
+  dh_strata(s, K)
+}
+analysis$tcc_dh <- dh_strata(analysis$tcc, params$K_strata)
+```
+
+```{r strat-eval}
+resp_table <- function(y) {
+  aa <- analysis %>%
+    mutate(.evt  = agg_by(type_cluster, .data[[y]], params$K_strata),
+           .flat = oof_dh(y, params$K_strata))
+  vv <- c(pooled_within(aa, "UNITCD", y),
+          pooled_within(aa, c("UNITCD", "tcc_dh"), y),
+          pooled_within(aa, c("UNITCD", ".evt"),  y),
+          pooled_within(aa, c("UNITCD", ".flat"), y))
+  data.frame(
+    stratification  = c("UNITCD only (baseline)",
+                        sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                        sprintf("UNITCD x EVT-cluster hierarchical (%d)", params$K_strata),
+                        sprintf("UNITCD x flat z_type supervised (%d)", params$K_strata)),
+    within_var      = round(vv, 2),
+    within_sd       = round(sqrt(vv), 3),
+    pct_of_baseline = round(100 * vv / vv[1], 1))
+}
+```
+
+### BALIVE
+
+```{r strat-balive}
+resp_table("BALIVE")
+```
+
+### Standing live volume
+
+```{r strat-volume}
+resp_table("volume")
+```
+
+```{r strat-cleanup}
+dbDisconnect(con)
 ```
 
 ## Notes
@@ -185,3 +321,9 @@ evt_map
 - **Using it downstream.** `emb$type_cluster` (or `evt_map`) is a drop-in
   replacement for the k-means/Ward `type_bin` step in the hierarchical
   stratification -- an EVT-supervised type binning that never sees the FIA target.
+- **Responses.** `Volume` is standing live net cu ft/acre (`TREE.VOLCFNET`,
+  `STATUSCD=1`). Swap in removals or another attribute by changing the `vol` query
+  (or adding a response column) and calling `resp_table()` on it. The
+  `EVT-cluster hierarchical` row is the EVT clusters aggregated to `K_strata` by
+  Ward on the cluster-mean response; `flat z_type supervised` is the direct OOF
+  probe ceiling for the same information.
