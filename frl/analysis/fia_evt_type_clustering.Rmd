@@ -212,9 +212,10 @@ type->phase refinement as the geometry hierarchical script, but with EVT-based
 type bins. Then aggregate the fine bins into `K_strata` strata by Ward on the
 cluster-mean response (supervised), and compare within-stratum SD against TCC and
 a flat type+phase probe, by survey unit. Responses: **BALIVE**, **standing live
-volume**, and **removals**. Stocks (BALIVE/volume) run on all forested plots;
-removals additionally require remeasurement (with forested zero-removal plots
-kept as 0).
+volume**, and **removals**. Stocks (BALIVE/volume) run on the **full plot
+population** (non-forest plots contribute 0 — no forest-code filter); removals
+additionally require remeasurement/GRM data, which naturally scopes them to
+treed plots while still retaining land-use diversions.
 
 ```{r strat-data}
 con <- dbConnect(RSQLite::SQLite(), params$fiadb)
@@ -270,8 +271,8 @@ analysis <- emb %>%
   inner_join(select(fia_locs, CN, UNITCD), by = "CN") %>%
   inner_join(tcc_by_cn, by = "CN") %>%
   mutate(volume = coalesce(volume, 0)) %>%
-  filter(!is.na(FORTYPCD), !is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)
-cat(sprintf("forested plots with covariates: %d across %d units\n",
+  filter(!is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)   # full population; no forest-code filter
+cat(sprintf("plots with covariates: %d across %d units\n",
             nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
 ```
 
@@ -369,11 +370,11 @@ tibble(type_cluster = names(pvar),
   arrange(desc(phase_var))
 ```
 
-### Removals population (forested + remeasured)
+### Removals population (remeasured + GRM data)
 
 ```{r removals-pop}
-ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # remeasured; zeros kept
-cat(sprintf("forested remeasured plots: %d (%.1f%% with any removal)\n",
+ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # GRM/remeasured; zeros kept
+cat(sprintf("remeasured plots with GRM data: %d (%.1f%% with any removal)\n",
             nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
 ```
 
@@ -604,7 +605,7 @@ bins' mean response) plus 1 non-Tree stratum.
 ```{r c-analysis}
 analysis_c <- analysis %>%
   inner_join(select(emb, CN, type_cluster_c, macro_c), by = "CN")
-cat(sprintf("forested plots: %d (%d Tree / %d non-Tree)\n",
+cat(sprintf("plots: %d (%d Tree / %d non-Tree)\n",
             nrow(analysis_c), sum(analysis_c$macro_c == "Tree"),
             sum(analysis_c$macro_c == "nonTree")))
 ```
@@ -686,8 +687,8 @@ resp_table_c <- function(df, y, vars = emb_vars) {
 ```
 
 ```{r c-removals-pop}
-ar_c <- analysis_c %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # remeasured; zeros kept
-cat(sprintf("forested remeasured plots: %d (%d Tree / %d non-Tree; %.1f%% with any removal)\n",
+ar_c <- analysis_c %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # GRM/remeasured; zeros kept
+cat(sprintf("remeasured plots with GRM data: %d (%d Tree / %d non-Tree; %.1f%% with any removal)\n",
             nrow(ar_c), sum(ar_c$macro_c == "Tree"), sum(ar_c$macro_c == "nonTree"),
             100 * mean(ar_c$remv_cfgs > 0)))
 ```
@@ -759,9 +760,11 @@ strata_boxplot(ar_c, "remv_cfgs", list(
   match the geometry hierarchical script; set `phase_subdivide_frac = 0` to test
   EVT-type-only fine bins.
 - **Responses.** BALIVE and standing live volume (`TREE.VOLCFNET`, `STATUSCD=1`)
-  are stocks on all forested plots; removals (`TREE_GRM_COMPONENT`, annual per-acre
-  removed GS volume) additionally require remeasurement, with forested no-removal
-  plots kept as 0. The `EVT type/phase hierarchical` row aggregates the fine bins
+  are stocks on the **full plot population** (no forest-code filter; non-forest
+  plots contribute 0). Removals (`TREE_GRM_COMPONENT`, annual per-acre removed GS
+  volume) additionally require remeasurement/GRM data, so the inner join to `remv`
+  scopes them to treed plots (retaining land-use diversions) — this replaces the
+  old `FORTYPCD`-not-NA proxy, which dropped diverted plots and is no longer used. The `EVT type/phase hierarchical` row aggregates the fine bins
   to `K_strata` by Ward on the fine-bin-mean response; `flat embedding supervised`
   is the direct OOF (type+phase) probe ceiling for the same information.
 - **Constrained Tree / non-Tree method** (second section, independent of the
