@@ -542,6 +542,33 @@ tibble(segment = seg_ids,
   arrange(macro, desc(n_plots))
 ```
 
+## EVT -> segment map (constrained)
+
+Each EVT's **modal** segment under embedding-only assignment, its macro side,
+cohesion (fraction of the EVT's plots in that segment), and a `leaks` flag —
+`TRUE` when the EVT's plots land, on balance, in a segment of the *other* macro
+than its own `EVT_LF`.
+
+```{r c-map}
+evt_lookup2 <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  select(VALUE, EVT_NAME, EVT_LF) %>% mutate(VALUE = as.integer(VALUE))
+
+evt_map_c <- emb %>%
+  group_by(VALUE = evt) %>%
+  summarize(n_plots  = n(),
+            segment  = as.integer(names(sort(table(type_cluster_c), decreasing = TRUE))[1]),
+            macro    = names(sort(table(macro_c), decreasing = TRUE))[1],
+            cohesion = round(max(table(type_cluster_c)) / n(), 3),
+            .groups  = "drop") %>%
+  mutate(VALUE = as.integer(VALUE)) %>%
+  left_join(evt_lookup2, by = "VALUE") %>%
+  mutate(evt_lf_macro = ifelse(!is.na(EVT_LF) & EVT_LF == "Tree", "Tree", "nonTree"),
+         leaks = macro != evt_lf_macro) %>%
+  select(VALUE, EVT_NAME, EVT_LF, n_plots, segment, macro, cohesion, leaks) %>%
+  arrange(macro, segment, desc(n_plots))
+evt_map_c
+```
+
 ## Stratification (constrained typology)
 
 Tree segments are phase-subdivided (top `r round(100*params$tree_phase_frac)`% by
