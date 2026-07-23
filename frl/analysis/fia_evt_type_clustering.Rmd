@@ -279,13 +279,18 @@ pooled_within <- function(df, groups, y) {
     summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
   sum(g$ss) / (sum(g$n) - nrow(g))
 }
-dh_strata <- function(x, K, nbins = 100) {
+# Dalenius-Hodges cumulative-sqrt(f) boundaries (the K-1 interior breaks)
+dh_breaks <- function(x, K, nbins = 100) {
   x <- as.numeric(x); rng <- range(x, finite = TRUE)
-  if (!is.finite(diff(rng)) || diff(rng) == 0) return(factor(rep(1L, length(x))))
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(numeric(0))
   h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
   csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
-  bnd <- sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
-  factor(findInterval(x, c(-Inf, bnd, Inf)))
+  sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+}
+dh_strata <- function(x, K, nbins = 100) {
+  bnd <- dh_breaks(x, K, nbins)
+  if (length(bnd) == 0) return(factor(rep(1L, length(x))))
+  factor(findInterval(as.numeric(x), c(-Inf, bnd, Inf)))
 }
 ward <- function(X, k) {
   d  <- dist(X)
@@ -350,16 +355,25 @@ cat(sprintf("forested remeasured plots: %d (%.1f%% with any removal)\n",
 ### Evaluation
 
 ```{r strat-eval}
+# TCC break points actually used by the two TCC schemes
+cat("FIA fixed TCC breaks:", "10, 48, 85", "(0-10 / 11-48 / 49-85 / 86-100)\n")
+cat(sprintf("TCC DH (%d) breaks: %s\n", params$K_strata,
+            paste(round(dh_breaks(analysis$tcc, params$K_strata), 1), collapse = ", ")))
+
 resp_table <- function(df, y, vars = emb_vars) {
+  s_fia  <- cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                labels = c("0-10", "11-48", "49-85", "86-100"))     # FIA operational
   s_tcc  <- dh_strata(df$tcc, params$K_strata)
   s_evt  <- agg_by(df$fine_bin, df[[y]], params$K_strata)
   s_flat <- oof_dh(df, y, vars, params$K_strata)
   vv <- c(pooled_within(df, "UNITCD", y),
+          pooled_within(mutate(df, .s = s_fia),  c("UNITCD", ".s"), y),
           pooled_within(mutate(df, .s = s_tcc),  c("UNITCD", ".s"), y),
           pooled_within(mutate(df, .s = s_evt),  c("UNITCD", ".s"), y),
           pooled_within(mutate(df, .s = s_flat), c("UNITCD", ".s"), y))
   data.frame(
     stratification  = c("UNITCD only (baseline)",
+                        "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
                         sprintf("UNITCD x TCC DH (%d)", params$K_strata),
                         sprintf("UNITCD x EVT type/phase hierarchical (%d)", params$K_strata),
                         sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
