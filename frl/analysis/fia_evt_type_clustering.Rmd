@@ -12,6 +12,7 @@ output:
     df_print: paged
 params:
   emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  evt_table: "~/Dropbox/git/vq-vae/data/LF2024_EVT.csv"
   fia_locs: "/data/FIADB/spatial/va_merge.csv"
   tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
   fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
@@ -168,10 +169,16 @@ The full assignment (join `evt` -> `type_cluster` onto any plot table to use the
 as type strata).
 
 ```{r map}
-evt_map <- tibble(evt = as.integer(names(evt_cluster)),
+# LANDFIRE EVT lookup: VALUE (the EVT code) -> EVT_NAME
+evt_lookup <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  select(VALUE, EVT_NAME)
+
+evt_map <- tibble(VALUE = as.integer(names(evt_cluster)),
                   n_plots = as.integer(evt_n[names(evt_cluster)]),
                   type_cluster = as.integer(evt_cluster),
                   atom = names(evt_cluster) %in% big) %>%
+  left_join(evt_lookup, by = "VALUE") %>%
+  select(VALUE, EVT_NAME, n_plots, type_cluster, atom) %>%
   arrange(type_cluster, desc(n_plots))
 evt_map
 ```
