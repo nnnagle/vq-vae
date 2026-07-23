@@ -17,8 +17,10 @@ params:
   tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
   fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
   statecd: "51"
-  K: 20            # number of type clusters (EVT-cohesive fine bins)
+  K: 20            # number of EVT-cohesive type clusters
   min_evt_n: 20    # min plots for an EVT to be a clustering atom; smaller -> nearest cluster
+  phase_subdivide_frac: 0.25  # fraction of type clusters (highest z_phase spread) to subdivide
+  k_phase: 3       # phase sub-groups per subdivided cluster
   K_strata: 5      # final strata after supervised aggregation
 ---
 
@@ -57,7 +59,9 @@ library(terra)
 ## Load and per-EVT centroids
 
 ```{r load}
-emb_type_vars <- paste0("z_type_", 0:47)
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)
 
 emb <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
   mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
@@ -183,14 +187,19 @@ evt_map <- tibble(VALUE = as.integer(names(evt_cluster)),
 evt_map
 ```
 
-## Stratification: BALIVE and standing Volume vs TCC
+## Stratification: BALIVE, Volume, and Removals vs TCC
 
-Use the EVT-cohesive clusters as **fine bins**, aggregate them into `K_strata`
-strata by Ward on the cluster-mean response (the "subsequent supervised
-hierarchical clustering"), and compare within-stratum SD of the response against
-TCC and a flat `z_type` probe, by survey unit -- as in the other scripts. Two
-stock responses: **BALIVE** and **standing live net volume** (cu ft/acre).
-Restricted to forested plots.
+Build the fine bins as **EVT type clusters, then phase-subdivided**: take the
+`r params$K` EVT-cohesive clusters, and split the top
+`r round(100*params$phase_subdivide_frac)`% (by within-cluster `z_phase` spread)
+into `r params$k_phase` phase sub-groups each (Ward on `z_phase`) — the same
+type->phase refinement as the geometry hierarchical script, but with EVT-based
+type bins. Then aggregate the fine bins into `K_strata` strata by Ward on the
+cluster-mean response (supervised), and compare within-stratum SD against TCC and
+a flat type+phase probe, by survey unit. Responses: **BALIVE**, **standing live
+volume**, and **removals**. Stocks (BALIVE/volume) run on all forested plots;
+removals additionally require remeasurement (with forested zero-removal plots
+kept as 0).
 
 ```{r strat-data}
 con <- dbConnect(RSQLite::SQLite(), params$fiadb)
@@ -206,12 +215,21 @@ fortyp <- cond %>%
   group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
   ungroup() %>% select(PLT_CN, FORTYPCD)
 
-# standing LIVE net cu ft volume per acre (STATUSCD=1); big TREE table filtered by join
 dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, overwrite = TRUE)
+
+# standing LIVE net cu ft volume per acre (STATUSCD=1)
 vol <- dbGetQuery(con,
   "SELECT g.PLT_CN,
           SUM(CASE WHEN g.STATUSCD=1 THEN COALESCE(g.VOLCFNET,0)*COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS volume
      FROM TREE g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+
+# annual per-acre removed GS volume; COALESCE inside SUM so no-removal plots are 0
+remv <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
     GROUP BY g.PLT_CN") %>%
   mutate(PLT_CN = as.character(PLT_CN))
 
@@ -230,7 +248,7 @@ tcc_by_cn <- tibble(CN = locs$CN, tcc = tv)
 
 ```{r strat-assemble}
 analysis <- emb %>%
-  select(CN, type_cluster, all_of(emb_type_vars)) %>%
+  select(CN, type_cluster, all_of(emb_type_vars), all_of(emb_phase_vars)) %>%
   inner_join(balive, by = c("CN" = "PLT_CN")) %>%
   left_join(vol,     by = c("CN" = "PLT_CN")) %>%
   inner_join(fortyp, by = c("CN" = "PLT_CN")) %>%
@@ -256,55 +274,97 @@ dh_strata <- function(x, K, nbins = 100) {
   bnd <- sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
   factor(findInterval(x, c(-Inf, bnd, Inf)))
 }
-# aggregate EVT clusters -> K strata by Ward on cluster-mean response (supervised)
-agg_by <- function(cluster, y, K) {
-  d  <- tibble(cl = cluster, my = y) %>% group_by(cl) %>%
-        summarize(my = mean(my), .groups = "drop")
+ward <- function(X, k) {
+  d  <- dist(X)
+  hc <- if (requireNamespace("fastcluster", quietly = TRUE))
+          fastcluster::hclust(d, method = "ward.D2") else hclust(d, method = "ward.D2")
+  cutree(hc, k = k)
+}
+# aggregate fine bins -> K strata by Ward on the fine-bin-mean response (supervised)
+agg_by <- function(bin, y, K) {
+  d  <- tibble(b = bin, my = y) %>% group_by(b) %>% summarize(my = mean(my), .groups = "drop")
   Kk <- min(K, nrow(d))
   d$s <- cutree(hclust(dist(scale(d$my)), method = "ward.D2"), Kk)
-  factor(d$s[match(cluster, d$cl)])
+  factor(d$s[match(bin, d$b)])
 }
-# flat z_type OOF supervised probe -> DH bins (type-only, matched to the EVT clustering)
-oof_dh <- function(y, K) {
-  set.seed(1); folds <- sample(rep(1:5, length.out = nrow(analysis)))
-  d <- analysis %>% mutate(y_resp = .data[[y]])
-  form <- reformulate(emb_type_vars, "y_resp"); s <- numeric(nrow(analysis))
+# flat OOF supervised probe on `vars` -> DH bins (the direct-supervision ceiling)
+oof_dh <- function(df, y, vars, K) {
+  set.seed(1); folds <- sample(rep(1:5, length.out = nrow(df)))
+  d <- df %>% mutate(y_resp = .data[[y]])
+  form <- reformulate(vars, "y_resp"); s <- numeric(nrow(df))
   for (f in 1:5) { fit <- lm(form, d[folds != f, ]); s[folds == f] <- predict(fit, d[folds == f, ]) }
   dh_strata(s, K)
 }
-analysis$tcc_dh <- dh_strata(analysis$tcc, params$K_strata)
 ```
 
+### Fine bins: EVT type clusters -> phase subdivision
+
+```{r fine-bins}
+# within-cluster z_phase spread; subdivide the top fraction into k_phase groups
+Zp   <- scale(as.matrix(analysis[, emb_phase_vars]))
+pvar <- tapply(seq_len(nrow(analysis)), analysis$type_cluster,
+               function(ix) sum(apply(Zp[ix, , drop = FALSE], 2, var)))
+n_cl   <- length(pvar)
+n_sub  <- max(1, round(params$phase_subdivide_frac * n_cl))
+sub_cl <- names(sort(pvar, decreasing = TRUE))[seq_len(n_sub)]
+
+analysis$phase_sub <- 1L
+for (b in sub_cl) {
+  ix <- which(as.character(analysis$type_cluster) == b)
+  if (length(ix) >= 10 * params$k_phase)
+    analysis$phase_sub[ix] <- ward(Zp[ix, , drop = FALSE], params$k_phase)
+}
+analysis$fine_bin <- interaction(analysis$type_cluster, analysis$phase_sub, drop = TRUE)
+cat(sprintf("fine bins: %d (from %d type clusters, %d phase-subdivided)\n",
+            nlevels(analysis$fine_bin), n_cl, length(sub_cl)))
+```
+
+### Removals population (forested + remeasured)
+
+```{r removals-pop}
+ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # remeasured; zeros kept
+cat(sprintf("forested remeasured plots: %d (%.1f%% with any removal)\n",
+            nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
+```
+
+### Evaluation
+
 ```{r strat-eval}
-resp_table <- function(y) {
-  aa <- analysis %>%
-    mutate(.evt  = agg_by(type_cluster, .data[[y]], params$K_strata),
-           .flat = oof_dh(y, params$K_strata))
-  vv <- c(pooled_within(aa, "UNITCD", y),
-          pooled_within(aa, c("UNITCD", "tcc_dh"), y),
-          pooled_within(aa, c("UNITCD", ".evt"),  y),
-          pooled_within(aa, c("UNITCD", ".flat"), y))
+resp_table <- function(df, y, vars = emb_vars) {
+  s_tcc  <- dh_strata(df$tcc, params$K_strata)
+  s_evt  <- agg_by(df$fine_bin, df[[y]], params$K_strata)
+  s_flat <- oof_dh(df, y, vars, params$K_strata)
+  vv <- c(pooled_within(df, "UNITCD", y),
+          pooled_within(mutate(df, .s = s_tcc),  c("UNITCD", ".s"), y),
+          pooled_within(mutate(df, .s = s_evt),  c("UNITCD", ".s"), y),
+          pooled_within(mutate(df, .s = s_flat), c("UNITCD", ".s"), y))
   data.frame(
     stratification  = c("UNITCD only (baseline)",
                         sprintf("UNITCD x TCC DH (%d)", params$K_strata),
-                        sprintf("UNITCD x EVT-cluster hierarchical (%d)", params$K_strata),
-                        sprintf("UNITCD x flat z_type supervised (%d)", params$K_strata)),
+                        sprintf("UNITCD x EVT type/phase hierarchical (%d)", params$K_strata),
+                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
     within_var      = round(vv, 2),
     within_sd       = round(sqrt(vv), 3),
     pct_of_baseline = round(100 * vv / vv[1], 1))
 }
 ```
 
-### BALIVE
+#### BALIVE
 
 ```{r strat-balive}
-resp_table("BALIVE")
+resp_table(analysis, "BALIVE")
 ```
 
-### Standing live volume
+#### Standing live volume
 
 ```{r strat-volume}
-resp_table("volume")
+resp_table(analysis, "volume")
+```
+
+#### Removals
+
+```{r strat-removals}
+resp_table(ar, "remv_cfgs")
 ```
 
 ```{r strat-cleanup}
@@ -328,9 +388,13 @@ dbDisconnect(con)
 - **Using it downstream.** `emb$type_cluster` (or `evt_map`) is a drop-in
   replacement for the k-means/Ward `type_bin` step in the hierarchical
   stratification -- an EVT-supervised type binning that never sees the FIA target.
-- **Responses.** `Volume` is standing live net cu ft/acre (`TREE.VOLCFNET`,
-  `STATUSCD=1`). Swap in removals or another attribute by changing the `vol` query
-  (or adding a response column) and calling `resp_table()` on it. The
-  `EVT-cluster hierarchical` row is the EVT clusters aggregated to `K_strata` by
-  Ward on the cluster-mean response; `flat z_type supervised` is the direct OOF
-  probe ceiling for the same information.
+- **Fine bins = EVT type + phase.** The EVT clusters are phase-subdivided (top
+  `phase_subdivide_frac` by `z_phase` spread, `k_phase` groups each via Ward) to
+  match the geometry hierarchical script; set `phase_subdivide_frac = 0` to test
+  EVT-type-only fine bins.
+- **Responses.** BALIVE and standing live volume (`TREE.VOLCFNET`, `STATUSCD=1`)
+  are stocks on all forested plots; removals (`TREE_GRM_COMPONENT`, annual per-acre
+  removed GS volume) additionally require remeasurement, with forested no-removal
+  plots kept as 0. The `EVT type/phase hierarchical` row aggregates the fine bins
+  to `K_strata` by Ward on the fine-bin-mean response; `flat embedding supervised`
+  is the direct OOF (type+phase) probe ceiling for the same information.
