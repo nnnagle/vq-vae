@@ -298,12 +298,23 @@ ward <- function(X, k) {
           fastcluster::hclust(d, method = "ward.D2") else hclust(d, method = "ward.D2")
   cutree(hc, k = k)
 }
-# aggregate fine bins -> K strata by Ward on the fine-bin-mean response (supervised)
-agg_by <- function(bin, y, K) {
-  d  <- tibble(b = bin, my = y) %>% group_by(b) %>% summarize(my = mean(my), .groups = "drop")
+# fine bins -> strata: Ward on the fine-bin-mean response (supervised aggregation)
+bin_map <- function(bin, y, K) {
+  d  <- tibble(fine_bin = bin, .y = y) %>% group_by(fine_bin) %>%
+        summarize(n_plots = n(), mean_y = mean(.y), .groups = "drop")
   Kk <- min(K, nrow(d))
-  d$s <- cutree(hclust(dist(scale(d$my)), method = "ward.D2"), Kk)
-  factor(d$s[match(bin, d$b)])
+  d$stratum <- cutree(hclust(dist(scale(d$mean_y)), method = "ward.D2"), Kk)
+  d
+}
+agg_by <- function(bin, y, K) {
+  d <- bin_map(bin, y, K)
+  factor(d$stratum[match(bin, d$fine_bin)])
+}
+# fine-bin -> stratum table for display
+show_map <- function(df, y) {
+  bin_map(df$fine_bin, df[[y]], params$K_strata) %>%
+    transmute(fine_bin, n_plots, mean_response = round(mean_y, 2), stratum) %>%
+    arrange(stratum, desc(mean_response))
 }
 # flat OOF supervised probe on `vars` -> DH bins (the direct-supervision ceiling)
 oof_dh <- function(df, y, vars, K) {
@@ -389,16 +400,34 @@ resp_table <- function(df, y, vars = emb_vars) {
 resp_table(analysis, "BALIVE")
 ```
 
+Fine bin -> stratum mapping (BALIVE):
+
+```{r strat-balive-map}
+show_map(analysis, "BALIVE")
+```
+
 #### Standing live volume
 
 ```{r strat-volume}
 resp_table(analysis, "volume")
 ```
 
+Fine bin -> stratum mapping (volume):
+
+```{r strat-volume-map}
+show_map(analysis, "volume")
+```
+
 #### Removals
 
 ```{r strat-removals}
 resp_table(ar, "remv_cfgs")
+```
+
+Fine bin -> stratum mapping (removals):
+
+```{r strat-removals-map}
+show_map(ar, "remv_cfgs")
 ```
 
 ```{r strat-cleanup}
