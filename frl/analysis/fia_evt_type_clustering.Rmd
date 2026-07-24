@@ -25,6 +25,7 @@ params:
   tree_phase_frac: 0.20       # [constrained] top fraction of TREE segments to subdivide
   K_strata_tree: 3            # [constrained] Tree strata
   K_strata_nontree: 2         # [constrained] non-Tree strata (total = tree + nontree)
+  K_full: 50                  # [full-embedding] k-means clusters over z_type + z_phase
 ---
 
 ```{r setup, include=FALSE}
@@ -839,6 +840,117 @@ non-Tree plots form `r params$K_strata_nontree` strata `N1..N`):
 strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
 ```
 
+# Full-embedding clustering (type + phase)
+
+*(A third stratification method — the two above are untouched.)*
+
+The EVT methods above cluster only `z_type`. This one clusters the **full
+embedding** — all `r length(emb_type_vars)` `z_type` + `r length(emb_phase_vars)`
+`z_phase` dims — directly, so vegetation type *and* temporal-phase structure
+jointly define the bins. Because we want `r params$K_full` clusters (far more than
+the ~50 reliable EVT centroids), the bins are formed by **k-means on the plot
+embeddings** rather than by clustering EVT centroids (which would be one-per-EVT
+at this K), and there is no separate phase-subdivision step — phase is already in
+the space. It uses **no EVT and no FIA target** to form the clusters; only the
+final aggregation of the `r params$K_full` clusters into `r params$K_strata`
+strata (Ward on the cluster-mean response) is supervised, exactly as in the other
+methods. Compared against TCC and the flat probe for BALIVE, volume, and removals.
+
+```{r full-cluster}
+Zfull <- scale(as.matrix(emb[, emb_vars]))          # standardized z_type + z_phase
+set.seed(1)
+kmf <- kmeans(Zfull, centers = params$K_full, nstart = 10, iter.max = 50)
+emb$full_cluster <- factor(kmf$cluster)
+cat(sprintf("full-embedding k-means: %d clusters over %d dims; sizes %d..%d\n",
+            length(unique(kmf$cluster)), length(emb_vars),
+            min(table(kmf$cluster)), max(table(kmf$cluster))))
+```
+
+```{r full-assemble}
+analysis_f <- analysis %>% inner_join(select(emb, CN, full_cluster), by = "CN")
+ar_f       <- analysis_f %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals pop
+cat(sprintf("plots: %d   remeasured with GRM: %d\n", nrow(analysis_f), nrow(ar_f)))
+```
+
+```{r full-helpers}
+# stratifications compared for the FULL-EMBEDDING method
+schemes_f <- function(df, y) list(
+  "TCC FIA fixed"     = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                            labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"            = dh_strata(df$tcc, params$K_strata),
+  "full-emb clusters" = agg_by(df$full_cluster, df[[y]], params$K_strata),
+  "flat probe"        = oof_dh(df, y, emb_vars, params$K_strata))
+
+resp_table_f <- function(df, y) {
+  sch <- schemes_f(df, y)
+  vv  <- c(pooled_within(df, "UNITCD", y),
+           sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y)))
+  data.frame(
+    stratification = c("UNITCD only (baseline)",
+                       "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
+                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                       sprintf("UNITCD x full-embedding clusters (%d -> %d)",
+                               params$K_full, params$K_strata),
+                       sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
+    within_var = round(vv, 2),
+    within_sd  = round(sqrt(vv), 3),
+    pct_of_baseline = round(100 * vv / vv[1], 1))
+}
+# cluster -> stratum mapping for display
+show_map_f <- function(df, y) {
+  bin_map(df$full_cluster, df[[y]], params$K_strata) %>%
+    transmute(cluster = fine_bin, n_plots, mean_response = round(mean_y, 2), stratum) %>%
+    arrange(stratum, desc(mean_response))
+}
+```
+
+### BALIVE (full-embedding)
+
+```{r full-balive}
+resp_table_f(analysis_f, "BALIVE")
+```
+
+Strata sizes, mean, and SD (BALIVE):
+
+```{r full-balive-strata}
+sch_bal_f <- schemes_f(analysis_f, "BALIVE")
+strata_summary(analysis_f, "BALIVE", sch_bal_f)
+```
+
+```{r full-balive-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis_f, "BALIVE", sch_bal_f, ylab = "BALIVE")
+```
+
+### Standing live volume (full-embedding)
+
+```{r full-volume}
+resp_table_f(analysis_f, "volume")
+```
+
+```{r full-volume-strata}
+sch_vol_f <- schemes_f(analysis_f, "volume")
+strata_summary(analysis_f, "volume", sch_vol_f)
+```
+
+```{r full-volume-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis_f, "volume", sch_vol_f, ylab = "volume")
+```
+
+### Removals (full-embedding)
+
+```{r full-removals}
+resp_table_f(ar_f, "remv_cfgs")
+```
+
+```{r full-removals-strata}
+sch_rmv_f <- schemes_f(ar_f, "remv_cfgs")
+strata_summary(ar_f, "remv_cfgs", sch_rmv_f)
+```
+
+```{r full-removals-box, fig.width=11, fig.height=4}
+strata_boxplot(ar_f, "remv_cfgs", sch_rmv_f, ylab = "removals", logy = TRUE)
+```
+
 # Forest / non-forest detection (OOF)
 
 Does the embedding detect non-forest as well as TCC? The stratification tables
@@ -977,6 +1089,11 @@ stratification gap.
   non-Tree segment means). Tunable via `tree_phase_frac`, `K_strata_tree`,
   `K_strata_nontree` — the original method's `phase_subdivide_frac` / `K_strata`
   are left unchanged.
+- **Full-embedding clustering (third method).** k-means on the full
+  `z_type + z_phase` space into `K_full` clusters (default 50), aggregated to
+  `K_strata` by Ward on the cluster-mean response. Unlike the EVT methods it
+  clusters plot embeddings directly (no EVT, no phase-subdivision) since at
+  `K_full` EVT centroids would be one-per-EVT. Tunable via `K_full`.
 - **Forest / non-forest detection (OOF).** A direct classification check
   (`is.na(FORTYPCD)` label) of whether the embedding separates non-forest as well
   as TCC, comparing the `tcc <= 10` rule, OOF logistic probes on `z_type` and
