@@ -399,6 +399,49 @@ cat(sprintf("remeasured plots with GRM data: %d (%.1f%% with any removal)\n",
             nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
 ```
 
+### Response distributions by top EVT classes
+
+Histograms of each response within the 10 most common EVT forest types (by plot
+count over the full population). Shows how each target is distributed within a
+forest type — and how much of the total spread is *within* a type, which caps how
+much a type-based stratification can reduce variance.
+
+```{r evt-hist-setup}
+evt_names <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  transmute(evt = as.character(VALUE), EVT_NAME)
+emb_evt <- emb %>% transmute(CN, evt = as.character(evt))
+
+top10 <- analysis %>% inner_join(emb_evt, by = "CN") %>%
+  count(evt, sort = TRUE) %>% slice_head(n = 10) %>% pull(evt)
+
+lab_of <- function(e) {
+  nm <- evt_names$EVT_NAME[match(e, evt_names$evt)]
+  ifelse(is.na(nm), e, sprintf("%s (%s)", substr(nm, 1, 26), e))
+}
+hist_by_evt <- function(df, y, ylab, logx = FALSE) {
+  d <- df %>% inner_join(emb_evt, by = "CN") %>% filter(evt %in% top10) %>%
+    mutate(evt_lab = factor(lab_of(evt), levels = lab_of(top10)),
+           val = if (logx) log1p(.data[[y]]) else .data[[y]])
+  ggplot(d, aes(val)) +
+    geom_histogram(bins = 30, fill = "grey40") +
+    facet_wrap(~ evt_lab, scales = "free_y", ncol = 2) +
+    labs(x = if (logx) paste0("log1p(", ylab, ")") else ylab, y = "plots") +
+    theme_bw(base_size = 9)
+}
+```
+
+```{r evt-hist-balive, fig.width=11, fig.height=9}
+hist_by_evt(analysis, "BALIVE", "BALIVE")
+```
+
+```{r evt-hist-volume, fig.width=11, fig.height=9}
+hist_by_evt(analysis, "volume", "volume")
+```
+
+```{r evt-hist-removals, fig.width=11, fig.height=9}
+hist_by_evt(ar, "remv_cfgs", "removals", logx = TRUE)
+```
+
 ### Evaluation
 
 ```{r strat-eval}
