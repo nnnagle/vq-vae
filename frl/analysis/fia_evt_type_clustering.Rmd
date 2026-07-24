@@ -840,79 +840,61 @@ non-Tree plots form `r params$K_strata_nontree` strata `N1..N`):
 strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
 ```
 
-# Full-embedding clustering (type + phase)
+# Full-embedding clustering (type + phase, one step)
 
 *(A third stratification method — the two above are untouched.)*
 
-The EVT methods above cluster only `z_type`. This one clusters the **full
-embedding** — all `r length(emb_type_vars)` `z_type` + `r length(emb_phase_vars)`
-`z_phase` dims — so vegetation type *and* temporal-phase structure jointly define
-the bins. It is a **two-stage** pathway, matching the EVT methods:
+The EVT methods above cluster only `z_type` (then refine with a phase step). This
+one clusters the **full embedding** — all `r length(emb_type_vars)` `z_type` +
+`r length(emb_phase_vars)` `z_phase` dims — in a **single k-means step**, so type
+*and* temporal-phase structure are captured jointly, with no separate
+phase-subdivision stage (k-means rather than EVT-centroid Ward, which would be
+one-per-EVT at this K). The `r params$K_full` clusters are aggregated to
+`r params$K_strata` strata by Ward on the cluster-mean response. It uses **no EVT
+and no FIA target** to form the clusters; only the final aggregation is supervised.
 
-1. **Stage 1** — k-means on the plot embeddings into `r params$K_full` clusters
-   (k-means rather than EVT-centroid Ward, which would be one-per-EVT at this K).
-2. **Stage 2** — the top `r round(100*params$phase_subdivide_frac)`% most
-   `z_phase`-variable clusters are each subdivided into `r params$k_phase` phase
-   sub-groups (Ward on `z_phase`), giving the fine bins.
-
-The fine bins are aggregated to `r params$K_strata` strata by Ward on the
-cluster-mean response. It uses **no EVT and no FIA target** to form the bins; only
-the final aggregation is supervised, exactly as in the other methods. Compared
-against TCC and the flat probe for BALIVE, volume, and removals.
+Each response is compared across: the **original EVT type/phase hierarchical**
+binning (`z_type`), this **full one-step clustering**, **TCC** (fixed + DH), and
+the **flat supervised probe**. For volume and removals we also report a
+**transfer** table: each clustering's fine-bin -> stratum aggregation trained once
+on **BALIVE** and applied unchanged, versus trained on the response itself —
+showing how well a BALIVE-tuned stratification carries to other attributes.
 
 ```{r full-cluster}
 Zfull <- scale(as.matrix(emb[, emb_vars]))          # standardized z_type + z_phase
 set.seed(1)
 kmf <- kmeans(Zfull, centers = params$K_full, nstart = 10, iter.max = 50)
 emb$full_cluster <- factor(kmf$cluster)
-cat(sprintf("stage 1: full-embedding k-means -> %d clusters over %d dims; sizes %d..%d\n",
+cat(sprintf("full-embedding k-means (one step): %d clusters over %d dims; sizes %d..%d\n",
             length(unique(kmf$cluster)), length(emb_vars),
             min(table(kmf$cluster)), max(table(kmf$cluster))))
 ```
 
 ```{r full-assemble}
 analysis_f <- analysis %>% inner_join(select(emb, CN, full_cluster), by = "CN")
-```
-
-```{r full-fine-bins}
-# stage 2: phase-subdivide the most z_phase-variable full-embedding clusters
-Zp_f   <- scale(as.matrix(analysis_f[, emb_phase_vars]))
-pvar_f <- tapply(seq_len(nrow(analysis_f)), analysis_f$full_cluster,
-                 function(ix) sum(apply(Zp_f[ix, , drop = FALSE], 2, var)))
-n_sub_f  <- max(1, round(params$phase_subdivide_frac * length(pvar_f)))
-sub_cl_f <- names(sort(pvar_f, decreasing = TRUE))[seq_len(n_sub_f)]
-
-analysis_f$phase_sub_f <- 1L
-for (b in sub_cl_f) {
-  ix <- which(as.character(analysis_f$full_cluster) == b)
-  if (length(ix) >= 10 * params$k_phase)
-    analysis_f$phase_sub_f[ix] <- ward(Zp_f[ix, , drop = FALSE], params$k_phase)
-}
-analysis_f$fine_bin_f <- interaction(analysis_f$full_cluster, analysis_f$phase_sub_f, drop = TRUE)
-cat(sprintf("stage 2: fine bins: %d (from %d clusters, %d phase-subdivided into %d)\n",
-            nlevels(analysis_f$fine_bin_f), length(pvar_f), length(sub_cl_f), params$k_phase))
-
-# clusters ranked by within-cluster z_phase variance, flagged if subdivided
-tibble(cluster   = names(pvar_f),
-       n         = as.integer(table(analysis_f$full_cluster)[names(pvar_f)]),
-       phase_var = round(as.numeric(pvar_f), 3),
-       subdivided = names(pvar_f) %in% sub_cl_f) %>%
-  arrange(desc(phase_var)) %>% head(15)
-```
-
-```{r full-removals-pop}
-ar_f <- analysis_f %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals pop
+ar_f       <- analysis_f %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals pop
 cat(sprintf("plots: %d   remeasured with GRM: %d\n", nrow(analysis_f), nrow(ar_f)))
 ```
 
 ```{r full-helpers}
-# stratifications compared for the FULL-EMBEDDING method
+# fit/apply a fine-bin -> stratum aggregation, so a binning trained on one
+# response can be scored on another (the BALIVE-trained transfer test)
+fit_agg <- function(train_df, train_y, binvar) {
+  bm <- bin_map(train_df[[binvar]], train_df[[train_y]], params$K_strata)
+  setNames(as.character(bm$stratum), as.character(bm$fine_bin))
+}
+apply_agg <- function(df, binvar, mapping) factor(unname(mapping[as.character(df[[binvar]])]))
+map_bal_evt  <- fit_agg(analysis_f, "BALIVE", "fine_bin")      # EVT type/phase, BALIVE-trained
+map_bal_full <- fit_agg(analysis_f, "BALIVE", "full_cluster")  # full one-step,  BALIVE-trained
+
+# main comparison: TCC, original EVT hierarchical, full one-step clustering, flat probe
 schemes_f <- function(df, y) list(
-  "TCC FIA fixed"       = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
-                              labels = c("0-10", "11-48", "49-85", "86-100")),
-  "TCC DH"              = dh_strata(df$tcc, params$K_strata),
-  "full-emb type+phase" = agg_by(df$fine_bin_f, df[[y]], params$K_strata),
-  "flat probe"          = oof_dh(df, y, emb_vars, params$K_strata))
+  "TCC FIA fixed"   = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                          labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"          = dh_strata(df$tcc, params$K_strata),
+  "EVT type/phase"  = agg_by(df$fine_bin, df[[y]], params$K_strata),
+  "full type+phase" = agg_by(df$full_cluster, df[[y]], params$K_strata),
+  "flat probe"      = oof_dh(df, y, emb_vars, params$K_strata))
 
 resp_table_f <- function(df, y) {
   sch <- schemes_f(df, y)
@@ -922,17 +904,30 @@ resp_table_f <- function(df, y) {
     stratification = c("UNITCD only (baseline)",
                        "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
                        sprintf("UNITCD x TCC DH (%d)", params$K_strata),
-                       sprintf("UNITCD x full-embedding type+phase (%d -> %d)",
+                       sprintf("UNITCD x EVT type/phase hierarchical, z_type (%d)", params$K_strata),
+                       sprintf("UNITCD x full-embedding type+phase, one step (%d -> %d)",
                                params$K_full, params$K_strata),
                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
-    within_var = round(vv, 2),
-    within_sd  = round(sqrt(vv), 3),
+    within_var = round(vv, 2), within_sd = round(sqrt(vv), 3),
     pct_of_baseline = round(100 * vv / vv[1], 1))
 }
-# fine-bin -> stratum mapping for display
+# transfer: self-trained vs BALIVE-trained aggregation, for both clusterings
+transfer_table_f <- function(df, y) {
+  base <- pooled_within(df, "UNITCD", y)
+  sch <- list(
+    "EVT type/phase (self-trained)"    = apply_agg(df, "fine_bin",     fit_agg(df, y, "fine_bin")),
+    "EVT type/phase (BALIVE-trained)"  = apply_agg(df, "fine_bin",     map_bal_evt),
+    "full type+phase (self-trained)"   = apply_agg(df, "full_cluster", fit_agg(df, y, "full_cluster")),
+    "full type+phase (BALIVE-trained)" = apply_agg(df, "full_cluster", map_bal_full))
+  vv <- sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y))
+  data.frame(stratification = names(sch), within_var = round(vv, 2),
+             within_sd = round(sqrt(vv), 3), pct_of_baseline = round(100 * vv / base, 1),
+             row.names = NULL)
+}
+# full-cluster -> stratum mapping for display
 show_map_f <- function(df, y) {
-  bin_map(df$fine_bin_f, df[[y]], params$K_strata) %>%
-    transmute(fine_bin = fine_bin, n_plots, mean_response = round(mean_y, 2), stratum) %>%
+  bin_map(df$full_cluster, df[[y]], params$K_strata) %>%
+    transmute(cluster = fine_bin, n_plots, mean_response = round(mean_y, 2), stratum) %>%
     arrange(stratum, desc(mean_response))
 }
 ```
@@ -950,7 +945,7 @@ sch_bal_f <- schemes_f(analysis_f, "BALIVE")
 strata_summary(analysis_f, "BALIVE", sch_bal_f)
 ```
 
-```{r full-balive-box, fig.width=11, fig.height=4}
+```{r full-balive-box, fig.width=12, fig.height=4}
 strata_boxplot(analysis_f, "BALIVE", sch_bal_f, ylab = "BALIVE")
 ```
 
@@ -960,12 +955,18 @@ strata_boxplot(analysis_f, "BALIVE", sch_bal_f, ylab = "BALIVE")
 resp_table_f(analysis_f, "volume")
 ```
 
+Transfer — clusterings trained on BALIVE, applied to volume:
+
+```{r full-volume-transfer}
+transfer_table_f(analysis_f, "volume")
+```
+
 ```{r full-volume-strata}
 sch_vol_f <- schemes_f(analysis_f, "volume")
 strata_summary(analysis_f, "volume", sch_vol_f)
 ```
 
-```{r full-volume-box, fig.width=11, fig.height=4}
+```{r full-volume-box, fig.width=12, fig.height=4}
 strata_boxplot(analysis_f, "volume", sch_vol_f, ylab = "volume")
 ```
 
@@ -975,12 +976,18 @@ strata_boxplot(analysis_f, "volume", sch_vol_f, ylab = "volume")
 resp_table_f(ar_f, "remv_cfgs")
 ```
 
+Transfer — clusterings trained on BALIVE, applied to removals:
+
+```{r full-removals-transfer}
+transfer_table_f(ar_f, "remv_cfgs")
+```
+
 ```{r full-removals-strata}
 sch_rmv_f <- schemes_f(ar_f, "remv_cfgs")
 strata_summary(ar_f, "remv_cfgs", sch_rmv_f)
 ```
 
-```{r full-removals-box, fig.width=11, fig.height=4}
+```{r full-removals-box, fig.width=12, fig.height=4}
 strata_boxplot(ar_f, "remv_cfgs", sch_rmv_f, ylab = "removals", logy = TRUE)
 ```
 
@@ -1122,14 +1129,15 @@ stratification gap.
   non-Tree segment means). Tunable via `tree_phase_frac`, `K_strata_tree`,
   `K_strata_nontree` — the original method's `phase_subdivide_frac` / `K_strata`
   are left unchanged.
-- **Full-embedding clustering (third method).** Two-stage, matching the EVT
-  methods: stage 1 is k-means on the full `z_type + z_phase` space into `K_full`
-  clusters (default 50; k-means rather than EVT-centroid Ward, which would be
-  one-per-EVT at this K); stage 2 phase-subdivides the top `phase_subdivide_frac`
-  most `z_phase`-variable clusters into `k_phase` groups. The fine bins are
-  aggregated to `K_strata` by Ward on the cluster-mean response. Uses no EVT and
-  no FIA target to form the bins. Tunable via `K_full` (and the shared
-  `phase_subdivide_frac` / `k_phase`).
+- **Full-embedding clustering (third method).** A single k-means step on the full
+  `z_type + z_phase` space into `K_full` clusters (default 50; k-means rather than
+  EVT-centroid Ward, which would be one-per-EVT at this K), aggregated to
+  `K_strata` by Ward on the cluster-mean response — type and phase captured in one
+  step, no phase-subdivision stage. The section compares it against the original
+  EVT type/phase hierarchical binning, TCC, and the flat probe, and includes a
+  BALIVE-trained transfer table (`fit_agg`/`apply_agg`) showing how each
+  clustering, aggregated on BALIVE, carries to volume and removals. Tunable via
+  `K_full`.
 - **Forest / non-forest detection (OOF).** A direct classification check
   (`is.na(FORTYPCD)` label) of whether the embedding separates non-forest as well
   as TCC, comparing the `tcc <= 10` rule, OOF logistic probes on `z_type` and
