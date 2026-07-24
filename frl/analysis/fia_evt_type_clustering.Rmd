@@ -650,6 +650,14 @@ The strata are then `r params$K_strata_tree` Tree strata (Ward on the Tree fine
 bins' mean response) plus `r params$K_strata_nontree` non-Tree strata (Ward on the
 non-Tree segments' mean response).
 
+Each response is stratified two ways: **self-trained** (the fine-bin -> stratum
+aggregation trained on that response) and **BALIVE-trained** (the aggregation
+trained once on BALIVE and applied *unchanged*). Comparing them shows whether a
+binning learned on one attribute transfers to attributes it never saw — the
+type/phase fine bins are already response-agnostic (EVT + `z_phase` only); only
+this last aggregation step is supervised. On the BALIVE panel the two rows
+coincide by construction (a useful sanity check).
+
 ```{r c-analysis}
 analysis_c <- analysis %>%
   inner_join(select(emb, CN, type_cluster_c, macro_c), by = "CN")
@@ -688,22 +696,31 @@ tibble(tree_segment = tree_cl,
 ```
 
 ```{r c-strata-helpers}
-# Tree fine bins -> K_strata_tree via Ward on fine-bin-mean response; non-Tree -> "N"
-agg_macro <- function(df, y) {
-  s <- character(nrow(df))
-  is_tree <- df$macro_c == "Tree"
-  # Tree fine bins (type x phase) -> K_strata_tree strata
-  dt <- df[is_tree, ]
-  bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree)
-  s[is_tree] <- paste0("T", bmt$stratum[match(as.character(dt$fine_bin_c),
-                                              as.character(bmt$fine_bin))])
-  # non-Tree segments (not phase-subdivided) -> K_strata_nontree strata
-  dn <- df[!is_tree, ]
-  bmn <- bin_map(droplevels(factor(dn$type_cluster_c)), dn[[y]], params$K_strata_nontree)
-  s[!is_tree] <- paste0("N", bmn$stratum[match(as.character(dn$type_cluster_c),
-                                               as.character(bmn$fine_bin))])
+# Train the constrained aggregation on (train_df, train_y): Tree fine bins ->
+# K_strata_tree, non-Tree segments -> K_strata_nontree, both by Ward on the
+# group-mean response. Returns a mapping (fine_bin/segment -> stratum label)
+# that can be applied to ANY df, so a binning trained on one response can be
+# scored on another.
+fit_agg_macro <- function(train_df, train_y) {
+  dt  <- train_df[train_df$macro_c == "Tree", ]
+  bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[train_y]], params$K_strata_tree)
+  dn  <- train_df[train_df$macro_c == "nonTree", ]
+  bmn <- bin_map(droplevels(factor(dn$type_cluster_c)), dn[[train_y]], params$K_strata_nontree)
+  list(tree    = setNames(paste0("T", bmt$stratum), as.character(bmt$fine_bin)),
+       nontree = setNames(paste0("N", bmn$stratum), as.character(bmn$fine_bin)))
+}
+apply_agg_macro <- function(df, mapping) {
+  s <- character(nrow(df)); is_tree <- df$macro_c == "Tree"
+  s[is_tree]  <- mapping$tree[as.character(df$fine_bin_c[is_tree])]
+  s[!is_tree] <- mapping$nontree[as.character(df$type_cluster_c[!is_tree])]
   factor(s)
 }
+# self-trained: aggregation trained and applied on the same response
+agg_macro <- function(df, y) apply_agg_macro(df, fit_agg_macro(df, y))
+# a single BALIVE-trained mapping, applied UNCHANGED to volume/removals to test
+# whether a BALIVE binning transfers to attributes it was not trained on
+map_balive_c <- fit_agg_macro(analysis_c, "BALIVE")
+
 show_map_c <- function(df, y) {
   dt <- df[df$macro_c == "Tree", ]
   bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree) %>%
@@ -716,35 +733,33 @@ show_map_c <- function(df, y) {
   bind_rows(bmt, bmn) %>% arrange(stratum, desc(mean_response))
 }
 
+# stratifications compared for the CONSTRAINED method. Two EVT variants:
+#  - self-trained: strata aggregated on the response being scored
+#  - BALIVE-trained: the fixed BALIVE mapping applied unchanged (transfer test)
+schemes_c <- function(df, y) list(
+  "TCC FIA fixed"      = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                             labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"             = dh_strata(df$tcc, params$K_strata),
+  "EVT self-trained"   = agg_macro(df, y),
+  "EVT BALIVE-trained" = apply_agg_macro(df, map_balive_c),
+  "flat probe"         = oof_dh(df, y, emb_vars, params$K_strata))
+
 resp_table_c <- function(df, y, vars = emb_vars) {
-  s_fia  <- cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
-                labels = c("0-10", "11-48", "49-85", "86-100"))
-  s_tcc  <- dh_strata(df$tcc, params$K_strata)
-  s_evt  <- agg_macro(df, y)
-  s_flat <- oof_dh(df, y, vars, params$K_strata)
-  vv <- c(pooled_within(df, "UNITCD", y),
-          pooled_within(mutate(df, .s = s_fia),  c("UNITCD", ".s"), y),
-          pooled_within(mutate(df, .s = s_tcc),  c("UNITCD", ".s"), y),
-          pooled_within(mutate(df, .s = s_evt),  c("UNITCD", ".s"), y),
-          pooled_within(mutate(df, .s = s_flat), c("UNITCD", ".s"), y))
+  sch <- schemes_c(df, y)
+  vv  <- c(pooled_within(df, "UNITCD", y),
+           sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y)))
+  kk <- sprintf("%d+%d", params$K_strata_tree, params$K_strata_nontree)
   data.frame(
     stratification = c("UNITCD only (baseline)",
                        "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
                        sprintf("UNITCD x TCC DH (%d)", params$K_strata),
-                       sprintf("UNITCD x EVT constrained Tree/non-Tree (%d+%d)",
-                               params$K_strata_tree, params$K_strata_nontree),
+                       sprintf("UNITCD x EVT constrained, self-trained (%s)", kk),
+                       sprintf("UNITCD x EVT constrained, BALIVE-trained (%s)", kk),
                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
     within_var = round(vv, 2),
     within_sd  = round(sqrt(vv), 3),
     pct_of_baseline = round(100 * vv / vv[1], 1))
 }
-# the four stratifications compared for the CONSTRAINED method
-schemes_c <- function(df, y) list(
-  "TCC FIA fixed"   = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
-                          labels = c("0-10", "11-48", "49-85", "86-100")),
-  "TCC DH"          = dh_strata(df$tcc, params$K_strata),
-  "EVT constrained" = agg_macro(df, y),
-  "flat probe"      = oof_dh(df, y, emb_vars, params$K_strata))
 ```
 
 ```{r c-removals-pop}
@@ -865,3 +880,9 @@ strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
   non-Tree segment means). Tunable via `tree_phase_frac`, `K_strata_tree`,
   `K_strata_nontree` — the original method's `phase_subdivide_frac` / `K_strata`
   are left unchanged.
+- **Self-trained vs BALIVE-trained (transfer test).** Each response is scored
+  with two EVT stratifications: one whose fine-bin -> stratum aggregation is
+  trained on that response (`agg_macro`/`fit_agg_macro`), and one that reuses a
+  single BALIVE-trained mapping (`map_balive_c`) unchanged. The gap between them
+  is the cost of transferring a BALIVE binning to volume/removals; on BALIVE they
+  are identical by construction.
