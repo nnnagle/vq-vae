@@ -166,13 +166,17 @@ run_knn <- function(df, yname, label) {
     r2(y[va], FNN::knn.reg(X[tr, , drop = FALSE], X[va, , drop = FALSE], y[tr], k = k)$pred))
   kbest <- kgrid[which.max(val_r2)]
   pte <- FNN::knn.reg(X[tr, , drop = FALSE], X[te, , drop = FALSE], y[tr], k = kbest)$pred
+  # linear probe (same train -> test), to separate "embedding decodable" from "kNN-local"
+  dtr <- as.data.frame(X[tr, , drop = FALSE]); dtr$.y <- y[tr]
+  lm_pred <- as.numeric(predict(lm(.y ~ ., data = dtr), as.data.frame(X[te, , drop = FALSE])))
   list(
     metric = data.frame(target = label, k_best = kbest,
                         n_train = length(tr), n_val = length(va), n_test = length(te),
                         val_R2 = round(max(val_r2), 3), test_R2 = round(r2(y[te], pte), 3),
+                        test_R2_lm = round(r2(y[te], lm_pred), 3),
                         test_RMSE = round(sqrt(mean((y[te] - pte)^2)), 2),
                         test_MAE = round(mean(abs(y[te] - pte)), 2)),
-    pred = tibble(target = label, obs = y[te], pred = pte,
+    pred = tibble(target = label, obs = y[te], pred = pte, lm_pred = lm_pred,
                   UNITCD = df$UNITCD[te], tcc = df$tcc[te]))
 }
 
@@ -188,7 +192,9 @@ res <- lapply(targets, function(t) run_knn(t[[1]], t[[2]], t[[3]]))
 
 ### Test-set performance
 
-`k_best` is chosen on validation; `test_R2/RMSE/MAE` are the held-out scores.
+`k_best` is chosen on validation; `test_R2/RMSE/MAE` are the held-out kNN scores.
+`test_R2_lm` is a linear probe (trained on train, scored on test) on the same
+embedding — the linear reference for kNN.
 
 ```{r knn-metrics}
 bind_rows(lapply(res, `[[`, "metric"))
@@ -239,19 +245,24 @@ strat_summary <- function(pd) {
   base  <- pooled_within(pd, "UNITCD", "obs")
   s_tcc <- cut(pd$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
                labels = c("0-10", "11-48", "49-85", "86-100"))
+  s_lm  <- dh_strata(pd$lm_pred, params$K_strata)
   s_knn <- dh_strata(pd$pred, params$K_strata)
   v_tcc <- pooled_within(mutate(pd, .s = s_tcc), c("UNITCD", ".s"), "obs")
+  v_lm  <- pooled_within(mutate(pd, .s = s_lm),  c("UNITCD", ".s"), "obs")
   v_knn <- pooled_within(mutate(pd, .s = s_knn), c("UNITCD", ".s"), "obs")
   data.frame(target = pd$target[1], n_test = nrow(pd),
              baseline_sd = round(sqrt(base), 3),
              tcc_pct = round(100 * v_tcc / base, 1),
+             lm_pct  = round(100 * v_lm  / base, 1),
              knn_pct = round(100 * v_knn / base, 1))
 }
 ```
 
-`tcc_pct` / `knn_pct` are within-stratum variance as a percent of the UNITCD-only
-baseline (lower = better); `knn_pct < tcc_pct` means the kNN-prediction strata
-beat the TCC split.
+`tcc_pct` / `lm_pct` / `knn_pct` are within-stratum variance as a percent of the
+UNITCD-only baseline (lower = better). `knn_pct < tcc_pct` means the
+kNN-prediction strata beat the TCC split; comparing `knn_pct` to `lm_pct` (strata
+from a linear probe trained the same way) separates *"the embedding is
+decodable"* (both low) from *"kNN's local geometry helps"* (`knn_pct` << `lm_pct`).
 
 ```{r strat-summary}
 bind_rows(lapply(res, function(r) strat_summary(r$pred)))
