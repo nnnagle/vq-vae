@@ -12,10 +12,13 @@ output:
     df_print: paged
 params:
   emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
   fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
   statecd: "51"
   split_col: "split"          # train/val/test column in the embeddings CSV
   k_grid: "5,10,20,40"        # neighbour counts tuned on the validation split
+  K_strata: 5                 # strata formed from the kNN prediction (DH bins)
 ---
 
 ```{r setup, include=FALSE}
@@ -53,6 +56,7 @@ library(tidyverse)
 library(DBI)
 library(RSQLite)
 library(FNN)
+library(terra)
 ```
 
 ## Load embeddings and split
@@ -83,12 +87,17 @@ cat("split counts:\n"); print(table(split_df$split))
 con <- dbConnect(RSQLite::SQLite(), params$fiadb)
 dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, overwrite = TRUE)
 
-# basal area (live) per acre, from COND
-balive <- dbGetQuery(con, sprintf(
-  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE FROM COND WHERE STATECD='%s'", params$statecd)) %>%
-  mutate(PLT_CN = as.character(PLT_CN), BALIVE = ifelse(is.na(BALIVE), 0, BALIVE)) %>%
-  group_by(PLT_CN) %>%
+# basal area (live) per acre + condition status, from COND
+cond <- dbGetQuery(con, sprintf(
+  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, COND_STATUS_CD FROM COND WHERE STATECD='%s'",
+  params$statecd)) %>%
+  mutate(PLT_CN = as.character(PLT_CN), BALIVE = ifelse(is.na(BALIVE), 0, BALIVE))
+balive <- cond %>% group_by(PLT_CN) %>%
   summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+# dominant-condition status; COND_STATUS_CD == 4 is census water
+cstat <- cond %>% group_by(PLT_CN) %>%
+  slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% transmute(PLT_CN, cond_status = COND_STATUS_CD)
 
 # TPA (total / hardwood SPCD>=300 / softwood SPCD<300) and live volume, from TREE
 tree_stats <- dbGetQuery(con,
@@ -109,14 +118,32 @@ remv <- dbGetQuery(con,
 dbDisconnect(con)
 ```
 
+```{r locs-tcc}
+# survey unit + TCC (for the post-stratification baseline)
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN))
+locs <- fia_locs %>% filter(CN %in% emb$CN) %>% distinct(CN, .keep_all = TRUE)
+tccr <- rast(params$tcc)
+tv   <- extract(tccr, project(vect(locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"),
+                                   crs = "EPSG:4269"), crs(tccr)), ID = FALSE)[[1]]
+tv   <- as.numeric(as.character(tv)); tv[tv > 100] <- NA_real_
+tcc_by_cn <- tibble(CN = locs$CN, tcc = tv)
+```
+
 ```{r assemble}
 analysis <- emb %>% select(CN, all_of(emb_vars)) %>%
   inner_join(split_df, by = "CN") %>%
   left_join(tree_stats, by = c("CN" = "PLT_CN")) %>%
   left_join(balive,     by = c("CN" = "PLT_CN")) %>%
-  mutate(across(c(tpa_total, tpa_hard, tpa_soft, volume, BALIVE), ~ coalesce(., 0)))
+  left_join(cstat,      by = c("CN" = "PLT_CN")) %>%
+  inner_join(select(fia_locs, CN, UNITCD), by = "CN") %>%
+  inner_join(tcc_by_cn, by = "CN") %>%
+  mutate(across(c(tpa_total, tpa_hard, tpa_soft, volume, BALIVE), ~ coalesce(., 0))) %>%
+  filter(is.na(cond_status) | cond_status != 4,          # drop census water
+         !is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)
 ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals: GRM/remeasured
-cat(sprintf("plots (stocks): %d   plots (removals): %d\n", nrow(analysis), nrow(ar)))
+cat(sprintf("plots (stocks): %d   plots (removals): %d   (census water removed)\n",
+            nrow(analysis), nrow(ar)))
 
 # train-only standardization of the embedding (fit scaler on train rows)
 tr_all <- analysis$split == "train"
@@ -145,7 +172,8 @@ run_knn <- function(df, yname, label) {
                         val_R2 = round(max(val_r2), 3), test_R2 = round(r2(y[te], pte), 3),
                         test_RMSE = round(sqrt(mean((y[te] - pte)^2)), 2),
                         test_MAE = round(mean(abs(y[te] - pte)), 2)),
-    pred = tibble(target = label, obs = y[te], pred = pte))
+    pred = tibble(target = label, obs = y[te], pred = pte,
+                  UNITCD = df$UNITCD[te], tcc = df$tcc[te]))
 }
 
 targets <- list(
@@ -179,8 +207,79 @@ ggplot(preds, aes(obs, pred)) +
   theme_bw(base_size = 10)
 ```
 
+## Post-stratification from kNN predictions
+
+Use each kNN prediction to build strata and measure how much it reduces
+within-stratum variance of the *actual* target, exactly as in the earlier
+post-stratification analyses — but here the strata come from the held-out **test**
+predictions (leak-free), and variance is measured on the **test** set. The
+**baseline stratification is the TCC split** (FIA operational breaks); the kNN
+strata are Dalenius-Hodges bins of the predicted value. Everything is pooled
+within survey unit (`UNITCD`), and reported relative to the UNITCD-only variance.
+
+```{r strat-helpers}
+pooled_within <- function(df, groups, y) {
+  g <- df %>% group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+dh_breaks <- function(x, K, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(numeric(0))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+}
+dh_strata <- function(x, K) {
+  bnd <- dh_breaks(x, K); if (length(bnd) == 0) return(factor(rep(1L, length(x))))
+  factor(findInterval(as.numeric(x), c(-Inf, bnd, Inf)))
+}
+# per target: within-var under UNITCD-only, UNITCD x TCC, UNITCD x kNN-prediction DH
+strat_summary <- function(pd) {
+  base  <- pooled_within(pd, "UNITCD", "obs")
+  s_tcc <- cut(pd$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+               labels = c("0-10", "11-48", "49-85", "86-100"))
+  s_knn <- dh_strata(pd$pred, params$K_strata)
+  v_tcc <- pooled_within(mutate(pd, .s = s_tcc), c("UNITCD", ".s"), "obs")
+  v_knn <- pooled_within(mutate(pd, .s = s_knn), c("UNITCD", ".s"), "obs")
+  data.frame(target = pd$target[1], n_test = nrow(pd),
+             baseline_sd = round(sqrt(base), 3),
+             tcc_pct = round(100 * v_tcc / base, 1),
+             knn_pct = round(100 * v_knn / base, 1))
+}
+```
+
+`tcc_pct` / `knn_pct` are within-stratum variance as a percent of the UNITCD-only
+baseline (lower = better); `knn_pct < tcc_pct` means the kNN-prediction strata
+beat the TCC split.
+
+```{r strat-summary}
+bind_rows(lapply(res, function(r) strat_summary(r$pred)))
+```
+
+Per-stratum detail (kNN-prediction strata) for each target — n, mean, and SD of
+the actual target within each stratum:
+
+```{r strat-detail}
+bind_rows(lapply(res, function(r) {
+  pd <- r$pred
+  pd %>% mutate(stratum = as.character(dh_strata(pred, params$K_strata))) %>%
+    group_by(target, stratum) %>%
+    summarize(n = n(), mean = round(mean(obs), 2), sd = round(sd(obs), 2), .groups = "drop")
+})) %>% arrange(target, stratum)
+```
+
 ## Notes
 
+- **Post-stratification is on held-out test data.** Strata are formed from the
+  kNN **test** predictions and variance is measured on the test set — no plot is
+  binned by its own in-sample prediction. The baseline stratification is the TCC
+  split; kNN strata are `K_strata` DH bins of the prediction. Thin `UNITCD x
+  stratum` cells on the test set (especially removals) make those numbers noisier
+  than the full-population figures elsewhere.
+- **Census water removed.** Plots whose dominant condition is census water
+  (`COND_STATUS_CD == 4`) are dropped from the whole sample (kNN fit and
+  stratification), along with plots missing `UNITCD` or TCC.
 - **Split source.** The `train`/`val`/`test` label is the `split` column in the
   embeddings CSV — the same source `fia_embedding_evaluation.Rmd` uses
   (`reg_data$split`). Override with `split_col` if needed; the chunk errors and
