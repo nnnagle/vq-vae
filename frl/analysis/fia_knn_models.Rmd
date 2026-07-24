@@ -1,0 +1,213 @@
+---
+title: "kNN embedding models for FIA attributes"
+subtitle: "TPA, hardwood/softwood TPA, basal area, live volume, removals"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  split_col: "split"          # column (in emb CSV or fia_locs) holding train/val/test
+  k_grid: "5,10,20,40"        # neighbour counts tuned on the validation split
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6, dpi = 110)
+```
+
+## Overview
+
+kNN regression from the **entire embedding** (`z_type` + `z_phase`, all
+dimensions) to six FIA attributes:
+
+| target | source |
+|--------|--------|
+| **TPA** (all live) | `TREE.TPA_UNADJ`, `STATUSCD=1` |
+| **TPA hardwood** | as above, `SPCD >= 300` |
+| **TPA softwood** | as above, `SPCD < 300` |
+| **basal area** | `COND.BALIVE` |
+| **standing live volume** | `TREE.VOLCFNET * TPA_UNADJ`, `STATUSCD=1` |
+| **removals** | `TREE_GRM_COMPONENT` annual removed GS volume |
+
+Uses the existing **train / val / test** split: the model (train neighbours) is
+fit on train, `k` is tuned on val, and test is scored once. The embedding is
+standardized with **train-only** statistics (no leakage). Distances are Euclidean
+over the full embedding — note kNN in this many dimensions is subject to distance
+concentration, so treat these as a baseline "is the signal linearly *and* locally
+present" check against the linear probes elsewhere.
+
+Populations: TPA / basal area / volume are over the full plot population
+(non-forest plots contribute 0); removals additionally require GRM/remeasured
+data.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(FNN)
+```
+
+## Load embeddings and split
+
+```{r load}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)
+
+emb <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  filter(if_all(all_of(emb_vars), ~ !is.na(.)))
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN))
+
+# resolve the split column from emb, else fia_locs
+norm_split <- function(x) {
+  x <- tolower(as.character(x))
+  dplyr::recode(x, training = "train", valid = "val", validation = "val",
+                testing = "test", .default = x)
+}
+split_df <-
+  if (params$split_col %in% names(emb)) {
+    emb %>% transmute(CN, split = norm_split(.data[[params$split_col]]))
+  } else if (params$split_col %in% names(fia_locs)) {
+    fia_locs %>% transmute(CN, split = norm_split(.data[[params$split_col]]))
+  } else {
+    stop(sprintf("split column '%s' not found in emb (%s) or fia_locs (%s)",
+                 params$split_col,
+                 paste(names(emb)[1:min(12, ncol(emb))], collapse = ", "),
+                 paste(names(fia_locs), collapse = ", ")))
+  }
+split_df <- split_df %>% filter(split %in% c("train", "val", "test")) %>%
+  distinct(CN, .keep_all = TRUE)
+cat("split counts:\n"); print(table(split_df$split))
+```
+
+## FIA targets
+
+```{r fia-data}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, overwrite = TRUE)
+
+# basal area (live) per acre, from COND
+balive <- dbGetQuery(con, sprintf(
+  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE FROM COND WHERE STATECD='%s'", params$statecd)) %>%
+  mutate(PLT_CN = as.character(PLT_CN), BALIVE = ifelse(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+
+# TPA (total / hardwood SPCD>=300 / softwood SPCD<300) and live volume, from TREE
+tree_stats <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+     SUM(CASE WHEN g.STATUSCD=1 THEN COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS tpa_total,
+     SUM(CASE WHEN g.STATUSCD=1 AND g.SPCD>=300 THEN COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS tpa_hard,
+     SUM(CASE WHEN g.STATUSCD=1 AND g.SPCD<300  THEN COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS tpa_soft,
+     SUM(CASE WHEN g.STATUSCD=1 THEN COALESCE(g.VOLCFNET,0)*COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS volume
+   FROM TREE g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+
+# removals: annual per-acre removed GS volume (GRM; 0 for no-removal plots)
+remv <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+dbDisconnect(con)
+```
+
+```{r assemble}
+analysis <- emb %>% select(CN, all_of(emb_vars)) %>%
+  inner_join(split_df, by = "CN") %>%
+  left_join(tree_stats, by = c("CN" = "PLT_CN")) %>%
+  left_join(balive,     by = c("CN" = "PLT_CN")) %>%
+  mutate(across(c(tpa_total, tpa_hard, tpa_soft, volume, BALIVE), ~ coalesce(., 0)))
+ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals: GRM/remeasured
+cat(sprintf("plots (stocks): %d   plots (removals): %d\n", nrow(analysis), nrow(ar)))
+
+# train-only standardization of the embedding (fit scaler on train rows)
+tr_all <- analysis$split == "train"
+mu     <- colMeans(as.matrix(analysis[tr_all, emb_vars]))
+sdv    <- apply(as.matrix(analysis[tr_all, emb_vars]), 2, sd); sdv[sdv == 0] <- 1
+```
+
+## kNN evaluation
+
+```{r knn-helpers}
+kgrid <- as.integer(strsplit(params$k_grid, ",")[[1]])
+r2   <- function(obs, pred) 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+
+run_knn <- function(df, yname, label) {
+  X <- scale(as.matrix(df[, emb_vars]), center = mu, scale = sdv)
+  y <- df[[yname]]
+  tr <- which(df$split == "train"); va <- which(df$split == "val"); te <- which(df$split == "test")
+  # tune k on validation
+  val_r2 <- sapply(kgrid, function(k)
+    r2(y[va], FNN::knn.reg(X[tr, , drop = FALSE], X[va, , drop = FALSE], y[tr], k = k)$pred))
+  kbest <- kgrid[which.max(val_r2)]
+  pte <- FNN::knn.reg(X[tr, , drop = FALSE], X[te, , drop = FALSE], y[tr], k = kbest)$pred
+  list(
+    metric = data.frame(target = label, k_best = kbest,
+                        n_train = length(tr), n_val = length(va), n_test = length(te),
+                        val_R2 = round(max(val_r2), 3), test_R2 = round(r2(y[te], pte), 3),
+                        test_RMSE = round(sqrt(mean((y[te] - pte)^2)), 2),
+                        test_MAE = round(mean(abs(y[te] - pte)), 2)),
+    pred = tibble(target = label, obs = y[te], pred = pte))
+}
+
+targets <- list(
+  list(analysis, "tpa_total", "TPA (all live)"),
+  list(analysis, "tpa_hard",  "TPA hardwood"),
+  list(analysis, "tpa_soft",  "TPA softwood"),
+  list(analysis, "BALIVE",    "basal area"),
+  list(analysis, "volume",    "standing live volume"),
+  list(ar,       "remv_cfgs", "removals"))
+res <- lapply(targets, function(t) run_knn(t[[1]], t[[2]], t[[3]]))
+```
+
+### Test-set performance
+
+`k_best` is chosen on validation; `test_R2/RMSE/MAE` are the held-out scores.
+
+```{r knn-metrics}
+bind_rows(lapply(res, `[[`, "metric"))
+```
+
+### Predicted vs observed (test)
+
+```{r knn-scatter, fig.width=11, fig.height=7}
+preds <- bind_rows(lapply(res, `[[`, "pred")) %>%
+  mutate(target = factor(target, levels = sapply(targets, `[[`, 3)))
+ggplot(preds, aes(obs, pred)) +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linewidth = 0.4) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  facet_wrap(~ target, scales = "free", ncol = 3) +
+  labs(x = "observed", y = "kNN predicted") +
+  theme_bw(base_size = 10)
+```
+
+## Notes
+
+- **Split source.** The `train`/`val`/`test` label is read from `split_col` in the
+  embeddings CSV (or `fia_locs`). Set `split_col` to your actual column name; the
+  chunk errors and lists available columns if it can't find it. Values are
+  normalized (`training`->`train`, `valid`/`validation`->`val`, `testing`->`test`).
+- **No leakage.** The embedding is standardized with train-only mean/sd, `k` is
+  tuned only on validation, and test is scored once with the selected `k`.
+- **Hardwood/softwood split** uses the FIA convention `SPCD < 300` = softwood
+  (conifer), `SPCD >= 300` = hardwood.
+- **Populations.** TPA/basal area/volume use all plots (non-forest = 0); removals
+  use the GRM/remeasured subset (`ar`), keeping forested zero-removal plots as 0.
+- **Dimensionality caveat.** kNN uses Euclidean distance over the full
+  `r length(emb_vars)`-dim embedding; distance concentration can blunt it. Compare
+  `test_R2` here against the linear-probe R² in the other scripts — a large gap in
+  either direction is informative about whether the signal is linear vs local.
+- **Tuning.** `k` is tuned over `k_grid`; widen it (e.g. add 80, 160) if the best
+  `k` sits at the edge of the grid.
