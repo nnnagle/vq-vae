@@ -442,6 +442,35 @@ hist_by_evt(analysis, "volume", "volume")
 hist_by_evt(ar, "remv_cfgs", "removals", logx = TRUE)
 ```
 
+### Response statistics by EVT class
+
+Per-EVT mean, SD, 75th percentile, and fraction of zero-valued plots for each
+response. BALIVE and volume are over the full population (`n`); removals are over
+the remeasured/GRM subset (`rem_n`). `*_fz` is the zero fraction.
+
+```{r evt-stats}
+av <- analysis %>% inner_join(emb_evt, by = "CN") %>% group_by(evt) %>%
+  summarize(n = n(),
+            bal_mean = round(mean(BALIVE), 1), bal_sd = round(sd(BALIVE), 1),
+            bal_q75 = round(quantile(BALIVE, .75), 1), bal_fz = round(mean(BALIVE == 0), 3),
+            vol_mean = round(mean(volume), 0), vol_sd = round(sd(volume), 0),
+            vol_q75 = round(quantile(volume, .75), 0), vol_fz = round(mean(volume == 0), 3),
+            .groups = "drop")
+rm_stats <- ar %>% inner_join(emb_evt, by = "CN") %>% group_by(evt) %>%
+  summarize(rem_n = n(), rem_mean = round(mean(remv_cfgs), 1), rem_sd = round(sd(remv_cfgs), 1),
+            rem_q75 = round(quantile(remv_cfgs, .75), 1), rem_fz = round(mean(remv_cfgs == 0), 3),
+            .groups = "drop")
+
+av %>% left_join(rm_stats, by = "evt") %>%
+  mutate(VALUE = as.integer(evt)) %>%
+  left_join(transmute(evt_names, VALUE = as.integer(evt), EVT_NAME), by = "VALUE") %>%
+  select(VALUE, EVT_NAME, n,
+         bal_mean, bal_sd, bal_q75, bal_fz,
+         vol_mean, vol_sd, vol_q75, vol_fz,
+         rem_n, rem_mean, rem_sd, rem_q75, rem_fz) %>%
+  arrange(desc(n))
+```
+
 ### Evaluation
 
 ```{r strat-eval}
