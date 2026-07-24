@@ -23,7 +23,8 @@ params:
   k_phase: 3       # phase sub-groups per subdivided cluster (both methods)
   K_strata: 5      # [original] final strata; also the TCC/flat competitors
   tree_phase_frac: 0.20       # [constrained] top fraction of TREE segments to subdivide
-  K_strata_tree: 4            # [constrained] Tree strata (non-Tree -> 1 stratum; total 5)
+  K_strata_tree: 3            # [constrained] Tree strata
+  K_strata_nontree: 2         # [constrained] non-Tree strata (total = tree + nontree)
 ---
 
 ```{r setup, include=FALSE}
@@ -306,7 +307,8 @@ bin_map <- function(bin, y, K) {
   d  <- tibble(fine_bin = bin, .y = y) %>% group_by(fine_bin) %>%
         summarize(n_plots = n(), mean_y = mean(.y), .groups = "drop")
   Kk <- min(K, nrow(d))
-  d$stratum <- cutree(hclust(dist(scale(d$mean_y)), method = "ward.D2"), Kk)
+  d$stratum <- if (nrow(d) <= 1) 1L else
+    cutree(hclust(dist(scale(d$mean_y)), method = "ward.D2"), Kk)
   d
 }
 agg_by <- function(bin, y, K) {
@@ -520,7 +522,7 @@ segment centroid in `z_type` alone** — the macro side is never used to place a
 plot, so we can measure *leakage*: plots that land embedding-nearest to a segment
 whose macro differs from the plot's own EVT macro. Downstream, only Tree segments
 are phase-subdivided, and the strata keep the split: `r params$K_strata_tree`
-Tree strata + 1 non-Tree stratum.
+Tree strata + `r params$K_strata_nontree` non-Tree strata.
 
 ## Cannot-link Ward on EVT centroids
 
@@ -645,7 +647,8 @@ evt_map_c
 Tree segments are phase-subdivided (top `r round(100*params$tree_phase_frac)`% by
 `z_phase` spread into `r params$k_phase` groups each); non-Tree segments are not.
 The strata are then `r params$K_strata_tree` Tree strata (Ward on the Tree fine
-bins' mean response) plus 1 non-Tree stratum.
+bins' mean response) plus `r params$K_strata_nontree` non-Tree strata (Ward on the
+non-Tree segments' mean response).
 
 ```{r c-analysis}
 analysis_c <- analysis %>%
@@ -689,23 +692,28 @@ tibble(tree_segment = tree_cl,
 agg_macro <- function(df, y) {
   s <- character(nrow(df))
   is_tree <- df$macro_c == "Tree"
-  s[!is_tree] <- "N"
+  # Tree fine bins (type x phase) -> K_strata_tree strata
   dt <- df[is_tree, ]
-  bm <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree)
-  st <- bm$stratum[match(as.character(dt$fine_bin_c), as.character(bm$fine_bin))]
-  s[is_tree] <- paste0("T", st)
+  bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree)
+  s[is_tree] <- paste0("T", bmt$stratum[match(as.character(dt$fine_bin_c),
+                                              as.character(bmt$fine_bin))])
+  # non-Tree segments (not phase-subdivided) -> K_strata_nontree strata
+  dn <- df[!is_tree, ]
+  bmn <- bin_map(droplevels(factor(dn$type_cluster_c)), dn[[y]], params$K_strata_nontree)
+  s[!is_tree] <- paste0("N", bmn$stratum[match(as.character(dn$type_cluster_c),
+                                               as.character(bmn$fine_bin))])
   factor(s)
 }
 show_map_c <- function(df, y) {
   dt <- df[df$macro_c == "Tree", ]
-  bm <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree)
-  bm %>% transmute(fine_bin, n_plots, mean_response = round(mean_y, 2),
-                   stratum = paste0("T", stratum)) %>%
-    bind_rows(tibble(fine_bin = "<all non-Tree>",
-                     n_plots  = sum(df$macro_c == "nonTree"),
-                     mean_response = round(mean(df[[y]][df$macro_c == "nonTree"]), 2),
-                     stratum  = "N")) %>%
-    arrange(stratum, desc(mean_response))
+  bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree) %>%
+    transmute(bin = as.character(fine_bin), macro = "Tree", n_plots,
+              mean_response = round(mean_y, 2), stratum = paste0("T", stratum))
+  dn <- df[df$macro_c == "nonTree", ]
+  bmn <- bin_map(droplevels(factor(dn$type_cluster_c)), dn[[y]], params$K_strata_nontree) %>%
+    transmute(bin = paste0("seg ", as.character(fine_bin)), macro = "nonTree", n_plots,
+              mean_response = round(mean_y, 2), stratum = paste0("N", stratum))
+  bind_rows(bmt, bmn) %>% arrange(stratum, desc(mean_response))
 }
 
 resp_table_c <- function(df, y, vars = emb_vars) {
@@ -723,7 +731,8 @@ resp_table_c <- function(df, y, vars = emb_vars) {
     stratification = c("UNITCD only (baseline)",
                        "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
                        sprintf("UNITCD x TCC DH (%d)", params$K_strata),
-                       sprintf("UNITCD x EVT constrained Tree/non-Tree (%d+1)", params$K_strata_tree),
+                       sprintf("UNITCD x EVT constrained Tree/non-Tree (%d+%d)",
+                               params$K_strata_tree, params$K_strata_nontree),
                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
     within_var = round(vv, 2),
     within_sd  = round(sqrt(vv), 3),
@@ -809,7 +818,7 @@ strata_summary(ar_c, "remv_cfgs", sch_rmv_c)
 ```
 
 Removals by stratum for each scheme (`log1p` axis; the constrained method's
-non-Tree plots are pooled into the single `N` stratum):
+non-Tree plots form `r params$K_strata_nontree` strata `N1..N`):
 
 ```{r c-strat-removals-box, fig.width=11, fig.height=4}
 strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
@@ -851,6 +860,8 @@ strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
   macro-pure at the clustering step; plots are still assigned by nearest `z_type`
   centroid alone, so `leakage` measures how clean the Tree/non-Tree boundary is
   in the embedding. Only Tree segments are phase-subdivided (top
-  `tree_phase_frac`, `k_phase` groups); strata are `K_strata_tree` Tree strata +
-  1 non-Tree stratum. Tunable via `tree_phase_frac`, `K_strata_tree` — the
-  original method's `phase_subdivide_frac` / `K_strata` are left unchanged.
+  `tree_phase_frac`, `k_phase` groups); strata are `K_strata_tree` Tree strata
+  (Ward on Tree fine-bin means) + `K_strata_nontree` non-Tree strata (Ward on
+  non-Tree segment means). Tunable via `tree_phase_frac`, `K_strata_tree`,
+  `K_strata_nontree` — the original method's `phase_subdivide_frac` / `K_strata`
+  are left unchanged.
