@@ -12,10 +12,9 @@ output:
     df_print: paged
 params:
   emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
-  fia_locs: "/data/FIADB/spatial/va_merge.csv"
   fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
   statecd: "51"
-  split_col: "split"          # column (in emb CSV or fia_locs) holding train/val/test
+  split_col: "split"          # train/val/test column in the embeddings CSV
   k_grid: "5,10,20,40"        # neighbour counts tuned on the validation split
 ---
 
@@ -66,27 +65,14 @@ emb_vars       <- c(emb_type_vars, emb_phase_vars)
 emb <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
   mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
   filter(if_all(all_of(emb_vars), ~ !is.na(.)))
-fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
-  mutate(CN = sub("\\.0$", "", CN))
 
-# resolve the split column from emb, else fia_locs
-norm_split <- function(x) {
-  x <- tolower(as.character(x))
-  dplyr::recode(x, training = "train", valid = "val", validation = "val",
-                testing = "test", .default = x)
-}
-split_df <-
-  if (params$split_col %in% names(emb)) {
-    emb %>% transmute(CN, split = norm_split(.data[[params$split_col]]))
-  } else if (params$split_col %in% names(fia_locs)) {
-    fia_locs %>% transmute(CN, split = norm_split(.data[[params$split_col]]))
-  } else {
-    stop(sprintf("split column '%s' not found in emb (%s) or fia_locs (%s)",
-                 params$split_col,
-                 paste(names(emb)[1:min(12, ncol(emb))], collapse = ", "),
-                 paste(names(fia_locs), collapse = ", ")))
-  }
-split_df <- split_df %>% filter(split %in% c("train", "val", "test")) %>%
+# train/val/test come from the `split` column in the embeddings CSV, the same
+# source fia_embedding_evaluation.Rmd uses (reg_data$split)
+if (!params$split_col %in% names(emb))
+  stop(sprintf("split column '%s' not in embeddings CSV; columns include: %s",
+               params$split_col, paste(head(names(emb), 15), collapse = ", ")))
+split_df <- emb %>% transmute(CN, split = as.character(.data[[params$split_col]])) %>%
+  filter(split %in% c("train", "val", "test")) %>%
   distinct(CN, .keep_all = TRUE)
 cat("split counts:\n"); print(table(split_df$split))
 ```
@@ -195,10 +181,10 @@ ggplot(preds, aes(obs, pred)) +
 
 ## Notes
 
-- **Split source.** The `train`/`val`/`test` label is read from `split_col` in the
-  embeddings CSV (or `fia_locs`). Set `split_col` to your actual column name; the
-  chunk errors and lists available columns if it can't find it. Values are
-  normalized (`training`->`train`, `valid`/`validation`->`val`, `testing`->`test`).
+- **Split source.** The `train`/`val`/`test` label is the `split` column in the
+  embeddings CSV — the same source `fia_embedding_evaluation.Rmd` uses
+  (`reg_data$split`). Override with `split_col` if needed; the chunk errors and
+  lists available columns if the column is missing.
 - **No leakage.** The embedding is standardized with train-only mean/sd, `k` is
   tuned only on validation, and test is scored once with the selected `k`.
 - **Hardwood/softwood split** uses the FIA convention `SPCD < 300` = softwood
