@@ -89,10 +89,10 @@ dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, o
 
 # basal area (live) per acre + condition status, from COND
 cond <- dbGetQuery(con, sprintf(
-  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, COND_STATUS_CD FROM COND WHERE STATECD='%s'",
+  "SELECT PLT_CN, INVYR, CONDPROP_UNADJ, BALIVE, COND_STATUS_CD FROM COND WHERE STATECD='%s'",
   params$statecd)) %>%
   mutate(PLT_CN = as.character(PLT_CN), BALIVE = ifelse(is.na(BALIVE), 0, BALIVE))
-balive <- cond %>% group_by(PLT_CN) %>%
+balive <- cond %>% group_by(PLT_CN, INVYR) %>%
   summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
 # dominant-condition status; COND_STATUS_CD == 4 is census water
 cstat <- cond %>% group_by(PLT_CN) %>%
