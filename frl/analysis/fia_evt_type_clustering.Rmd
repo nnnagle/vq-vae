@@ -839,6 +839,103 @@ non-Tree plots form `r params$K_strata_nontree` strata `N1..N`):
 strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
 ```
 
+# Forest / non-forest detection (OOF)
+
+Does the embedding detect non-forest as well as TCC? The stratification tables
+suggest TCC's full-population edge is really forest/non-forest separation, so
+here we test that directly, as a **classification** task rather than through
+BALIVE variance. Label: a plot is **non-forest** when its dominant FIA condition
+has no forest type (`is.na(FORTYPCD)`) — the agency's own forest/non-forest
+determination, independent of the embedding and of BALIVE.
+
+Four detectors, all scored out-of-fold (5-fold) where a model is fit:
+
+1. **TCC 0-10 (baseline)** — the operational rule: `tcc <= 10` -> non-forest.
+2. **logit z_type** — logistic regression of non-forest on the 48 `z_type` dims.
+3. **logit z_type + z_phase** — same, adding the 8 `z_phase` dims.
+4. **k-20 type-cluster aggregation** — the unsupervised `r params$K`-segment
+   EVT-trained `type_cluster`, aggregated by each cluster's training non-forest
+   rate (OOF). This is the *clustering* pathway that the hierarchical
+   stratification actually uses, so it isolates whether the clustering — not the
+   representation — is what loses the signal.
+
+`AUC` is threshold-free (how separable the classes are under each score). The
+operating-point metrics (`accuracy`/`sensitivity`/`specificity`/`precision`) are
+all evaluated at a **matched budget**: each score flags the same number of plots
+as the `tcc <= 10` rule, so they are directly comparable to the baseline.
+`sensitivity` is recall of the non-forest class.
+
+```{r detect-setup}
+det <- analysis %>% mutate(nonforest = as.integer(is.na(FORTYPCD)))
+lab <- det$nonforest
+cat(sprintf("plots: %d   non-forest (is.na FORTYPCD): %d (%.1f%%)\n",
+            nrow(det), sum(lab), 100 * mean(lab)))
+
+set.seed(1); folds <- sample(rep(1:5, length.out = nrow(det)))
+
+# rank-based (Mann-Whitney) AUC; higher score = more likely non-forest
+auc <- function(score, label) {
+  r <- rank(score); n1 <- sum(label == 1); n0 <- sum(label == 0)
+  (sum(r[label == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+op_metrics <- function(pred_pos, label) {
+  tp <- sum(pred_pos & label == 1); fp <- sum(pred_pos & label == 0)
+  fn <- sum(!pred_pos & label == 1); tn <- sum(!pred_pos & label == 0)
+  c(accuracy = (tp + tn) / length(label), sensitivity = tp / (tp + fn),
+    specificity = tn / (tn + fp), precision = tp / (tp + fp))
+}
+# OOF logistic P(non-forest)
+oof_logit <- function(df, vars) {
+  form <- reformulate(vars, "nonforest"); s <- numeric(nrow(df))
+  for (f in 1:5) {
+    fit <- glm(form, family = binomial, data = df[folds != f, ])
+    s[folds == f] <- predict(fit, df[folds == f, ], type = "response")
+  }
+  s
+}
+# OOF cluster aggregation: assign each plot its cluster's training non-forest rate
+oof_cluster <- function(df, cl) {
+  cl <- as.character(cl); s <- numeric(nrow(df))
+  for (f in 1:5) {
+    rate <- tapply(df$nonforest[folds != f], cl[folds != f], mean)
+    gm   <- mean(df$nonforest[folds != f])
+    v <- rate[cl[folds == f]]; v[is.na(v)] <- gm; s[folds == f] <- v
+  }
+  s
+}
+```
+
+```{r detect-eval}
+p_type <- oof_logit(det, emb_type_vars)
+p_tp   <- oof_logit(det, emb_vars)
+p_cl   <- oof_cluster(det, det$type_cluster)
+
+k    <- sum(det$tcc <= 10)                       # matched flagging budget
+topk <- function(sc) sc >= sort(sc, decreasing = TRUE)[k]
+mk <- function(nm, sc, pred) {
+  m <- op_metrics(pred, lab)
+  data.frame(scheme = nm, AUC = round(auc(sc, lab), 3),
+             accuracy = round(m["accuracy"], 3),
+             sens_nonforest = round(m["sensitivity"], 3),
+             specificity = round(m["specificity"], 3),
+             precision = round(m["precision"], 3), row.names = NULL)
+}
+cat(sprintf("matched budget: %d plots flagged non-forest (= plots with tcc <= 10)\n", k))
+bind_rows(
+  mk("TCC 0-10 (baseline)",           100 - det$tcc, det$tcc <= 10),
+  mk("logit z_type (OOF)",            p_type,        topk(p_type)),
+  mk("logit z_type + z_phase (OOF)",  p_tp,          topk(p_tp)),
+  mk("k-20 type-cluster agg (OOF)",   p_cl,          topk(p_cl)))
+```
+
+Read it as: if **logit z_type** matches or beats the TCC baseline on AUC, the
+embedding detects non-forest at least as well as canopy cover — so the
+hierarchical method's weakness is not the representation. If the **k-20
+cluster aggregation** trails the logits, the *clustering* is where the signal is
+lost (20 type segments cannot carve out a clean non-forest region the way a
+supervised direction does), which is exactly the failure mode behind the BALIVE
+stratification gap.
+
 ## Notes
 
 - **EVT-trained, location-assigned.** EVT groups define the segment centroids;
@@ -880,6 +977,13 @@ strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
   non-Tree segment means). Tunable via `tree_phase_frac`, `K_strata_tree`,
   `K_strata_nontree` — the original method's `phase_subdivide_frac` / `K_strata`
   are left unchanged.
+- **Forest / non-forest detection (OOF).** A direct classification check
+  (`is.na(FORTYPCD)` label) of whether the embedding separates non-forest as well
+  as TCC, comparing the `tcc <= 10` rule, OOF logistic probes on `z_type` and
+  `z_type + z_phase`, and an OOF aggregation of the `K`-segment `type_cluster`.
+  AUC is threshold-free; the operating-point metrics use a budget matched to the
+  `tcc <= 10` rule. A logit that matches TCC while the cluster aggregation trails
+  it localizes the stratification gap to the clustering, not the representation.
 - **Self-trained vs BALIVE-trained (transfer test).** Each response is scored
   with two EVT stratifications: one whose fine-bin -> stratum aggregation is
   trained on that response (`agg_macro`/`fit_agg_macro`), and one that reuses a
