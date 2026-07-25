@@ -294,6 +294,17 @@ precise as UNITCD-only with twice the plots). **Both assume a self-weighting
 sample** — stratum weights `W_h = n_h/N` — so they are internal, sample-based
 efficiencies; a design-based version would reweight by population stratum area.
 
+The last two rows are **Wu–Sitter model-calibration** references (GREG-type,
+model-assisted). Instead of binning a covariate into strata they fit a smooth
+out-of-fold working model `μ̂(x)` and take the estimator variance to be the
+variance of the residuals `y − μ̂(x)` — a natural-spline calibration on TCC and a
+linear calibration on the full embedding. This isolates the cost of *binning*:
+the calibration row using a covariate should beat the strata rows using the same
+covariate, since it uses it continuously. Only the **variance / RE** are
+computed — the calibration *point* estimate additionally needs the population
+total of `μ̂(x)` (the auxiliary scored wall-to-wall), which is the same
+missing ingredient as design-based stratum weights.
+
 ```{r headline}
 v_unit  <- pooled_within(analysis, "UNITCD")
 v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
@@ -304,7 +315,36 @@ v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
 v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
 
-vv <- c(v_unit, v_tcc, v_tccq, v_tccd5, v_km, v_supt, v_sup, v_ct)
+# --- Wu-Sitter model-calibration reference (variance / RE only) --------------
+# A calibration (model-assisted / GREG) estimator uses a smooth working model
+# mu_hat(x) instead of stratum means; its asymptotic variance is the design
+# variance of the residuals e = y - mu_hat(x). We estimate that here from the
+# sample -- the POINT estimate would additionally need the population total of
+# mu_hat (the auxiliary scored wall-to-wall), which we do not have. mu_hat is
+# cross-fitted (out-of-fold, reusing `folds`) so the residual variance is not
+# optimistic about the fit; the residual variance is pooled within UNITCD to
+# match how the strata rows cross with UNITCD. Two working models mirror the two
+# covariates already compared: a natural-spline calibration on TCC (the smooth
+# analog of TCC binning) and a linear calibration on the full embedding (the
+# unbinned analog of the supervised embedding strata).
+require(splines)
+oof_pred <- function(rhs) {
+  form <- as.formula(paste("BALIVE ~", rhs)); p <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    p[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  p
+}
+calib_var <- function(pred) {                       # within-UNITCD residual var, /(N - n_units)
+  g <- mutate(analysis, .r = BALIVE - pred) %>% group_by(UNITCD) %>%
+       summarize(n = n(), ss = sum((.r - mean(.r))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+v_cal_tcc <- calib_var(oof_pred("factor(UNITCD) + ns(tcc, 4)"))
+v_cal_emb <- calib_var(oof_pred(paste("factor(UNITCD) +", paste(emb_vars, collapse = " + "))))
+
+vv <- c(v_unit, v_tcc, v_tccq, v_tccd5, v_km, v_supt, v_sup, v_ct, v_cal_tcc, v_cal_emb)
 # Relative efficiency vs the (fixed-bin) TCC baseline and effective sample size
 # relative to the UNITCD-only baseline. Under a self-weighting sample the
 # estimator variance is within_var / N, so both are ratios of within_var:
@@ -320,7 +360,9 @@ data.frame(
                       "UNITCD x embedding k-means (4, unsup)",
                       "UNITCD x embedding supervised type-only (4, OOF)",
                       "UNITCD x embedding supervised type+phase (4, OOF)",
-                      "UNITCD x TCC + embedding supervised (4, OOF)"),
+                      "UNITCD x TCC + embedding supervised (4, OOF)",
+                      "UNITCD + TCC spline calibration (Wu-Sitter, OOF)",
+                      "UNITCD + embedding linear calibration (Wu-Sitter, OOF)"),
   within_var      = round(vv, 1),
   within_sd       = round(sqrt(vv), 2),
   pct_of_baseline = round(100 * vv / v_unit, 1),

@@ -276,6 +276,13 @@ baseline** (`N · V_unit / within_var`; baseline row = `N`, sub-stratification
 above `N`). Both assume a self-weighting sample (`W_h = n_h/N`) — internal,
 sample-based efficiencies rather than design-based (area-weighted) ones.
 
+The last two rows are **Wu–Sitter model-calibration** references: instead of
+binning a covariate they fit a smooth out-of-fold working model `μ̂(x)` and take
+the variance to be that of the residuals `y − μ̂(x)` (spline on TCC, linear on
+the embedding). Only variance / RE are computed — the calibration *point*
+estimate needs the population total of `μ̂(x)` (auxiliary scored wall-to-wall),
+the same missing ingredient as design-based weights.
+
 ```{r headline}
 v_unit  <- pooled_within(analysis, "UNITCD")
 v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
@@ -287,7 +294,29 @@ v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
 v_bal   <- pooled_within(analysis, c("UNITCD", "emb_sup_bal"))
 
-vv <- c(v_unit, v_tcc, v_tccd, v_tccd5, v_km, v_supt, v_sup, v_ct, v_bal)
+# --- Wu-Sitter model-calibration reference (variance / RE only) --------------
+# Calibration (model-assisted / GREG) variance is the design variance of the
+# residuals e = y - mu_hat(x) from a smooth out-of-fold working model, instead of
+# stratum means. Estimated from the sample here; the POINT estimate would also
+# need the population total of mu_hat (auxiliary scored wall-to-wall), unavailable.
+# mu_hat is cross-fitted (reusing `folds`); residual variance pooled within
+# UNITCD. Two models mirror the covariates compared: spline calibration on TCC and
+# linear calibration on the full embedding (both target-trained on removals).
+require(splines)
+oof_pred <- function(rhs) {
+  form <- as.formula(paste(resp, "~", rhs)); p <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    p[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  p
+}
+calib_var <- function(pred)                          # within-UNITCD residual var
+  pooled_within(mutate(analysis, .r = analysis[[resp]] - pred), "UNITCD", y = ".r")
+v_cal_tcc <- calib_var(oof_pred("factor(UNITCD) + ns(tcc, 4)"))
+v_cal_emb <- calib_var(oof_pred(paste("factor(UNITCD) +", paste(emb_vars, collapse = " + "))))
+
+vv <- c(v_unit, v_tcc, v_tccd, v_tccd5, v_km, v_supt, v_sup, v_ct, v_bal, v_cal_tcc, v_cal_emb)
 # Relative efficiency vs the (fixed-bin) TCC baseline and effective sample size
 # relative to the UNITCD-only baseline. Under a self-weighting sample the
 # estimator variance is within_var / N, so RE_vs_tcc = V_TCC / V_method (>1 beats
@@ -303,7 +332,9 @@ data.frame(
                       "UNITCD x emb supervised-for-removals, type-only (4)",
                       "UNITCD x emb supervised-for-removals, type+phase (4)",
                       "UNITCD x TCC + emb supervised-for-removals (4)",
-                      "UNITCD x emb supervised-for-BALIVE, applied to removals (4)"),
+                      "UNITCD x emb supervised-for-BALIVE, applied to removals (4)",
+                      "UNITCD + TCC spline calibration (Wu-Sitter, OOF)",
+                      "UNITCD + embedding linear calibration (Wu-Sitter, OOF)"),
   within_var      = round(vv, 2),
   within_sd       = round(sqrt(vv), 3),
   pct_of_baseline = round(100 * vv / v_unit, 1),
