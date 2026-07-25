@@ -253,6 +253,23 @@ strat_summary <- function(pd) {
   v_tccd <- pooled_within(mutate(pd, .s = s_tccd), c("UNITCD", ".s"), "obs")
   v_lm  <- pooled_within(mutate(pd, .s = s_lm),  c("UNITCD", ".s"), "obs")
   v_knn <- pooled_within(mutate(pd, .s = s_knn), c("UNITCD", ".s"), "obs")
+  # Wu-Sitter model-calibration (GREG) variance: instead of DH-binning a covariate
+  # into strata, use it CONTINUOUSLY as the calibration auxiliary and take the
+  # variance to be the residual variance of obs ~ factor(UNITCD) + auxiliary
+  # (RSS / df.residual). pred/lm_pred are already out-of-sample (train->test); the
+  # calibration slope and the TCC spline are fit on the test set, adding only a few
+  # in-sample parameters -- symmetric with how the binned versions form and score
+  # strata on the same test predictions. calib_*_pct vs the binned *_pct is the
+  # precision lost to binning; the calibration POINT estimate (not computed) would
+  # need the population total of the fitted values (auxiliary scored wall-to-wall).
+  require(splines)
+  resid_var <- function(rhs) {
+    f <- lm(as.formula(paste("obs ~ factor(UNITCD) +", rhs)), data = pd)
+    sum(residuals(f)^2) / f$df.residual
+  }
+  v_cal_tcc <- resid_var("ns(tcc, 4)")
+  v_cal_lm  <- resid_var("lm_pred")
+  v_cal_knn <- resid_var("pred")
   # RE vs the (fixed-bin) TCC baseline and effective sample size relative to the
   # UNITCD-only baseline (`base`). Under a self-weighting sample the estimator
   # variance is within_var / n, so RE = V_TCC / V_method (>1 beats TCC) and
@@ -265,9 +282,14 @@ strat_summary <- function(pd) {
              tccdh_pct = round(100 * v_tccd / base, 1),
              lm_pct  = round(100 * v_lm  / base, 1),
              knn_pct = round(100 * v_knn / base, 1),
-             RE_knn_vs_tcc = round(v_tcc / v_knn, 2),
-             ess_tcc = round(n * base / v_tcc),
-             ess_knn = round(n * base / v_knn))
+             calib_tcc_pct = round(100 * v_cal_tcc / base, 1),
+             calib_lm_pct  = round(100 * v_cal_lm  / base, 1),
+             calib_knn_pct = round(100 * v_cal_knn / base, 1),
+             RE_knn_vs_tcc      = round(v_tcc / v_knn,     2),
+             RE_calibknn_vs_tcc = round(v_tcc / v_cal_knn, 2),
+             ess_tcc      = round(n * base / v_tcc),
+             ess_knn      = round(n * base / v_knn),
+             ess_calibknn = round(n * base / v_cal_knn))
 }
 ```
 
@@ -279,11 +301,21 @@ do at matched strata count. `knn_pct < tccdh_pct` means the
 kNN-prediction strata beat even the optimally-binned TCC split; comparing `knn_pct` to `lm_pct` (strata
 from a linear probe trained the same way) separates *"the embedding is
 decodable"* (both low) from *"kNN's local geometry helps"* (`knn_pct` << `lm_pct`).
-`RE_knn_vs_tcc` is the kNN strata's relative efficiency over the fixed-bin TCC
-baseline (`V_TCC / V_knn`; > 1 beats TCC). `ess_tcc` / `ess_knn` are **effective
-sample sizes relative to the UNITCD-only baseline** (`n_test · V_unit /
-within_var`) — the UNITCD-only plot count matching each estimator's precision
-(UNITCD-only itself would be `n_test`). All three assume a self-weighting sample
+`calib_tcc_pct` / `calib_lm_pct` / `calib_knn_pct` are the **Wu–Sitter
+model-calibration** (GREG) analogs: the same covariate used *continuously* as a
+calibration auxiliary rather than DH-binned, scored as the residual variance of
+`obs ~ factor(UNITCD) + auxiliary` (percent of baseline). `calib_knn_pct <
+knn_pct` is the precision recovered by not binning the kNN prediction. Only the
+calibration *variance* is estimable here — the calibration point estimate would
+need the population total of the fitted values (auxiliary scored wall-to-wall),
+the same missing ingredient as design-based stratum weights.
+
+`RE_knn_vs_tcc` / `RE_calibknn_vs_tcc` are the relative efficiency of the kNN
+strata and of the kNN *calibration* estimator over the fixed-bin TCC baseline
+(`V_TCC / V_method`; > 1 beats TCC). `ess_tcc` / `ess_knn` / `ess_calibknn` are
+**effective sample sizes relative to the UNITCD-only baseline** (`n_test · V_unit
+/ within_var`) — the UNITCD-only plot count matching each estimator's precision
+(UNITCD-only itself would be `n_test`). All assume a self-weighting sample
 (`W_h = n_h/N`).
 
 ```{r strat-summary}
