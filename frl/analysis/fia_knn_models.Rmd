@@ -253,11 +253,12 @@ strat_summary <- function(pd) {
   v_tccd <- pooled_within(mutate(pd, .s = s_tccd), c("UNITCD", ".s"), "obs")
   v_lm  <- pooled_within(mutate(pd, .s = s_lm),  c("UNITCD", ".s"), "obs")
   v_knn <- pooled_within(mutate(pd, .s = s_knn), c("UNITCD", ".s"), "obs")
-  # RE vs the (fixed-bin) TCC baseline and SRS-equivalent effective sample size.
-  # Under a self-weighting sample the estimator variance is within_var / n, so
-  # RE = V_TCC / V_method (>1 beats TCC) and ess = n_test * S2 / V_method, with
-  # S2 the unstratified (SRS) per-plot variance of the target on the test set.
-  S2 <- var(pd$obs); n <- nrow(pd)
+  # RE vs the (fixed-bin) TCC baseline and effective sample size relative to the
+  # UNITCD-only baseline (`base`). Under a self-weighting sample the estimator
+  # variance is within_var / n, so RE = V_TCC / V_method (>1 beats TCC) and
+  # ess = n_test * V_unit / V_method -- the UNITCD-only plot count matching each
+  # estimator's precision (UNITCD-only itself would be n_test).
+  n <- nrow(pd)
   data.frame(target = pd$target[1], n_test = n,
              baseline_sd = round(sqrt(base), 3),
              tcc_pct   = round(100 * v_tcc  / base, 1),
@@ -265,8 +266,8 @@ strat_summary <- function(pd) {
              lm_pct  = round(100 * v_lm  / base, 1),
              knn_pct = round(100 * v_knn / base, 1),
              RE_knn_vs_tcc = round(v_tcc / v_knn, 2),
-             ess_tcc = round(n * S2 / v_tcc),
-             ess_knn = round(n * S2 / v_knn))
+             ess_tcc = round(n * base / v_tcc),
+             ess_knn = round(n * base / v_knn))
 }
 ```
 
@@ -279,10 +280,11 @@ kNN-prediction strata beat even the optimally-binned TCC split; comparing `knn_p
 from a linear probe trained the same way) separates *"the embedding is
 decodable"* (both low) from *"kNN's local geometry helps"* (`knn_pct` << `lm_pct`).
 `RE_knn_vs_tcc` is the kNN strata's relative efficiency over the fixed-bin TCC
-baseline (`V_TCC / V_knn`; > 1 beats TCC). `ess_tcc` / `ess_knn` are
-SRS-equivalent **effective sample sizes** (`n_test · S² / within_var`, `S²` the
-unstratified target variance) — the SRS plot count matching each estimator's
-precision. All three assume a self-weighting sample (`W_h = n_h/N`).
+baseline (`V_TCC / V_knn`; > 1 beats TCC). `ess_tcc` / `ess_knn` are **effective
+sample sizes relative to the UNITCD-only baseline** (`n_test · V_unit /
+within_var`) — the UNITCD-only plot count matching each estimator's precision
+(UNITCD-only itself would be `n_test`). All three assume a self-weighting sample
+(`W_h = n_h/N`).
 
 ```{r strat-summary}
 bind_rows(lapply(res, function(r) strat_summary(r$pred)))

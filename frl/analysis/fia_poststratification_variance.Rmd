@@ -286,12 +286,13 @@ the sub-stratification made `BALIVE` more homogeneous within cells — i.e. a mo
 efficient post-stratified estimator. `RE_vs_tcc` is the relative efficiency
 against the fixed-bin TCC baseline (`V_TCC / V_method`; > 1 means more efficient
 than TCC — equivalently, TCC would need `RE_vs_tcc ×` as many plots to match this
-estimator). `ess_srs` is the SRS-equivalent **effective sample size**: the number
-of simple-random-sample plots that would give the same precision (`N · S² /
-within_var`, `S²` the unstratified `BALIVE` variance). **Both assume a
-self-weighting sample** — stratum weights `W_h = n_h/N` — so they are internal,
-sample-based efficiencies; a design-based version would reweight by population
-stratum area.
+estimator). `ess_unit` is the **effective sample size relative to the UNITCD-only
+baseline**: the number of `UNITCD`-only-stratified plots that would give the same
+precision (`N · V_unit / within_var`). The baseline row is `N` by construction;
+sub-stratification pushes `ess_unit` above `N` (e.g. `ess_unit = 2N` means as
+precise as UNITCD-only with twice the plots). **Both assume a self-weighting
+sample** — stratum weights `W_h = n_h/N` — so they are internal, sample-based
+efficiencies; a design-based version would reweight by population stratum area.
 
 ```{r headline}
 v_unit  <- pooled_within(analysis, "UNITCD")
@@ -304,13 +305,13 @@ v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
 
 vv <- c(v_unit, v_tcc, v_tccq, v_tccd5, v_km, v_supt, v_sup, v_ct)
-# Relative efficiency vs the (fixed-bin) TCC baseline and SRS-equivalent
-# effective sample size. Under a self-weighting sample the estimator variance is
-# within_var / N, so RE and ESS are ratios of within_var: RE = V_TCC / V_method
-# (>1 beats TCC); ess_srs = N * S2 / V_method, with S2 the unstratified (SRS)
-# per-plot variance -- the SRS plot count that would match this estimator.
-N  <- nrow(analysis)
-S2 <- var(analysis$BALIVE)
+# Relative efficiency vs the (fixed-bin) TCC baseline and effective sample size
+# relative to the UNITCD-only baseline. Under a self-weighting sample the
+# estimator variance is within_var / N, so both are ratios of within_var:
+# RE_vs_tcc = V_TCC / V_method (>1 beats TCC); ess_unit = N * V_unit / V_method --
+# the UNITCD-only plot count that would match this estimator's precision (so the
+# baseline row is N, and sub-stratification pushes it above N).
+N <- nrow(analysis)
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       "UNITCD x TCC fixed bins (4)",
@@ -324,7 +325,7 @@ data.frame(
   within_sd       = round(sqrt(vv), 2),
   pct_of_baseline = round(100 * vv / v_unit, 1),
   RE_vs_tcc       = round(v_tcc / vv, 2),
-  ess_srs         = round(N * S2 / vv)
+  ess_unit        = round(N * v_unit / vv)
 )
 ```
 

@@ -235,8 +235,9 @@ v_flat <- pooled_within(analysis, c("UNITCD", "emb_flat"))
 v_hier <- pooled_within(analysis, c("UNITCD", "stratum"))
 
 vv <- c(v_unit, v_tcc, v_flat, v_hier)
-# RE vs the TCC (DH) baseline and SRS-equivalent effective sample size; under a
-# self-weighting sample RE = V_TCC/V_method (>1 beats TCC), ess_srs = N*S2/V_method
+# RE vs the TCC (DH) baseline and effective sample size relative to UNITCD-only;
+# under a self-weighting sample RE = V_TCC/V_method (>1 beats TCC) and
+# ess_unit = N*V_unit/V_method (baseline row = N, sub-stratification above N).
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
@@ -246,7 +247,7 @@ data.frame(
   within_sd       = round(sqrt(vv), 2),
   pct_of_baseline = round(100 * vv / v_unit, 1),
   RE_vs_tcc       = round(v_tcc / vv, 2),
-  ess_srs         = round(nrow(analysis) * var(analysis[[resp]]) / vv)
+  ess_unit        = round(nrow(analysis) * v_unit / vv)
 )
 ```
 
@@ -321,8 +322,8 @@ data.frame(
   within_var      = round(vr, 2),
   within_sd       = round(sqrt(vr), 3),
   pct_of_baseline = round(100 * vr / vr_unit, 1),
-  RE_vs_tcc       = round(vr_tcc / vr, 2),                       # V_TCC / V_method
-  ess_srs         = round(nrow(ar) * var(ar$remv_cfgs) / vr)     # SRS-equivalent ESS
+  RE_vs_tcc       = round(vr_tcc / vr, 2),               # V_TCC / V_method
+  ess_unit        = round(nrow(ar) * vr_unit / vr)       # ESS vs UNITCD-only baseline
 )
 ```
 
