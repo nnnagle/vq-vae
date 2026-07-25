@@ -287,6 +287,43 @@ bind_rows(lapply(res, function(r) {
 })) %>% arrange(target, stratum)
 ```
 
+### Per-stratum distribution, by method
+
+The tables above give the within-stratum variance (as a percent) and per-stratum
+means; this shows the full distribution behind them. For every target (rows) and
+every stratification method (columns), a boxplot of the **actual** target within
+each stratum. A method separates the target well when its boxes sit at clearly
+different levels with little overlap — the visual analog of a low `*_pct`. The
+grid shares the y-axis **within each target row** (so the four methods are
+directly comparable for a given target) and frees it across rows (targets are on
+very different scales); the x-axis is free because strata labels differ across
+methods.
+
+```{r strat-boxplot, fig.width=11, fig.height=13}
+strata_long <- function(pd) {
+  meths <- list(
+    "TCC fixed (4)" = cut(pd$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                          labels = c("0-10", "11-48", "49-85", "86-100")),
+    "TCC DH (5)"    = dh_strata(pd$tcc,     params$K_strata),
+    "LM DH (5)"     = dh_strata(pd$lm_pred, params$K_strata),
+    "kNN DH (5)"    = dh_strata(pd$pred,    params$K_strata))
+  bind_rows(lapply(names(meths), function(nm)
+    tibble(target = pd$target[1], method = nm,
+           stratum = as.character(meths[[nm]]), obs = pd$obs)))
+}
+box_long <- bind_rows(lapply(res, function(r) strata_long(r$pred))) %>%
+  mutate(target = factor(target, levels = sapply(targets, `[[`, 3)),
+         method = factor(method, levels = c("TCC fixed (4)", "TCC DH (5)",
+                                            "LM DH (5)", "kNN DH (5)")))
+ggplot(box_long, aes(x = stratum, y = obs)) +
+  geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+  facet_grid(target ~ method, scales = "free") +
+  labs(x = "stratum", y = "observed target value",
+       title = "Per-stratum distribution of the actual target, by method") +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
 ## Notes
 
 - **Post-stratification is on held-out test data.** Strata are formed from the
