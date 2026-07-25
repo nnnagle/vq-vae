@@ -299,6 +299,42 @@ data.frame(
 )
 ```
 
+### Removals distribution within each stratum, by method
+
+The headline table gives one within-stratum variance per method; this unpacks it
+into the full distribution. For every stratification scheme, a boxplot of the
+removals response within each of its strata. Because removals are heavily
+zero-inflated and right-skewed, the y-axis is `log1p(removals)` so the boxes are
+legible; a method separates removals well when its boxes sit at visibly different
+levels. Facets share the y-axis (comparable across methods); the x-axis is free
+because strata labels differ across schemes.
+
+```{r strata-boxplot, fig.width = 11, fig.height = 6}
+strata_cols <- c(
+  "TCC fixed (4)"                 = "tcc_stratum",
+  "TCC DH (4)"                    = "tcc_dh",
+  "TCC DH-optimal (5)"            = "tcc_dh5",
+  "emb k-means (4, unsup)"        = "emb_km",
+  "emb sup-removals type (4)"     = "emb_sup_type",
+  "emb sup-removals type+phase (4)" = "emb_sup",
+  "TCC + emb sup-removals (4)"    = "emb_tcc_sup",
+  "emb sup-BALIVE -> removals (4)" = "emb_sup_bal")
+
+box_long <- dplyr::bind_rows(lapply(names(strata_cols), function(nm)
+  tibble(method  = nm,
+         stratum = as.character(analysis[[strata_cols[[nm]]]]),
+         val     = analysis[[resp]])))
+box_long$method <- factor(box_long$method, levels = names(strata_cols))
+
+ggplot(box_long, aes(x = stratum, y = log1p(val))) +
+  geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+  facet_wrap(~ method, scales = "free_x", nrow = 2) +
+  labs(x = "stratum", y = sprintf("log1p(%s)", resp),
+       title = "Removals within stratum, by stratification method") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
 ### Per survey unit
 
 ```{r per-unit}
