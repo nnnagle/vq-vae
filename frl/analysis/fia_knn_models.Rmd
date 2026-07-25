@@ -140,7 +140,8 @@ analysis <- emb %>% select(CN, all_of(emb_vars)) %>%
   inner_join(tcc_by_cn, by = "CN") %>%
   mutate(across(c(tpa_total, tpa_hard, tpa_soft, volume, BALIVE), ~ coalesce(., 0))) %>%
   filter(is.na(cond_status) | cond_status != 4,          # drop census water
-         !is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)
+         !is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100,
+         INVYR >=2019, INVYR <= 2024)
 ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals: GRM/remeasured
 cat(sprintf("plots (stocks): %d   plots (removals): %d   (census water removed)\n",
             nrow(analysis), nrow(ar)))
