@@ -235,6 +235,8 @@ v_flat <- pooled_within(analysis, c("UNITCD", "emb_flat"))
 v_hier <- pooled_within(analysis, c("UNITCD", "stratum"))
 
 vv <- c(v_unit, v_tcc, v_flat, v_hier)
+# RE vs the TCC (DH) baseline and SRS-equivalent effective sample size; under a
+# self-weighting sample RE = V_TCC/V_method (>1 beats TCC), ess_srs = N*S2/V_method
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
@@ -242,7 +244,9 @@ data.frame(
                       sprintf("UNITCD x hierarchical type/phase (%d)", params$K_strata)),
   within_var      = round(vv, 1),
   within_sd       = round(sqrt(vv), 2),
-  pct_of_baseline = round(100 * vv / v_unit, 1)
+  pct_of_baseline = round(100 * vv / v_unit, 1),
+  RE_vs_tcc       = round(v_tcc / vv, 2),
+  ess_srs         = round(nrow(analysis) * var(analysis[[resp]]) / vv)
 )
 ```
 
@@ -316,7 +320,9 @@ data.frame(
                       sprintf("UNITCD x flat removals supervised (%d)", params$K_strata)),
   within_var      = round(vr, 2),
   within_sd       = round(sqrt(vr), 3),
-  pct_of_baseline = round(100 * vr / vr_unit, 1)
+  pct_of_baseline = round(100 * vr / vr_unit, 1),
+  RE_vs_tcc       = round(vr_tcc / vr, 2),                       # V_TCC / V_method
+  ess_srs         = round(nrow(ar) * var(ar$remv_cfgs) / vr)     # SRS-equivalent ESS
 )
 ```
 

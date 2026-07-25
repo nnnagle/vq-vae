@@ -288,7 +288,10 @@ resp_table <- function(df, y) {
                        sprintf("UNITCD x HDBSCAN type+phase (k=%d -> %d)", ktp, params$K_strata),
                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
     within_var = round(vv, 2), within_sd = round(sqrt(vv), 3),
-    pct_of_baseline = round(100 * vv / vv[1], 1))
+    pct_of_baseline = round(100 * vv / vv[1], 1),
+    # vv[2] = TCC FIA fixed; RE = V_TCC/V_method (>1 beats TCC); ess_srs = N*S2/V_method
+    RE_vs_tcc = round(vv[2] / vv, 2),
+    ess_srs   = round(nrow(df) * var(df[[y]]) / vv))
 }
 # transfer: self-trained vs BALIVE-trained aggregation, for both HDBSCAN clusterings
 transfer_table <- function(df, y) {

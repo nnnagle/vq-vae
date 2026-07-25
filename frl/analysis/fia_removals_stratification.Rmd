@@ -269,7 +269,11 @@ pooled_within <- function(df, groups, y = resp) {
 ### Headline: overall pooled within-stratum variance
 
 Lower `within_var` / `pct_of_baseline < 100` = more homogeneous strata = a more
-efficient post-stratified estimator of removals.
+efficient post-stratified estimator of removals. `RE_vs_tcc` is the relative
+efficiency against the fixed-bin TCC baseline (`V_TCC / V_method`; > 1 beats
+TCC). `ess_srs` is the SRS-equivalent **effective sample size** (`N · S² /
+within_var`). Both assume a self-weighting sample (`W_h = n_h/N`) — internal,
+sample-based efficiencies rather than design-based (area-weighted) ones.
 
 ```{r headline}
 v_unit  <- pooled_within(analysis, "UNITCD")
@@ -283,6 +287,12 @@ v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
 v_bal   <- pooled_within(analysis, c("UNITCD", "emb_sup_bal"))
 
 vv <- c(v_unit, v_tcc, v_tccd, v_tccd5, v_km, v_supt, v_sup, v_ct, v_bal)
+# Relative efficiency vs the (fixed-bin) TCC baseline and SRS-equivalent effective
+# sample size. Under a self-weighting sample the estimator variance is
+# within_var / N, so RE = V_TCC / V_method (>1 beats TCC) and
+# ess_srs = N * S2 / V_method, with S2 the unstratified (SRS) per-plot variance.
+N  <- nrow(analysis)
+S2 <- var(analysis[[resp]])
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       "UNITCD x TCC fixed bins (4)",
@@ -295,7 +305,9 @@ data.frame(
                       "UNITCD x emb supervised-for-BALIVE, applied to removals (4)"),
   within_var      = round(vv, 2),
   within_sd       = round(sqrt(vv), 3),
-  pct_of_baseline = round(100 * vv / v_unit, 1)
+  pct_of_baseline = round(100 * vv / v_unit, 1),
+  RE_vs_tcc       = round(v_tcc / vv, 2),
+  ess_srs         = round(N * S2 / vv)
 )
 ```
 
