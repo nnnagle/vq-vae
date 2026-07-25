@@ -219,6 +219,7 @@ analysis <- analysis %>%
   mutate(tcc_stratum = cut(tcc, breaks = c(-Inf, 10, 48, 85, Inf),
                            labels = c("0-10", "11-48", "49-85", "86-100")))
 analysis$tcc_dh <- dh_strata(analysis$tcc, 4)
+analysis$tcc_dh5 <- dh_strata(analysis$tcc, 5)   # optimal (Dalenius-Hodges) 5-strata TCC
 
 # --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type ------------
 set.seed(1)
@@ -274,17 +275,19 @@ efficient post-stratified estimator of removals.
 v_unit  <- pooled_within(analysis, "UNITCD")
 v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
 v_tccd  <- pooled_within(analysis, c("UNITCD", "tcc_dh"))
+v_tccd5 <- pooled_within(analysis, c("UNITCD", "tcc_dh5"))
 v_km    <- pooled_within(analysis, c("UNITCD", "emb_km"))
 v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
 v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
 v_bal   <- pooled_within(analysis, c("UNITCD", "emb_sup_bal"))
 
-vv <- c(v_unit, v_tcc, v_tccd, v_km, v_supt, v_sup, v_ct, v_bal)
+vv <- c(v_unit, v_tcc, v_tccd, v_tccd5, v_km, v_supt, v_sup, v_ct, v_bal)
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       "UNITCD x TCC fixed bins (4)",
                       "UNITCD x TCC DH bins (4)",
+                      "UNITCD x TCC DH bins (5, optimal)",
                       "UNITCD x embedding k-means (4, unsup)",
                       "UNITCD x emb supervised-for-removals, type-only (4)",
                       "UNITCD x emb supervised-for-removals, type+phase (4)",

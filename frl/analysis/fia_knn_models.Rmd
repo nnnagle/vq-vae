@@ -246,22 +246,28 @@ strat_summary <- function(pd) {
   base  <- pooled_within(pd, "UNITCD", "obs")
   s_tcc <- cut(pd$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
                labels = c("0-10", "11-48", "49-85", "86-100"))
+  s_tccd <- dh_strata(pd$tcc, params$K_strata)   # optimal (DH) 5-strata TCC
   s_lm  <- dh_strata(pd$lm_pred, params$K_strata)
   s_knn <- dh_strata(pd$pred, params$K_strata)
-  v_tcc <- pooled_within(mutate(pd, .s = s_tcc), c("UNITCD", ".s"), "obs")
+  v_tcc  <- pooled_within(mutate(pd, .s = s_tcc),  c("UNITCD", ".s"), "obs")
+  v_tccd <- pooled_within(mutate(pd, .s = s_tccd), c("UNITCD", ".s"), "obs")
   v_lm  <- pooled_within(mutate(pd, .s = s_lm),  c("UNITCD", ".s"), "obs")
   v_knn <- pooled_within(mutate(pd, .s = s_knn), c("UNITCD", ".s"), "obs")
   data.frame(target = pd$target[1], n_test = nrow(pd),
              baseline_sd = round(sqrt(base), 3),
-             tcc_pct = round(100 * v_tcc / base, 1),
+             tcc_pct   = round(100 * v_tcc  / base, 1),
+             tccdh_pct = round(100 * v_tccd / base, 1),
              lm_pct  = round(100 * v_lm  / base, 1),
              knn_pct = round(100 * v_knn / base, 1))
 }
 ```
 
-`tcc_pct` / `lm_pct` / `knn_pct` are within-stratum variance as a percent of the
-UNITCD-only baseline (lower = better). `knn_pct < tcc_pct` means the
-kNN-prediction strata beat the TCC split; comparing `knn_pct` to `lm_pct` (strata
+`tcc_pct` / `tccdh_pct` / `lm_pct` / `knn_pct` are within-stratum variance as a
+percent of the UNITCD-only baseline (lower = better). `tcc_pct` uses the FIA
+operational canopy breaks; `tccdh_pct` uses an optimal (Dalenius-Hodges)
+5-strata split of the same TCC covariate — the strongest a single TCC axis can
+do at matched strata count. `knn_pct < tccdh_pct` means the
+kNN-prediction strata beat even the optimally-binned TCC split; comparing `knn_pct` to `lm_pct` (strata
 from a linear probe trained the same way) separates *"the embedding is
 decodable"* (both low) from *"kNN's local geometry helps"* (`knn_pct` << `lm_pct`).
 

@@ -271,6 +271,7 @@ map_bal_tp   <- fit_agg(analysis, "BALIVE", "hdb_tp")
 schemes <- function(df, y) list(
   "TCC FIA fixed"      = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
                              labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"             = dh_strata(df$tcc, params$K_strata),
   "HDBSCAN type"       = agg_by(df$hdb_type, df[[y]], params$K_strata),
   "HDBSCAN type+phase" = agg_by(df$hdb_tp,   df[[y]], params$K_strata),
   "flat probe"         = oof_dh(df, y, emb_vars, params$K_strata))
@@ -282,6 +283,7 @@ resp_table <- function(df, y) {
   data.frame(
     stratification = c("UNITCD only (baseline)",
                        "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
+                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
                        sprintf("UNITCD x HDBSCAN type (k=%d -> %d)", ktype, params$K_strata),
                        sprintf("UNITCD x HDBSCAN type+phase (k=%d -> %d)", ktp, params$K_strata),
                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),

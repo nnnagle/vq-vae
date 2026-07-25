@@ -203,6 +203,23 @@ analysis <- analysis %>%
 # fixed bins above are lopsided (few low-canopy plots), which handicaps them.
 analysis$tcc_q <- factor(dplyr::ntile(analysis$tcc, 4), labels = paste0("T", 1:4))
 
+# --- TCC strata: optimal (Dalenius-Hodges) 5 bins ---------------------------
+# The strongest a single TCC axis can do at a fixed strata count: cumulative-
+# sqrt(frequency) boundaries minimize within-stratum variance for the covariate.
+dh_breaks <- function(x, K, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(numeric(0))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+}
+dh_strata <- function(x, K, nbins = 100) {
+  bnd <- dh_breaks(x, K, nbins)
+  if (length(bnd) == 0) return(factor(rep(1L, length(x))))
+  factor(findInterval(as.numeric(x), c(-Inf, bnd, Inf)))
+}
+analysis$tcc_dh5 <- dh_strata(analysis$tcc, 5)
+
 # --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type space -------
 set.seed(1)
 Z  <- scale(as.matrix(analysis[, emb_type_vars]))
@@ -238,6 +255,7 @@ analysis$emb_tcc_sup <- factor(dplyr::ntile(oof_score(c(emb_vars, "tcc")), 4), l
 
 cat("TCC fixed-bin counts:\n");                     print(table(analysis$tcc_stratum))
 cat("\nTCC quartile counts:\n");                     print(table(analysis$tcc_q))
+cat("\nTCC DH-optimal (5) counts:\n");               print(table(analysis$tcc_dh5))
 cat("\nEmbedding k-means (unsup) counts:\n");        print(table(analysis$emb_km))
 cat("\nEmbedding supervised type-only counts:\n");   print(table(analysis$emb_sup_type))
 cat("\nEmbedding supervised type+phase counts:\n");  print(table(analysis$emb_sup))
@@ -271,16 +289,18 @@ efficient post-stratified estimator.
 v_unit  <- pooled_within(analysis, "UNITCD")
 v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
 v_tccq  <- pooled_within(analysis, c("UNITCD", "tcc_q"))
+v_tccd5 <- pooled_within(analysis, c("UNITCD", "tcc_dh5"))
 v_km    <- pooled_within(analysis, c("UNITCD", "emb_km"))
 v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
 v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
 v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
 
-vv <- c(v_unit, v_tcc, v_tccq, v_km, v_supt, v_sup, v_ct)
+vv <- c(v_unit, v_tcc, v_tccq, v_tccd5, v_km, v_supt, v_sup, v_ct)
 data.frame(
   stratification  = c("UNITCD only (baseline)",
                       "UNITCD x TCC fixed bins (4)",
                       "UNITCD x TCC quartiles (4)",
+                      "UNITCD x TCC DH-optimal (5)",
                       "UNITCD x embedding k-means (4, unsup)",
                       "UNITCD x embedding supervised type-only (4, OOF)",
                       "UNITCD x embedding supervised type+phase (4, OOF)",
