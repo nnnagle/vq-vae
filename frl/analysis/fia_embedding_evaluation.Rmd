@@ -1075,36 +1075,88 @@ rbind(
 ```
 
 
-## 9. Removals kNN evaluation (optimum w) + neighborhood removal coherence
+## 9. Removals kNN evaluation (removals-tuned w) + neighborhood removal coherence
 
-Section 2b imputed removals with an unweighted phase block (`w = 1`, run before
-the tuning). This repeats it with the **BALIVE-tuned** phase weight from Section 3
-(`w_opt` / `w_opt_inp`) — reused, not re-tuned for removals — and adds a
-neighborhood-coherence probe: for a query plot, what fraction of its k nearest
+Removals are a *disturbance/phase* phenomenon, so the type-vs-phase weight tuned
+on **BALIVE** (`w_opt = 1`, phase-light) is the wrong weight to carry over. This
+section therefore runs a **removals-specific** joint `(w, k)` sweep — the phase
+weight `w` and neighborhood `k` are tuned together on **removals validation MSE**,
+separately for the embedding and the raw inputs — and compares the result against
+the BALIVE-reused weight. Everything downstream (prediction loss, the
+neighborhood-coherence probe, the actual-vs-predicted plot) then uses the
+removals-tuned weights. Population and block-L2 normalization are the
+remeasured/GRM objects built in Section 2b.
+
+The coherence probe asks: for a query plot, what fraction of its `k` nearest
 neighbors are themselves **removal plots** (`remv_cfgs > 0`)? If the embedding
 places removal plots near each other, that fraction should sit above the base
-rate and **rise with the query's own removal value**. Population and block-L2
-normalization are the remeasured/GRM objects built in Section 2b.
+rate and **rise with the query's own removal value**.
 
 ```{r removals-w-prep}
-we <- w_opt        # BALIVE-tuned embedding phase weight (Section 3)
-wi <- w_opt_inp    # BALIVE-tuned input phase weight (Section 3)
-cat(sprintf("reused phase weights (tuned on BALIVE): emb=%.2f  inp=%.2f\n", we, wi))
+wb_emb <- w_opt; wb_inp <- w_opt_inp               # BALIVE-tuned weights (baseline for comparison)
+yq_tr <- rd_r_train$remv_cfgs; yq_va <- rd_r_val$remv_cfgs; yq_te <- rd_r_test$remv_cfgs
+is_rem_tr <- as.integer(yq_tr > 0)                 # neighbor "is a removal plot" indicator
+cat(sprintf("train removal-plot base rate (remv>0): %.3f | reused BALIVE w: emb=%.2f inp=%.2f\n",
+            mean(is_rem_tr), wb_emb, wb_inp))
+```
 
-# phase-weighted features on the removals (remeasured) population from Section 2b
+### Removals-specific phase-weight sweep
+
+Joint `(w, k)` grid search minimizing **removals** validation MSE, separately per
+representation. The table contrasts the BALIVE-reused weight (best `k` at that
+fixed `w`) with the removals-tuned `(w, k)` — a large drop in `valMSE_removals`
+vs. `valMSE_balive` means removals genuinely want a different (heavier) phase
+weight than BALIVE.
+
+```{r removals-w-sweep}
+kgrid_w    <- c(5, 10, 15, 20, 30, 50, 100); kgrid_w <- kgrid_w[kgrid_w < nrow(type_emb_r$train)]
+w_grid_emb <- c(0.5, 1, 1.5, 2, 3, 4, 6, 8, 12, 16)
+w_grid_inp <- c(2, 4, 6, 8, 11, 14, 18, 24, 30, 40)
+
+# joint (w, k) tuner on removals validation MSE (w_grid = single value -> best k at that w)
+tune_wk <- function(type_tr, phase_tr, type_va, phase_va, w_grid) {
+  best <- list(w = NA, k = NA, mse = Inf)
+  for (w in w_grid) {
+    ref <- cbind(type_tr, w * phase_tr); qva <- cbind(type_va, w * phase_va)
+    for (k in kgrid_w) {
+      m <- mse(yq_va, knn_balive(get.knnx(ref, qva, k = k), yq_tr))
+      if (m < best$mse) best <- list(w = w, k = k, mse = m)
+    }
+  }
+  best
+}
+et <- type_emb_r$train; ep <- phase_emb_r$train; ev <- type_emb_r$val; epv <- phase_emb_r$val
+it <- rd_r_train[, inp_type_vars]; ip <- rd_r_train[, inp_phase_vars]
+iv <- rd_r_val[, inp_type_vars];   ipv <- rd_r_val[, inp_phase_vars]
+
+sw_emb <- tune_wk(et, ep, ev, epv, w_grid_emb)     # removals-tuned, embedding
+sw_inp <- tune_wk(it, ip, iv, ipv, w_grid_inp)     # removals-tuned, input
+bl_emb <- tune_wk(et, ep, ev, epv, wb_emb)         # BALIVE-reused w, best k
+bl_inp <- tune_wk(it, ip, iv, ipv, wb_inp)
+
+data.frame(
+  representation   = c("embedding", "raw input"),
+  w_balive         = c(bl_emb$w, bl_inp$w),
+  valMSE_balive    = round(c(bl_emb$mse, bl_inp$mse), 1),
+  w_removals       = c(sw_emb$w, sw_inp$w),
+  k_removals       = c(sw_emb$k, sw_inp$k),
+  valMSE_removals  = round(c(sw_emb$mse, sw_inp$mse), 1)
+)
+```
+
+```{r removals-w-features}
+we <- sw_emb$w; wi <- sw_inp$w                      # removals-tuned phase weights, used below
 emb_ref_w <- cbind(type_emb_r$train, we * phase_emb_r$train)
 emb_va_w  <- cbind(type_emb_r$val,   we * phase_emb_r$val)
 emb_te_w  <- cbind(type_emb_r$test,  we * phase_emb_r$test)
 inp_ref_w <- cbind(rd_r_train[, inp_type_vars], wi * rd_r_train[, inp_phase_vars])
 inp_va_w  <- cbind(rd_r_val[,   inp_type_vars], wi * rd_r_val[,   inp_phase_vars])
 inp_te_w  <- cbind(rd_r_test[,  inp_type_vars], wi * rd_r_test[,  inp_phase_vars])
-
-yq_tr <- rd_r_train$remv_cfgs; yq_va <- rd_r_val$remv_cfgs; yq_te <- rd_r_test$remv_cfgs
-is_rem_tr <- as.integer(yq_tr > 0)                 # neighbor "is a removal plot" indicator
-cat(sprintf("train removal-plot base rate (remv>0): %.3f\n", mean(is_rem_tr)))
+cat(sprintf("removals-tuned phase weights: emb w=%.2f (BALIVE %.2f)   inp w=%.2f (BALIVE %.2f)\n",
+            we, wb_emb, wi, wb_inp))
 ```
 
-### Prediction loss (kNN regression, tuned w)
+### Prediction loss (kNN regression, removals-tuned w)
 
 ```{r removals-w-regression}
 r2v <- function(o, p) 1 - sum((o - p)^2) / sum((o - mean(o))^2)
