@@ -1168,6 +1168,40 @@ legend("topleft", c("embedding", "raw input", "train base rate"),
        pch = c(16, 16, NA), bty = "n")
 ```
 
+### Actual vs. predicted removals (removal plots only)
+
+Restricted to plots with an actual removal (`remv_cfgs > 0`), since the zero mass
+would otherwise dominate the panel. `k` is the same validation-tuned value used in
+the loss table. Expect strong **regression to the mean** — kNN averages neighbors
+whose removals are mostly small or zero, so predictions for large actual removals
+sit well below the 1:1 line; the question is whether the embedding tracks the
+diagonal more closely than the raw inputs.
+
+```{r removals-w-actual-pred, fig.width=10, fig.height=5}
+tune_k <- function(ref, qva) {
+  vm <- sapply(kgrid_w, function(k) mse(yq_va, knn_balive(get.knnx(ref, qva, k = k), yq_tr)))
+  kgrid_w[which.min(vm)]
+}
+kb_emb <- tune_k(emb_ref_w, emb_va_w); kb_inp <- tune_k(inp_ref_w, inp_va_w)
+p_emb  <- knn_balive(get.knnx(emb_ref_w, emb_te_w, k = kb_emb), yq_tr)
+p_inp  <- knn_balive(get.knnx(inp_ref_w, inp_te_w, k = kb_inp), yq_tr)
+
+pos <- yq_te > 0                                   # removal plots only (actual > 0)
+lim <- range(0, yq_te[pos], p_emb[pos], p_inp[pos])
+op <- par(mfrow = c(1, 2), mar = c(4.4, 4.4, 3, 1))
+plot(yq_te[pos], p_emb[pos], pch = 16, col = adjustcolor("steelblue", 0.4),
+     xlim = lim, ylim = lim, xlab = "actual removals (remv_cfgs)",
+     ylab = "kNN predicted removals",
+     main = sprintf("Embedding (k=%d, n=%d removal plots)", kb_emb, sum(pos)))
+abline(0, 1, col = "red", lwd = 1.5)
+plot(yq_te[pos], p_inp[pos], pch = 16, col = adjustcolor("darkorange", 0.4),
+     xlim = lim, ylim = lim, xlab = "actual removals (remv_cfgs)",
+     ylab = "kNN predicted removals",
+     main = sprintf("Raw input (k=%d, n=%d removal plots)", kb_inp, sum(pos)))
+abline(0, 1, col = "red", lwd = 1.5)
+par(op)
+```
+
 
 ## Cleanup
 
