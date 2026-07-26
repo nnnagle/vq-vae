@@ -1075,6 +1075,100 @@ rbind(
 ```
 
 
+## 9. Removals kNN evaluation (optimum w) + neighborhood removal coherence
+
+Section 2b imputed removals with an unweighted phase block (`w = 1`, run before
+the tuning). This repeats it with the **BALIVE-tuned** phase weight from Section 3
+(`w_opt` / `w_opt_inp`) — reused, not re-tuned for removals — and adds a
+neighborhood-coherence probe: for a query plot, what fraction of its k nearest
+neighbors are themselves **removal plots** (`remv_cfgs > 0`)? If the embedding
+places removal plots near each other, that fraction should sit above the base
+rate and **rise with the query's own removal value**. Population and block-L2
+normalization are the remeasured/GRM objects built in Section 2b.
+
+```{r removals-w-prep}
+we <- w_opt        # BALIVE-tuned embedding phase weight (Section 3)
+wi <- w_opt_inp    # BALIVE-tuned input phase weight (Section 3)
+cat(sprintf("reused phase weights (tuned on BALIVE): emb=%.2f  inp=%.2f\n", we, wi))
+
+# phase-weighted features on the removals (remeasured) population from Section 2b
+emb_ref_w <- cbind(type_emb_r$train, we * phase_emb_r$train)
+emb_va_w  <- cbind(type_emb_r$val,   we * phase_emb_r$val)
+emb_te_w  <- cbind(type_emb_r$test,  we * phase_emb_r$test)
+inp_ref_w <- cbind(rd_r_train[, inp_type_vars], wi * rd_r_train[, inp_phase_vars])
+inp_va_w  <- cbind(rd_r_val[,   inp_type_vars], wi * rd_r_val[,   inp_phase_vars])
+inp_te_w  <- cbind(rd_r_test[,  inp_type_vars], wi * rd_r_test[,  inp_phase_vars])
+
+yq_tr <- rd_r_train$remv_cfgs; yq_va <- rd_r_val$remv_cfgs; yq_te <- rd_r_test$remv_cfgs
+is_rem_tr <- as.integer(yq_tr > 0)                 # neighbor "is a removal plot" indicator
+cat(sprintf("train removal-plot base rate (remv>0): %.3f\n", mean(is_rem_tr)))
+```
+
+### Prediction loss (kNN regression, tuned w)
+
+```{r removals-w-regression}
+r2v <- function(o, p) 1 - sum((o - p)^2) / sum((o - mean(o))^2)
+kgrid_w <- c(5, 10, 15, 20, 30, 50, 100); kgrid_w <- kgrid_w[kgrid_w < nrow(emb_ref_w)]
+knn_reg_eval <- function(ref, qva, qte) {
+  vm <- sapply(kgrid_w, function(k) mse(yq_va, knn_balive(get.knnx(ref, qva, k = k), yq_tr)))
+  kb <- kgrid_w[which.min(vm)]
+  pt <- knn_balive(get.knnx(ref, qte, k = kb), yq_tr)
+  data.frame(k_best = kb, val_MSE = round(min(vm), 3),
+             test_MSE = round(mse(yq_te, pt), 3), test_RMSE = round(sqrt(mse(yq_te, pt)), 3),
+             test_R2 = round(r2v(yq_te, pt), 3))
+}
+rbind(
+  cbind(representation = "embedding", knn_reg_eval(emb_ref_w, emb_va_w, emb_te_w)),
+  cbind(representation = "raw input", knn_reg_eval(inp_ref_w, inp_va_w, inp_te_w))
+)
+```
+
+### Fraction of neighbors that are removals, and vs. removal value
+
+```{r removals-w-neighbors, fig.width=10, fig.height=5}
+k_nbr <- min(25, nrow(emb_ref_w) - 1)              # fixed neighborhood for the coherence probe
+nbr_rem_frac <- function(ref, qte) {
+  nn <- get.knnx(ref, qte, k = k_nbr)$nn.index
+  rowMeans(matrix(is_rem_tr[nn], nrow = nrow(nn)))
+}
+frac_emb <- nbr_rem_frac(emb_ref_w, emb_te_w)
+frac_inp <- nbr_rem_frac(inp_ref_w, inp_te_w)
+
+base_rate <- mean(is_rem_tr)
+qpos <- yq_te > 0
+summ <- data.frame(
+  representation       = c("embedding", "raw input"),
+  frac_removal_query   = c(mean(frac_emb[qpos]),  mean(frac_inp[qpos])),
+  frac_zero_query      = c(mean(frac_emb[!qpos]), mean(frac_inp[!qpos])),
+  lift_removal_vs_base = c(mean(frac_emb[qpos]),  mean(frac_inp[qpos])) / base_rate
+)
+summ[, -1] <- round(summ[, -1], 3)
+cat(sprintf("neighbor removal-fraction at k=%d  (train base rate = %.3f)\n", k_nbr, base_rate))
+print(summ)
+
+# fraction of removal-neighbors as a function of the query's own removal value:
+# zero class + quantile bins of positive removals
+bin_stat <- function(frac) {
+  br <- unique(quantile(yq_te[qpos], probs = seq(0, 1, length.out = 6), na.rm = TRUE))
+  b  <- rep(0L, length(yq_te)); b[qpos] <- as.integer(cut(yq_te[qpos], br, include.lowest = TRUE))
+  data.frame(b = b, q = yq_te, frac = frac) %>% group_by(b) %>%
+    summarize(n = n(), q_mean = mean(q), frac_mean = mean(frac), .groups = "drop")
+}
+be <- bin_stat(frac_emb); bi <- bin_stat(frac_inp)
+
+xr <- range(0, be$q_mean, bi$q_mean); yr <- range(0, be$frac_mean, bi$frac_mean, base_rate)
+plot(be$q_mean, be$frac_mean, type = "o", pch = 16, col = "steelblue", lwd = 2, xlim = xr, ylim = yr,
+     xlab = "query plot removal value (remv_cfgs; x = 0 = no-removal class)",
+     ylab = sprintf("fraction of %d nearest neighbors that are removals", k_nbr),
+     main = "Neighborhood removal coherence vs. query removal value")
+lines(bi$q_mean, bi$frac_mean, type = "o", pch = 16, col = "darkorange", lwd = 2)
+abline(h = base_rate, lty = 3)
+legend("topleft", c("embedding", "raw input", "train base rate"),
+       col = c("steelblue", "darkorange", "black"), lwd = 2, lty = c(1, 1, 3),
+       pch = c(16, 16, NA), bty = "n")
+```
+
+
 ## Cleanup
 
 ```{r cleanup}
