@@ -986,6 +986,95 @@ cat(sprintf("Embedding multinom accuracy: %.3f\n", mean(pred_emb[ok] == reg_data
 ```
 
 
+## 8. Recovery-stage (ysfc) kNN evaluation
+
+The direct test of the `z_phase` pathway's purpose: can kNN in the embedding
+recover a plot's **years-since-fast-change (`ysfc`)** — both as a continuous
+imputation and as a recovery-*class* vote — better than the raw inputs? To keep
+this an honest **reuse** rather than a fresh tune, the type-vs-phase phase weight
+is **not** re-optimized for recovery: it is fixed at the value tuned on **BALIVE**
+in Section 3 (`w_opt` for the embedding, `w_opt_inp` for the inputs). Only `k` is
+tuned here, on validation, for each target. If recovery signal survives a weight
+picked for a *different* target, it is genuinely present in the metric — not an
+artifact of tuning the metric to the recovery labels.
+
+```{r recovery-prep}
+we <- w_opt        # BALIVE-tuned embedding phase weight (Section 3 baseline sweep)
+wi <- w_opt_inp    # BALIVE-tuned input phase weight (carried from Section 3)
+cat(sprintf("reused phase weights (tuned on BALIVE): emb w_opt = %.2f   inp w_opt_inp = %.2f\n", we, wi))
+
+# rows with a finite ysfc, per split
+fin_tr <- is.finite(AnnDat_train$ysfc)
+fin_va <- is.finite(AnnDat_val$ysfc)
+fin_te <- is.finite(AnnDat_test$ysfc)
+
+# phase-weighted reference/query matrices, restricted to finite-ysfc rows
+emb_ref <- cbind(type_emb$train, we * phase_emb$train)[fin_tr, ]
+emb_va  <- cbind(type_emb$val,   we * phase_emb$val)[fin_va, ]
+emb_te  <- cbind(type_emb$test,  we * phase_emb$test)[fin_te, ]
+inp_ref <- cbind(AnnDat_train[, inp_type_vars], wi * AnnDat_train[, inp_phase_vars])[fin_tr, ]
+inp_va  <- cbind(AnnDat_val[,   inp_type_vars], wi * AnnDat_val[,   inp_phase_vars])[fin_va, ]
+inp_te  <- cbind(AnnDat_test[,  inp_type_vars], wi * AnnDat_test[,  inp_phase_vars])[fin_te, ]
+
+y_tr <- AnnDat_train$ysfc[fin_tr]; y_va <- AnnDat_val$ysfc[fin_va]; y_te <- AnnDat_test$ysfc[fin_te]
+
+# recovery classes (same bins as the Section 6 coherence figure), integer-coded so
+# the numeric-returning knn_mode() from Section 7 can be reused
+brks_r <- c(-Inf, 2, 5, 10, 20, Inf)
+labs_r <- c("recent(0-2)", "young(3-5)", "mid(6-10)", "mature(11-19)", "stable(20+)")
+code_tr <- as.integer(cut(y_tr, brks_r, labels = labs_r))
+code_va <- as.integer(cut(y_va, brks_r, labels = labs_r))
+code_te <- as.integer(cut(y_te, brks_r, labels = labs_r))
+
+kgrid_rec <- c(5, 10, 15, 20, 30, 50, 75, 100)
+kgrid_rec <- kgrid_rec[kgrid_rec < nrow(emb_ref)]     # k must not exceed the reference size
+r2v <- function(o, p) 1 - sum((o - p)^2) / sum((o - mean(o))^2)
+
+cat(sprintf("recovery kNN population (finite ysfc): train=%d val=%d test=%d\n",
+            sum(fin_tr), sum(fin_va), sum(fin_te)))
+```
+
+### Continuous ysfc imputation (kNN regression)
+
+`ysfc` imputed as the mean of the k train neighbors; `k` tuned on validation MSE
+with the phase weight fixed at its BALIVE-tuned value.
+
+```{r recovery-regression}
+knn_reg_eval <- function(ref, qva, qte) {
+  vm <- sapply(kgrid_rec, function(k) mse(y_va, knn_balive(get.knnx(ref, qva, k = k), y_tr)))
+  kb <- kgrid_rec[which.min(vm)]
+  pt <- knn_balive(get.knnx(ref, qte, k = kb), y_tr)
+  data.frame(k_best = kb, val_MSE = round(min(vm), 2),
+             test_RMSE = round(sqrt(mse(y_te, pt)), 2), test_R2 = round(r2v(y_te, pt), 3))
+}
+rbind(
+  cbind(representation = "embedding", knn_reg_eval(emb_ref, emb_va, emb_te)),
+  cbind(representation = "raw input", knn_reg_eval(inp_ref, inp_va, inp_te))
+)
+```
+
+### Recovery-class vote (kNN classification)
+
+Majority vote over the k train neighbors' recovery class; `k` tuned on validation
+accuracy. Compare `test_acc` to the no-information rate (predicting the largest
+class), since the stable class dominates.
+
+```{r recovery-classification}
+knn_cls_eval <- function(ref, qva, qte) {
+  va <- sapply(kgrid_rec, function(k) acc(code_va, knn_mode(get.knnx(ref, qva, k = k), code_tr)))
+  kb <- kgrid_rec[which.max(va)]
+  pt <- knn_mode(get.knnx(ref, qte, k = kb), code_tr)
+  data.frame(k_best = kb, val_acc = round(max(va), 3), test_acc = round(acc(code_te, pt), 3))
+}
+cat(sprintf("recovery-class no-information rate (largest class, test): %.3f\n",
+            max(prop.table(table(code_te)))))
+rbind(
+  cbind(representation = "embedding", knn_cls_eval(emb_ref, emb_va, emb_te)),
+  cbind(representation = "raw input", knn_cls_eval(inp_ref, inp_va, inp_te))
+)
+```
+
+
 ## Cleanup
 
 ```{r cleanup}
