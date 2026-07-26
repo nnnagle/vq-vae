@@ -178,17 +178,39 @@ plot_cond_data_max <- cond_data %>%
   select(PLT_CN, FORTYPCD)
 ```
 
+### Pull removals (GRM), a second continuous target
+
+`BALIVE` (from `COND`) is a *stock*. Removals are a *flux* — annual per-acre
+removed growing-stock volume — and live in `TREE_GRM_COMPONENT`, defined only on
+**remeasured** plots. A remeasured plot with no cut trees is a genuine `0`;
+plots not in the GRM table get `NA` and are excluded from the removals kNN in
+Section 2b (they have no removals to predict). This mirrors the `remv_cfgs`
+target and population used in `fia_knn_models.Rmd`.
+
+```{r fia-removals}
+dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb_data$CN)),
+             temporary = TRUE, overwrite = TRUE)
+remv_data <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+```
+
 ### Join to a single regression frame
 
 Every downstream analysis (linear probes, kNN imputation, forest-type
 classification) is restricted to plots with a **known forest type**: rows with a
 missing `FORTYPCD` are dropped here at the source, so the whole report runs on the
-same forest-type population.
+same forest-type population. `remv_cfgs` is joined on as well (left join, so
+non-remeasured plots carry `NA` and are filtered only where removals are used).
 
 ```{r reg-data}
 reg_data <- plot_cond_data_avg %>%
   left_join(plot_cond_data_max, by = "PLT_CN") %>%
   inner_join(emb_data, by = c("PLT_CN" = "CN")) %>%
+  left_join(remv_data, by = "PLT_CN") %>%          # removals: NA off the GRM/remeasured panel
   filter(!is.na(FORTYPCD)) %>%                     # only plots with a forest type
   mutate(FORTYPGRP = as.factor(substr(FORTYPCD, 1, 2)))
 
@@ -338,6 +360,62 @@ data.frame(
               mse(AnnDat_test$BALIVE,  pred_inp_test))
 )
 
+```
+
+## 2b. k-Nearest-Neighbor imputation of removals
+
+`BALIVE` above is a *stock*; this repeats the kNN test for **removals**
+(`remv_cfgs`), the *flux* target, on the remeasured/GRM subset. Removals are
+strongly **zero-inflated and right-skewed** — most plots have no cut — so MSE is
+dominated by the zero mass and a handful of large cuts, and R² runs low. Read the
+**embedding-vs-input gap**, not the absolute level. The block-L2 normalization and
+`k` are refit on this population's train rows; `k` is tuned on validation MSE.
+
+```{r knn-removals-prep}
+# remeasured subset of each split (removals defined; NA = off the GRM panel)
+rd_r_train <- AnnDat_train[!is.na(AnnDat_train$remv_cfgs), ]
+rd_r_val   <- AnnDat_val[  !is.na(AnnDat_val$remv_cfgs),   ]
+rd_r_test  <- AnnDat_test[ !is.na(AnnDat_test$remv_cfgs),  ]
+
+# block-L2-normalized embedding, refit on THIS population's train rows
+type_emb_r  <- pop_l2_normalize(rd_r_train[, emb_type_vars],  rd_r_val[, emb_type_vars],  rd_r_test[, emb_type_vars])
+phase_emb_r <- pop_l2_normalize(rd_r_train[, emb_phase_vars], rd_r_val[, emb_phase_vars], rd_r_test[, emb_phase_vars])
+emb_r_train <- cbind(type_emb_r$train, phase_emb_r$train)
+emb_r_val   <- cbind(type_emb_r$val,   phase_emb_r$val)
+emb_r_test  <- cbind(type_emb_r$test,  phase_emb_r$test)
+
+# raw inputs (already model-ready scale) as-is
+inp_r_train <- rd_r_train[, c(inp_type_vars, inp_phase_vars)]
+inp_r_val   <- rd_r_val[,   c(inp_type_vars, inp_phase_vars)]
+inp_r_test  <- rd_r_test[,  c(inp_type_vars, inp_phase_vars)]
+
+cat(sprintf("removals kNN population: train=%d val=%d test=%d | mean(train)=%.3f  frac_zero(train)=%.2f\n",
+            nrow(rd_r_train), nrow(rd_r_val), nrow(rd_r_test),
+            mean(rd_r_train$remv_cfgs), mean(rd_r_train$remv_cfgs == 0)))
+```
+
+```{r knn-removals-eval}
+r2v <- function(obs, pred) 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+kgrid_r <- c(5, 10, 15, 20, 30, 50, 100)
+kgrid_r <- kgrid_r[kgrid_r < nrow(rd_r_train)]     # k must not exceed the reference size
+
+# impute removals as the mean of the k train neighbors; tune k on val, score test
+knn_rmv <- function(ref, qval, qtest) {
+  y_tr <- rd_r_train$remv_cfgs
+  val_mse <- sapply(kgrid_r, function(k)
+    mse(rd_r_val$remv_cfgs, knn_balive(get.knnx(ref, qval, k = k), y_tr)))
+  kbest  <- kgrid_r[which.min(val_mse)]
+  p_test <- knn_balive(get.knnx(ref, qtest, k = kbest), y_tr)
+  data.frame(k_best = kbest,
+             val_MSE  = round(min(val_mse), 3),
+             test_MSE = round(mse(rd_r_test$remv_cfgs, p_test), 3),
+             test_R2  = round(r2v(rd_r_test$remv_cfgs, p_test), 3))
+}
+
+rbind(
+  cbind(representation = "embedding", knn_rmv(emb_r_train, emb_r_val, emb_r_test)),
+  cbind(representation = "raw input", knn_rmv(inp_r_train, inp_r_val, inp_r_test))
+)
 ```
 
 ## 3. Tuning the type-vs-phase scale, then sweeping k
