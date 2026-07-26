@@ -1165,9 +1165,18 @@ knn_reg_eval <- function(ref, qva, qte) {
   vm <- sapply(kgrid_w, function(k) mse(yq_va, knn_balive(get.knnx(ref, qva, k = k), yq_tr)))
   kb <- kgrid_w[which.min(vm)]
   pt <- knn_balive(get.knnx(ref, qte, k = kb), yq_tr)
-  data.frame(k_best = kb, val_MSE = round(min(vm), 3),
-             test_MSE = round(mse(yq_te, pt), 3), test_RMSE = round(sqrt(mse(yq_te, pt)), 3),
-             test_R2 = round(r2v(yq_te, pt), 3))
+  pos <- yq_te > 0                                      # removal plots only (the scatter's population)
+  data.frame(
+    k_best = kb,
+    # full test set (all plots, ~89% zeros) -- what the table reported before
+    test_RMSE = round(sqrt(mse(yq_te, pt)), 2), test_R2 = round(r2v(yq_te, pt), 3),
+    # removal plots only (yq_te > 0) -- same population as the actual-vs-predicted plot
+    n_pos = sum(pos),
+    test_RMSE_pos = round(sqrt(mse(yq_te[pos], pt[pos])), 2),
+    test_R2_pos   = round(r2v(yq_te[pos], pt[pos]), 3),
+    # zero plots only: how much each representation over-predicts removals where there are none
+    test_RMSE_zero = round(sqrt(mse(yq_te[!pos], pt[!pos])), 2)
+  )
 }
 res_emb <- knn_reg_eval(emb_ref_w, emb_va_w, emb_te_w)
 res_inp <- knn_reg_eval(inp_ref_w, inp_va_w, inp_te_w)
@@ -1177,6 +1186,15 @@ rbind(
   cbind(representation = "raw input", res_inp)
 )
 ```
+
+`test_RMSE` / `test_R2` are over the **full** test set (all plots, ~89% zeros) —
+the numbers reported before. `test_RMSE_pos` / `test_R2_pos` are over the
+**removal plots only** (`yq_te > 0`, `n_pos` of them) — the exact population the
+actual-vs-predicted scatter shows, so they and the plot now answer the same
+question. `test_RMSE_zero` is the error on the zero plots alone (over-prediction
+where there are no removals). If a representation wins on the full set but not on
+`*_pos`, its advantage lives in the zero mass / zero-vs-nonzero separation, not in
+grading the size of actual removals.
 
 ### Fraction of neighbors that are removals, and vs. removal value
 
