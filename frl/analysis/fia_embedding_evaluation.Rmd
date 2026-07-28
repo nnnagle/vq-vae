@@ -1037,41 +1037,63 @@ cat(sprintf("recovery kNN population (finite ysfc): train=%d val=%d test=%d\n",
 ### Continuous ysfc imputation (kNN regression)
 
 `ysfc` imputed as the mean of the k train neighbors; `k` tuned on validation MSE
-with the phase weight fixed at its BALIVE-tuned value.
+with the phase weight fixed at its BALIVE-tuned value. Each representation has its
+own validation-optimal `k`, so **both** representations are evaluated at **both**
+`k` values; `native_k = TRUE` marks the `k` that was tuned for that representation
+(so its own row is a fair self-comparison, and the cross rows show how each does at
+the other's preferred neighborhood).
 
 ```{r recovery-regression}
-knn_reg_eval <- function(ref, qva, qte) {
-  vm <- sapply(kgrid_rec, function(k) mse(y_va, knn_balive(get.knnx(ref, qva, k = k), y_tr)))
-  kb <- kgrid_rec[which.min(vm)]
-  pt <- knn_balive(get.knnx(ref, qte, k = kb), y_tr)
-  data.frame(k_best = kb, val_MSE = round(min(vm), 2),
+tune_k_reg <- function(ref, qva)                       # validation-MSE-optimal k
+  kgrid_rec[which.min(sapply(kgrid_rec, function(k)
+    mse(y_va, knn_balive(get.knnx(ref, qva, k = k), y_tr))))]
+kbe <- tune_k_reg(emb_ref, emb_va)                     # embedding native k_best
+kbi <- tune_k_reg(inp_ref, inp_va)                     # raw input native k_best
+k_set <- sort(unique(c(kbe, kbi)))
+
+eval_reg_at <- function(ref, qva, qte, k) {
+  pv <- knn_balive(get.knnx(ref, qva, k = k), y_tr)
+  pt <- knn_balive(get.knnx(ref, qte, k = k), y_tr)
+  data.frame(k = k, val_MSE = round(mse(y_va, pv), 2),
              test_RMSE = round(sqrt(mse(y_te, pt)), 2), test_R2 = round(r2v(y_te, pt), 3))
 }
-rbind(
-  cbind(representation = "embedding", knn_reg_eval(emb_ref, emb_va, emb_te)),
-  cbind(representation = "raw input", knn_reg_eval(inp_ref, inp_va, inp_te))
-)
+do.call(rbind, c(
+  lapply(k_set, function(k) cbind(representation = "embedding", native_k = (k == kbe),
+                                  eval_reg_at(emb_ref, emb_va, emb_te, k))),
+  lapply(k_set, function(k) cbind(representation = "raw input", native_k = (k == kbi),
+                                  eval_reg_at(inp_ref, inp_va, inp_te, k)))
+))
 ```
 
 ### Recovery-class vote (kNN classification)
 
 Majority vote over the k train neighbors' recovery class; `k` tuned on validation
-accuracy. Compare `test_acc` to the no-information rate (predicting the largest
-class), since the stable class dominates.
+accuracy. As above, both representations are evaluated at **both** native `k`
+values, with `native_k = TRUE` marking each one's own tuned `k`. Compare
+`test_acc` to the no-information rate (predicting the largest class), since the
+stable class dominates.
 
 ```{r recovery-classification}
-knn_cls_eval <- function(ref, qva, qte) {
-  va <- sapply(kgrid_rec, function(k) acc(code_va, knn_mode(get.knnx(ref, qva, k = k), code_tr)))
-  kb <- kgrid_rec[which.max(va)]
-  pt <- knn_mode(get.knnx(ref, qte, k = kb), code_tr)
-  data.frame(k_best = kb, val_acc = round(max(va), 3), test_acc = round(acc(code_te, pt), 3))
+tune_k_cls <- function(ref, qva)                       # validation-accuracy-optimal k
+  kgrid_rec[which.max(sapply(kgrid_rec, function(k)
+    acc(code_va, knn_mode(get.knnx(ref, qva, k = k), code_tr))))]
+kce <- tune_k_cls(emb_ref, emb_va)                     # embedding native k_best
+kci <- tune_k_cls(inp_ref, inp_va)                     # raw input native k_best
+kc_set <- sort(unique(c(kce, kci)))
+
+eval_cls_at <- function(ref, qva, qte, k) {
+  pv <- knn_mode(get.knnx(ref, qva, k = k), code_tr)
+  pt <- knn_mode(get.knnx(ref, qte, k = k), code_tr)
+  data.frame(k = k, val_acc = round(acc(code_va, pv), 3), test_acc = round(acc(code_te, pt), 3))
 }
 cat(sprintf("recovery-class no-information rate (largest class, test): %.3f\n",
             max(prop.table(table(code_te)))))
-rbind(
-  cbind(representation = "embedding", knn_cls_eval(emb_ref, emb_va, emb_te)),
-  cbind(representation = "raw input", knn_cls_eval(inp_ref, inp_va, inp_te))
-)
+do.call(rbind, c(
+  lapply(kc_set, function(k) cbind(representation = "embedding", native_k = (k == kce),
+                                   eval_cls_at(emb_ref, emb_va, emb_te, k))),
+  lapply(kc_set, function(k) cbind(representation = "raw input", native_k = (k == kci),
+                                   eval_cls_at(inp_ref, inp_va, inp_te, k)))
+))
 ```
 
 
