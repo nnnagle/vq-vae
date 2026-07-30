@@ -1,0 +1,447 @@
+---
+title: "FIA Removals Post-Stratification: TCC vs Embedding"
+subtitle: "Within-stratum variance of removed volume by survey unit, Virginia FIA plots"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  yr_start: 2017     # measurement window (inclusive) for the remeasured plots
+  yr_end:   2023
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110
+)
+```
+
+## Overview
+
+A **removals** post-stratification analysis, parallel to the BALIVE one, using
+FIA's own GRM removal volumes — no plot-to-plot differencing.
+
+1. Take the **remeasured plots** whose measurement falls in `[yr_start, yr_end]`
+   (`PREV_PLT_CN` not null).
+2. Per plot, sum FIA's per-tree removal volume × annual removal expansion from
+   **`TREE_GRM_COMPONENT`**:
+
+   $$\texttt{remv\_cfgs} = \sum_{\text{trees}} \texttt{REMVCFGS\_FOREST} \times
+     \texttt{SUBP\_TPAREMV\_UNADJ\_GS\_FOREST}$$
+
+   giving **annual per-acre removed merchantable growing-stock volume**
+   (cu ft/acre/yr). (`REMVCFAL_FOREST`/`REMVBFSL_FOREST` give all-live sound cu ft
+   and sawtimber board ft — see Notes to switch.)
+3. Stratify by **TCC** and by the **embedding (at that measurement)** and compare
+   the within-stratum variance of removals, within each survey unit (`UNITCD`).
+
+> **This is true GRM removals** — cut **and** land-use diversion — at the plot,
+> already annualized (`SUBP_TPAREMV_UNADJ_*` is per-year, so we do **not** divide
+> by `REMPER`). Trees that were not removed contribute 0 (their `TPAREMV` is 0).
+
+Why the embedding should shine here: removals = harvest = a **fast disturbance
+event**, exactly what the phase pathway (`z_phase`, conditioned on
+years-since-fast-change) is built to detect; a single-date TCC snapshot barely
+encodes *whether a cut happened*.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
+```
+
+## Data assembly
+
+### Remeasured plots in the window
+
+```{r plots}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+plots <- dbGetQuery(
+  con,
+  sprintf("SELECT CN, PREV_PLT_CN, UNITCD, INVYR
+             FROM PLOT
+            WHERE STATECD='%s' AND INVYR BETWEEN %d AND %d",
+          params$statecd, params$yr_start, params$yr_end)
+) %>%
+  mutate(CN = as.character(CN), PREV_PLT_CN = as.character(PREV_PLT_CN)) %>%
+  filter(!is.na(PREV_PLT_CN))                    # remeasured only (removals defined)
+
+cat(sprintf("remeasured plots in [%d, %d]: %d\n",
+            params$yr_start, params$yr_end, nrow(plots)))
+```
+
+### Removed volume per plot (TREE_GRM_COMPONENT)
+
+Sum FIA's per-tree removal volume × annual removal TPA. We restrict the (national)
+GRM table to our plots via a temporary join table, and compute all three removal
+bases (GS cu ft, AL sound cu ft, SL board ft) so the response is easy to swap.
+`SUBP_TPAREMV_UNADJ_*` is already annual, so **no `REMPER` division**.
+
+```{r removals}
+# push the plot CNs into a temp table so the big GRM table is filtered by join
+dbWriteTable(con, "tmp_plots", tibble(PLT_CN = plots$CN),
+             temporary = TRUE, overwrite = TRUE)
+
+remv <- dbGetQuery(
+  con,
+  "SELECT g.PLT_CN,
+          SUM(g.REMVCFGS_FOREST * g.SUBP_TPAREMV_UNADJ_GS_FOREST) AS remv_cfgs,
+          SUM(g.REMVCFAL_FOREST * g.SUBP_TPAREMV_UNADJ_AL_FOREST) AS remv_cfal,
+          SUM(g.REMVBFSL_FOREST * g.SUBP_TPAREMV_UNADJ_SL_FOREST) AS remv_bfsl
+     FROM TREE_GRM_COMPONENT g
+     JOIN tmp_plots t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN"
+) %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+# NOTE: if TREE_GRM_COMPONENT lacks PLT_CN in your build, join TREE on
+# g.TRE_CN = TREE.CN to recover TREE.PLT_CN.
+
+plots <- plots %>%
+  left_join(remv, by = c("CN" = "PLT_CN")) %>%
+  mutate(across(c(remv_cfgs, remv_cfal, remv_bfsl), ~ coalesce(.x, 0)))  # no cut trees -> 0
+```
+
+### BALIVE per plot (for the shared / transfer stratification)
+
+We also pull BALIVE at the same plots, so we can test a stratification **trained on
+BALIVE** (not removals) applied to the removals response — the realistic "build
+strata once, use for many targets" case, and a magnitude proxy since removals are
+bounded by standing volume.
+
+```{r balive}
+cond_data <- dbGetQuery(
+  con,
+  sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, FORTYPCD FROM COND WHERE STATECD='%s'",
+          params$statecd)
+) %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+balive <- cond_data %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+# dominant-condition forest type (Forest Class); NA = nonforest plot -> excluded
+fortyp <- cond_data %>%
+  group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(PLT_CN, FORTYPCD)
+```
+
+### TCC at the plot location
+
+Science-TCC is categorical, so `extract` returns a factor — coerce to numeric and
+NA the nodata codes (>100).
+
+```{r tcc}
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID))
+
+locs <- fia_locs %>% filter(CN %in% plots$CN) %>% distinct(CN, .keep_all = TRUE)
+
+tcc     <- rast(params$tcc)
+pts     <- vect(locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+pts_aea <- project(pts, crs(tcc))
+vals <- extract(tcc, pts_aea, ID = FALSE); names(vals) <- "tcc"
+vals$tcc <- as.numeric(as.character(vals$tcc))
+vals$tcc[vals$tcc > 100] <- NA_real_
+
+tcc_by_cn <- tibble(CN = locs$CN, tcc = vals$tcc)
+```
+
+### Embedding at the measurement
+
+```{r embeddings}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)
+
+emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  distinct(CN, .keep_all = TRUE)
+```
+
+### One analysis frame
+
+```{r assemble}
+analysis <- plots %>%
+  select(CN, UNITCD, remv_cfgs, remv_cfal, remv_bfsl) %>%
+  left_join(balive, by = c("CN" = "PLT_CN")) %>%
+  mutate(BALIVE = coalesce(BALIVE, 0)) %>%
+  inner_join(fortyp, by = c("CN" = "PLT_CN")) %>%   # forested plots only
+  inner_join(tcc_by_cn, by = "CN") %>%
+  inner_join(select(emb_data, CN, all_of(emb_vars)), by = "CN") %>%
+  filter(!is.na(FORTYPCD), !is.na(UNITCD), !is.na(remv_cfgs), !is.na(tcc), tcc >= 0, tcc <= 100)
+
+cat(sprintf("plots in analysis frame: %d across %d survey units\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
+cat(sprintf("plots with any GS removal: %.1f%%\n", 100 * mean(analysis$remv_cfgs > 0)))
+summary(analysis$remv_cfgs)
+```
+
+## Define the stratifications
+
+Response for the supervised embedding score is `remv_cfgs` (annual per-acre GS
+removed volume). Everything else mirrors the BALIVE post-stratification report.
+
+```{r strata}
+resp <- "remv_cfgs"
+
+# Removals are heavily zero-inflated + right-skewed, so equal-count quantile bins
+# waste strata on the zero mass. Use Dalenius-Hodges cumulative-sqrt(f) boundaries
+# instead -- the optimal-boundary rule for a skewed variable: a large low/zero
+# stratum and progressively finer strata toward the high-removal tail. Applied
+# identically to the TCC axis and to every embedding score, so the comparison
+# still isolates the covariate.
+dh_strata <- function(x, K = 4, nbins = 100) {
+  x   <- as.numeric(x)
+  rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(factor(rep(1L, length(x))))
+  h   <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts))
+  tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  bnd <- sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+  factor(findInterval(x, c(-Inf, bnd, Inf)))
+}
+
+# --- TCC strata: fixed canopy bins + DH-optimal bins ------------------------
+analysis <- analysis %>%
+  mutate(tcc_stratum = cut(tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                           labels = c("0-10", "11-48", "49-85", "86-100")))
+analysis$tcc_dh <- dh_strata(analysis$tcc, 4)
+analysis$tcc_dh5 <- dh_strata(analysis$tcc, 5)   # optimal (Dalenius-Hodges) 5-strata TCC
+
+# --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type ------------
+set.seed(1)
+Z  <- scale(as.matrix(analysis[, emb_type_vars]))
+km <- kmeans(Z, centers = 4, nstart = 25)
+analysis$emb_km <- factor(km$cluster, labels = paste0("K", 1:4))
+
+# --- Embedding strata, SUPERVISED: OOF read-out of removals, DH-binned ------
+set.seed(1)
+folds <- sample(rep(1:5, length.out = nrow(analysis)))
+oof_score <- function(vars, y = resp) {                 # OOF linear probe of `y`
+  form <- reformulate(vars, response = y)
+  s <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    s[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  s
+}
+
+# Trained ON REMOVALS (target-specific)
+analysis$emb_sup_type <- dh_strata(oof_score(emb_type_vars),      4)
+analysis$emb_sup      <- dh_strata(oof_score(emb_vars),           4)
+analysis$emb_tcc_sup  <- dh_strata(oof_score(c(emb_vars, "tcc")), 4)
+
+# Trained ON BALIVE, applied to removals (shared / transfer stratification):
+# the realistic "one stratification for many targets" case, and a magnitude proxy
+# since removed volume is bounded by standing volume.
+analysis$emb_sup_bal <- dh_strata(oof_score(emb_vars, y = "BALIVE"), 4)
+
+cat("TCC DH-stratum counts:\n");                     print(table(analysis$tcc_dh))
+cat("\nRemovals-trained emb counts:\n");             print(table(analysis$emb_sup))
+cat("\nBALIVE-trained emb counts:\n");               print(table(analysis$emb_sup_bal))
+```
+
+## Within-stratum variance of removals
+
+```{r within-var-fn}
+pooled_within <- function(df, groups, y = resp) {
+  g <- df %>%
+    group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+```
+
+### Headline: overall pooled within-stratum variance
+
+Lower `within_var` / `pct_of_baseline < 100` = more homogeneous strata = a more
+efficient post-stratified estimator of removals. `RE_vs_tcc` is the relative
+efficiency against the fixed-bin TCC baseline (`V_TCC / V_method`; > 1 beats
+TCC). `ess_unit` is the **effective sample size relative to the UNITCD-only
+baseline** (`N · V_unit / within_var`; baseline row = `N`, sub-stratification
+above `N`). Both assume a self-weighting sample (`W_h = n_h/N`) — internal,
+sample-based efficiencies rather than design-based (area-weighted) ones.
+
+The last two rows are **Wu–Sitter model-calibration** references: instead of
+binning a covariate they fit a smooth out-of-fold working model `μ̂(x)` and take
+the variance to be that of the residuals `y − μ̂(x)` (spline on TCC, linear on
+the embedding). Only variance / RE are computed — the calibration *point*
+estimate needs the population total of `μ̂(x)` (auxiliary scored wall-to-wall),
+the same missing ingredient as design-based weights.
+
+```{r headline}
+v_unit  <- pooled_within(analysis, "UNITCD")
+v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
+v_tccd  <- pooled_within(analysis, c("UNITCD", "tcc_dh"))
+v_tccd5 <- pooled_within(analysis, c("UNITCD", "tcc_dh5"))
+v_km    <- pooled_within(analysis, c("UNITCD", "emb_km"))
+v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
+v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
+v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
+v_bal   <- pooled_within(analysis, c("UNITCD", "emb_sup_bal"))
+
+# --- Wu-Sitter model-calibration reference (variance / RE only) --------------
+# Calibration (model-assisted / GREG) variance is the design variance of the
+# residuals e = y - mu_hat(x) from a smooth out-of-fold working model, instead of
+# stratum means. Estimated from the sample here; the POINT estimate would also
+# need the population total of mu_hat (auxiliary scored wall-to-wall), unavailable.
+# mu_hat is cross-fitted (reusing `folds`); residual variance pooled within
+# UNITCD. Two models mirror the covariates compared: spline calibration on TCC and
+# linear calibration on the full embedding (both target-trained on removals).
+require(splines)
+oof_pred <- function(rhs) {
+  form <- as.formula(paste(resp, "~", rhs)); p <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    p[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  p
+}
+calib_var <- function(pred)                          # within-UNITCD residual var
+  pooled_within(mutate(analysis, .r = analysis[[resp]] - pred), "UNITCD", y = ".r")
+v_cal_tcc <- calib_var(oof_pred("factor(UNITCD) + ns(tcc, 4)"))
+v_cal_emb <- calib_var(oof_pred(paste("factor(UNITCD) +", paste(emb_vars, collapse = " + "))))
+
+vv <- c(v_unit, v_tcc, v_tccd, v_tccd5, v_km, v_supt, v_sup, v_ct, v_bal, v_cal_tcc, v_cal_emb)
+# Relative efficiency vs the (fixed-bin) TCC baseline and effective sample size
+# relative to the UNITCD-only baseline. Under a self-weighting sample the
+# estimator variance is within_var / N, so RE_vs_tcc = V_TCC / V_method (>1 beats
+# TCC) and ess_unit = N * V_unit / V_method -- the UNITCD-only plot count matching
+# this estimator (baseline row = N; sub-stratification pushes it above N).
+N <- nrow(analysis)
+data.frame(
+  stratification  = c("UNITCD only (baseline)",
+                      "UNITCD x TCC fixed bins (4)",
+                      "UNITCD x TCC DH bins (4)",
+                      "UNITCD x TCC DH bins (5, optimal)",
+                      "UNITCD x embedding k-means (4, unsup)",
+                      "UNITCD x emb supervised-for-removals, type-only (4)",
+                      "UNITCD x emb supervised-for-removals, type+phase (4)",
+                      "UNITCD x TCC + emb supervised-for-removals (4)",
+                      "UNITCD x emb supervised-for-BALIVE, applied to removals (4)",
+                      "UNITCD + TCC spline calibration (Wu-Sitter, OOF)",
+                      "UNITCD + embedding linear calibration (Wu-Sitter, OOF)"),
+  within_var      = round(vv, 2),
+  within_sd       = round(sqrt(vv), 3),
+  pct_of_baseline = round(100 * vv / v_unit, 1),
+  RE_vs_tcc       = round(v_tcc / vv, 2),
+  ess_unit        = round(N * v_unit / vv)
+)
+```
+
+### Removals distribution within each stratum, by method
+
+The headline table gives one within-stratum variance per method; this unpacks it
+into the full distribution. For every stratification scheme, a boxplot of the
+removals response within each of its strata. Because removals are heavily
+zero-inflated and right-skewed, the y-axis is `log1p(removals)` so the boxes are
+legible; a method separates removals well when its boxes sit at visibly different
+levels. Facets share the y-axis (comparable across methods); the x-axis is free
+because strata labels differ across schemes.
+
+```{r strata-boxplot, fig.width = 11, fig.height = 6}
+strata_cols <- c(
+  "TCC fixed (4)"                 = "tcc_stratum",
+  "TCC DH (4)"                    = "tcc_dh",
+  "TCC DH-optimal (5)"            = "tcc_dh5",
+  "emb k-means (4, unsup)"        = "emb_km",
+  "emb sup-removals type (4)"     = "emb_sup_type",
+  "emb sup-removals type+phase (4)" = "emb_sup",
+  "TCC + emb sup-removals (4)"    = "emb_tcc_sup",
+  "emb sup-BALIVE -> removals (4)" = "emb_sup_bal")
+
+box_long <- dplyr::bind_rows(lapply(names(strata_cols), function(nm)
+  tibble(method  = nm,
+         stratum = as.character(analysis[[strata_cols[[nm]]]]),
+         val     = analysis[[resp]])))
+box_long$method <- factor(box_long$method, levels = names(strata_cols))
+
+ggplot(box_long, aes(x = stratum, y = log1p(val))) +
+  geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+  facet_wrap(~ method, scales = "free_x", nrow = 2) +
+  labs(x = "stratum", y = sprintf("log1p(%s)", resp),
+       title = "Removals within stratum, by stratification method") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Per survey unit
+
+```{r per-unit}
+per_unit <- analysis %>%
+  group_by(UNITCD) %>%
+  group_modify(~ tibble(
+    n         = nrow(.x),
+    pct_cut   = round(100 * mean(.x[[resp]] > 0), 1),
+    var_total = var(.x[[resp]]),
+    var_tcc   = pooled_within(.x, "tcc_stratum"),
+    var_emb   = pooled_within(.x, "emb_sup")
+  )) %>%
+  ungroup() %>%
+  mutate(tcc_ratio = round(var_tcc / var_total, 3),
+         emb_ratio = round(var_emb / var_total, 3),
+         winner    = if_else(var_emb < var_tcc, "embedding", "tcc"),
+         across(c(var_total, var_tcc, var_emb), ~ round(.x, 2)))
+per_unit
+```
+
+### Does each stratifier concentrate the harvested plots?
+
+For a rare, zero-inflated event, a good stratifier puts the cut plots together.
+Mean removals by stratum shows how peaked each scheme is.
+
+```{r plot-conc, fig.width=11, fig.height=5}
+op <- par(mfrow = c(1, 2), mar = c(4.4, 4.6, 3, 1))
+barplot(tapply(analysis[[resp]], analysis$tcc_stratum, mean), col = "firebrick",
+        las = 2, ylab = "mean removed GS volume (cu ft/acre/yr)",
+        main = "Mean removals by TCC stratum")
+barplot(tapply(analysis[[resp]], analysis$emb_sup, mean), col = "steelblue",
+        las = 2, ylab = "mean removed GS volume (cu ft/acre/yr)",
+        main = "Mean removals by embedding stratum")
+par(op)
+```
+
+## Cleanup
+
+```{r cleanup}
+dbDisconnect(con)
+```
+
+## Notes
+
+- **Which removal basis.** `remv_cfgs` = merchantable growing-stock cu ft
+  (`REMVCFGS_FOREST` x `SUBP_TPAREMV_UNADJ_GS_FOREST`). Swap `resp` to `remv_cfal`
+  (all-live sound cu ft) or `remv_bfsl` (sawtimber board ft) — both are already
+  computed on the analysis frame.
+- **Already annual.** `SUBP_TPAREMV_UNADJ_*` is a per-year expansion, so the
+  product is annual per-acre removals; do **not** divide by `REMPER`.
+- **Full removals.** GRM `REMV` includes cut **and** land-use diversion, so this
+  is complete removals, not cut-only.
+- **PLT_CN join.** If `TREE_GRM_COMPONENT` in your build has no `PLT_CN` column,
+  join `TREE` on `g.TRE_CN = TREE.CN` to recover `TREE.PLT_CN`.
+- **Unadjusted per-acre.** Uses `SUBP_TPAREMV_UNADJ_*` without the `POP_STRATUM`
+  `ADJ_FACTOR_*`; fine for a *strata efficiency* comparison, not an official
+  population estimate. (Also SUBP only — if you need micro/macroplot removals, add
+  the `MICR_`/`MACR_` TPAREMV terms.)
+- **Heavy zero-inflation.** Removals are ~0 on most plots; variance lives in the
+  few cut plots. Consider a **harvest-incidence** response
+  (`as.integer(remv_cfgs > 0)`) to stratify *occurrence* separately from
+  magnitude — often the more stratifiable signal, and a natural fit for `z_phase`.
+- **Expected result.** Because removals is a disturbance signal, expect the
+  embedding (esp. `type+phase`) to beat TCC by a wider margin than for BALIVE, and
+  the `type-only` vs `type+phase` gap to be large — the phase pathway is doing the
+  work.

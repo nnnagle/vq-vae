@@ -1,0 +1,505 @@
+---
+title: "FIA Post-Stratification Efficiency: TCC vs Embedding Strata"
+subtitle: "Within-stratum BALIVE variance by survey unit, Virginia FIA plots"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  reticulate_python: "/home/nnagle/miniconda3/envs/r-tf/bin/python"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi = 110
+)
+```
+
+## Overview
+
+This report asks a **post-stratification efficiency** question: to estimate
+`BALIVE` (live basal area) within each FIA survey unit (`UNITCD`), is it better
+to post-stratify plots by **tree canopy cover (TCC)** or by **learned embedding
+space**?
+
+The relevant quantity is the **within-stratum variance of `BALIVE`**. Under an
+approximately equal-probability sample (the FIA base grid, so stratum weight
+`W_h ≈ n_h / n`) with proportional allocation, the variance of the
+post-stratified mean is approximately
+
+$$\operatorname{Var}(\bar y_{\text{strat}}) \;\approx\; \frac{1}{n}\sum_h W_h\,S_h^2
+  \;=\; \frac{S^2_{\text{within}}}{n},$$
+
+so the **pooled within-stratum variance** `S²_within` is exactly the number to
+minimize. Both stratifications get **4 strata** and are crossed with `UNITCD`, so
+the comparison is like-for-like.
+
+- **TCC strata:** canopy-cover bins `0–10, 11–48, 49–85, 86–100`.
+- **Embedding strata:** two variants — unsupervised k-means on `z_type`, and a
+  supervised (out-of-fold) BALIVE read-out of the embedding binned into 4. The
+  supervised one is the fair analog to TCC (a single BALIVE-correlated covariate
+  binned into 4); k-means tests whether raw embedding *geometry* stratifies BALIVE.
+
+The baseline is `UNITCD`-only (no sub-stratification); TCC and embedding are
+judged by how far below that baseline they push the residual `BALIVE` variance.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
+```
+
+## FIA population tables (reference)
+
+Pulled for context / later design-based weighting; not used in the variance
+comparison below.
+
+```{r pop-tables}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+stratum_data <- dbGetQuery(
+  con,
+  sprintf("SELECT * FROM POP_STRATUM WHERE STATECD='%s' AND EVALID=512201", params$statecd)
+)
+eval_data <- dbGetQuery(
+  con,
+  sprintf("SELECT * FROM POP_EVAL WHERE STATECD='%s'", params$statecd)
+)
+```
+
+## Data assembly
+
+### Plot locations
+
+`CN`/`ID` are FIA control numbers that exceed IEEE-754 double precision, and the
+embedding CSV / `COND` table carry them as **text**. They must be read as
+character here too, or the downstream joins silently drop or mismatch rows.
+
+```{r fia-locs}
+fia_locs <- read_csv(
+  params$fia_locs,
+  col_types = cols(CN = "c", ID = "c")   # keep control numbers exact
+) %>%
+  mutate(CN = sub("\\.0$", "", CN),
+         ID = sub("\\.0$", "", ID))
+```
+
+### Extract TCC at each plot
+
+Points are built in NAD83 (FIA datum), reprojected into the raster's AEA CRS, and
+the extracted value column is renamed to `tcc`.
+
+```{r tcc-extract}
+tcc <- rast(params$tcc)
+
+pts     <- vect(fia_locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+pts_aea <- project(pts, crs(tcc))
+
+vals <- extract(tcc, pts_aea, ID = FALSE)   # nearest cell
+names(vals) <- "tcc"                        # drop the long raster layer name
+
+# The science-TCC raster carries a categorical attribute table, so `extract`
+# returns a FACTOR with levels "0".."100","254","255" -- not numbers. Recover the
+# numeric percent via as.character() first (as.numeric() on a factor would give
+# level indices, not values), then blank out the nodata codes: 254 = non-
+# processing area, 255 = fill, and anything > 100 is not a canopy-cover percent.
+vals$tcc <- as.numeric(as.character(vals$tcc))
+vals$tcc[vals$tcc > 100] <- NA_real_
+
+fia_merged <- bind_cols(fia_locs, vals)
+```
+
+### BALIVE per plot (from COND)
+
+Area-weighted over conditions (`CONDPROP_UNADJ`), with nonforest `BALIVE` (`NA`)
+treated as 0 — the same convention as the embedding-evaluation report.
+
+```{r balive}
+cond_data <- dbGetQuery(
+  con,
+  sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE FROM COND WHERE STATECD='%s'",
+          params$statecd)
+)
+
+balive_plot <- cond_data %>%
+  mutate(PLT_CN = as.character(PLT_CN),
+         BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ),
+            .groups = "drop")
+```
+
+### Embeddings (z_type block)
+
+```{r embeddings}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)   # full embedding for the supervised score
+
+emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  distinct(CN, .keep_all = TRUE)             # one embedding row per plot
+```
+
+### One analysis frame
+
+Plot → `UNITCD`, `tcc`, `BALIVE`, `z_type`. Restricted to complete cases with a
+valid canopy-cover value (0–100; the science-TCC raster uses >100 for nodata) so
+that the **TCC and embedding stratifications are computed on the identical set of
+plots**.
+
+```{r assemble}
+analysis <- fia_merged %>%
+  select(CN, UNITCD, tcc) %>%
+  inner_join(balive_plot, by = c("CN" = "PLT_CN")) %>%
+  inner_join(select(emb_data, CN, all_of(emb_vars)), by = "CN") %>%
+  filter(!is.na(UNITCD), !is.na(BALIVE), !is.na(tcc), tcc >= 0, tcc <= 100)
+
+cat(sprintf("plots in analysis frame: %d across %d survey units\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
+```
+
+## Define the 4-way stratifications
+
+TCC is a single **BALIVE-correlated** axis (canopy cover ≈ a structural proxy for
+basal area) cut into 4 ordered bins, so its strata are naturally homogeneous in
+BALIVE. An unsupervised k-means on the embedding is *not* comparable: it splits
+the 48-D space along its highest-variance directions — forest type/species — which
+need not align with BALIVE magnitude. We therefore report **two** embedding
+stratifications:
+
+- **k-means (unsupervised):** 4 regions of `z_type` geometry, agnostic to BALIVE.
+  A reference for "does raw embedding geometry stratify BALIVE?"
+- **supervised (the fair analog to TCC):** a single BALIVE-predictive score read
+  out of the embedding, cut into 4 quantile bins. The score is an **out-of-fold**
+  (5-fold) linear fit of BALIVE on the full embedding, so every plot is scored by
+  a model that never saw it — no in-sample optimism that TCC also never gets.
+
+```{r strata}
+# --- TCC strata: fixed canopy-cover percent bins (domain-standard) ----------
+analysis <- analysis %>%
+  mutate(tcc_stratum = cut(tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                           labels = c("0-10", "11-48", "49-85", "86-100")))
+
+# --- TCC strata: equal-count quartiles (fairness control) -------------------
+# Bins TCC the SAME way emb_sup bins its score (ntile), so a TCC-vs-embedding
+# comparison isolates the covariate, not the binning scheme. In forested VA the
+# fixed bins above are lopsided (few low-canopy plots), which handicaps them.
+analysis$tcc_q <- factor(dplyr::ntile(analysis$tcc, 4), labels = paste0("T", 1:4))
+
+# --- TCC strata: optimal (Dalenius-Hodges) 5 bins ---------------------------
+# The strongest a single TCC axis can do at a fixed strata count: cumulative-
+# sqrt(frequency) boundaries minimize within-stratum variance for the covariate.
+dh_breaks <- function(x, K, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(numeric(0))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+}
+dh_strata <- function(x, K, nbins = 100) {
+  bnd <- dh_breaks(x, K, nbins)
+  if (length(bnd) == 0) return(factor(rep(1L, length(x))))
+  factor(findInterval(as.numeric(x), c(-Inf, bnd, Inf)))
+}
+analysis$tcc_dh5 <- dh_strata(analysis$tcc, 5)
+
+# --- Embedding strata, UNSUPERVISED: 4 k-means regions of z_type space -------
+set.seed(1)
+Z  <- scale(as.matrix(analysis[, emb_type_vars]))
+km <- kmeans(Z, centers = 4, nstart = 25)
+analysis$emb_km <- factor(km$cluster, labels = paste0("K", 1:4))
+
+# --- Embedding strata, SUPERVISED: quantile bins of a cross-fit BALIVE read-out
+# Out-of-fold OLS of BALIVE on the embedding, then equal-count quantile bins --
+# the learned analog of "a BALIVE-correlated covariate binned into 4," matched to
+# how TCC is used. Two versions, on the SAME folds: the full embedding
+# (type + phase) and z_type only, to isolate the phase pathway's contribution.
+set.seed(1)
+folds <- sample(rep(1:5, length.out = nrow(analysis)))
+
+oof_score <- function(vars) {                       # leakage-free BALIVE read-out
+  form <- reformulate(vars, response = "BALIVE")
+  s <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    s[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  s
+}
+
+analysis$emb_sup      <- factor(dplyr::ntile(oof_score(emb_vars),      4), labels = paste0("S",  1:4))
+analysis$emb_sup_type <- factor(dplyr::ntile(oof_score(emb_type_vars), 4), labels = paste0("St", 1:4))
+
+# --- Combined: does the embedding ADD to TCC? -------------------------------
+# OOF read-out on the full embedding *plus* TCC, quartile-binned. If this beats
+# embedding-alone, the embedding is capturing BALIVE structure TCC misses (and
+# vice versa); if it only matches, they are largely redundant.
+analysis$emb_tcc_sup <- factor(dplyr::ntile(oof_score(c(emb_vars, "tcc")), 4), labels = paste0("C", 1:4))
+
+cat("TCC fixed-bin counts:\n");                     print(table(analysis$tcc_stratum))
+cat("\nTCC quartile counts:\n");                     print(table(analysis$tcc_q))
+cat("\nTCC DH-optimal (5) counts:\n");               print(table(analysis$tcc_dh5))
+cat("\nEmbedding k-means (unsup) counts:\n");        print(table(analysis$emb_km))
+cat("\nEmbedding supervised type-only counts:\n");   print(table(analysis$emb_sup_type))
+cat("\nEmbedding supervised type+phase counts:\n");  print(table(analysis$emb_sup))
+cat("\nTCC + embedding supervised counts:\n");       print(table(analysis$emb_tcc_sup))
+```
+
+## Within-stratum variance of BALIVE
+
+`pooled_within()` returns the residual `BALIVE` variance after removing cell
+means — `SS_within / (N − H)` for cells defined by the grouping columns. Strata
+are always crossed with `UNITCD`, so a "cell" is one `(unit, stratum)`
+combination. Empty and singleton cells are handled correctly (they contribute 0
+to `SS` and reduce the degrees of freedom).
+
+```{r within-var-fn}
+pooled_within <- function(df, groups) {
+  g <- df %>%
+    group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((BALIVE - mean(BALIVE))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+```
+
+### Headline: overall pooled within-stratum variance
+
+Baseline is `UNITCD`-only. Lower `within_var` (and `pct_of_baseline < 100`) means
+the sub-stratification made `BALIVE` more homogeneous within cells — i.e. a more
+efficient post-stratified estimator. `RE_vs_tcc` is the relative efficiency
+against the fixed-bin TCC baseline (`V_TCC / V_method`; > 1 means more efficient
+than TCC — equivalently, TCC would need `RE_vs_tcc ×` as many plots to match this
+estimator). `ess_unit` is the **effective sample size relative to the UNITCD-only
+baseline**: the number of `UNITCD`-only-stratified plots that would give the same
+precision (`N · V_unit / within_var`). The baseline row is `N` by construction;
+sub-stratification pushes `ess_unit` above `N` (e.g. `ess_unit = 2N` means as
+precise as UNITCD-only with twice the plots). **Both assume a self-weighting
+sample** — stratum weights `W_h = n_h/N` — so they are internal, sample-based
+efficiencies; a design-based version would reweight by population stratum area.
+
+The last two rows are **Wu–Sitter model-calibration** references (GREG-type,
+model-assisted). Instead of binning a covariate into strata they fit a smooth
+out-of-fold working model `μ̂(x)` and take the estimator variance to be the
+variance of the residuals `y − μ̂(x)` — a natural-spline calibration on TCC and a
+linear calibration on the full embedding. This isolates the cost of *binning*:
+the calibration row using a covariate should beat the strata rows using the same
+covariate, since it uses it continuously. Only the **variance / RE** are
+computed — the calibration *point* estimate additionally needs the population
+total of `μ̂(x)` (the auxiliary scored wall-to-wall), which is the same
+missing ingredient as design-based stratum weights.
+
+```{r headline}
+v_unit  <- pooled_within(analysis, "UNITCD")
+v_tcc   <- pooled_within(analysis, c("UNITCD", "tcc_stratum"))
+v_tccq  <- pooled_within(analysis, c("UNITCD", "tcc_q"))
+v_tccd5 <- pooled_within(analysis, c("UNITCD", "tcc_dh5"))
+v_km    <- pooled_within(analysis, c("UNITCD", "emb_km"))
+v_supt  <- pooled_within(analysis, c("UNITCD", "emb_sup_type"))
+v_sup   <- pooled_within(analysis, c("UNITCD", "emb_sup"))
+v_ct    <- pooled_within(analysis, c("UNITCD", "emb_tcc_sup"))
+
+# --- Wu-Sitter model-calibration reference (variance / RE only) --------------
+# A calibration (model-assisted / GREG) estimator uses a smooth working model
+# mu_hat(x) instead of stratum means; its asymptotic variance is the design
+# variance of the residuals e = y - mu_hat(x). We estimate that here from the
+# sample -- the POINT estimate would additionally need the population total of
+# mu_hat (the auxiliary scored wall-to-wall), which we do not have. mu_hat is
+# cross-fitted (out-of-fold, reusing `folds`) so the residual variance is not
+# optimistic about the fit; the residual variance is pooled within UNITCD to
+# match how the strata rows cross with UNITCD. Two working models mirror the two
+# covariates already compared: a natural-spline calibration on TCC (the smooth
+# analog of TCC binning) and a linear calibration on the full embedding (the
+# unbinned analog of the supervised embedding strata).
+require(splines)
+oof_pred <- function(rhs) {
+  form <- as.formula(paste("BALIVE ~", rhs)); p <- numeric(nrow(analysis))
+  for (f in 1:5) {
+    fit <- lm(form, data = analysis[folds != f, ])
+    p[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+  }
+  p
+}
+calib_var <- function(pred) {                       # within-UNITCD residual var, /(N - n_units)
+  g <- mutate(analysis, .r = BALIVE - pred) %>% group_by(UNITCD) %>%
+       summarize(n = n(), ss = sum((.r - mean(.r))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+v_cal_tcc <- calib_var(oof_pred("factor(UNITCD) + ns(tcc, 4)"))
+v_cal_emb <- calib_var(oof_pred(paste("factor(UNITCD) +", paste(emb_vars, collapse = " + "))))
+
+vv <- c(v_unit, v_tcc, v_tccq, v_tccd5, v_km, v_supt, v_sup, v_ct, v_cal_tcc, v_cal_emb)
+# Relative efficiency vs the (fixed-bin) TCC baseline and effective sample size
+# relative to the UNITCD-only baseline. Under a self-weighting sample the
+# estimator variance is within_var / N, so both are ratios of within_var:
+# RE_vs_tcc = V_TCC / V_method (>1 beats TCC); ess_unit = N * V_unit / V_method --
+# the UNITCD-only plot count that would match this estimator's precision (so the
+# baseline row is N, and sub-stratification pushes it above N).
+N <- nrow(analysis)
+data.frame(
+  stratification  = c("UNITCD only (baseline)",
+                      "UNITCD x TCC fixed bins (4)",
+                      "UNITCD x TCC quartiles (4)",
+                      "UNITCD x TCC DH-optimal (5)",
+                      "UNITCD x embedding k-means (4, unsup)",
+                      "UNITCD x embedding supervised type-only (4, OOF)",
+                      "UNITCD x embedding supervised type+phase (4, OOF)",
+                      "UNITCD x TCC + embedding supervised (4, OOF)",
+                      "UNITCD + TCC spline calibration (Wu-Sitter, OOF)",
+                      "UNITCD + embedding linear calibration (Wu-Sitter, OOF)"),
+  within_var      = round(vv, 1),
+  within_sd       = round(sqrt(vv), 2),
+  pct_of_baseline = round(100 * vv / v_unit, 1),
+  RE_vs_tcc       = round(v_tcc / vv, 2),
+  ess_unit        = round(N * v_unit / vv)
+)
+```
+
+### BALIVE distribution within each stratum, by method
+
+The headline table collapses each method to a single within-stratum variance.
+This unpacks it: for every stratification scheme, a boxplot of `BALIVE` within
+each of its strata. A method separates the target well when its boxes sit at
+clearly different levels with little overlap (between-stratum spread large,
+within-box spread small) — the visual analog of a low `within_var`. Facets share
+a common y-axis so methods are directly comparable; the x-axis is free because
+strata labels differ across schemes.
+
+```{r strata-boxplot, fig.width = 11, fig.height = 5}
+strata_cols <- c(
+  "TCC fixed (4)"              = "tcc_stratum",
+  "TCC quartiles (4)"          = "tcc_q",
+  "TCC DH-optimal (5)"         = "tcc_dh5",
+  "emb k-means (4, unsup)"     = "emb_km",
+  "emb supervised type (4)"    = "emb_sup_type",
+  "emb supervised type+phase (4)" = "emb_sup",
+  "TCC + emb supervised (4)"   = "emb_tcc_sup")
+
+box_long <- dplyr::bind_rows(lapply(names(strata_cols), function(nm)
+  tibble(method  = nm,
+         stratum = as.character(analysis[[strata_cols[[nm]]]]),
+         BALIVE  = analysis$BALIVE)))
+box_long$method <- factor(box_long$method, levels = names(strata_cols))
+
+ggplot(box_long, aes(x = stratum, y = BALIVE)) +
+  geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+  facet_wrap(~ method, scales = "free_x", nrow = 2) +
+  labs(x = "stratum", y = "BALIVE",
+       title = "BALIVE within stratum, by stratification method") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Per survey unit: TCC vs embedding
+
+For each `UNITCD`, the unstratified variance and the within-stratum variance
+under each 4-way scheme (`*_ratio` = fraction of the unit's variance that
+remains; smaller is better).
+
+```{r per-unit}
+per_unit <- analysis %>%
+  group_by(UNITCD) %>%
+  group_modify(~ tibble(
+    n         = nrow(.x),
+    var_total = var(.x$BALIVE),
+    var_tcc   = pooled_within(.x, "tcc_stratum"),
+    var_km    = pooled_within(.x, "emb_km"),
+    var_emb   = pooled_within(.x, "emb_sup")   # supervised = the fair contender
+  )) %>%
+  ungroup() %>%
+  mutate(tcc_ratio = round(var_tcc / var_total, 3),
+         emb_ratio = round(var_emb / var_total, 3),
+         winner    = if_else(var_emb < var_tcc, "embedding", "tcc"),
+         across(c(var_total, var_tcc, var_km, var_emb), ~ round(.x, 1)))
+per_unit
+```
+
+### Per-cell detail (the within-strata variances)
+
+Mean, variance, and n of `BALIVE` in every `(unit, stratum)` cell — the raw
+within-strata variances, for both stratifications.
+
+```{r per-cell}
+cell_tcc <- analysis %>%
+  group_by(UNITCD, tcc_stratum) %>%
+  summarize(n = n(), mean_balive = round(mean(BALIVE), 1),
+            var_balive = round(var(BALIVE), 1), .groups = "drop")
+
+cell_emb <- analysis %>%
+  group_by(UNITCD, emb_sup) %>%
+  summarize(n = n(), mean_balive = round(mean(BALIVE), 1),
+            var_balive = round(var(BALIVE), 1), .groups = "drop")
+
+cat("=== BALIVE within (UNITCD x TCC stratum) ===\n"); cell_tcc
+cat("\n=== BALIVE within (UNITCD x embedding supervised stratum) ===\n"); cell_emb
+```
+
+### Visual: within-stratum SD by unit
+
+```{r plot-compare, fig.width=9, fig.height=5}
+op <- par(mar = c(4.5, 4.5, 3, 1))
+ymax <- sqrt(max(per_unit$var_total, na.rm = TRUE)) * 1.05
+plot(seq_len(nrow(per_unit)), sqrt(per_unit$var_total), type = "n",
+     ylim = c(0, ymax), xaxt = "n",
+     xlab = "survey unit (UNITCD)", ylab = "within-stratum SD of BALIVE (sq ft/acre)",
+     main = "Post-stratification: TCC vs embedding, by survey unit")
+axis(1, at = seq_len(nrow(per_unit)), labels = per_unit$UNITCD)
+points(seq_len(nrow(per_unit)), sqrt(per_unit$var_total), pch = 1,  col = "grey50", cex = 1.4)
+points(seq_len(nrow(per_unit)), sqrt(per_unit$var_tcc),   pch = 16, col = "firebrick", cex = 1.4)
+points(seq_len(nrow(per_unit)), sqrt(per_unit$var_km),    pch = 4,  col = "grey40",    cex = 1.2)
+points(seq_len(nrow(per_unit)), sqrt(per_unit$var_emb),   pch = 16, col = "steelblue", cex = 1.4)
+legend("topright", c("unstratified", "TCC (4)", "embedding k-means (4)", "embedding supervised (4)"),
+       pch = c(1, 16, 4, 16), col = c("grey50", "firebrick", "grey40", "steelblue"), bty = "n")
+par(op)
+```
+
+## Cleanup
+
+```{r cleanup}
+dbDisconnect(con)
+```
+
+## Notes and design choices
+
+- **Why pooled within-stratum variance.** Under proportional allocation and an
+  equal-probability sample, it is (up to the `1/n` factor) the variance of the
+  post-stratified estimator, so it is the direct efficiency criterion. The
+  `pct_of_baseline` / `*_ratio` columns are the variance-reduction achieved over
+  `UNITCD`-only estimation.
+- **Like-for-like.** Both schemes use exactly 4 strata on the same plots, crossed
+  with `UNITCD`. Giving the embedding more clusters would trivially lower variance
+  (more, smaller cells), so 4-vs-4 is the fair comparison.
+- **Why two embedding stratifications.** Unsupervised k-means splits the embedding
+  along its highest-variance directions (forest type/species), which need not align
+  with BALIVE — so it is expected to stratify BALIVE weakly, and is kept only as a
+  geometry reference. The supervised quantile stratifier is the fair comparison to
+  TCC. It is *not* circular: the score is fit **out-of-fold**, and post-stratification
+  by definition uses a target-correlated covariate — TCC is simply one whose
+  correlation is built in rather than learned. If TCC still wins, that is a real
+  result: canopy cover is a near-direct structural measurement of basal area, while
+  the embedding was trained for forest-type similarity, not BALIVE regression.
+- **Combining them** (e.g. TCC × embedding, or embedding strata *within* TCC bins)
+  is the natural next step if you want the embedding to add resolution on top of the
+  structural signal TCC already captures.
+- **Not design-based (yet).** This uses the proportional-allocation approximation
+  `W_h ≈ n_h/n`. `POP_STRATUM` (pulled above) carries FIA's official
+  area-expansion factors; a fully design-based variance would weight strata by
+  those areas rather than plot counts.
+- **k-means caveat.** Clusters depend on the seed and on standardization; with
+  `nstart = 25` and `set.seed(1)` the solution is stable, but report the seed.

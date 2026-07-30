@@ -1,0 +1,1237 @@
+---
+title: "EVT-trained Type Segmentation"
+subtitle: "z_type segments trained on EVT, plots assigned by embedding location"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  evt_table: "~/Dropbox/git/vq-vae/data/LF2024_EVT.csv"
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  K: 20            # number of type clusters / segments (both methods)
+  min_evt_n: 20    # min plots for an EVT centroid to seed clustering (both methods)
+  phase_subdivide_frac: 0.25  # [original] fraction of type clusters to phase-subdivide
+  k_phase: 3       # phase sub-groups per subdivided cluster (both methods)
+  K_strata: 5      # [original] final strata; also the TCC/flat competitors
+  tree_phase_frac: 0.20       # [constrained] top fraction of TREE segments to subdivide
+  K_strata_tree: 3            # [constrained] Tree strata
+  K_strata_nontree: 2         # [constrained] non-Tree strata (total = tree + nontree)
+  K_full: 50                  # [full-embedding] k-means clusters over z_type + z_phase
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 110)
+```
+
+## Overview
+
+**Segment** the type embedding `z_type` using EVT as supervision, then assign each
+plot to a segment by **its own location in `z_type`** — not by its EVT label.
+
+1. Represent each EVT by its **centroid** in standardized `z_type` (reliable EVTs,
+   `n >= min_evt_n`; rare EVTs attach to the nearest).
+2. **Ward-cluster the EVT centroids** into `K` groups — EVT trains *which regions
+   of the embedding form*.
+3. Compute each group's centroid from its plots and **assign every plot to the
+   nearest group centroid** — a Voronoi segmentation of `z_type` space.
+
+So the segment boundaries are learned from EVT, but plots land in bins by *where
+they sit* in the embedding; an EVT may split across bins if its plots are
+embedding-diverse. EVT is external to the FIA responses, so this supervision
+cannot leak into BALIVE/volume/removals. Diagnostics report how cohesive EVTs
+remain and how compact the segmentation is vs a free k-means.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
+```
+
+## Load and per-EVT centroids
+
+```{r load}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)
+
+emb <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  filter(!is.na(evt), evt != -9999)                     # drop nodata EVT
+
+Z    <- scale(as.matrix(emb[, emb_type_vars]))          # standardized z_type
+evt  <- as.character(emb$evt)
+evt_n <- table(evt)
+
+# per-EVT centroid in standardized z_type
+cent  <- rowsum(Z, evt) / as.numeric(evt_n[rownames(rowsum(Z, evt))])
+big   <- names(evt_n)[evt_n >= params$min_evt_n]        # reliable centroids
+cat(sprintf("plots: %d   EVTs: %d (%d with n >= %d used as clustering atoms)\n",
+            nrow(emb), length(evt_n), length(big), params$min_evt_n))
+```
+
+## Ward-cluster the EVT centroids
+
+```{r cluster, fig.width=11, fig.height=6}
+cent_big <- cent[big, , drop = FALSE]
+hc <- hclust(dist(cent_big), method = "ward.D2")
+K  <- min(params$K, nrow(cent_big))
+cl_big <- cutree(hc, k = K)                              # named by big EVT
+
+# cluster centroids (rows ordered 1..K)
+clcent <- t(sapply(sort(unique(cl_big)),
+                   function(k) colMeans(cent_big[cl_big == k, , drop = FALSE])))
+
+# EVT -> group map (the EVT-trained grouping): big EVTs from the Ward cut, rare
+# EVTs attached to the nearest EVT-centroid cluster.
+nearest_c <- function(v) which.min(colSums((t(clcent) - v)^2))
+evt_group <- vapply(rownames(cent), function(e)
+  if (e %in% big) cl_big[[e]] else nearest_c(cent[e, ]), integer(1))
+names(evt_group) <- rownames(cent)
+
+# Segment z_type: group centroids computed from the plots (seeded by the EVT
+# grouping), then assign EVERY PLOT to the nearest group centroid by its own
+# z_type location. An EVT may split across segments.
+grp0 <- evt_group[evt]
+glev <- sort(unique(grp0))
+gc   <- t(sapply(glev, function(g) colMeans(Z[grp0 == g, , drop = FALSE])))
+d2   <- sapply(seq_len(nrow(gc)), function(k) rowSums(sweep(Z, 2, gc[k, ], "-")^2))
+emb$type_cluster <- factor(glev[max.col(-d2, ties.method = "first")])
+
+# dendrogram of the big EVTs, boxed by cluster
+op <- par(mar = c(6, 4, 3, 1))
+plot(hc, labels = big, xlab = "EVT", sub = "", cex = 0.6,
+     main = sprintf("EVT centroids in z_type -> %d clusters (Ward)", K))
+rect.hclust(hc, k = K, border = 2:(K + 1))
+par(op)
+```
+
+## EVT cohesion under location-based assignment
+
+How much do EVTs stay together now that plots are assigned by embedding location?
+(High = `z_type` respects EVT; an EVT splits only when its plots are
+embedding-diverse.)
+
+```{r verify}
+tab <- table(evt = evt, cluster = emb$type_cluster)
+cat(sprintf("EVT cohesion (plot-weighted: plots in their EVT's modal segment): %.3f\n",
+            sum(apply(tab, 1, max)) / sum(tab)))
+cat(sprintf("EVTs entirely within one segment: %d / %d (%.1f%%)\n",
+            sum(rowSums(tab > 0) == 1), nrow(tab), 100 * mean(rowSums(tab > 0) == 1)))
+```
+
+## Cluster composition
+
+Each cluster aggregates several EVTs (expected). `n_evts` = distinct EVTs pooled
+into the cluster; `top_evts` = the largest few by plot count.
+
+```{r composition}
+emb %>%
+  group_by(type_cluster) %>%
+  summarize(n_plots = n(),
+            n_evts  = dplyr::n_distinct(evt),
+            top_evts = paste(names(sort(table(evt), decreasing = TRUE))[1:3], collapse = ", "),
+            .groups = "drop") %>%
+  arrange(desc(n_plots))
+```
+
+## Does z_type respect EVT? (segmentation compactness)
+
+Compare within-segment `z_type` dispersion of the EVT-trained segmentation to a
+**free** k-means at the same `K` (which minimizes it). Ratio near 1 means the
+EVT-trained segments are almost as tight as unconstrained clusters — i.e. `z_type`
+already separates EVTs cleanly; a large ratio means the EVT supervision pulls the
+segments away from the embedding's natural structure.
+
+```{r compactness}
+tot_within <- function(cl) {
+  ss <- sum(vapply(split(seq_len(nrow(Z)), cl), function(ix) {
+    m <- Z[ix, , drop = FALSE]; sum(sweep(m, 2, colMeans(m))^2)
+  }, numeric(1)))
+  ss / nrow(Z)
+}
+set.seed(1)
+km <- kmeans(Z, centers = K, nstart = 10)
+
+w_evt <- tot_within(emb$type_cluster)
+w_km  <- tot_within(km$cluster)
+data.frame(
+  clustering = c("EVT-trained segmentation (this)", "free k-means (same K)"),
+  within_var = round(c(w_evt, w_km), 3),
+  ratio_to_kmeans = round(c(w_evt / w_km, 1), 3)
+)
+
+# homogeneity: how EVT-coherent the segments are (higher = each segment ~ few EVTs)
+homogeneity <- 1 - sum(apply(tab, 2, function(col) {
+  p <- col[col > 0] / sum(col); -sum(p * log(p))
+}) * colSums(tab)) / sum(tab) /
+  ( -sum((rowSums(tab)/sum(tab)) * log(rowSums(tab)/sum(tab))) )
+cat(sprintf("homogeneity (segment -> one EVT): %.3f (higher = segments are EVT-coherent)\n",
+            homogeneity))
+```
+
+## EVT -> segment map
+
+Each EVT's **modal** segment and its **cohesion** (fraction of the EVT's plots in
+that segment). Cohesion < 1 means the EVT split across segments under
+location-based assignment.
+
+```{r map}
+# LANDFIRE EVT lookup: VALUE (the EVT code) -> EVT_NAME
+evt_lookup <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  select(VALUE, EVT_NAME)
+
+evt_map <- emb %>%
+  group_by(VALUE = evt) %>%
+  summarize(n_plots  = n(),
+            cluster  = as.integer(names(sort(table(type_cluster), decreasing = TRUE))[1]),
+            cohesion = round(max(table(type_cluster)) / n(), 3),
+            .groups  = "drop") %>%
+  mutate(VALUE = as.integer(VALUE)) %>%
+  left_join(evt_lookup, by = "VALUE") %>%
+  select(VALUE, EVT_NAME, n_plots, type_cluster = cluster, cohesion) %>%
+  arrange(type_cluster, desc(n_plots))
+evt_map
+```
+
+## Stratification: BALIVE, Volume, and Removals vs TCC
+
+Build the fine bins as **EVT type clusters, then phase-subdivided**: take the
+`r params$K` EVT-trained type segments, and split the top
+`r round(100*params$phase_subdivide_frac)`% (by within-cluster `z_phase` spread)
+into `r params$k_phase` phase sub-groups each (Ward on `z_phase`) — the same
+type->phase refinement as the geometry hierarchical script, but with EVT-based
+type bins. Then aggregate the fine bins into `K_strata` strata by Ward on the
+cluster-mean response (supervised), and compare within-stratum SD against TCC and
+a flat type+phase probe, by survey unit. Responses: **BALIVE**, **standing live
+volume**, and **removals**. Stocks (BALIVE/volume) run on the **full plot
+population** (non-forest plots contribute 0 — no forest-code filter); removals
+additionally require remeasurement/GRM data, which naturally scopes them to
+treed plots while still retaining land-use diversions.
+
+```{r strat-data}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+cond <- dbGetQuery(con, sprintf(
+  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, FORTYPCD FROM COND WHERE STATECD='%s'",
+  params$statecd)) %>% mutate(PLT_CN = as.character(PLT_CN))
+balive <- cond %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+fortyp <- cond %>%
+  group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(PLT_CN, FORTYPCD)
+
+dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, overwrite = TRUE)
+
+# standing LIVE net cu ft volume per acre (STATUSCD=1)
+vol <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(CASE WHEN g.STATUSCD=1 THEN COALESCE(g.VOLCFNET,0)*COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS volume
+     FROM TREE g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+
+# annual per-acre removed GS volume; COALESCE inside SUM so no-removal plots are 0
+remv <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN))
+```
+
+```{r strat-tcc}
+locs <- fia_locs %>% filter(CN %in% emb$CN) %>% distinct(CN, .keep_all = TRUE)
+tccr <- rast(params$tcc)
+pts  <- vect(locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+tv   <- extract(tccr, project(pts, crs(tccr)), ID = FALSE)[[1]]
+tv   <- as.numeric(as.character(tv)); tv[tv > 100] <- NA_real_
+tcc_by_cn <- tibble(CN = locs$CN, tcc = tv)
+```
+
+```{r strat-assemble}
+analysis <- emb %>%
+  select(CN, type_cluster, all_of(emb_type_vars), all_of(emb_phase_vars)) %>%
+  inner_join(balive, by = c("CN" = "PLT_CN")) %>%
+  left_join(vol,     by = c("CN" = "PLT_CN")) %>%
+  inner_join(fortyp, by = c("CN" = "PLT_CN")) %>%
+  inner_join(select(fia_locs, CN, UNITCD), by = "CN") %>%
+  inner_join(tcc_by_cn, by = "CN") %>%
+  mutate(volume = coalesce(volume, 0)) %>%
+  filter(!is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)   # full population; no forest-code filter
+cat(sprintf("plots with covariates: %d across %d units\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
+```
+
+```{r strat-helpers}
+pooled_within <- function(df, groups, y) {
+  g <- df %>% group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+# Dalenius-Hodges cumulative-sqrt(f) boundaries (the K-1 interior breaks)
+dh_breaks <- function(x, K, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(numeric(0))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+}
+dh_strata <- function(x, K, nbins = 100) {
+  bnd <- dh_breaks(x, K, nbins)
+  if (length(bnd) == 0) return(factor(rep(1L, length(x))))
+  factor(findInterval(as.numeric(x), c(-Inf, bnd, Inf)))
+}
+ward <- function(X, k) {
+  d  <- dist(X)
+  hc <- if (requireNamespace("fastcluster", quietly = TRUE))
+          fastcluster::hclust(d, method = "ward.D2") else hclust(d, method = "ward.D2")
+  cutree(hc, k = k)
+}
+# fine bins -> strata: Ward on the fine-bin-mean response (supervised aggregation)
+bin_map <- function(bin, y, K) {
+  d  <- tibble(fine_bin = bin, .y = y) %>% group_by(fine_bin) %>%
+        summarize(n_plots = n(), mean_y = mean(.y), .groups = "drop")
+  Kk <- min(K, nrow(d))
+  d$stratum <- if (nrow(d) <= 1) 1L else
+    cutree(hclust(dist(scale(d$mean_y)), method = "ward.D2"), Kk)
+  d
+}
+agg_by <- function(bin, y, K) {
+  d <- bin_map(bin, y, K)
+  factor(d$stratum[match(bin, d$fine_bin)])
+}
+# fine-bin -> stratum table for display
+show_map <- function(df, y) {
+  bin_map(df$fine_bin, df[[y]], params$K_strata) %>%
+    transmute(fine_bin, n_plots, mean_response = round(mean_y, 2), stratum) %>%
+    arrange(stratum, desc(mean_response))
+}
+# flat OOF supervised probe on `vars` -> DH bins (the direct-supervision ceiling)
+oof_dh <- function(df, y, vars, K) {
+  set.seed(1); folds <- sample(rep(1:5, length.out = nrow(df)))
+  d <- df %>% mutate(y_resp = .data[[y]])
+  form <- reformulate(vars, "y_resp"); s <- numeric(nrow(df))
+  for (f in 1:5) { fit <- lm(form, d[folds != f, ]); s[folds == f] <- predict(fit, d[folds == f, ]) }
+  dh_strata(s, K)
+}
+# response-by-stratum boxplots for a named list of stratifications (one facet each)
+strata_boxplot <- function(df, y, schemes, ylab = y, logy = FALSE) {
+  long <- dplyr::bind_rows(lapply(names(schemes), function(nm)
+    tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]])))
+  long$scheme <- factor(long$scheme, levels = names(schemes))
+  long$yval   <- if (logy) log1p(long$val) else long$val
+  ggplot(long, aes(x = stratum, y = yval)) +
+    geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+    facet_wrap(~ scheme, scales = "free_x", nrow = 1) +
+    labs(x = "stratum", y = if (logy) paste0("log1p(", ylab, ")") else ylab) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+# per-stratum n / mean / sd for a named list of stratifications
+strata_summary <- function(df, y, schemes) {
+  dplyr::bind_rows(lapply(names(schemes), function(nm)
+    tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]]) %>%
+      group_by(scheme, stratum) %>%
+      summarize(n = dplyr::n(), mean = round(mean(val), 3), sd = round(sd(val), 3),
+                .groups = "drop"))) %>%
+    mutate(scheme = factor(scheme, levels = names(schemes))) %>%
+    arrange(scheme, stratum)
+}
+# the four stratifications compared for the ORIGINAL (location-based) method
+schemes_o <- function(df, y) list(
+  "TCC FIA fixed"  = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                         labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"         = dh_strata(df$tcc, params$K_strata),
+  "EVT type/phase" = agg_by(df$fine_bin, df[[y]], params$K_strata),
+  "flat probe"     = oof_dh(df, y, emb_vars, params$K_strata))
+```
+
+### Fine bins: EVT type clusters -> phase subdivision
+
+```{r fine-bins}
+# within-cluster z_phase spread; subdivide the top fraction into k_phase groups
+Zp   <- scale(as.matrix(analysis[, emb_phase_vars]))
+pvar <- tapply(seq_len(nrow(analysis)), analysis$type_cluster,
+               function(ix) sum(apply(Zp[ix, , drop = FALSE], 2, var)))
+n_cl   <- length(pvar)
+n_sub  <- max(1, round(params$phase_subdivide_frac * n_cl))
+sub_cl <- names(sort(pvar, decreasing = TRUE))[seq_len(n_sub)]
+
+analysis$phase_sub <- 1L
+for (b in sub_cl) {
+  ix <- which(as.character(analysis$type_cluster) == b)
+  if (length(ix) >= 10 * params$k_phase)
+    analysis$phase_sub[ix] <- ward(Zp[ix, , drop = FALSE], params$k_phase)
+}
+analysis$fine_bin <- interaction(analysis$type_cluster, analysis$phase_sub, drop = TRUE)
+cat(sprintf("fine bins: %d (from %d type clusters, %d phase-subdivided)\n",
+            nlevels(analysis$fine_bin), n_cl, length(sub_cl)))
+
+# type clusters ranked by within-cluster z_phase variance, flagged if subdivided
+tibble(type_cluster = names(pvar),
+       n            = as.integer(table(analysis$type_cluster)[names(pvar)]),
+       phase_var    = round(as.numeric(pvar), 3),
+       subdivided   = names(pvar) %in% sub_cl) %>%
+  arrange(desc(phase_var))
+```
+
+### Removals population (remeasured + GRM data)
+
+```{r removals-pop}
+ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # GRM/remeasured; zeros kept
+cat(sprintf("remeasured plots with GRM data: %d (%.1f%% with any removal)\n",
+            nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
+```
+
+### Response distributions by top EVT classes
+
+Histograms of each response within the 10 most common EVT forest types (by plot
+count over the full population). Shows how each target is distributed within a
+forest type — and how much of the total spread is *within* a type, which caps how
+much a type-based stratification can reduce variance.
+
+```{r evt-hist-setup}
+evt_names <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  transmute(evt = as.character(VALUE), EVT_NAME)
+emb_evt <- emb %>% transmute(CN, evt = as.character(evt))
+
+top10 <- analysis %>% inner_join(emb_evt, by = "CN") %>%
+  count(evt, sort = TRUE) %>% slice_head(n = 10) %>% pull(evt)
+
+lab_of <- function(e) {
+  nm <- evt_names$EVT_NAME[match(e, evt_names$evt)]
+  ifelse(is.na(nm), e, sprintf("%s (%s)", substr(nm, 1, 26), e))
+}
+hist_by_evt <- function(df, y, ylab, logx = FALSE) {
+  d <- df %>% inner_join(emb_evt, by = "CN") %>% filter(evt %in% top10) %>%
+    mutate(evt_lab = factor(lab_of(evt), levels = lab_of(top10)),
+           val = if (logx) log1p(.data[[y]]) else .data[[y]])
+  ggplot(d, aes(val)) +
+    geom_histogram(bins = 30, fill = "grey40") +
+    facet_wrap(~ evt_lab, scales = "free_y", ncol = 2) +
+    labs(x = if (logx) paste0("log1p(", ylab, ")") else ylab, y = "plots") +
+    theme_bw(base_size = 9)
+}
+```
+
+```{r evt-hist-balive, fig.width=11, fig.height=9}
+hist_by_evt(analysis, "BALIVE", "BALIVE")
+```
+
+```{r evt-hist-volume, fig.width=11, fig.height=9}
+hist_by_evt(analysis, "volume", "volume")
+```
+
+```{r evt-hist-removals, fig.width=11, fig.height=9}
+hist_by_evt(ar, "remv_cfgs", "removals", logx = TRUE)
+```
+
+### Response statistics by EVT class
+
+Per-EVT mean, SD, 75th percentile, and fraction of zero-valued plots for each
+response. BALIVE and volume are over the full population (`n`); removals are over
+the remeasured/GRM subset (`rem_n`). `*_fz` is the zero fraction.
+
+```{r evt-stats}
+av <- analysis %>% inner_join(emb_evt, by = "CN") %>% group_by(evt) %>%
+  summarize(n = n(),
+            bal_mean = round(mean(BALIVE), 1), bal_sd = round(sd(BALIVE), 1),
+            bal_q75 = round(quantile(BALIVE, .75), 1), bal_fz = round(mean(BALIVE == 0), 3),
+            vol_mean = round(mean(volume), 0), vol_sd = round(sd(volume), 0),
+            vol_q75 = round(quantile(volume, .75), 0), vol_fz = round(mean(volume == 0), 3),
+            .groups = "drop")
+rm_stats <- ar %>% inner_join(emb_evt, by = "CN") %>% group_by(evt) %>%
+  summarize(rem_n = n(), rem_mean = round(mean(remv_cfgs), 1), rem_sd = round(sd(remv_cfgs), 1),
+            rem_q75 = round(quantile(remv_cfgs, .75), 1), rem_fz = round(mean(remv_cfgs == 0), 3),
+            .groups = "drop")
+
+av %>% left_join(rm_stats, by = "evt") %>%
+  mutate(VALUE = as.integer(evt)) %>%
+  left_join(transmute(evt_names, VALUE = as.integer(evt), EVT_NAME), by = "VALUE") %>%
+  select(VALUE, EVT_NAME, n,
+         bal_mean, bal_sd, bal_q75, bal_fz,
+         vol_mean, vol_sd, vol_q75, vol_fz,
+         rem_n, rem_mean, rem_sd, rem_q75, rem_fz) %>%
+  arrange(desc(n))
+```
+
+### Evaluation
+
+```{r strat-eval}
+# TCC break points actually used by the two TCC schemes
+cat("FIA fixed TCC breaks:", "10, 48, 85", "(0-10 / 11-48 / 49-85 / 86-100)\n")
+cat(sprintf("TCC DH (%d) breaks: %s\n", params$K_strata,
+            paste(round(dh_breaks(analysis$tcc, params$K_strata), 1), collapse = ", ")))
+
+resp_table <- function(df, y, vars = emb_vars) {
+  s_fia  <- cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                labels = c("0-10", "11-48", "49-85", "86-100"))     # FIA operational
+  s_tcc  <- dh_strata(df$tcc, params$K_strata)
+  s_evt  <- agg_by(df$fine_bin, df[[y]], params$K_strata)
+  s_flat <- oof_dh(df, y, vars, params$K_strata)
+  vv <- c(pooled_within(df, "UNITCD", y),
+          pooled_within(mutate(df, .s = s_fia),  c("UNITCD", ".s"), y),
+          pooled_within(mutate(df, .s = s_tcc),  c("UNITCD", ".s"), y),
+          pooled_within(mutate(df, .s = s_evt),  c("UNITCD", ".s"), y),
+          pooled_within(mutate(df, .s = s_flat), c("UNITCD", ".s"), y))
+  data.frame(
+    stratification  = c("UNITCD only (baseline)",
+                        "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
+                        sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                        sprintf("UNITCD x EVT type/phase hierarchical (%d)", params$K_strata),
+                        sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
+    within_var      = round(vv, 2),
+    within_sd       = round(sqrt(vv), 3),
+    pct_of_baseline = round(100 * vv / vv[1], 1),
+    # vv[1] = UNITCD baseline, vv[2] = TCC FIA fixed. RE = V_TCC/V_method (>1 beats
+    # TCC); ess_unit = N*V_unit/V_method (baseline row = N, sub-strat above N).
+    RE_vs_tcc       = round(vv[2] / vv, 2),
+    ess_unit        = round(nrow(df) * vv[1] / vv))
+}
+```
+
+#### BALIVE
+
+```{r strat-balive}
+resp_table(analysis, "BALIVE")
+```
+
+Fine bin -> stratum mapping (BALIVE):
+
+```{r strat-balive-map}
+show_map(analysis, "BALIVE")
+```
+
+Strata sizes, mean, and SD (BALIVE):
+
+```{r strat-balive-strata}
+sch_bal <- schemes_o(analysis, "BALIVE")
+strata_summary(analysis, "BALIVE", sch_bal)
+```
+
+Distribution of BALIVE within each stratum:
+
+```{r strat-balive-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis, "BALIVE", sch_bal, ylab = "BALIVE")
+```
+
+#### Standing live volume
+
+```{r strat-volume}
+resp_table(analysis, "volume")
+```
+
+Fine bin -> stratum mapping (volume):
+
+```{r strat-volume-map}
+show_map(analysis, "volume")
+```
+
+Strata sizes, mean, and SD (volume):
+
+```{r strat-volume-strata}
+sch_vol <- schemes_o(analysis, "volume")
+strata_summary(analysis, "volume", sch_vol)
+```
+
+Distribution of volume within each stratum:
+
+```{r strat-volume-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis, "volume", sch_vol, ylab = "volume")
+```
+
+#### Removals
+
+```{r strat-removals}
+resp_table(ar, "remv_cfgs")
+```
+
+Fine bin -> stratum mapping (removals):
+
+```{r strat-removals-map}
+show_map(ar, "remv_cfgs")
+```
+
+Strata sizes, mean, and SD (removals):
+
+```{r strat-removals-strata}
+sch_rmv <- schemes_o(ar, "remv_cfgs")
+strata_summary(ar, "remv_cfgs", sch_rmv)
+```
+
+Removals by stratum for each scheme (`log1p` axis — removals are zero-inflated,
+so a scheme separates well when some strata lift off the zero floor):
+
+```{r strat-removals-box, fig.width=11, fig.height=4}
+strata_boxplot(ar, "remv_cfgs", sch_rmv, ylab = "removals", logy = TRUE)
+```
+
+```{r strat-cleanup}
+dbDisconnect(con)
+```
+
+# Constrained-Ward Tree / non-Tree typology
+
+*(A second, self-contained method — the original method above is untouched.)*
+
+A domain-directed variant that refuses to mix LANDFIRE macro life-forms. Using
+`EVT_LF`, every EVT is either **Tree** or **non-Tree**. We segment `z_type` with
+Ward clustering under a **cannot-link constraint** (a Tree centroid may never
+merge with a non-Tree centroid), so each of the `r params$K` segments is
+macro-pure by construction. As before, the final plot assignment is by **nearest
+segment centroid in `z_type` alone** — the macro side is never used to place a
+plot, so we can measure *leakage*: plots that land embedding-nearest to a segment
+whose macro differs from the plot's own EVT macro. Downstream, only Tree segments
+are phase-subdivided, and the strata keep the split: `r params$K_strata_tree`
+Tree strata + `r params$K_strata_nontree` non-Tree strata.
+
+## Cannot-link Ward on EVT centroids
+
+```{r c-load-lf}
+evt_lf <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  transmute(VALUE = as.character(VALUE), EVT_LF)
+lf_by_evt <- setNames(evt_lf$EVT_LF, evt_lf$VALUE)
+
+is_tree_evt <- setNames(lf_by_evt[names(evt_n)] == "Tree", names(evt_n))
+is_tree_evt[is.na(is_tree_evt)] <- FALSE                 # unknown LF -> non-Tree
+cat(sprintf("EVTs: %d Tree / %d non-Tree (by EVT_LF); big EVTs: %d Tree / %d non-Tree\n",
+            sum(is_tree_evt), sum(!is_tree_evt),
+            sum(is_tree_evt[big]), sum(!is_tree_evt[big])))
+```
+
+```{r c-cluster, fig.width=11, fig.height=6}
+cent_big <- cent[big, , drop = FALSE]
+tree_big <- is_tree_evt[big]                             # named logical, big EVTs
+
+# cannot-link: inflate every cross-macro distance so Ward defers those merges
+D <- as.matrix(dist(cent_big))
+D[outer(tree_big, tree_big, `!=`)] <- max(D) * 1000
+hc_c   <- hclust(as.dist(D), method = "ward.D2")
+K      <- min(params$K, nrow(cent_big))
+cl_big_c <- cutree(hc_c, k = K)                          # named by big EVT
+
+seg_ids   <- sort(unique(cl_big_c))
+clcent_c  <- t(sapply(seg_ids, function(k)
+  colMeans(cent_big[cl_big_c == k, , drop = FALSE])))
+# segment macro = majority macro of its big EVTs (pure if the constraint held)
+seg_macro0 <- vapply(seg_ids, function(k) mean(tree_big[cl_big_c == k]) >= 0.5, logical(1))
+
+# dendrogram, boxed by segment
+op <- par(mar = c(6, 4, 3, 1))
+plot(hc_c, labels = ifelse(tree_big, paste0(big, "*"), big), xlab = "EVT (* = Tree)",
+     sub = "", cex = 0.6,
+     main = sprintf("Cannot-link Ward: EVT centroids -> %d macro-pure segments", K))
+rect.hclust(hc_c, k = K, border = 2:(K + 1))
+par(op)
+```
+
+```{r c-assign}
+# rare EVTs seed the grouping via nearest SAME-MACRO segment centroid
+nearest_c_macro <- function(v, want_tree) {
+  cand <- which(seg_macro0 == want_tree)
+  cand[which.min(colSums((t(clcent_c[cand, , drop = FALSE]) - v)^2))]
+}
+evt_group_c <- vapply(rownames(cent), function(e) {
+  if (e %in% big) return(match(cl_big_c[[e]], seg_ids))
+  nearest_c_macro(cent[e, ], isTRUE(is_tree_evt[e]))
+}, integer(1))
+names(evt_group_c) <- rownames(cent)
+
+# segment centroids from the plots; assign EVERY plot by nearest centroid in
+# z_type ONLY (macro side never used to place a plot)
+grp0_c <- evt_group_c[evt]
+glev_c <- sort(unique(grp0_c))
+gc_c   <- t(sapply(glev_c, function(g) colMeans(Z[grp0_c == g, , drop = FALSE])))
+d2_c   <- sapply(seq_len(nrow(gc_c)), function(k) rowSums(sweep(Z, 2, gc_c[k, ], "-")^2))
+seg_pos <- glev_c[max.col(-d2_c, ties.method = "first")]
+emb$type_cluster_c <- factor(seg_pos)
+emb$macro_c <- ifelse(seg_macro0[seg_pos], "Tree", "nonTree")
+```
+
+## Leakage under embedding-only assignment
+
+Segments are macro-pure by construction; leakage is what the *location-based*
+assignment costs — plots whose nearest `z_type` segment belongs to the other
+macro than their own EVT. Low leakage means the Tree / non-Tree boundary is
+clean in the embedding.
+
+```{r c-leakage}
+plot_evt_macro <- ifelse(is_tree_evt[evt], "Tree", "nonTree")
+cat(sprintf("segments: %d Tree / %d non-Tree\n", sum(seg_macro0), sum(!seg_macro0)))
+cat(sprintf("plot macro leakage (assigned macro != EVT macro): %.2f%%\n",
+            100 * mean(emb$macro_c != plot_evt_macro)))
+cat(sprintf("  of Tree-EVT plots landing in a non-Tree segment: %.2f%%\n",
+            100 * mean(emb$macro_c[plot_evt_macro == "Tree"] == "nonTree")))
+cat(sprintf("  of non-Tree-EVT plots landing in a Tree segment: %.2f%%\n",
+            100 * mean(emb$macro_c[plot_evt_macro == "nonTree"] == "Tree")))
+
+# per-segment purity of the seeding EVTs (cannot-link check)
+tibble(segment = seg_ids,
+       macro   = ifelse(seg_macro0, "Tree", "nonTree"),
+       n_big_evts = as.integer(table(cl_big_c)[as.character(seg_ids)]),
+       n_tree_evts    = as.integer(tapply(tree_big, cl_big_c, sum)[as.character(seg_ids)]),
+       n_nontree_evts = as.integer(tapply(!tree_big, cl_big_c, sum)[as.character(seg_ids)])) %>%
+  mutate(segment = match(segment, glev_c),
+         n_plots = as.integer(table(factor(seg_pos, levels = glev_c))[as.character(segment)])) %>%
+  arrange(macro, desc(n_plots))
+```
+
+## EVT -> segment map (constrained)
+
+Each EVT's **modal** segment under embedding-only assignment, its macro side,
+cohesion (fraction of the EVT's plots in that segment), and a `leaks` flag —
+`TRUE` when the EVT's plots land, on balance, in a segment of the *other* macro
+than its own `EVT_LF`.
+
+```{r c-map}
+evt_lookup2 <- read_csv(params$evt_table, show_col_types = FALSE) %>%
+  select(VALUE, EVT_NAME, EVT_LF) %>% mutate(VALUE = as.integer(VALUE))
+
+evt_map_c <- emb %>%
+  group_by(VALUE = evt) %>%
+  summarize(n_plots  = n(),
+            segment  = as.integer(names(sort(table(type_cluster_c), decreasing = TRUE))[1]),
+            macro    = names(sort(table(macro_c), decreasing = TRUE))[1],
+            cohesion = round(max(table(type_cluster_c)) / n(), 3),
+            .groups  = "drop") %>%
+  mutate(VALUE = as.integer(VALUE)) %>%
+  left_join(evt_lookup2, by = "VALUE") %>%
+  mutate(evt_lf_macro = ifelse(!is.na(EVT_LF) & EVT_LF == "Tree", "Tree", "nonTree"),
+         leaks = macro != evt_lf_macro) %>%
+  select(VALUE, EVT_NAME, EVT_LF, n_plots, segment, macro, cohesion, leaks) %>%
+  arrange(macro, segment, desc(n_plots))
+evt_map_c
+```
+
+## Stratification (constrained typology)
+
+Tree segments are phase-subdivided (top `r round(100*params$tree_phase_frac)`% by
+`z_phase` spread into `r params$k_phase` groups each); non-Tree segments are not.
+The strata are then `r params$K_strata_tree` Tree strata (Ward on the Tree fine
+bins' mean response) plus `r params$K_strata_nontree` non-Tree strata (Ward on the
+non-Tree segments' mean response).
+
+Each response is stratified two ways: **self-trained** (the fine-bin -> stratum
+aggregation trained on that response) and **BALIVE-trained** (the aggregation
+trained once on BALIVE and applied *unchanged*). Comparing them shows whether a
+binning learned on one attribute transfers to attributes it never saw — the
+type/phase fine bins are already response-agnostic (EVT + `z_phase` only); only
+this last aggregation step is supervised. On the BALIVE panel the two rows
+coincide by construction (a useful sanity check).
+
+```{r c-analysis}
+analysis_c <- analysis %>%
+  inner_join(select(emb, CN, type_cluster_c, macro_c), by = "CN")
+cat(sprintf("plots: %d (%d Tree / %d non-Tree)\n",
+            nrow(analysis_c), sum(analysis_c$macro_c == "Tree"),
+            sum(analysis_c$macro_c == "nonTree")))
+```
+
+```{r c-fine-bins}
+# phase-subdivide the top fraction of TREE segments only
+Zp_c    <- scale(as.matrix(analysis_c[, emb_phase_vars]))
+tree_cl <- unique(as.character(analysis_c$type_cluster_c[analysis_c$macro_c == "Tree"]))
+pvar_c  <- vapply(tree_cl, function(b) {
+  ix <- which(as.character(analysis_c$type_cluster_c) == b)
+  sum(apply(Zp_c[ix, , drop = FALSE], 2, var))
+}, numeric(1))
+n_sub_c  <- max(1, round(params$tree_phase_frac * length(tree_cl)))
+sub_cl_c <- names(sort(pvar_c, decreasing = TRUE))[seq_len(n_sub_c)]
+
+analysis_c$phase_sub_c <- 1L
+for (b in sub_cl_c) {
+  ix <- which(as.character(analysis_c$type_cluster_c) == b)
+  if (length(ix) >= 10 * params$k_phase)
+    analysis_c$phase_sub_c[ix] <- ward(Zp_c[ix, , drop = FALSE], params$k_phase)
+}
+analysis_c$fine_bin_c <- interaction(analysis_c$type_cluster_c, analysis_c$phase_sub_c, drop = TRUE)
+cat(sprintf("Tree segments: %d (%d subdivided into %d phase groups); fine bins: %d\n",
+            length(tree_cl), length(sub_cl_c), params$k_phase, nlevels(analysis_c$fine_bin_c)))
+
+# Tree segments ranked by z_phase variance, flagged if subdivided
+tibble(tree_segment = tree_cl,
+       n         = as.integer(table(analysis_c$type_cluster_c)[tree_cl]),
+       phase_var = round(as.numeric(pvar_c), 3),
+       subdivided = tree_cl %in% sub_cl_c) %>%
+  arrange(desc(phase_var))
+```
+
+```{r c-strata-helpers}
+# Train the constrained aggregation on (train_df, train_y): Tree fine bins ->
+# K_strata_tree, non-Tree segments -> K_strata_nontree, both by Ward on the
+# group-mean response. Returns a mapping (fine_bin/segment -> stratum label)
+# that can be applied to ANY df, so a binning trained on one response can be
+# scored on another.
+fit_agg_macro <- function(train_df, train_y) {
+  dt  <- train_df[train_df$macro_c == "Tree", ]
+  bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[train_y]], params$K_strata_tree)
+  dn  <- train_df[train_df$macro_c == "nonTree", ]
+  bmn <- bin_map(droplevels(factor(dn$type_cluster_c)), dn[[train_y]], params$K_strata_nontree)
+  list(tree    = setNames(paste0("T", bmt$stratum), as.character(bmt$fine_bin)),
+       nontree = setNames(paste0("N", bmn$stratum), as.character(bmn$fine_bin)))
+}
+apply_agg_macro <- function(df, mapping) {
+  s <- character(nrow(df)); is_tree <- df$macro_c == "Tree"
+  s[is_tree]  <- mapping$tree[as.character(df$fine_bin_c[is_tree])]
+  s[!is_tree] <- mapping$nontree[as.character(df$type_cluster_c[!is_tree])]
+  factor(s)
+}
+# self-trained: aggregation trained and applied on the same response
+agg_macro <- function(df, y) apply_agg_macro(df, fit_agg_macro(df, y))
+# a single BALIVE-trained mapping, applied UNCHANGED to volume/removals to test
+# whether a BALIVE binning transfers to attributes it was not trained on
+map_balive_c <- fit_agg_macro(analysis_c, "BALIVE")
+
+show_map_c <- function(df, y) {
+  dt <- df[df$macro_c == "Tree", ]
+  bmt <- bin_map(droplevels(factor(dt$fine_bin_c)), dt[[y]], params$K_strata_tree) %>%
+    transmute(bin = as.character(fine_bin), macro = "Tree", n_plots,
+              mean_response = round(mean_y, 2), stratum = paste0("T", stratum))
+  dn <- df[df$macro_c == "nonTree", ]
+  bmn <- bin_map(droplevels(factor(dn$type_cluster_c)), dn[[y]], params$K_strata_nontree) %>%
+    transmute(bin = paste0("seg ", as.character(fine_bin)), macro = "nonTree", n_plots,
+              mean_response = round(mean_y, 2), stratum = paste0("N", stratum))
+  bind_rows(bmt, bmn) %>% arrange(stratum, desc(mean_response))
+}
+
+# stratifications compared for the CONSTRAINED method. Two EVT variants:
+#  - self-trained: strata aggregated on the response being scored
+#  - BALIVE-trained: the fixed BALIVE mapping applied unchanged (transfer test)
+schemes_c <- function(df, y) list(
+  "TCC FIA fixed"      = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                             labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"             = dh_strata(df$tcc, params$K_strata),
+  "EVT self-trained"   = agg_macro(df, y),
+  "EVT BALIVE-trained" = apply_agg_macro(df, map_balive_c),
+  "flat probe"         = oof_dh(df, y, emb_vars, params$K_strata))
+
+resp_table_c <- function(df, y, vars = emb_vars) {
+  sch <- schemes_c(df, y)
+  vv  <- c(pooled_within(df, "UNITCD", y),
+           sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y)))
+  kk <- sprintf("%d+%d", params$K_strata_tree, params$K_strata_nontree)
+  data.frame(
+    stratification = c("UNITCD only (baseline)",
+                       "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
+                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                       sprintf("UNITCD x EVT constrained, self-trained (%s)", kk),
+                       sprintf("UNITCD x EVT constrained, BALIVE-trained (%s)", kk),
+                       sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
+    within_var = round(vv, 2),
+    within_sd  = round(sqrt(vv), 3),
+    pct_of_baseline = round(100 * vv / vv[1], 1),
+    # vv[1] = UNITCD baseline, vv[2] = TCC FIA fixed. RE = V_TCC/V_method (>1 beats
+    # TCC); ess_unit = N*V_unit/V_method (baseline row = N, sub-strat above N).
+    RE_vs_tcc  = round(vv[2] / vv, 2),
+    ess_unit   = round(nrow(df) * vv[1] / vv))
+}
+```
+
+```{r c-removals-pop}
+ar_c <- analysis_c %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # GRM/remeasured; zeros kept
+cat(sprintf("remeasured plots with GRM data: %d (%d Tree / %d non-Tree; %.1f%% with any removal)\n",
+            nrow(ar_c), sum(ar_c$macro_c == "Tree"), sum(ar_c$macro_c == "nonTree"),
+            100 * mean(ar_c$remv_cfgs > 0)))
+```
+
+### BALIVE (constrained)
+
+```{r c-strat-balive}
+resp_table_c(analysis_c, "BALIVE")
+```
+
+```{r c-strat-balive-map}
+show_map_c(analysis_c, "BALIVE")
+```
+
+Strata sizes, mean, and SD (BALIVE):
+
+```{r c-strat-balive-strata}
+sch_bal_c <- schemes_c(analysis_c, "BALIVE")
+strata_summary(analysis_c, "BALIVE", sch_bal_c)
+```
+
+Distribution of BALIVE within each stratum:
+
+```{r c-strat-balive-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis_c, "BALIVE", sch_bal_c, ylab = "BALIVE")
+```
+
+### Standing live volume (constrained)
+
+```{r c-strat-volume}
+resp_table_c(analysis_c, "volume")
+```
+
+```{r c-strat-volume-map}
+show_map_c(analysis_c, "volume")
+```
+
+Strata sizes, mean, and SD (volume):
+
+```{r c-strat-volume-strata}
+sch_vol_c <- schemes_c(analysis_c, "volume")
+strata_summary(analysis_c, "volume", sch_vol_c)
+```
+
+Distribution of volume within each stratum:
+
+```{r c-strat-volume-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis_c, "volume", sch_vol_c, ylab = "volume")
+```
+
+### Removals (constrained)
+
+```{r c-strat-removals}
+resp_table_c(ar_c, "remv_cfgs")
+```
+
+```{r c-strat-removals-map}
+show_map_c(ar_c, "remv_cfgs")
+```
+
+Strata sizes, mean, and SD (removals):
+
+```{r c-strat-removals-strata}
+sch_rmv_c <- schemes_c(ar_c, "remv_cfgs")
+strata_summary(ar_c, "remv_cfgs", sch_rmv_c)
+```
+
+Removals by stratum for each scheme (`log1p` axis; the constrained method's
+non-Tree plots form `r params$K_strata_nontree` strata `N1..N`):
+
+```{r c-strat-removals-box, fig.width=11, fig.height=4}
+strata_boxplot(ar_c, "remv_cfgs", sch_rmv_c, ylab = "removals", logy = TRUE)
+```
+
+# Full-embedding clustering (type + phase, one step)
+
+*(A third stratification method — the two above are untouched.)*
+
+The EVT methods above cluster only `z_type` (then refine with a phase step). This
+one clusters the **full embedding** — all `r length(emb_type_vars)` `z_type` +
+`r length(emb_phase_vars)` `z_phase` dims — in a **single k-means step**, so type
+*and* temporal-phase structure are captured jointly, with no separate
+phase-subdivision stage (k-means rather than EVT-centroid Ward, which would be
+one-per-EVT at this K). The `r params$K_full` clusters are aggregated to
+`r params$K_strata` strata by Ward on the cluster-mean response. It uses **no EVT
+and no FIA target** to form the clusters; only the final aggregation is supervised.
+
+Each response is compared across: the **original EVT type/phase hierarchical**
+binning (`z_type`), this **full one-step clustering**, **TCC** (fixed + DH), and
+the **flat supervised probe**. For volume and removals we also report a
+**transfer** table: each clustering's fine-bin -> stratum aggregation trained once
+on **BALIVE** and applied unchanged, versus trained on the response itself —
+showing how well a BALIVE-tuned stratification carries to other attributes.
+
+```{r full-cluster}
+Zfull <- scale(as.matrix(emb[, emb_vars]))          # standardized z_type + z_phase
+set.seed(1)
+kmf <- kmeans(Zfull, centers = params$K_full, nstart = 10, iter.max = 50)
+emb$full_cluster <- factor(kmf$cluster)
+cat(sprintf("full-embedding k-means (one step): %d clusters over %d dims; sizes %d..%d\n",
+            length(unique(kmf$cluster)), length(emb_vars),
+            min(table(kmf$cluster)), max(table(kmf$cluster))))
+```
+
+```{r full-assemble}
+analysis_f <- analysis %>% inner_join(select(emb, CN, full_cluster), by = "CN")
+ar_f       <- analysis_f %>% inner_join(remv, by = c("CN" = "PLT_CN"))   # removals pop
+cat(sprintf("plots: %d   remeasured with GRM: %d\n", nrow(analysis_f), nrow(ar_f)))
+```
+
+```{r full-helpers}
+# fit/apply a fine-bin -> stratum aggregation, so a binning trained on one
+# response can be scored on another (the BALIVE-trained transfer test)
+fit_agg <- function(train_df, train_y, binvar) {
+  bm <- bin_map(train_df[[binvar]], train_df[[train_y]], params$K_strata)
+  setNames(as.character(bm$stratum), as.character(bm$fine_bin))
+}
+apply_agg <- function(df, binvar, mapping) factor(unname(mapping[as.character(df[[binvar]])]))
+map_bal_evt  <- fit_agg(analysis_f, "BALIVE", "fine_bin")      # EVT type/phase, BALIVE-trained
+map_bal_full <- fit_agg(analysis_f, "BALIVE", "full_cluster")  # full one-step,  BALIVE-trained
+
+# main comparison: TCC, original EVT hierarchical, full one-step clustering, flat probe
+schemes_f <- function(df, y) list(
+  "TCC FIA fixed"   = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                          labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"          = dh_strata(df$tcc, params$K_strata),
+  "EVT type/phase"  = agg_by(df$fine_bin, df[[y]], params$K_strata),
+  "full type+phase" = agg_by(df$full_cluster, df[[y]], params$K_strata),
+  "flat probe"      = oof_dh(df, y, emb_vars, params$K_strata))
+
+resp_table_f <- function(df, y) {
+  sch <- schemes_f(df, y)
+  vv  <- c(pooled_within(df, "UNITCD", y),
+           sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y)))
+  data.frame(
+    stratification = c("UNITCD only (baseline)",
+                       "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
+                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                       sprintf("UNITCD x EVT type/phase hierarchical, z_type (%d)", params$K_strata),
+                       sprintf("UNITCD x full-embedding type+phase, one step (%d -> %d)",
+                               params$K_full, params$K_strata),
+                       sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
+    within_var = round(vv, 2), within_sd = round(sqrt(vv), 3),
+    pct_of_baseline = round(100 * vv / vv[1], 1),
+    # vv[1] = UNITCD baseline, vv[2] = TCC FIA fixed. RE = V_TCC/V_method (>1 beats
+    # TCC); ess_unit = N*V_unit/V_method (baseline row = N, sub-strat above N).
+    RE_vs_tcc = round(vv[2] / vv, 2),
+    ess_unit  = round(nrow(df) * vv[1] / vv))
+}
+# transfer: self-trained vs BALIVE-trained aggregation, for both clusterings
+transfer_table_f <- function(df, y) {
+  base <- pooled_within(df, "UNITCD", y)
+  sch <- list(
+    "EVT type/phase (self-trained)"    = apply_agg(df, "fine_bin",     fit_agg(df, y, "fine_bin")),
+    "EVT type/phase (BALIVE-trained)"  = apply_agg(df, "fine_bin",     map_bal_evt),
+    "full type+phase (self-trained)"   = apply_agg(df, "full_cluster", fit_agg(df, y, "full_cluster")),
+    "full type+phase (BALIVE-trained)" = apply_agg(df, "full_cluster", map_bal_full))
+  vv <- sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y))
+  data.frame(stratification = names(sch), within_var = round(vv, 2),
+             within_sd = round(sqrt(vv), 3), pct_of_baseline = round(100 * vv / base, 1),
+             row.names = NULL)
+}
+# full-cluster -> stratum mapping for display
+show_map_f <- function(df, y) {
+  bin_map(df$full_cluster, df[[y]], params$K_strata) %>%
+    transmute(cluster = fine_bin, n_plots, mean_response = round(mean_y, 2), stratum) %>%
+    arrange(stratum, desc(mean_response))
+}
+```
+
+### BALIVE (full-embedding)
+
+```{r full-balive}
+resp_table_f(analysis_f, "BALIVE")
+```
+
+Strata sizes, mean, and SD (BALIVE):
+
+```{r full-balive-strata}
+sch_bal_f <- schemes_f(analysis_f, "BALIVE")
+strata_summary(analysis_f, "BALIVE", sch_bal_f)
+```
+
+```{r full-balive-box, fig.width=12, fig.height=4}
+strata_boxplot(analysis_f, "BALIVE", sch_bal_f, ylab = "BALIVE")
+```
+
+### Standing live volume (full-embedding)
+
+```{r full-volume}
+resp_table_f(analysis_f, "volume")
+```
+
+Transfer — clusterings trained on BALIVE, applied to volume:
+
+```{r full-volume-transfer}
+transfer_table_f(analysis_f, "volume")
+```
+
+```{r full-volume-strata}
+sch_vol_f <- schemes_f(analysis_f, "volume")
+strata_summary(analysis_f, "volume", sch_vol_f)
+```
+
+```{r full-volume-box, fig.width=12, fig.height=4}
+strata_boxplot(analysis_f, "volume", sch_vol_f, ylab = "volume")
+```
+
+### Removals (full-embedding)
+
+```{r full-removals}
+resp_table_f(ar_f, "remv_cfgs")
+```
+
+Transfer — clusterings trained on BALIVE, applied to removals:
+
+```{r full-removals-transfer}
+transfer_table_f(ar_f, "remv_cfgs")
+```
+
+```{r full-removals-strata}
+sch_rmv_f <- schemes_f(ar_f, "remv_cfgs")
+strata_summary(ar_f, "remv_cfgs", sch_rmv_f)
+```
+
+```{r full-removals-box, fig.width=12, fig.height=4}
+strata_boxplot(ar_f, "remv_cfgs", sch_rmv_f, ylab = "removals", logy = TRUE)
+```
+
+# Forest / non-forest detection (OOF)
+
+Does the embedding detect non-forest as well as TCC? The stratification tables
+suggest TCC's full-population edge is really forest/non-forest separation, so
+here we test that directly, as a **classification** task rather than through
+BALIVE variance. Label: a plot is **non-forest** when its dominant FIA condition
+has no forest type (`is.na(FORTYPCD)`) — the agency's own forest/non-forest
+determination, independent of the embedding and of BALIVE.
+
+Four detectors, all scored out-of-fold (5-fold) where a model is fit:
+
+1. **TCC 0-10 (baseline)** — the operational rule: `tcc <= 10` -> non-forest.
+2. **logit z_type** — logistic regression of non-forest on the 48 `z_type` dims.
+3. **logit z_type + z_phase** — same, adding the 8 `z_phase` dims.
+4. **k-20 type-cluster aggregation** — the unsupervised `r params$K`-segment
+   EVT-trained `type_cluster`, aggregated by each cluster's training non-forest
+   rate (OOF). This is the *clustering* pathway that the hierarchical
+   stratification actually uses, so it isolates whether the clustering — not the
+   representation — is what loses the signal.
+
+`AUC` is threshold-free (how separable the classes are under each score). The
+operating-point metrics (`accuracy`/`sensitivity`/`specificity`/`precision`) are
+all evaluated at a **matched budget**: each score flags the same number of plots
+as the `tcc <= 10` rule, so they are directly comparable to the baseline.
+`sensitivity` is recall of the non-forest class.
+
+```{r detect-setup}
+det <- analysis %>% mutate(nonforest = as.integer(is.na(FORTYPCD)))
+lab <- det$nonforest
+cat(sprintf("plots: %d   non-forest (is.na FORTYPCD): %d (%.1f%%)\n",
+            nrow(det), sum(lab), 100 * mean(lab)))
+
+set.seed(1); folds <- sample(rep(1:5, length.out = nrow(det)))
+
+# rank-based (Mann-Whitney) AUC; higher score = more likely non-forest
+auc <- function(score, label) {
+  r <- rank(score); n1 <- sum(label == 1); n0 <- sum(label == 0)
+  (sum(r[label == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+op_metrics <- function(pred_pos, label) {
+  tp <- sum(pred_pos & label == 1); fp <- sum(pred_pos & label == 0)
+  fn <- sum(!pred_pos & label == 1); tn <- sum(!pred_pos & label == 0)
+  c(accuracy = (tp + tn) / length(label), sensitivity = tp / (tp + fn),
+    specificity = tn / (tn + fp), precision = tp / (tp + fp))
+}
+# OOF logistic P(non-forest)
+oof_logit <- function(df, vars) {
+  form <- reformulate(vars, "nonforest"); s <- numeric(nrow(df))
+  for (f in 1:5) {
+    fit <- glm(form, family = binomial, data = df[folds != f, ])
+    s[folds == f] <- predict(fit, df[folds == f, ], type = "response")
+  }
+  s
+}
+# OOF cluster aggregation: assign each plot its cluster's training non-forest rate
+oof_cluster <- function(df, cl) {
+  cl <- as.character(cl); s <- numeric(nrow(df))
+  for (f in 1:5) {
+    rate <- tapply(df$nonforest[folds != f], cl[folds != f], mean)
+    gm   <- mean(df$nonforest[folds != f])
+    v <- rate[cl[folds == f]]; v[is.na(v)] <- gm; s[folds == f] <- v
+  }
+  s
+}
+```
+
+```{r detect-eval}
+p_type <- oof_logit(det, emb_type_vars)
+p_tp   <- oof_logit(det, emb_vars)
+p_cl   <- oof_cluster(det, det$type_cluster)
+
+k    <- sum(det$tcc <= 10)                       # matched flagging budget
+topk <- function(sc) sc >= sort(sc, decreasing = TRUE)[k]
+mk <- function(nm, sc, pred) {
+  m <- op_metrics(pred, lab)
+  data.frame(scheme = nm, AUC = round(auc(sc, lab), 3),
+             accuracy = round(m["accuracy"], 3),
+             sens_nonforest = round(m["sensitivity"], 3),
+             specificity = round(m["specificity"], 3),
+             precision = round(m["precision"], 3), row.names = NULL)
+}
+cat(sprintf("matched budget: %d plots flagged non-forest (= plots with tcc <= 10)\n", k))
+bind_rows(
+  mk("TCC 0-10 (baseline)",           100 - det$tcc, det$tcc <= 10),
+  mk("logit z_type (OOF)",            p_type,        topk(p_type)),
+  mk("logit z_type + z_phase (OOF)",  p_tp,          topk(p_tp)),
+  mk("k-20 type-cluster agg (OOF)",   p_cl,          topk(p_cl)))
+```
+
+Read it as: if **logit z_type** matches or beats the TCC baseline on AUC, the
+embedding detects non-forest at least as well as canopy cover — so the
+hierarchical method's weakness is not the representation. If the **k-20
+cluster aggregation** trails the logits, the *clustering* is where the signal is
+lost (20 type segments cannot carve out a clean non-forest region the way a
+supervised direction does), which is exactly the failure mode behind the BALIVE
+stratification gap.
+
+## Notes
+
+- **EVT-trained, location-assigned.** EVT groups define the segment centroids;
+  each plot is then assigned by nearest centroid in `z_type`, so an EVT may split
+  across segments. The `EVT cohesion` diagnostic reports how much they stay
+  together (high if `z_type` respects EVT).
+- **The compactness ratio is the headline diagnostic.** Near 1.0 = `z_type`
+  already encodes EVT structure (the model learned vegetation type), so the
+  EVT-trained segments are almost as tight as free clusters. Far above 1 = EVTs
+  are smeared across the embedding and the supervision is expensive.
+- **Rare EVTs** (`n < min_evt_n`) only seed the *grouping* via the nearest
+  EVT-centroid cluster; their plots, like all plots, are then assigned by
+  location. Raise `min_evt_n` to keep noisier EVT centroids out of the grouping.
+- **Choosing K.** Read it off the dendrogram; `K` is a param. Unweighted centroids
+  give rare and common EVTs equal say in the grouping -- weight `cent_big` rows by
+  `sqrt(n)` if you want common EVTs to dominate the merges.
+- **Using it downstream.** `emb$type_cluster` (or `evt_map`) is a drop-in
+  replacement for the k-means/Ward `type_bin` step in the hierarchical
+  stratification -- an EVT-supervised type binning that never sees the FIA target.
+- **Fine bins = EVT type + phase.** The EVT clusters are phase-subdivided (top
+  `phase_subdivide_frac` by `z_phase` spread, `k_phase` groups each via Ward) to
+  match the geometry hierarchical script; set `phase_subdivide_frac = 0` to test
+  EVT-type-only fine bins.
+- **Responses.** BALIVE and standing live volume (`TREE.VOLCFNET`, `STATUSCD=1`)
+  are stocks on the **full plot population** (no forest-code filter; non-forest
+  plots contribute 0). Removals (`TREE_GRM_COMPONENT`, annual per-acre removed GS
+  volume) additionally require remeasurement/GRM data, so the inner join to `remv`
+  scopes them to treed plots (retaining land-use diversions) — this replaces the
+  old `FORTYPCD`-not-NA proxy, which dropped diverted plots and is no longer used. The `EVT type/phase hierarchical` row aggregates the fine bins
+  to `K_strata` by Ward on the fine-bin-mean response; `flat embedding supervised`
+  is the direct OOF (type+phase) probe ceiling for the same information.
+- **Constrained Tree / non-Tree method** (second section, independent of the
+  original). Cannot-link Ward on `EVT_LF` macro life-form makes every segment
+  macro-pure at the clustering step; plots are still assigned by nearest `z_type`
+  centroid alone, so `leakage` measures how clean the Tree/non-Tree boundary is
+  in the embedding. Only Tree segments are phase-subdivided (top
+  `tree_phase_frac`, `k_phase` groups); strata are `K_strata_tree` Tree strata
+  (Ward on Tree fine-bin means) + `K_strata_nontree` non-Tree strata (Ward on
+  non-Tree segment means). Tunable via `tree_phase_frac`, `K_strata_tree`,
+  `K_strata_nontree` — the original method's `phase_subdivide_frac` / `K_strata`
+  are left unchanged.
+- **Full-embedding clustering (third method).** A single k-means step on the full
+  `z_type + z_phase` space into `K_full` clusters (default 50; k-means rather than
+  EVT-centroid Ward, which would be one-per-EVT at this K), aggregated to
+  `K_strata` by Ward on the cluster-mean response — type and phase captured in one
+  step, no phase-subdivision stage. The section compares it against the original
+  EVT type/phase hierarchical binning, TCC, and the flat probe, and includes a
+  BALIVE-trained transfer table (`fit_agg`/`apply_agg`) showing how each
+  clustering, aggregated on BALIVE, carries to volume and removals. Tunable via
+  `K_full`.
+- **Forest / non-forest detection (OOF).** A direct classification check
+  (`is.na(FORTYPCD)` label) of whether the embedding separates non-forest as well
+  as TCC, comparing the `tcc <= 10` rule, OOF logistic probes on `z_type` and
+  `z_type + z_phase`, and an OOF aggregation of the `K`-segment `type_cluster`.
+  AUC is threshold-free; the operating-point metrics use a budget matched to the
+  `tcc <= 10` rule. A logit that matches TCC while the cluster aggregation trails
+  it localizes the stratification gap to the clustering, not the representation.
+- **Self-trained vs BALIVE-trained (transfer test).** Each response is scored
+  with two EVT stratifications: one whose fine-bin -> stratum aggregation is
+  trained on that response (`agg_macro`/`fit_agg_macro`), and one that reuses a
+  single BALIVE-trained mapping (`map_balive_c`) unchanged. The gap between them
+  is the cost of transferring a BALIVE binning to volume/removals; on BALIVE they
+  are identical by construction.

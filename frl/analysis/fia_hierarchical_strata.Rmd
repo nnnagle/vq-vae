@@ -1,0 +1,352 @@
+---
+title: "FIA Hierarchical Type/Phase Strata for BALIVE"
+subtitle: "20 type bins -> phase subdivision -> 5 BALIVE-homogeneous strata, Virginia FIA plots"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  k_type: 20                  # number of z_type bins
+  phase_subdivide_frac: 0.25  # fraction of type bins (highest phase variability) to split
+  k_phase: 3                 # phase sub-groups per subdivided bin
+  K_strata: 5                # final number of strata
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110
+)
+```
+
+## Overview
+
+A **hierarchical, structure-aware** stratification of the embedding space for
+estimating BALIVE:
+
+1. **~`r params$k_type` type bins** — Ward agglomerative clustering on `z_type`.
+2. **Phase variability per bin** — within each type bin, the spread of `z_phase`;
+   rank bins by it.
+3. **Subdivide the most-variable bins** — the top `r round(100*params$phase_subdivide_frac)`%
+   each split into `r params$k_phase` phase sub-groups (Ward on `z_phase`);
+   the rest stay whole. -> "fine bins".
+4. **Aggregate to `r params$K_strata` strata** — Ward hierarchical clustering of
+   the fine bins on their **mean BALIVE**, cut to `r params$K_strata`.
+
+The idea: respect the type structure, refine only where the temporal (phase) axis
+actually varies, and organize the result into a few BALIVE-homogeneous strata.
+Evaluated by pooled within-stratum BALIVE variance (by `UNITCD`), against
+baseline, TCC, and a *flat* supervised stratifier.
+
+> **Optimism note.** Plot -> fine-bin assignment uses embeddings only (no leak).
+> The 40 -> `r params$K_strata` aggregation uses bin-mean BALIVE — a coarse
+> supervised step, so the optimism vs an out-of-fold build is small; treat the
+> absolute numbers as slightly optimistic but the *comparison* as fair.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
+```
+
+## Data assembly
+
+```{r assemble}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+cond_data <- dbGetQuery(
+  con, sprintf("SELECT PLT_CN, CONDPROP_UNADJ, BALIVE, FORTYPCD FROM COND WHERE STATECD='%s'",
+               params$statecd)) %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+balive <- cond_data %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+# dominant-condition forest type (Forest Class); NA = nonforest plot
+fortyp <- cond_data %>%
+  group_by(PLT_CN) %>% slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup() %>% select(PLT_CN, FORTYPCD)
+
+emb_data <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  distinct(CN, .keep_all = TRUE)
+
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID))
+
+base <- balive %>%
+  inner_join(fortyp, by = "PLT_CN") %>%
+  inner_join(select(emb_data, CN, all_of(c(emb_type_vars, emb_phase_vars))),
+             by = c("PLT_CN" = "CN")) %>%
+  inner_join(select(fia_locs, CN, UNITCD, LON_ACTUAL, LAT_ACTUAL),
+             by = c("PLT_CN" = "CN")) %>%
+  filter(!is.na(UNITCD))
+
+# TCC at the plot locations (categorical raster -> factor -> numeric; >100 = nodata)
+tcc     <- rast(params$tcc)
+pts     <- vect(base, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+pts_aea <- project(pts, crs(tcc))
+tv <- extract(tcc, pts_aea, ID = FALSE)[[1]]
+tv <- as.numeric(as.character(tv)); tv[tv > 100] <- NA_real_
+base$tcc <- tv
+
+# Forested plots only (Forest Class not NA): a 0 removal on a forested plot is
+# data; a nonforest plot is not part of the population.
+analysis <- base %>% filter(!is.na(FORTYPCD), !is.na(tcc), tcc >= 0, tcc <= 100)
+cat(sprintf("forested plots: %d across %d survey units\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD)))
+```
+
+## Step 1 - Type bins
+
+```{r type-bins}
+# Ward agglomerative clustering (replaces k-means). Ward minimizes within-cluster
+# variance -- the stratification objective -- and gives one nested hierarchy.
+# dist() is O(n^2) (~200 MB at ~7k plots); fastcluster does it faster/leaner.
+ward <- function(X, k) {
+  d  <- dist(X)
+  hc <- if (requireNamespace("fastcluster", quietly = TRUE))
+          fastcluster::hclust(d, method = "ward.D2") else hclust(d, method = "ward.D2")
+  cutree(hc, k = k)
+}
+
+Zt <- scale(as.matrix(analysis[, emb_type_vars]))
+analysis$type_bin <- factor(ward(Zt, params$k_type))
+table(analysis$type_bin)
+```
+
+## Step 2 - Phase variability per type bin
+
+Total within-bin spread of (standardized) `z_phase` = sum of per-dimension
+variances. Higher = this forest type spans diverse temporal states.
+
+```{r phase-var}
+Zp <- scale(as.matrix(analysis[, emb_phase_vars]))
+
+phase_var <- tapply(seq_len(nrow(analysis)), analysis$type_bin, function(idx)
+  sum(apply(Zp[idx, , drop = FALSE], 2, var)))
+
+n_sub    <- round(params$phase_subdivide_frac * params$k_type)
+sub_bins <- names(sort(phase_var, decreasing = TRUE))[seq_len(n_sub)]
+
+pv <- tibble(type_bin = names(phase_var),
+             n = as.integer(table(analysis$type_bin)[names(phase_var)]),
+             phase_var = round(as.numeric(phase_var), 2)) %>%
+  arrange(desc(phase_var)) %>%
+  mutate(subdivided = type_bin %in% sub_bins)
+pv
+```
+
+## Step 3 - Subdivide high-phase-variability bins -> fine bins
+
+Each selected bin (with enough plots) splits into `r params$k_phase` phase
+sub-groups; others keep a single sub-group.
+
+```{r subdivide}
+analysis$phase_sub <- 1L
+for (b in sub_bins) {
+  idx <- which(analysis$type_bin == b)
+  if (length(idx) >= 10 * params$k_phase) {         # enough points to split
+    analysis$phase_sub[idx] <- ward(Zp[idx, , drop = FALSE], params$k_phase)   # Ward on z_phase
+  }
+}
+analysis$fine_bin <- interaction(analysis$type_bin, analysis$phase_sub, drop = TRUE)
+cat(sprintf("fine bins: %d (from %d type bins, %d subdivided)\n",
+            nlevels(analysis$fine_bin), params$k_type, length(sub_bins)))
+```
+
+## Step 4 - Aggregate fine bins into strata (Ward on mean BALIVE)
+
+```{r aggregate, fig.width=10, fig.height=5}
+bin_stats <- analysis %>%
+  group_by(fine_bin) %>%
+  summarize(n = n(), mean_bal = mean(BALIVE), sd_bal = sd(BALIVE), .groups = "drop")
+
+K  <- min(params$K_strata, nrow(bin_stats))
+hc <- hclust(dist(scale(bin_stats$mean_bal)), method = "ward.D2")
+bin_stats$stratum <- factor(cutree(hc, k = K))
+analysis$stratum  <- bin_stats$stratum[match(analysis$fine_bin, bin_stats$fine_bin)]
+
+# dendrogram of fine bins, leaves ordered by mean BALIVE
+op <- par(mar = c(6, 4, 3, 1))
+plot(hc, labels = round(bin_stats$mean_bal), xlab = "fine bin (mean BALIVE)",
+     main = sprintf("Fine bins -> %d strata (Ward on mean BALIVE)", K), sub = "")
+rect.hclust(hc, k = K, border = 2:(K + 1))
+par(op)
+
+# stratum summary
+analysis %>%
+  group_by(stratum) %>%
+  summarize(n_plots = n(), n_fine_bins = dplyr::n_distinct(fine_bin),
+            mean_bal = round(mean(BALIVE), 1), sd_bal = round(sd(BALIVE), 1),
+            .groups = "drop") %>%
+  arrange(mean_bal)
+```
+
+## Evaluation - within-stratum BALIVE variance
+
+```{r eval}
+resp <- "BALIVE"
+pooled_within <- function(df, groups, y = resp) {
+  g <- df %>% group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+dh_strata <- function(x, K = 5, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(factor(rep(1L, length(x))))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  bnd <- sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+  factor(findInterval(x, c(-Inf, bnd, Inf)))
+}
+
+# reference stratifications at the same K
+analysis$tcc_dh <- dh_strata(analysis$tcc, params$K_strata)
+
+# flat supervised: out-of-fold BALIVE probe on the full embedding, DH-binned
+set.seed(1)
+folds <- sample(rep(1:5, length.out = nrow(analysis)))
+emb_vars <- c(emb_type_vars, emb_phase_vars)
+oof <- numeric(nrow(analysis))
+form <- reformulate(emb_vars, response = "BALIVE")
+for (f in 1:5) {
+  fit <- lm(form, data = analysis[folds != f, ])
+  oof[folds == f] <- predict(fit, newdata = analysis[folds == f, ])
+}
+analysis$emb_flat <- dh_strata(oof, params$K_strata)
+
+v_unit <- pooled_within(analysis, "UNITCD")
+v_tcc  <- pooled_within(analysis, c("UNITCD", "tcc_dh"))
+v_flat <- pooled_within(analysis, c("UNITCD", "emb_flat"))
+v_hier <- pooled_within(analysis, c("UNITCD", "stratum"))
+
+vv <- c(v_unit, v_tcc, v_flat, v_hier)
+# RE vs the TCC (DH) baseline and effective sample size relative to UNITCD-only;
+# under a self-weighting sample RE = V_TCC/V_method (>1 beats TCC) and
+# ess_unit = N*V_unit/V_method (baseline row = N, sub-stratification above N).
+data.frame(
+  stratification  = c("UNITCD only (baseline)",
+                      sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                      sprintf("UNITCD x embedding flat supervised (%d)", params$K_strata),
+                      sprintf("UNITCD x hierarchical type/phase (%d)", params$K_strata)),
+  within_var      = round(vv, 1),
+  within_sd       = round(sqrt(vv), 2),
+  pct_of_baseline = round(100 * vv / v_unit, 1),
+  RE_vs_tcc       = round(v_tcc / vv, 2),
+  ess_unit        = round(nrow(analysis) * v_unit / vv)
+)
+```
+
+## Removals evaluation (multi-target test)
+
+Now score the **same fine-bin structure** on **removals** (annual per-acre removed
+growing-stock volume), aggregated two ways:
+
+1. **BALIVE-aggregated strata applied to removals** — the transfer / "one
+   stratification for many targets" case (this is the `stratum` from Step 4).
+2. **Removals-aggregated strata** — re-run the fine-bin -> `K` merge with **mean
+   removals** as the clustering feature.
+
+The population is **forested** plots (already filtered above): a 0 removal on a
+forested plot is real data, a nonforest plot is not in the population. Removals
+also require **remeasurement** to be observed, so we keep forested plots that are
+present in the GRM table (`ar`); their removal is 0 if no tree was cut.
+
+```{r removals-pull}
+dbWriteTable(con, "tmp_plots", tibble(PLT_CN = analysis$PLT_CN),
+             temporary = TRUE, overwrite = TRUE)
+# COALESCE *inside* the SUM: a remeasured plot with only survivor trees would
+# otherwise sum all-NULL -> NULL and be mistaken for "no data". Here it returns 0.
+remv <- dbGetQuery(
+  con,
+  "SELECT g.PLT_CN,
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_plots t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>%
+  mutate(PLT_CN = as.character(PLT_CN))
+# (if TREE_GRM_COMPONENT lacks PLT_CN, join TREE on g.TRE_CN = TREE.CN)
+
+# forested (analysis) AND remeasured (in GRM); zero-removal forested plots kept as 0
+ar <- analysis %>% inner_join(remv, by = "PLT_CN")
+cat(sprintf("forested remeasured plots: %d (%.1f%% with any removal)\n",
+            nrow(ar), 100 * mean(ar$remv_cfgs > 0)))
+```
+
+```{r removals-strata}
+K <- min(params$K_strata, dplyr::n_distinct(ar$fine_bin))
+
+# (2) hierarchical strata re-aggregated by REMOVALS (same fine bins, new merge)
+bin_remv <- ar %>% group_by(fine_bin) %>%
+  summarize(mean_remv = mean(remv_cfgs), .groups = "drop")
+hc_r <- hclust(dist(scale(bin_remv$mean_remv)), method = "ward.D2")
+bin_remv$stratum_remv <- factor(cutree(hc_r, k = K))
+ar$stratum_remv <- bin_remv$stratum_remv[match(ar$fine_bin, bin_remv$fine_bin)]
+
+# reference: flat OOF removals probe + TCC, both DH-binned
+set.seed(2)
+fr <- sample(rep(1:5, length.out = nrow(ar)))
+oofr <- numeric(nrow(ar)); formr <- reformulate(emb_vars, "remv_cfgs")
+for (f in 1:5) { fit <- lm(formr, ar[fr != f, ]); oofr[fr == f] <- predict(fit, ar[fr == f, ]) }
+ar$remv_flat <- dh_strata(oofr,   params$K_strata)
+ar$tcc_dh    <- dh_strata(ar$tcc, params$K_strata)
+```
+
+```{r removals-eval}
+vr_unit <- pooled_within(ar, "UNITCD",                    y = "remv_cfgs")
+vr_tcc  <- pooled_within(ar, c("UNITCD", "tcc_dh"),       y = "remv_cfgs")
+vr_bal  <- pooled_within(ar, c("UNITCD", "stratum"),      y = "remv_cfgs")  # BALIVE-agg (transfer)
+vr_rem  <- pooled_within(ar, c("UNITCD", "stratum_remv"), y = "remv_cfgs")  # removals-agg
+vr_flat <- pooled_within(ar, c("UNITCD", "remv_flat"),    y = "remv_cfgs")
+
+vr <- c(vr_unit, vr_tcc, vr_bal, vr_rem, vr_flat)
+data.frame(
+  stratification  = c("UNITCD only (baseline)",
+                      sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                      sprintf("UNITCD x hierarchical, BALIVE-aggregated (%d)", params$K_strata),
+                      sprintf("UNITCD x hierarchical, removals-aggregated (%d)", params$K_strata),
+                      sprintf("UNITCD x flat removals supervised (%d)", params$K_strata)),
+  within_var      = round(vr, 2),
+  within_sd       = round(sqrt(vr), 3),
+  pct_of_baseline = round(100 * vr / vr_unit, 1),
+  RE_vs_tcc       = round(vr_tcc / vr, 2),               # V_TCC / V_method
+  ess_unit        = round(nrow(ar) * vr_unit / vr)       # ESS vs UNITCD-only baseline
+)
+```
+
+## Cleanup
+
+```{r cleanup}
+dbDisconnect(con)
+```
+
+## Notes
+
+- **Phase-variability metric.** Total within-bin `z_phase` variance (trace of the
+  covariance). Swap for mean pairwise distance or a per-dimension max if you want
+  a different notion of "temporal diversity".
+- **Aggregation feature.** Ward clusters fine bins on **mean BALIVE** only. To make
+  strata differ in spread as well as level, cluster on `c(mean_bal, sd_bal)` (scaled)
+  or a vector of within-bin BALIVE quantiles.
+- **Weighting.** Fine bins enter the clustering unweighted (each bin one point).
+  For size-aware strata, replicate/weight bins by `n`, or post-balance strata sizes.
+- **Fairness of the comparison.** All rows use `K_strata` strata crossed with
+  `UNITCD`; TCC and the flat probe use DH bins. The hierarchical method is the only
+  one using the type/phase structure, so a win over `emb_flat` means the structure
+  (not just supervision) is buying you something.
+- **Knobs.** `k_type`, `phase_subdivide_frac`, `k_phase`, `K_strata` are params;
+  e.g. raise `k_type` for finer type resolution or `phase_subdivide_frac` to split
+  more aggressively on the temporal axis.

@@ -1,0 +1,392 @@
+---
+title: "HDBSCAN post-stratification"
+subtitle: "Density-based embedding strata vs TCC and a flat probe"
+author: "FoR-EST project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+params:
+  emb_csv: "~/Dropbox/git/vq-vae/frl/runs/frl_v0_exp033/va_merge_embeddings.csv"
+  fia_locs: "/data/FIADB/spatial/va_merge.csv"
+  tcc: "/data/usfs_science_tcc_v2023-5_wgs84/science_tcc_conus_wgs84_v2023-5_20230101_20231231.tif"
+  fiadb: "/data/FIADB/SQLite_FIADB_ENTIRE.db"
+  statecd: "51"
+  K_type: 20         # target HDBSCAN clusters, z_type space
+  K_tp: 50           # target HDBSCAN clusters, z_type + z_phase space
+  K_strata: 5        # final strata after aggregation (and flat-probe / TCC-DH bins)
+  minpts_grid: "10,20,40,70,120,200,320,500"   # minPts searched to hit target k
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 5, dpi = 110)
+```
+
+## Overview
+
+Density-based post-stratification. HDBSCAN clusters the embedding without assuming
+a globally Euclidean geometry — it uses only *local* density/reachability, so it
+can follow curved, variable-density structure that k-means/Ward (which fit
+compact, convex, globally-Euclidean clusters) cannot. Two clusterings are built:
+one on the **type** space (`z_type`), one on the **type + phase** space
+(`z_type + z_phase`). Each is aggregated to strata by the training target, and
+compared against the operational TCC bins and a flat supervised probe.
+
+Stratifications compared, per target:
+
+1. **TCC FIA fixed** — canopy cover at the operational breaks (0-10/11-48/49-85/86-100).
+2. **HDBSCAN type** (k ≈ `r params$K_type` on `z_type`) → aggregated to
+   `r params$K_strata` strata by Ward on the cluster-mean target.
+3. **HDBSCAN type+phase** (k ≈ `r params$K_tp` on `z_type + z_phase`) → aggregated
+   to `r params$K_strata` strata by Ward on the cluster-mean target.
+4. **flat probe** — OOF linear probe of the full embedding → target, DH-binned.
+
+Targets: **A** BALIVE, **B** standing live volume, **C** removal volume. For
+**B** and **C** we also report a **transfer** table: each HDBSCAN clustering
+aggregated once on **BALIVE** and applied unchanged, versus aggregated on the
+target itself.
+
+**HDBSCAN has no k.** Cluster count is governed by `minPts`; we search a `minPts`
+grid and take the run whose cluster count is closest to the target. HDBSCAN also
+labels low-density points as **noise** — those are assigned to their nearest
+clustered neighbour (1-NN) so every plot lands in a bin. Achieved cluster counts
+and noise fractions are reported; high-dimensional density estimation is hard, so
+if the counts land far from the targets or noise is large, that is itself evidence
+about how cleanly the embedding clusters.
+
+```{r libraries}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(terra)
+library(dbscan)
+```
+
+## Load embeddings
+
+```{r load}
+emb_type_vars  <- paste0("z_type_",  0:47)
+emb_phase_vars <- paste0("z_phase_", 0:7)
+emb_vars       <- c(emb_type_vars, emb_phase_vars)
+
+emb <- read_csv(params$emb_csv, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN), ID = sub("\\.0$", "", ID)) %>%
+  filter(if_all(all_of(emb_vars), ~ !is.na(.)))          # complete embeddings only
+cat(sprintf("plots with complete embeddings: %d\n", nrow(emb)))
+```
+
+## HDBSCAN clustering
+
+```{r hdbscan}
+# assign noise (cluster 0) to nearest clustered neighbour (1-NN in the same space)
+assign_noise <- function(X, cl) {
+  noise <- cl == 0
+  if (!any(noise) || all(noise)) return(cl)
+  keep <- which(!noise)
+  if (requireNamespace("FNN", quietly = TRUE)) {
+    nn <- FNN::get.knnx(X[keep, , drop = FALSE], X[noise, , drop = FALSE], k = 1)$nn.index[, 1]
+    cl[noise] <- cl[keep][nn]
+  } else {                                                # fallback: nearest centroid
+    ids   <- sort(unique(cl[keep]))
+    cents <- t(sapply(ids, function(k) colMeans(X[cl == k, , drop = FALSE])))
+    d <- sapply(seq_len(nrow(cents)), function(j) rowSums(sweep(X[noise, , drop = FALSE], 2, cents[j, ], "-")^2))
+    cl[noise] <- ids[max.col(-d, ties.method = "first")]
+  }
+  cl
+}
+# search minPts for the run closest to k_target; return clustering + diagnostics
+hdbscan_k <- function(X, k_target, grid) {
+  runs <- lapply(grid, function(mp) {
+    h <- dbscan::hdbscan(X, minPts = mp)
+    list(minPts = mp, cl = h$cluster,
+         k = length(setdiff(unique(h$cluster), 0)), noise = mean(h$cluster == 0))
+  })
+  ks    <- vapply(runs, function(r) r$k, integer(1))
+  valid <- which(ks >= 1); if (!length(valid)) valid <- seq_along(ks)
+  best  <- runs[[ valid[which.min(abs(ks[valid] - k_target))] ]]
+  list(cluster = factor(assign_noise(X, best$cl)),
+       minPts = best$minPts, k = best$k, noise = best$noise,
+       grid = data.frame(minPts = grid, k = ks,
+                         noise = round(vapply(runs, function(r) r$noise, numeric(1)), 3)))
+}
+
+grid  <- as.integer(strsplit(params$minpts_grid, ",")[[1]])
+Ztype <- scale(as.matrix(emb[, emb_type_vars]))          # standardized z_type
+Zall  <- scale(as.matrix(emb[, emb_vars]))               # standardized z_type + z_phase
+
+ht <- hdbscan_k(Ztype, params$K_type, grid)
+hf <- hdbscan_k(Zall,  params$K_tp,   grid)
+emb$hdb_type <- ht$cluster
+emb$hdb_tp   <- hf$cluster
+ktype <- ht$k; ktp <- hf$k
+
+cat(sprintf("type       : k=%d clusters (minPts=%d, target %d, noise %.1f%% reassigned)\n",
+            ht$k, ht$minPts, params$K_type, 100 * ht$noise))
+cat(sprintf("type+phase : k=%d clusters (minPts=%d, target %d, noise %.1f%% reassigned)\n",
+            hf$k, hf$minPts, params$K_tp, 100 * hf$noise))
+```
+
+minPts search paths (cluster count `k` and noise fraction at each `minPts`):
+
+```{r hdbscan-grid}
+list(type = ht$grid, type_phase = hf$grid)
+```
+
+## FIA targets and TCC
+
+```{r fia-data}
+con <- dbConnect(RSQLite::SQLite(), params$fiadb)
+
+cond <- dbGetQuery(con, sprintf(
+  "SELECT PLT_CN, CONDPROP_UNADJ, BALIVE FROM COND WHERE STATECD='%s'",
+  params$statecd)) %>% mutate(PLT_CN = as.character(PLT_CN))
+balive <- cond %>%
+  mutate(BALIVE = if_else(is.na(BALIVE), 0, BALIVE)) %>%
+  group_by(PLT_CN) %>%
+  summarize(BALIVE = sum(BALIVE * CONDPROP_UNADJ) / sum(CONDPROP_UNADJ), .groups = "drop")
+
+dbWriteTable(con, "tmp_cn", tibble(PLT_CN = unique(emb$CN)), temporary = TRUE, overwrite = TRUE)
+
+# A/B: standing LIVE net cu ft volume per acre (STATUSCD=1)
+vol <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(CASE WHEN g.STATUSCD=1 THEN COALESCE(g.VOLCFNET,0)*COALESCE(g.TPA_UNADJ,0) ELSE 0 END) AS volume
+     FROM TREE g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>% mutate(PLT_CN = as.character(PLT_CN))
+
+# C: annual per-acre removed GS volume; COALESCE inside SUM so no-removal plots are 0
+remv <- dbGetQuery(con,
+  "SELECT g.PLT_CN,
+          SUM(COALESCE(g.REMVCFGS_FOREST,0) * COALESCE(g.SUBP_TPAREMV_UNADJ_GS_FOREST,0)) AS remv_cfgs
+     FROM TREE_GRM_COMPONENT g JOIN tmp_cn t ON g.PLT_CN = t.PLT_CN
+    GROUP BY g.PLT_CN") %>% mutate(PLT_CN = as.character(PLT_CN))
+
+fia_locs <- read_csv(params$fia_locs, col_types = cols(CN = "c", ID = "c")) %>%
+  mutate(CN = sub("\\.0$", "", CN))
+dbDisconnect(con)
+```
+
+```{r tcc}
+locs <- fia_locs %>% filter(CN %in% emb$CN) %>% distinct(CN, .keep_all = TRUE)
+tccr <- rast(params$tcc)
+pts  <- vect(locs, geom = c("LON_ACTUAL", "LAT_ACTUAL"), crs = "EPSG:4269")
+tv   <- extract(tccr, project(pts, crs(tccr)), ID = FALSE)[[1]]
+tv   <- as.numeric(as.character(tv)); tv[tv > 100] <- NA_real_
+tcc_by_cn <- tibble(CN = locs$CN, tcc = tv)
+```
+
+```{r assemble}
+analysis <- emb %>%
+  select(CN, hdb_type, hdb_tp, all_of(emb_vars)) %>%
+  inner_join(balive, by = c("CN" = "PLT_CN")) %>%
+  left_join(vol,     by = c("CN" = "PLT_CN")) %>%
+  inner_join(select(fia_locs, CN, UNITCD), by = "CN") %>%
+  inner_join(tcc_by_cn, by = "CN") %>%
+  mutate(volume = coalesce(volume, 0)) %>%
+  filter(!is.na(UNITCD), !is.na(tcc), tcc >= 0, tcc <= 100)     # full population
+ar <- analysis %>% inner_join(remv, by = c("CN" = "PLT_CN"))     # removals: remeasured/GRM
+cat(sprintf("plots: %d across %d units;  remeasured with GRM: %d\n",
+            nrow(analysis), dplyr::n_distinct(analysis$UNITCD), nrow(ar)))
+```
+
+## Helpers
+
+```{r helpers}
+pooled_within <- function(df, groups, y) {
+  g <- df %>% group_by(across(all_of(groups))) %>%
+    summarize(n = n(), ss = sum((.data[[y]] - mean(.data[[y]]))^2), .groups = "drop")
+  sum(g$ss) / (sum(g$n) - nrow(g))
+}
+# Dalenius-Hodges cumulative-sqrt(f) boundaries
+dh_breaks <- function(x, K, nbins = 100) {
+  x <- as.numeric(x); rng <- range(x, finite = TRUE)
+  if (!is.finite(diff(rng)) || diff(rng) == 0) return(numeric(0))
+  h <- hist(x, breaks = seq(rng[1], rng[2], length.out = nbins + 1), plot = FALSE)
+  csf <- cumsum(sqrt(h$counts)); tgt <- seq(0, max(csf), length.out = K + 1)[-c(1, K + 1)]
+  sort(unique(vapply(tgt, function(t) h$breaks[which(csf >= t)[1] + 1L], numeric(1))))
+}
+dh_strata <- function(x, K, nbins = 100) {
+  bnd <- dh_breaks(x, K, nbins)
+  if (length(bnd) == 0) return(factor(rep(1L, length(x))))
+  factor(findInterval(as.numeric(x), c(-Inf, bnd, Inf)))
+}
+# fine bins -> strata: Ward on the fine-bin-mean response (supervised aggregation)
+bin_map <- function(bin, y, K) {
+  d  <- tibble(fine_bin = bin, .y = y) %>% group_by(fine_bin) %>%
+        summarize(n_plots = n(), mean_y = mean(.y), .groups = "drop")
+  Kk <- min(K, nrow(d))
+  d$stratum <- if (nrow(d) <= 1) 1L else
+    cutree(hclust(dist(scale(d$mean_y)), method = "ward.D2"), Kk)
+  d
+}
+agg_by <- function(bin, y, K) {
+  d <- bin_map(bin, y, K); factor(d$stratum[match(bin, d$fine_bin)])
+}
+# fit/apply a fine-bin -> stratum map so a binning trained on one target can be
+# scored on another (BALIVE-trained transfer)
+fit_agg <- function(train_df, train_y, binvar) {
+  bm <- bin_map(train_df[[binvar]], train_df[[train_y]], params$K_strata)
+  setNames(as.character(bm$stratum), as.character(bm$fine_bin))
+}
+apply_agg <- function(df, binvar, mapping) factor(unname(mapping[as.character(df[[binvar]])]))
+# flat OOF supervised probe on the full embedding -> DH bins
+oof_dh <- function(df, y, vars, K) {
+  set.seed(1); folds <- sample(rep(1:5, length.out = nrow(df)))
+  d <- df %>% mutate(y_resp = .data[[y]])
+  form <- reformulate(vars, "y_resp"); s <- numeric(nrow(df))
+  for (f in 1:5) { fit <- lm(form, d[folds != f, ]); s[folds == f] <- predict(fit, d[folds == f, ]) }
+  dh_strata(s, K)
+}
+# per-stratum n / mean / sd and response-by-stratum boxplots
+strata_summary <- function(df, y, schemes) {
+  dplyr::bind_rows(lapply(names(schemes), function(nm)
+    tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]]) %>%
+      group_by(scheme, stratum) %>%
+      summarize(n = dplyr::n(), mean = round(mean(val), 3), sd = round(sd(val), 3),
+                .groups = "drop"))) %>%
+    mutate(scheme = factor(scheme, levels = names(schemes))) %>% arrange(scheme, stratum)
+}
+strata_boxplot <- function(df, y, schemes, ylab = y, logy = FALSE) {
+  long <- dplyr::bind_rows(lapply(names(schemes), function(nm)
+    tibble(scheme = nm, stratum = as.character(schemes[[nm]]), val = df[[y]])))
+  long$scheme <- factor(long$scheme, levels = names(schemes))
+  long$yval   <- if (logy) log1p(long$val) else long$val
+  ggplot(long, aes(x = stratum, y = yval)) +
+    geom_boxplot(outlier.size = 0.4, fill = "grey85", linewidth = 0.3) +
+    facet_wrap(~ scheme, scales = "free_x", nrow = 1) +
+    labs(x = "stratum", y = if (logy) paste0("log1p(", ylab, ")") else ylab) +
+    theme_bw(base_size = 10) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# BALIVE-trained maps (aggregation trained once on BALIVE, for the transfer test)
+map_bal_type <- fit_agg(analysis, "BALIVE", "hdb_type")
+map_bal_tp   <- fit_agg(analysis, "BALIVE", "hdb_tp")
+
+# main comparison (self-trained: aggregation on the target being scored)
+schemes <- function(df, y) list(
+  "TCC FIA fixed"      = cut(df$tcc, breaks = c(-Inf, 10, 48, 85, Inf),
+                             labels = c("0-10", "11-48", "49-85", "86-100")),
+  "TCC DH"             = dh_strata(df$tcc, params$K_strata),
+  "HDBSCAN type"       = agg_by(df$hdb_type, df[[y]], params$K_strata),
+  "HDBSCAN type+phase" = agg_by(df$hdb_tp,   df[[y]], params$K_strata),
+  "flat probe"         = oof_dh(df, y, emb_vars, params$K_strata))
+
+resp_table <- function(df, y) {
+  sch <- schemes(df, y)
+  vv  <- c(pooled_within(df, "UNITCD", y),
+           sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y)))
+  data.frame(
+    stratification = c("UNITCD only (baseline)",
+                       "UNITCD x TCC FIA fixed (0-10/11-48/49-85/86-100)",
+                       sprintf("UNITCD x TCC DH (%d)", params$K_strata),
+                       sprintf("UNITCD x HDBSCAN type (k=%d -> %d)", ktype, params$K_strata),
+                       sprintf("UNITCD x HDBSCAN type+phase (k=%d -> %d)", ktp, params$K_strata),
+                       sprintf("UNITCD x flat embedding supervised (%d)", params$K_strata)),
+    within_var = round(vv, 2), within_sd = round(sqrt(vv), 3),
+    pct_of_baseline = round(100 * vv / vv[1], 1),
+    # vv[1] = UNITCD baseline, vv[2] = TCC FIA fixed. RE = V_TCC/V_method (>1 beats
+    # TCC); ess_unit = N*V_unit/V_method (baseline row = N, sub-strat above N).
+    RE_vs_tcc = round(vv[2] / vv, 2),
+    ess_unit  = round(nrow(df) * vv[1] / vv))
+}
+# transfer: self-trained vs BALIVE-trained aggregation, for both HDBSCAN clusterings
+transfer_table <- function(df, y) {
+  base <- pooled_within(df, "UNITCD", y)
+  sch <- list(
+    "HDBSCAN type (self-trained)"         = apply_agg(df, "hdb_type", fit_agg(df, y, "hdb_type")),
+    "HDBSCAN type (BALIVE-trained)"       = apply_agg(df, "hdb_type", map_bal_type),
+    "HDBSCAN type+phase (self-trained)"   = apply_agg(df, "hdb_tp",   fit_agg(df, y, "hdb_tp")),
+    "HDBSCAN type+phase (BALIVE-trained)" = apply_agg(df, "hdb_tp",   map_bal_tp))
+  vv <- sapply(sch, function(s) pooled_within(mutate(df, .s = s), c("UNITCD", ".s"), y))
+  data.frame(stratification = names(sch), within_var = round(vv, 2),
+             within_sd = round(sqrt(vv), 3), pct_of_baseline = round(100 * vv / base, 1),
+             row.names = NULL)
+}
+```
+
+## A. BALIVE
+
+```{r a-balive}
+resp_table(analysis, "BALIVE")
+```
+
+```{r a-balive-strata}
+sch_a <- schemes(analysis, "BALIVE")
+strata_summary(analysis, "BALIVE", sch_a)
+```
+
+```{r a-balive-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis, "BALIVE", sch_a, ylab = "BALIVE")
+```
+
+## B. Standing live volume
+
+```{r b-volume}
+resp_table(analysis, "volume")
+```
+
+Transfer — HDBSCAN strata trained on BALIVE, applied to volume:
+
+```{r b-volume-transfer}
+transfer_table(analysis, "volume")
+```
+
+```{r b-volume-strata}
+sch_b <- schemes(analysis, "volume")
+strata_summary(analysis, "volume", sch_b)
+```
+
+```{r b-volume-box, fig.width=11, fig.height=4}
+strata_boxplot(analysis, "volume", sch_b, ylab = "volume")
+```
+
+## C. Removal volume
+
+```{r c-removals}
+resp_table(ar, "remv_cfgs")
+```
+
+Transfer — HDBSCAN strata trained on BALIVE, applied to removals:
+
+```{r c-removals-transfer}
+transfer_table(ar, "remv_cfgs")
+```
+
+```{r c-removals-strata}
+sch_c <- schemes(ar, "remv_cfgs")
+strata_summary(ar, "remv_cfgs", sch_c)
+```
+
+```{r c-removals-box, fig.width=11, fig.height=4}
+strata_boxplot(ar, "remv_cfgs", sch_c, ylab = "removals", logy = TRUE)
+```
+
+## Notes
+
+- **Why HDBSCAN.** k-means/Ward fit compact convex clusters under a single global
+  Euclidean metric; HDBSCAN builds clusters from *local* mutual-reachability
+  density, so it can follow curved / variable-density manifolds where the space is
+  only locally Euclidean. It picks the number of clusters from density structure
+  rather than a fixed `k`.
+- **Targeting k.** Since HDBSCAN has no `k`, we search `minpts_grid` and take the
+  run whose cluster count is closest to `K_type` / `K_tp`. The `hdbscan-grid`
+  table shows the `minPts` -> (k, noise) curve; widen or refine the grid if the
+  achieved counts miss the targets.
+- **Noise.** Low-density points (HDBSCAN cluster 0) are reassigned to their nearest
+  clustered neighbour (1-NN, local — consistent with the local-Euclidean premise),
+  so every plot is stratified. A large reassigned fraction means the embedding does
+  not cluster cleanly at that scale.
+- **Aggregation is the only supervised step.** The `K_type` / `K_tp` clusters are
+  formed with no FIA target; only the final Ward aggregation of clusters to
+  `K_strata` uses the response — self-trained (on the scored target) or, in the
+  transfer tables, BALIVE-trained and applied unchanged to volume/removals.
+- **Population.** BALIVE and volume run on the full plot population (no forest-code
+  filter; non-forest contributes 0); removals additionally require GRM/remeasured
+  data (`ar`), keeping forested zero-removal plots as 0.
+- **Standardization.** Both spaces are `scale()`d before HDBSCAN so every embedding
+  dimension contributes comparably to the reachability distances.
