@@ -595,13 +595,23 @@ def align_to_template(
         try:
             # Get template bounds
             minx, miny, maxx, maxy = template.rio.bounds()
-            
+
             # Clip to bounds (lazy operation)
             clipped = da.rio.clip_box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
-            
-            log.debug(f"        ✓ Clipped from {da.rio.shape} to {clipped.rio.shape}")
-            return clipped
-            
+
+            # clip_box ONLY clips: when the source is smaller than the template
+            # extent it stays smaller, leaving layers on inconsistent grids (the
+            # topo/strata 12991-vs-13056 bug). Guarantee the exact template grid
+            # by padding/aligning with reproject_match whenever the shape still
+            # differs. For already-aligned grids at matching resolution this is a
+            # lossless pad (nearest, no interpolation), not a resample.
+            if clipped.rio.shape == template.rio.shape:
+                log.debug(f"        ✓ Clipped to template shape {clipped.rio.shape}")
+                return clipped
+            log.debug(f"        Clipped to {clipped.rio.shape} != template "
+                      f"{template.rio.shape}; padding to template grid")
+            return clipped.rio.reproject_match(template, resampling=resampling)
+
         except Exception as e:
             log.warning(f"        Clip failed ({e}), falling back to reproject")
             # Fall through to reproject
@@ -1532,6 +1542,7 @@ def open_zarr_store(
         )
         aoi_array[:] = aoi.values
         aoi_array.attrs.update(sanitize_attrs(aoi.attrs))
+        write_cf_grid_metadata(root, aoi_array, aoi, compressor)
 
     if strata is not None:
         log.info("Writing strata to zarr root")
@@ -1545,8 +1556,75 @@ def open_zarr_store(
         )
         strata_array[:] = strata.values
         strata_array.attrs.update(sanitize_attrs(strata.attrs))
+        write_cf_grid_metadata(root, strata_array, strata, compressor)
 
     return root, compressor
+
+
+def _gdal_geotransform_str(da: xr.DataArray) -> Optional[str]:
+    """rioxarray-style GeoTransform attr: 'c a b f d e' (GDAL order)."""
+    try:
+        t = da.rio.transform()
+    except Exception:
+        return None
+    return f"{t.c} {t.a} {t.b} {t.f} {t.d} {t.e}"
+
+
+def write_cf_grid_metadata(group, arr, da: xr.DataArray, compressor) -> None:
+    """Attach the xarray/CF-on-zarr grid metadata to a just-written array.
+
+    This is what makes the store self-describing and openable by xarray /
+    rioxarray, and it is what `from_zarr` in the GEDI downloader reads:
+
+      * `_ARRAY_DIMENSIONS` on the data array  (xarray-zarr v2 dimension labels)
+      * sibling 1-D coordinate arrays `x`, `y` (and `time`/`snapshot`), written
+        once per group, each labelled with its own `_ARRAY_DIMENSIONS`
+      * a scalar `spatial_ref` grid-mapping array carrying the CRS WKT and the
+        GDAL GeoTransform; the data array references it via `grid_mapping`
+
+    Coordinate/CRS arrays are written idempotently (skipped if already present),
+    so calling this per-band leaves one shared set of coords per leaf group.
+    None of these names collide with the data paths the DataReader requests, so
+    the reader is unaffected.
+    """
+    # 1. Dimension labels on the data array itself.
+    arr.attrs['_ARRAY_DIMENSIONS'] = list(da.dims)
+
+    # 2. Dimension coordinate arrays (x, y, time, ...), one per group.
+    for dim in da.dims:
+        if dim in da.coords and dim not in group:
+            cvals = np.asarray(da.coords[dim].values)
+            carr = group.create_array(
+                dim,
+                shape=cvals.shape,
+                chunks=cvals.shape if cvals.shape else (1,),
+                dtype=cvals.dtype,
+                compressor=compressor,
+                overwrite=False,
+            )
+            carr[:] = cvals
+            carr.attrs['_ARRAY_DIMENSIONS'] = [dim]
+
+    # 3. CRS as a CF grid_mapping variable (rioxarray `spatial_ref` convention).
+    try:
+        crs = da.rio.crs
+    except Exception:
+        crs = None
+    if crs is not None:
+        arr.attrs['grid_mapping'] = 'spatial_ref'
+        if 'spatial_ref' not in group:
+            sref = group.create_array(
+                'spatial_ref', shape=(), chunks=(), dtype='int32',
+                overwrite=False,
+            )
+            sref[...] = 0
+            sref.attrs['_ARRAY_DIMENSIONS'] = []
+            wkt = crs.to_wkt()
+            sref.attrs['crs_wkt'] = wkt
+            sref.attrs['spatial_ref'] = wkt
+            gt = _gdal_geotransform_str(da)
+            if gt is not None:
+                sref.attrs['GeoTransform'] = gt
 
 
 def write_variable_to_zarr(
@@ -1606,9 +1684,10 @@ def write_variable_to_zarr(
 
     ds.attrs.update(sanitize_attrs(da.attrs))
 
-    for dim in da.dims:
-        if dim in da.coords:
-            ds.attrs[f'{dim}_coords'] = da.coords[dim].values.tolist()
+    # Standard xarray/CF-on-zarr grid metadata (dimensions, x/y/time coords,
+    # spatial_ref CRS). Replaces the old nonstandard `{dim}_coords` attrs, which
+    # xarray/rioxarray could not use, and makes the store self-describing.
+    write_cf_grid_metadata(sub_group, ds, da, compressor)
 
 
 def write_zarr_hierarchy(
