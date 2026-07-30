@@ -37,14 +37,21 @@
 #   1. Authenticate to NASA Earthdata (earthaccess.login()).
 #   2. Search the GEDI L2A collection over the Virginia bounding box and
 #      an optional date range.
-#   3. Stream/download the matching .h5 granules to a local cache.
-#   4. For each granule + beam, read the requested RH percentiles and the
-#      curated metadata columns, apply quality filtering, and clip to the
-#      Virginia boundary (bbox, then precise polygon if provided).
-#   5. Reproject to the AEA_WGS84 grid and snap to (row, col, x_off, y_off);
-#      clip to the grid extent (or flag off-grid shots with --keep-off-grid).
-#   6. Write GeoParquet, partitioned by year (default), per-granule, or as a
-#      single combined file.
+#   3. Process in batches (--batch-size): download a batch of granules
+#      concurrently (--threads), then for each granule + beam read the
+#      requested RH percentiles and curated metadata, quality-filter, clip
+#      to the Virginia boundary (bbox, then precise polygon if provided),
+#      reproject to the AEA_WGS84 grid, snap to (row, col, x_off, y_off),
+#      write the batch's GeoParquet, and delete the batch's .h5 before the
+#      next batch. Peak disk stays ~batch_size GB (not the ~1.8 TB archive)
+#      and the run is resumable — completed part files survive a crash.
+#   4. Output is partitioned by year (default; year=YYYY/part-*.parquet),
+#      per-granule, or a single combined file.
+#
+# Why batches: the job is NETWORK-bound, not CPU-bound. The parallelism that
+# helps is concurrent downloads (--threads), which earthaccess does within a
+# batch. Adding CPU cores or running many processes in parallel does not help
+# (one shared network link) and risks tripping NASA rate limits.
 #
 # Grid source (how the target grid is defined):
 #   The sidecar table is meaningless without the cube it indexes into, so by
@@ -69,10 +76,20 @@
 # ----------------------------------------------------------------
 # EXAMPLE USAGE
 # ----------------------------------------------------------------
-#   # 1. Full Virginia archive, quality shots only, partitioned by year:
+#   # 1. PRODUCTION: full GEDI-era Virginia archive, quality shots only,
+#   #    batched streaming (bounded disk, resumable), year-partitioned.
+#   #    Point --cache-dir at scratch, NOT a synced folder (Dropbox etc.).
 #   python scripts/10_download_gedi_l2a_footprints.py \
 #       --out-dir data/gedi/va_l2a \
-#       --quality-only
+#       --cache-dir /scratch/$USER/gedi_cache \
+#       --start 2019-04-01 --end 2025-01-01 \
+#       --quality-only \
+#       --grid-source constants \
+#       --batch-size 32 --threads 16
+#
+#   #    Re-running the same command resumes: cached granules are skipped and
+#   #    existing part-*.parquet files are left in place (new granules add new
+#   #    part files). Delete the out-dir to start clean.
 #
 #   # 2. Restrict to a date range and a precise state-boundary clip:
 #   python scripts/10_download_gedi_l2a_footprints.py \
@@ -412,12 +429,36 @@ def search_granules(earthaccess, bbox, start: Optional[str], end: Optional[str])
     return results
 
 
-def download_granules(earthaccess, results, cache_dir: Path) -> List[Path]:
-    """Download granules to a local cache; returns local .h5 paths."""
+def granule_stem(result) -> Optional[str]:
+    """Best-effort .h5 filename stem for a search result (for resume skipping).
+
+    Returns None if it can't be determined, in which case the granule is not
+    skipped (safe: it just gets re-processed, which is idempotent).
+    """
+    from urllib.parse import urlparse
+    try:
+        for url in result.data_links():
+            name = Path(urlparse(url).path).name
+            if name.endswith(".h5"):
+                return Path(name).stem
+    except Exception:
+        pass
+    return None
+
+
+def download_granules(earthaccess, results, cache_dir: Path,
+                      threads: int = 8) -> List[Path]:
+    """Download a set of granules to a local cache; returns local .h5 paths.
+
+    `threads` controls how many granules download concurrently (earthaccess
+    uses a thread pool). This is the parallelism that matters for this
+    workload — it is network-bound, not CPU-bound. Already-cached files are
+    skipped, so this is safe to re-run.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    paths = earthaccess.download(results, local_path=str(cache_dir))
+    paths = earthaccess.download(results, local_path=str(cache_dir),
+                                 threads=threads)
     h5s = [Path(p) for p in paths if str(p).endswith(".h5")]
-    log("Downloaded / cached %d granule files in %s", len(h5s), cache_dir)
     return h5s
 
 
@@ -524,40 +565,50 @@ def clip_to_virginia(df: pd.DataFrame, bbox, boundary_path: Optional[str]):
 
 # ---------------------------------------------------------------------
 # WRITING
+#
+# Streaming-friendly: 'per-granule' and 'year' write immediately per batch so
+# a crash never loses more than the current batch and the run is resumable.
+# 'single' must accumulate (one file can't be appended to), so it holds
+# footprints in memory and writes once at the end.
 # ---------------------------------------------------------------------
-def write_output(gdf, out_dir: Path, partition: str, granule_stem: str,
-                 accumulator: list):
-    """Write (or accumulate) a granule's footprints per the partition mode."""
+def write_batch(gdf, out_dir: Path, partition: str, tag: str,
+                accumulator: list):
+    """Write a batch's footprints immediately, or accumulate for 'single'.
+
+    `tag` is a unique, stable label for this batch (used in the output file
+    name) so concurrent/streamed batches never clobber each other.
+    """
+    if partition == "single":
+        accumulator.append(gdf)
+        return
+
     if partition == "per-granule":
-        out_path = out_dir / f"{granule_stem}.parquet"
+        out_path = out_dir / f"{tag}.parquet"
         gdf.to_parquet(out_path, index=False)
         log("Wrote %d footprints -> %s", len(gdf), out_path.name)
-    else:
-        # 'year' and 'single' are both finalized after all granules are read.
-        accumulator.append(gdf)
+        return
+
+    # partition == "year": one part file per year present in this batch.
+    # Hive convention: the partition column lives in the path, NOT in the
+    # file (an in-file `year` collides with the path-derived one on read).
+    for yr, sub in gdf.groupby("year"):
+        ydir = out_dir / f"year={int(yr)}"
+        ydir.mkdir(parents=True, exist_ok=True)
+        out_path = ydir / f"part-{tag}.parquet"
+        sub.drop(columns=["year"]).to_parquet(out_path, index=False)
+        log("Wrote %d footprints -> %s", len(sub), out_path)
 
 
 def finalize(accumulator: list, out_dir: Path, partition: str):
-    """Flush accumulated footprints for 'year' / 'single' partition modes."""
-    if partition == "per-granule" or not accumulator:
+    """Flush accumulated footprints for 'single' mode (no-op otherwise)."""
+    if partition != "single" or not accumulator:
         return
     import geopandas as gpd
     allgdf = gpd.GeoDataFrame(pd.concat(accumulator, ignore_index=True),
                               crs=accumulator[0].crs)
-    if partition == "single":
-        out_path = out_dir / "gedi_l2a_virginia.parquet"
-        allgdf.to_parquet(out_path, index=False)
-        log("Wrote %d total footprints -> %s", len(allgdf), out_path)
-    elif partition == "year":
-        for yr, sub in allgdf.groupby("year"):
-            ydir = out_dir / f"year={int(yr)}"
-            ydir.mkdir(parents=True, exist_ok=True)
-            out_path = ydir / "gedi_l2a_virginia.parquet"
-            # Hive convention: the partition column lives in the path, NOT in
-            # the file. Keeping an in-file `year` too makes the dataset reader
-            # see two incompatible `year` columns (path dictionary vs int16).
-            sub.drop(columns=["year"]).to_parquet(out_path, index=False)
-            log("Wrote %d footprints -> %s", len(sub), out_path)
+    out_path = out_dir / "gedi_l2a_virginia.parquet"
+    allgdf.to_parquet(out_path, index=False)
+    log("Wrote %d total footprints -> %s", len(allgdf), out_path)
 
 
 # ---------------------------------------------------------------------
@@ -604,7 +655,16 @@ def parse_args(argv=None):
                    default="year",
                    help="Output layout (default: year=YYYY/ partitions).")
     p.add_argument("--keep-h5", action="store_true",
-                   help="Keep raw .h5 granules after extraction (default: delete).")
+                   help="Keep raw .h5 granules after extraction (default: delete). "
+                        "Iteration/debug only — a full run keeps ~1.8 TB of HDF5.")
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="Granules downloaded+processed+deleted per batch. Bounds "
+                        "peak disk to ~batch_size GB and makes the run resumable "
+                        "(default: 32).")
+    p.add_argument("--threads", type=int, default=8,
+                   help="Concurrent downloads within a batch (default: 8). This is "
+                        "the only parallelism that helps — the job is network-bound, "
+                        "not CPU-bound. Raise cautiously; too many trips NASA limits.")
     p.add_argument("--limit", type=int, default=None,
                    help="Process at most N granules (debugging).")
     return p.parse_args(argv)
@@ -667,33 +727,68 @@ def main(argv=None):
     if args.limit:
         results = results[: args.limit]
 
-    h5_paths = download_granules(ea, results, cache_dir)
+    # Resume: skip granules already recorded as processed in a prior run.
+    # 'single' mode can't resume (it writes one file at the very end), so the
+    # manifest is only consulted for the streaming (per-granule / year) modes.
+    manifest_path = out_dir / "_processed_granules.txt"
+    done: set = set()
+    if args.partition != "single" and manifest_path.exists():
+        done = set(manifest_path.read_text().split())
+    if done:
+        before = len(results)
+        results = [r for r in results if granule_stem(r) not in done]
+        log("Resume: skipping %d already-processed granules; %d remain.",
+            before - len(results), len(results))
+    if not results:
+        log("Nothing to do — all granules already processed. Output under %s", out_dir)
+        return
 
+    # Batched streaming: download a batch of granules concurrently, extract +
+    # snap + write, delete the batch, then move on. Peak disk stays ~batch_size
+    # granules (~GB each) instead of the full ~1.8 TB archive, and a crash only
+    # costs the current batch — completed year=YYYY/part-*.parquet files remain.
+    n_total = len(results)
+    n_batches = (n_total + args.batch_size - 1) // args.batch_size
+    log("Processing %d granules in %d batch(es) of up to %d (threads=%d).",
+        n_total, n_batches, args.batch_size, args.threads)
+
+    manifest = (None if args.partition == "single"
+                else open(manifest_path, "a"))
     accumulator: list = []
     n_shots = 0
-    for path in h5_paths:
-        df = granule_to_df(path, args.rh)
-        if df is None:
-            continue
-        df = apply_quality(df, args.quality_only, args.min_sensitivity)
-        if df.empty:
-            continue
-        gdf = clip_to_virginia(df, bbox, args.boundary)
-        if gdf is None or gdf.empty:
-            continue
-        gdf = snap_to_grid(gdf, grid, args.keep_off_grid)
-        if gdf is None or gdf.empty:
-            continue
+    for bi in range(n_batches):
+        batch = results[bi * args.batch_size:(bi + 1) * args.batch_size]
+        log("Batch %d/%d: downloading %d granules...", bi + 1, n_batches, len(batch))
+        h5_paths = download_granules(ea, batch, cache_dir, threads=args.threads)
 
-        n_shots += len(gdf)
-        write_output(gdf, out_dir, args.partition, path.stem, accumulator)
+        for path in h5_paths:
+            df = granule_to_df(path, args.rh)
+            if df is not None:
+                df = apply_quality(df, args.quality_only, args.min_sensitivity)
+                if not df.empty:
+                    gdf = clip_to_virginia(df, bbox, args.boundary)
+                    if gdf is not None and not gdf.empty:
+                        gdf = snap_to_grid(gdf, grid, args.keep_off_grid)
+                        if gdf is not None and not gdf.empty:
+                            n_shots += len(gdf)
+                            # Tag part files by granule stem so batches, and
+                            # re-runs, never collide within a partition dir.
+                            write_batch(gdf, out_dir, args.partition,
+                                        path.stem, accumulator)
 
-        if not args.keep_h5:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            # Mark processed (even if it yielded no footprints) so a resume
+            # doesn't re-download it, then drop the .h5.
+            if manifest is not None:
+                manifest.write(path.stem + "\n")
+                manifest.flush()
+            if not args.keep_h5:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
 
+    if manifest is not None:
+        manifest.close()
     finalize(accumulator, out_dir, args.partition)
 
     if n_shots == 0:
