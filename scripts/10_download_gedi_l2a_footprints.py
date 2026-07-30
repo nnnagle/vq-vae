@@ -54,15 +54,18 @@
 # (one shared network link) and risks tripping NASA rate limits.
 #
 # Grid source (how the target grid is defined):
-#   The sidecar table is meaningless without the cube it indexes into, so by
-#   default the grid is read straight from the training Zarr — its x/y cell
-#   coordinates and spatial_ref CRS are the single source of truth. If the
-#   grid ever changes, the sidecar re-syncs automatically.
-#     - default: --zarr PATH (or $ZARR_ROOT/va_vae_dataset.zarr). Reads
-#       CRS + transform + shape from the cube's coordinates.
-#     - --grid-template PATH: lift the grid from a template raster (rasterio).
-#     - --grid-source constants: hardcoded AEA_WGS84 CRS + TARGET_TRANSFORM
-#       below (offline fallback; kept in sync with scripts/09).
+#   IMPORTANT: this project's cube is stored as bare zarr arrays with NO
+#   georeferencing metadata (no x/y coords, no spatial_ref/CRS). The grid
+#   (CRS + 30 m Albers transform + extent) lives in the build config /
+#   scripts/09, and the pipeline works purely in pixel (row, col) space. So
+#   the canonical grid source here is the hardcoded constants below, which
+#   match the cube's 13056 x 23552 pixel grid exactly.
+#     - --grid-source constants  (RECOMMENDED): AEA_WGS84 CRS + TARGET_TRANSFORM.
+#     - --zarr PATH: attempts to read x/y/spatial_ref from the store; since
+#       this cube has none, it transparently falls back to the constants. Kept
+#       for stores that DO carry coordinate metadata.
+#     - --grid-template PATH: lift the grid from a template raster (rasterio),
+#       e.g. the mask/AOI GeoTIFF that seeded the cube.
 #
 # Dependencies (not part of the base env — install as needed):
 #   pip install earthaccess h5py numpy pandas geopandas shapely pyproj pyarrow
@@ -325,19 +328,21 @@ class TargetGrid:
     def from_zarr(cls, path: str) -> "TargetGrid":
         """Read the grid from the training Zarr's x/y coords + spatial_ref CRS.
 
-        The cube is written by build_zarr.py via rioxarray, so it follows the
-        CF/rioxarray convention: 1-D `x` and `y` cell-CENTRE coordinate arrays
-        and a `spatial_ref` variable carrying the CRS WKT — stored inside each
-        dataset subgroup (static, annual, ...), not at the root. The affine
-        transform is reconstructed from the cell spacing and the UL corner.
+        NOTE: this project's cube is written as bare zarr arrays WITHOUT the
+        xarray/CF coordinate metadata (no `x`/`y` coordinate arrays, no
+        `spatial_ref`, no `_ARRAY_DIMENSIONS`). The georeferencing lives in the
+        build config / scripts/09, not in the store, and the pipeline works in
+        pixel (row, col) space. So when the coords are absent we fall back to
+        the project constants — which ARE this cube's grid (verified: the
+        primary feature arrays are 13056 x 23552, matching TARGET_TRANSFORM).
+        This method still reads coords from any store that *does* carry them.
         """
         x, y, crs_wkt = _read_grid_from_zarr(str(path))
-        if x is None or y is None:
-            fail(f"Could not find 'x'/'y' coordinates in zarr: {path}. "
-                 "Pass --grid-template or --grid-source constants instead.")
-
-        if x.size < 2 or y.size < 2:
-            fail("Zarr x/y coordinates too small to infer pixel size.")
+        if x is None or y is None or x.size < 2 or y.size < 2:
+            warn("Zarr carries no x/y coordinate metadata (expected for this "
+                 "cube); using the project AEA_WGS84 constants, which match "
+                 "its 13056 x 23552 pixel grid.")
+            return cls.from_constants()
 
         px_w = float(x[1] - x[0])          # +ve, west->east
         px_h = float(y[1] - y[0])          # -ve when north->south (typical)
