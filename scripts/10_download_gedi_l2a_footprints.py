@@ -220,54 +220,84 @@ GEDI_EPOCH = np.datetime64("2018-01-01T00:00:00")
 # ---------------------------------------------------------------------
 # GRID DEFINITION
 # ---------------------------------------------------------------------
-def _find_grid_in_zarr(root):
-    """Locate 1-D 'x'/'y' coordinate arrays and a CRS WKT in a zarr tree.
+# Subgroups the cube is likely to store x/y/spatial_ref under. build_zarr.py
+# writes each dataset group (static, annual, ...) as its own xarray Dataset via
+# rioxarray, so the coordinates live inside the groups, not at the root.
+_ZARR_GRID_GROUPS = ["static", "annual", "irregular", "strata", "aoi"]
 
-    Walks the group hierarchy (build_zarr writes nested groups) and returns
-    (x_array, y_array, crs_wkt). Any element may be None if not found.
-    """
-    x = y = crs_wkt = None
 
-    def crs_from_attrs(attrs):
-        for key in ("crs_wkt", "spatial_ref", "crs", "esri_pe_string"):
-            val = attrs.get(key)
-            if isinstance(val, str) and val:
-                return val
-        return None
-
-    def visit(node):
-        nonlocal x, y, crs_wkt
-        # Arrays directly under this group.
-        arrays = getattr(node, "arrays", None)
-        items = arrays() if callable(arrays) else []
-        for name, arr in items:
-            base = name.split("/")[-1]
-            if base == "x" and x is None and arr.ndim == 1:
-                x = arr
-            elif base == "y" and y is None and arr.ndim == 1:
-                y = arr
-            if crs_wkt is None:
-                found = crs_from_attrs(dict(arr.attrs))
-                if found:
-                    crs_wkt = found
-        # Group-level attrs may also carry the CRS.
-        if crs_wkt is None:
-            found = crs_from_attrs(dict(getattr(node, "attrs", {})))
-            if found:
-                crs_wkt = found
-        # Recurse into subgroups.
-        groups = getattr(node, "groups", None)
-        subs = groups() if callable(groups) else []
-        for _, g in subs:
-            if x is not None and y is not None and crs_wkt is not None:
-                break
-            visit(g)
-
+def _zarr_group_names(path: str) -> List[str]:
+    """Best-effort list of subgroup names in a zarr store (version-agnostic)."""
+    names: List[str] = []
     try:
-        visit(root)
-    except Exception as e:  # pragma: no cover - defensive
-        warn("Error while scanning zarr for grid metadata: %s", e)
-    return x, y, crs_wkt
+        import zarr
+        root = zarr.open_group(str(path), mode="r")
+        for attr in ("group_keys", "groups"):
+            fn = getattr(root, attr, None)
+            if callable(fn):
+                try:
+                    for item in fn():
+                        names.append(item[0] if isinstance(item, tuple) else item)
+                    if names:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return names
+
+
+def _crs_wkt_from_dataset(ds) -> Optional[str]:
+    """Extract a CRS WKT from an xarray Dataset (rio accessor or spatial_ref)."""
+    # 1) rioxarray, if installed and the CRS decoded.
+    try:
+        import rioxarray  # noqa: F401
+        crs = ds.rio.crs
+        if crs is not None:
+            return crs.to_wkt()
+    except Exception:
+        pass
+    # 2) The spatial_ref coordinate's attrs (rioxarray/CF convention).
+    for cname in ("spatial_ref", "crs"):
+        if cname in ds.coords or cname in ds.variables:
+            attrs = ds[cname].attrs
+            for key in ("crs_wkt", "spatial_ref", "esri_pe_string"):
+                val = attrs.get(key)
+                if isinstance(val, str) and val:
+                    return val
+    return None
+
+
+def _read_grid_from_zarr(path: str):
+    """Open the cube with xarray and return (x_vals, y_vals, crs_wkt).
+
+    Tries the root and each known/discovered subgroup until one exposes 1-D
+    `x` and `y` coordinates. Uses xarray so it is agnostic to the installed
+    zarr-python version's Group API. Any element may be None if not found.
+    """
+    import xarray as xr
+
+    candidates = [None] + _ZARR_GRID_GROUPS
+    for name in _zarr_group_names(path):
+        if name not in candidates:
+            candidates.append(name)
+
+    for grp in candidates:
+        try:
+            ds = xr.open_zarr(path, group=grp, consolidated=False,
+                              mask_and_scale=False, decode_times=False)
+        except Exception:
+            continue
+        if "x" in ds.coords and "y" in ds.coords:
+            x = np.asarray(ds["x"].values, dtype="float64")
+            y = np.asarray(ds["y"].values, dtype="float64")
+            crs_wkt = _crs_wkt_from_dataset(ds)
+            ds.close()
+            log("Read grid from zarr group %r (%d x %d).",
+                grp if grp is not None else "<root>", y.size, x.size)
+            return x, y, crs_wkt
+        ds.close()
+    return None, None, None
 
 
 class TargetGrid:
@@ -297,19 +327,15 @@ class TargetGrid:
 
         The cube is written by build_zarr.py via rioxarray, so it follows the
         CF/rioxarray convention: 1-D `x` and `y` cell-CENTRE coordinate arrays
-        and a `spatial_ref` variable carrying the CRS WKT. The affine transform
-        is reconstructed from the cell spacing and the upper-left corner.
+        and a `spatial_ref` variable carrying the CRS WKT — stored inside each
+        dataset subgroup (static, annual, ...), not at the root. The affine
+        transform is reconstructed from the cell spacing and the UL corner.
         """
-        import zarr
-
-        root = zarr.open(str(path), mode="r")
-        x, y, crs_wkt = _find_grid_in_zarr(root)
+        x, y, crs_wkt = _read_grid_from_zarr(str(path))
         if x is None or y is None:
-            fail(f"Could not find 'x'/'y' coordinate arrays in zarr: {path}. "
+            fail(f"Could not find 'x'/'y' coordinates in zarr: {path}. "
                  "Pass --grid-template or --grid-source constants instead.")
 
-        x = np.asarray(x[:], dtype="float64")
-        y = np.asarray(y[:], dtype="float64")
         if x.size < 2 or y.size < 2:
             fail("Zarr x/y coordinates too small to infer pixel size.")
 
