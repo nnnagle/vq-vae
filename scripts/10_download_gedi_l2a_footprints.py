@@ -553,7 +553,10 @@ def finalize(accumulator: list, out_dir: Path, partition: str):
             ydir = out_dir / f"year={int(yr)}"
             ydir.mkdir(parents=True, exist_ok=True)
             out_path = ydir / "gedi_l2a_virginia.parquet"
-            sub.to_parquet(out_path, index=False)
+            # Hive convention: the partition column lives in the path, NOT in
+            # the file. Keeping an in-file `year` too makes the dataset reader
+            # see two incompatible `year` columns (path dictionary vs int16).
+            sub.drop(columns=["year"]).to_parquet(out_path, index=False)
             log("Wrote %d footprints -> %s", len(sub), out_path)
 
 
