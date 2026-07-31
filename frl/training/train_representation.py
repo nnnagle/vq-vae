@@ -49,6 +49,11 @@ from losses.phase_neighborhood import (
 from losses.triplet_phase import phase_recovery_discrimination_loss
 from losses.variance_covariance import variance_covariance_loss
 from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
+from training.representation.curriculum import (
+    compute_input_dropout_rate,
+    compute_smoothing_min_gate,
+    ramp_weight,
+)
 from utils import (
     compute_spatial_distances,
     extract_at_locations,
@@ -58,45 +63,6 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def compute_input_dropout_rate(
-    schedule_cfg: float | dict,
-    epoch: int,
-    total_epochs: int,
-) -> float:
-    """Return the input dropout rate for the current epoch.
-
-    Args:
-        schedule_cfg: Either a scalar float (constant rate) or a dict with keys:
-            - schedule: 'constant' | 'linear' | 'cosine'
-            - For 'constant': rate (float)
-            - For 'linear' / 'cosine': start, end, epochs (ramp length)
-        epoch: Current epoch index (0-based).
-        total_epochs: Total training epochs (used as ramp length fallback).
-
-    Returns:
-        Dropout probability for this epoch.
-    """
-    if isinstance(schedule_cfg, (int, float)):
-        return float(schedule_cfg)
-
-    schedule = schedule_cfg.get("schedule", "constant")
-
-    if schedule == "constant":
-        return float(schedule_cfg.get("rate", 0.0))
-
-    start = float(schedule_cfg.get("start", 0.0))
-    end = float(schedule_cfg.get("end", 0.1))
-    ramp_epochs = int(schedule_cfg.get("epochs", total_epochs))
-    t = min(epoch / max(ramp_epochs, 1), 1.0)
-
-    if schedule == "linear":
-        return start + t * (end - start)
-    elif schedule == "cosine":
-        return start + (end - start) * (1 - math.cos(math.pi * t)) / 2
-    else:
-        raise ValueError(f"Unknown input_dropout schedule: {schedule!r}")
 
 
 def pair_l2(a: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
@@ -277,38 +243,29 @@ def process_batch(
 
     # Hoist epoch-dependent curriculum weights (same for every patch in the batch)
     if phase_config is not None:
-        _start = phase_config.get('curriculum_start_epoch', 10)
-        _ramp  = phase_config.get('curriculum_ramp_epochs', 10)
-        if epoch < _start:
-            curriculum_w = 0.0
-        elif epoch >= _start + _ramp:
-            curriculum_w = 1.0
-        else:
-            curriculum_w = (epoch - _start) / _ramp
+        curriculum_w = ramp_weight(
+            epoch,
+            phase_config.get('curriculum_start_epoch', 10),
+            phase_config.get('curriculum_ramp_epochs', 10),
+        )
     else:
         curriculum_w = 0.0
 
     if spread_config is not None:
-        _s_start = spread_config['curriculum_start_epoch']
-        _s_ramp  = spread_config['curriculum_ramp_epochs']
-        if epoch < _s_start:
-            spread_w = 0.0
-        elif epoch >= _s_start + _s_ramp:
-            spread_w = 1.0
-        else:
-            spread_w = (epoch - _s_start) / _s_ramp
+        spread_w = ramp_weight(
+            epoch,
+            spread_config['curriculum_start_epoch'],
+            spread_config['curriculum_ramp_epochs'],
+        )
     else:
         spread_w = 0.0
 
     if recovery_disc_config is not None:
-        _rd_start = recovery_disc_config['curriculum_start_epoch']
-        _rd_ramp  = recovery_disc_config['curriculum_ramp_epochs']
-        if epoch < _rd_start:
-            rd_w = 0.0
-        elif epoch >= _rd_start + _rd_ramp:
-            rd_w = 1.0
-        else:
-            rd_w = (epoch - _rd_start) / _rd_ramp
+        rd_w = ramp_weight(
+            epoch,
+            recovery_disc_config['curriculum_start_epoch'],
+            recovery_disc_config['curriculum_ramp_epochs'],
+        )
     else:
         rd_w = 0.0
 
@@ -2682,13 +2639,9 @@ def main():
         # Apply spatial smoothing curriculum: lock gate open early so the model
         # can't use smoothing as a shortcut before z_type develops spectral structure.
         if smoothing_cur_enabled:
-            if epoch < smoothing_freeze_until:
-                min_gate = 1.0
-            elif epoch < smoothing_freeze_until + smoothing_ramp_epochs:
-                progress = (epoch - smoothing_freeze_until) / smoothing_ramp_epochs
-                min_gate = 1.0 - progress
-            else:
-                min_gate = 0.0
+            min_gate = compute_smoothing_min_gate(
+                epoch, smoothing_freeze_until, smoothing_ramp_epochs
+            )
             model.set_spatial_min_gate(min_gate)
             logger.debug(f"Epoch {epoch}: spatial min_gate={min_gate:.3f}")
 
