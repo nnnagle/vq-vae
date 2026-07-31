@@ -187,7 +187,10 @@ def log_epoch(
             f"cross p={pls['cross_mean_entropy_p']:.3f}, q={pls['cross_mean_entropy_q']:.3f} "
             f"[max~{pls['self_mean_overlap']:.1f} neighbors -> log(M)~{math.log(max(pls['self_mean_overlap'], 1)):.2f}]"
         )
-    elif pls:
+    elif pls and phase_config is not None:
+        # Phase loss configured but not yet active (curriculum still ramping in).
+        # When phase_config is None the loss is fully disabled — there is no start
+        # epoch to report, so skip the line rather than indexing a None config.
         logger.info(
             f"  Phase loss: inactive (curriculum_w={pls['curriculum_w']:.2f}, "
             f"starts epoch {phase_config['curriculum_start_epoch']+1})"
