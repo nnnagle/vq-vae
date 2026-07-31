@@ -65,6 +65,7 @@ from training.representation.curriculum import (
     ramp_weight,
 )
 from training.representation.epoch_logging import log_epoch
+from training.representation.profiling import is_profiling, set_profile
 from training.representation.scheduler import build_scheduler
 from utils import (
     compute_spatial_distances,
@@ -101,12 +102,6 @@ def _dataloader_worker_init(worker_id: int) -> None:
 # The gate tensor is [D,H,W] (~4.2M values); a few thousand samples are plenty
 # for mean/std/quantile summaries and avoid a multi-second cat+quantile per batch.
 _GATE_STATS_SAMPLES = 4096
-
-# Profiling master switch (set from --profile). When False (default/production)
-# every timing cuda.synchronize() and the per-epoch perf logging are skipped, so
-# training runs with no profiling overhead. --profile turns on the dataloader
-# wait/step split and the per-component step breakdown.
-_PROFILE = False
 
 
 def _get_feature(
@@ -520,7 +515,7 @@ def process_batch(
             'phase_prep':         phase_prep,
         }
 
-    if _PROFILE and device.type == 'cuda':
+    if is_profiling() and device.type == 'cuda':
         torch.cuda.synchronize()
     t_pass1 = time.perf_counter() - _t_pass1
 
@@ -541,7 +536,7 @@ def process_batch(
             gate_chunks.append(gate_c)
         z_batch = torch.cat(z_chunks, dim=0)
         gate_batch = torch.cat(gate_chunks, dim=0)
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         t_gpu_forward = time.perf_counter() - _t0
 
@@ -660,7 +655,7 @@ def process_batch(
                     return_film=True,
                     return_pre_film=True,
                 )
-                if _PROFILE and device.type == 'cuda':
+                if is_profiling() and device.type == 'cuda':
                     torch.cuda.synchronize()
                 t_phase_forward += time.perf_counter() - _t0
                 all_film_gamma.append(film_gamma.detach())
@@ -753,7 +748,7 @@ def process_batch(
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
         total_spatial_neg_pairs += spatial_neg_pairs.shape[0]
 
-    if _PROFILE and device.type == 'cuda':
+    if is_profiling() and device.type == 'cuda':
         torch.cuda.synchronize()
     t_pass2 = time.perf_counter() - _t_pass2
 
@@ -844,7 +839,7 @@ def process_batch(
         )
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         t_cross_spectral = time.perf_counter() - _t0
 
@@ -937,7 +932,7 @@ def process_batch(
         ysfc_all = torch.cat(cross_phase_ysfc, dim=0)      # [N_total, T]
         pairs_all = torch.cat(cross_phase_pairs, dim=0)    # [B_total, 2]
         weights_all = torch.cat(cross_phase_weights, dim=0)  # [B_total]
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['cat'] = time.perf_counter() - _t0
 
@@ -950,7 +945,7 @@ def process_batch(
         Z_c = Z - Z.mean(0, keepdim=True)
         U, _, _ = torch.pca_lowrank(Z_c, q=K, center=False)
         Z_k = U  # [N_total, K] — pca_lowrank already returns the top-K left vectors
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['svd'] = time.perf_counter() - _t0
 
@@ -963,7 +958,7 @@ def process_batch(
         S_mean = spec_all.mean(dim=1)                # [N_total, C] — pixel mean over T
         S_hat = S_mean[topk_idx].mean(dim=1)         # [N_total, C] — type-local baseline
         spec_demeaned = spec_all - S_hat.unsqueeze(1)  # [N_total, T, C]
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['knn'] = time.perf_counter() - _t0
 
@@ -976,7 +971,7 @@ def process_batch(
             pair_indices=pairs_all,
             min_overlap=phase_config.get('min_overlap', 3),
         )
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['build_batch'] = time.perf_counter() - _t0
 
@@ -996,7 +991,7 @@ def process_batch(
             cross_pixel_weight=phase_config.get('cross_pixel_weight', 1.0),
             _batch=phase_batch,
         )
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         cp_timing['neighborhood_loss'] = time.perf_counter() - _t0
         cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * p_loss
@@ -1022,7 +1017,7 @@ def process_batch(
                     delta=spread_config['delta'],
                 )
                 cross_phase_spread_val = spread_config['weight'] * spread_w * spread_loss
-            if _PROFILE and device.type == 'cuda':
+            if is_profiling() and device.type == 'cuda':
                 torch.cuda.synchronize()
             cp_timing['spread_loss'] = time.perf_counter() - _t0
 
@@ -1038,7 +1033,7 @@ def process_batch(
                 high_ysfc_min=recovery_disc_config['high_ysfc_min'],
             )
             cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
-            if _PROFILE and device.type == 'cuda':
+            if is_profiling() and device.type == 'cuda':
                 torch.cuda.synchronize()
             cp_timing['rd_loss'] = time.perf_counter() - _t0
 
@@ -1057,7 +1052,7 @@ def process_batch(
             cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
             frob = cross_cov.pow(2).sum().sqrt()
             cross_phase_leakage_val = leakage_weight * curriculum_w * frob
-            if _PROFILE and device.type == 'cuda':
+            if is_profiling() and device.type == 'cuda':
                 torch.cuda.synchronize()
             cp_timing['leakage'] = time.perf_counter() - _t0
 
@@ -1122,7 +1117,7 @@ def process_batch(
             )
 
         optimizer.step()
-        if _PROFILE and device.type == 'cuda':
+        if is_profiling() and device.type == 'cuda':
             torch.cuda.synchronize()
         t_backward += time.perf_counter() - _t0
         mean_loss = mean_loss.item()
@@ -1362,7 +1357,7 @@ def train_epoch(
 
         scheduler.step()
 
-        if _PROFILE and batch_idx >= 1 and stats.get('timing'):
+        if is_profiling() and batch_idx >= 1 and stats.get('timing'):
             for _k, _v in stats['timing'].items():
                 if _k == 'cross_phase_detail':
                     continue
@@ -1402,7 +1397,7 @@ def train_epoch(
             if stats.get('film_stats') is not None:
                 last_film_stats = stats['film_stats']
 
-            if _PROFILE and batch_idx == 0 and stats.get('timing'):
+            if is_profiling() and batch_idx == 0 and stats.get('timing'):
                 tm = stats['timing']
                 top_keys = [k for k in tm if k != 'cross_phase_detail']
                 total_t = sum(tm[k] for k in top_keys)
@@ -1470,7 +1465,7 @@ def train_epoch(
         n_batches_seen += 1
         _t_fetch = time.perf_counter()
 
-    if _PROFILE and n_batches_seen > 0:
+    if is_profiling() and n_batches_seen > 0:
         _wpb = t_wait_total / n_batches_seen
         _spb = t_step_total / n_batches_seen
         _tot = t_wait_total + t_step_total
@@ -1798,9 +1793,8 @@ def main():
     )
     args = parser.parse_args()
 
-    global _PROFILE
-    _PROFILE = args.profile
-    if _PROFILE:
+    set_profile(args.profile)
+    if is_profiling():
         logger.info("Profiling enabled (--profile): per-epoch wait/step + step breakdown will be logged.")
 
     # Parse configs first to get defaults
