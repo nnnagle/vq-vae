@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import shutil
 import time
 from pathlib import Path
@@ -49,6 +48,10 @@ from losses.phase_neighborhood import (
 from losses.triplet_phase import phase_recovery_discrimination_loss
 from losses.variance_covariance import variance_covariance_loss
 from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
+from training.representation.checkpointing import (
+    CheckpointManager,
+    resume_from_checkpoint,
+)
 from training.representation.curriculum import (
     compute_input_dropout_rate,
     compute_smoothing_min_gate,
@@ -2030,48 +2033,25 @@ def main():
         weight_decay=weight_decay,
     )
 
-    # Tracks (monitor_val, path) for top-k checkpoint pruning.
-    saved_ckpts: list = []
+    # Checkpoint manager owns the top-k (monitor_val, path) list and all per-epoch
+    # saves (last / periodic / best). Serialization is injected so the manager stays
+    # torch-agnostic and unit-testable.
+    ckpt_manager = CheckpointManager(
+        checkpoint_dir,
+        training_config.run.checkpoint,
+        logger,
+        save_fn=torch.save,
+        load_fn=lambda p: torch.load(p, map_location='cpu', weights_only=False),
+    )
 
     # --- Checkpoint resume ---
     # Auto-resume: if encoder_last.pt exists in the experiment dir, resume from it
     # unless --no-resume or an explicit --resume path was given.
     # Manual --resume: load the specified checkpoint and rebuild scheduler as a fresh
     # cosine from the checkpoint LR (original behavior).
-    start_epoch = 0
-    resume_lr = lr  # used only if manual --resume triggers the fresh-cosine path
-    auto_resume_path = Path(checkpoint_dir) / "encoder_last.pt"
-
-    if args.resume:
-        logger.info(f"Resuming from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        start_epoch = ckpt['epoch']  # saved as epoch+1 (the next epoch to run)
-        resume_lr = optimizer.param_groups[0]['lr']
-        logger.info(f"Resumed: start_epoch={start_epoch}, resume_lr={resume_lr:.3e}")
-
-    elif not args.no_resume and auto_resume_path.exists():
-        logger.info(f"Auto-resuming from {auto_resume_path}")
-        ckpt = torch.load(auto_resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        start_epoch = ckpt['epoch']
-        logger.info(f"Auto-resumed: start_epoch={start_epoch}, "
-                    f"lr={optimizer.param_groups[0]['lr']:.3e}")
-        # Rebuild saved_ckpts from existing best checkpoints on disk so top-k
-        # pruning is aware of what was saved before the crash.
-        monitor_key_for_resume = training_config.run.checkpoint.monitor
-        for p in sorted(Path(checkpoint_dir).glob("encoder_best_*.pt")):
-            try:
-                c = torch.load(p, map_location='cpu', weights_only=False)
-                val = c.get(monitor_key_for_resume, float('nan'))
-                saved_ckpts.append((val, p))
-                logger.info(f"  Restored top-k entry: {p.name} ({monitor_key_for_resume}={val:.4f})")
-            except Exception as e:
-                logger.warning(f"  Could not load {p.name} for top-k restore: {e}")
-        # scheduler state is restored below after scheduler creation
-        _auto_resume_scheduler_state = ckpt.get('scheduler_state_dict')
+    start_epoch, resume_lr, _auto_resume_scheduler_state = resume_from_checkpoint(
+        args, model, optimizer, checkpoint_dir, device, lr, ckpt_manager, logger,
+    )
 
     # Scheduler is created after phase_config below, so it can condition on whether
     # phase loss is active (needed for the two-phase LR schedule).
@@ -2554,7 +2534,6 @@ def main():
 
     # For auto-resume: restore scheduler state so LR continues exactly where it left off.
     # (Manual --resume intentionally rebuilds a fresh cosine; auto-resume is a crash recovery.)
-    _auto_resume_scheduler_state = locals().get('_auto_resume_scheduler_state')
     if _auto_resume_scheduler_state is not None:
         try:
             scheduler.load_state_dict(_auto_resume_scheduler_state)
@@ -2712,82 +2691,7 @@ def main():
             **{k: v for k, v in epoch_metrics.items()},
         }
 
-        ckpt_cfg = training_config.run.checkpoint
-        monitor_key = ckpt_cfg.monitor
-        if monitor_key not in epoch_metrics:
-            raise KeyError(
-                f"Checkpoint monitor '{monitor_key}' not found in epoch_metrics. "
-                f"Available keys: {list(epoch_metrics.keys())}"
-            )
-        monitor_val = epoch_metrics[monitor_key]
-
-        # Always save 'last' checkpoint (overwrites each epoch).
-        if ckpt_cfg.save_last:
-            last_path = ckpt_dir / "encoder_last.pt"
-            torch.save(ckpt_state, last_path)
-            logger.info(f"Saved last checkpoint to {last_path}")
-
-        # Periodic save (every nth epoch, never pruned).
-        if (epoch + 1) % ckpt_cfg.save_every_n_epochs == 0:
-            ckpt_path = ckpt_dir / f"encoder_epoch_{epoch+1:03d}.pt"
-            torch.save(ckpt_state, ckpt_path)
-            logger.info(
-                f"Saved periodic checkpoint to {ckpt_path} "
-                f"({monitor_key}={monitor_val:.4f})"
-            )
-
-        # Top-k save: only track best after monitor_start_epoch so pre-curriculum
-        # epochs (where phase loss is zero) can't be selected as the best checkpoint.
-        # saved_ckpts is sorted best-first (index 0 = rank 1).
-        # NaN-safe sort: map non-finite values to the worst possible sentinel so they
-        # sort to the tail and can be displaced by any finite value.
-        reverse = (ckpt_cfg.mode == "max")
-        nan_sentinel = float('-inf') if reverse else float('inf')
-        saved_ckpts.sort(key=lambda x: x[0] if math.isfinite(x[0]) else nan_sentinel, reverse=reverse)
-        worst_val_in_top_k = saved_ckpts[-1][0] if len(saved_ckpts) >= ckpt_cfg.save_top_k else None
-        if worst_val_in_top_k is not None and not math.isfinite(worst_val_in_top_k):
-            worst_val_in_top_k = nan_sentinel
-        is_better = (
-            math.isfinite(monitor_val)
-            and (
-                worst_val_in_top_k is None
-                or (ckpt_cfg.mode == "min" and monitor_val < worst_val_in_top_k)
-                or (ckpt_cfg.mode == "max" and monitor_val > worst_val_in_top_k)
-            )
-        )
-        if is_better and epoch >= ckpt_cfg.monitor_start_epoch:
-            # Save under a temporary name; will be renamed with rank below.
-            tmp_path = ckpt_dir / f"encoder_best_epoch_{epoch+1:03d}.pt"
-            torch.save(ckpt_state, tmp_path)
-            saved_ckpts.append((monitor_val, tmp_path))
-            saved_ckpts.sort(key=lambda x: x[0], reverse=reverse)
-
-            # Prune worst entry if over top-k.
-            while len(saved_ckpts) > ckpt_cfg.save_top_k:
-                worst_val, worst_path = saved_ckpts.pop()
-                if worst_path.exists():
-                    worst_path.unlink()
-                    logger.info(
-                        f"Removed checkpoint {worst_path.name} "
-                        f"({monitor_key}={worst_val:.4f}, outside top-{ckpt_cfg.save_top_k})"
-                    )
-
-            # Rename all top-k files to reflect current rank (rank 1 = best).
-            # Use temp names first to avoid collisions during rename.
-            tmp_renames = []
-            for rank, (val, old_path) in enumerate(saved_ckpts, 1):
-                ep = old_path.stem.split("_")[-1]  # e.g. '042'
-                new_name = ckpt_dir / f"encoder_best_{rank}_epoch_{ep}.pt"
-                tmp_name = ckpt_dir / f"_tmp_rank_{rank}_{ep}.pt"
-                old_path.rename(tmp_name)
-                tmp_renames.append((rank, val, tmp_name, new_name))
-            saved_ckpts = []
-            for rank, val, tmp_name, new_name in tmp_renames:
-                tmp_name.rename(new_name)
-                saved_ckpts.append((val, new_name))
-            logger.info(f"Updated top-{ckpt_cfg.save_top_k} checkpoints:")
-            for rank, (val, path) in enumerate(saved_ckpts, 1):
-                logger.info(f"  #{rank}: {path.name} ({monitor_key}={val:.4f})")
+        ckpt_manager.save(epoch, ckpt_state, epoch_metrics)
 
     logger.info("Training complete!")
 
