@@ -715,6 +715,7 @@ def process_batch(
     spectral_weight = config.get('spectral_loss_weight', 1.0)
     global_spectral_loss_val = torch.tensor(0.0, device=device)
     spectral_neg_tau_sweep: dict = {}
+    spectral_sim_stats: dict | None = None
     t_cross_spectral = 0.0
     t_cross_phase = 0.0
     if cross_patch_z_anchors:
@@ -789,6 +790,21 @@ def process_batch(
             similarity='l2',
             neg_weights=neg_weights,
         )
+        # Kernel-sizing diagnostic: pos/neg similarity in the same -||a-b||^2/D
+        # units the softmax sees. After the exp032 projection-head removal the
+        # spectral loss runs on raw z_type (D=z_type_dim), so the gap between
+        # these means and the spectral temperature reveals whether the exp(sim/T)
+        # kernel is saturated (gap/T >> the spatial loss's healthy ~2-3).
+        if global_pos.numel() > 0 and global_neg.numel() > 0:
+            with torch.no_grad():
+                _Dspec = z_all.shape[1]
+                _sp = -(z_all[global_pos[:, 0]] - z_all[global_pos[:, 1]]).pow(2).sum(1) / _Dspec
+                _sn = -(z_all[global_neg[:, 0]] - z_all[global_neg[:, 1]]).pow(2).sum(1) / _Dspec
+                spectral_sim_stats = {
+                    'pos_mean': _sp.mean().item(), 'pos_std': _sp.std().item(),
+                    'neg_mean': _sn.mean().item(), 'neg_std': _sn.std().item(),
+                    'temperature': float(config.get('temperature', 0.07)),
+                }
         total_spectral_pos_pairs = global_pos.shape[0]
         total_spectral_neg_pairs = global_neg.shape[0]
         if is_profiling() and device.type == 'cuda':
@@ -1192,6 +1208,7 @@ def process_batch(
         'neg_weight_stats': compute_stats(all_neg_weights),
         'pos_sim_stats': compute_stats(all_pos_sims),
         'neg_sim_stats': compute_stats(all_neg_sims),
+        'spectral_sim_stats': spectral_sim_stats,
         'pos_spec_dist_stats': compute_stats(all_pos_spec_dists),
         'neg_spec_dist_stats': compute_stats(all_neg_spec_dists),
         'tau_sweep': {

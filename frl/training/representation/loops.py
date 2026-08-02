@@ -75,6 +75,7 @@ def train_epoch(
     last_pos_spec_dist_stats = empty_stats
     last_neg_spec_dist_stats = empty_stats
     last_tau_sweep: dict = {}
+    last_spectral_sim_stats = None
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -143,6 +144,7 @@ def train_epoch(
             last_pos_spec_dist_stats = stats.get('pos_spec_dist_stats', empty_stats)
             last_neg_spec_dist_stats = stats.get('neg_spec_dist_stats', empty_stats)
             last_tau_sweep = stats.get('tau_sweep', {})
+            last_spectral_sim_stats = stats.get('spectral_sim_stats')
             last_phase_pair_stats = stats.get('phase_pair_stats')
             last_phase_loss_stats = stats.get('phase_loss_stats')
             if stats.get('film_stats') is not None:
@@ -253,6 +255,7 @@ def train_epoch(
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
             'pos_sim_stats': empty_stats, 'neg_sim_stats': empty_stats,
+            'spectral_sim_stats': None,
             'pos_spec_dist_stats': empty_stats, 'neg_spec_dist_stats': empty_stats,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
@@ -295,6 +298,7 @@ def train_epoch(
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
         'tau_sweep': last_tau_sweep,
         'spectral_neg_tau_sweep': locals().get('spectral_neg_tau_sweep', {}),
+        'spectral_sim_stats': last_spectral_sim_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,
@@ -339,6 +343,7 @@ def validate_epoch(
     last_neg_sim_stats = empty_stats
     last_pos_spec_dist_stats = empty_stats
     last_neg_spec_dist_stats = empty_stats
+    last_spectral_sim_stats = None
     last_phase_pair_stats = None
     last_phase_loss_stats = None
     last_film_stats = None
@@ -375,6 +380,7 @@ def validate_epoch(
                 last_neg_weight_stats = stats['neg_weight_stats']
                 last_pos_sim_stats = stats.get('pos_sim_stats', empty_stats)
                 last_neg_sim_stats = stats.get('neg_sim_stats', empty_stats)
+                last_spectral_sim_stats = stats.get('spectral_sim_stats')
                 last_phase_pair_stats = stats.get('phase_pair_stats')
                 last_phase_loss_stats = stats.get('phase_loss_stats')
                 if stats.get('film_stats') is not None:
@@ -395,6 +401,7 @@ def validate_epoch(
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
             'neg_weight_stats': empty_stats,
+            'spectral_sim_stats': None,
             'phase_pair_stats': None, 'phase_loss_stats': None,
             'film_stats': None,
         }
@@ -430,6 +437,7 @@ def validate_epoch(
         'neg_sim_stats': last_neg_sim_stats,
         'pos_spec_dist_stats': last_pos_spec_dist_stats,
         'neg_spec_dist_stats': last_neg_spec_dist_stats,
+        'spectral_sim_stats': last_spectral_sim_stats,
         'phase_pair_stats': last_phase_pair_stats,
         'phase_loss_stats': last_phase_loss_stats,
         'film_stats': last_film_stats,

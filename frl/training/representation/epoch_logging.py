@@ -138,6 +138,18 @@ def log_epoch(
             f"neg mean={ns.get('mean', 0.0):.4f} | "
             f"gap={gap:.4f} | eff_confusers={eff_confusers}/{train_stats.get('spatial_neg_pairs', '?')}"
         )
+    sss = train_stats.get('spectral_sim_stats')
+    if sss is not None:
+        _T = sss.get('temperature', 0.07) or 0.07
+        _gap = sss['pos_mean'] - sss['neg_mean']
+        _spw = loss_config.get('spectral_loss_weight', 1.0)
+        _raw_spec = (train_stats.get('spectral_loss', 0.0) / _spw) if _spw > 0 else 0.0
+        logger.info(
+            f"  Spectral sims: pos_mean={sss['pos_mean']:.4f}±{sss['pos_std']:.4f} | "
+            f"neg mean={sss['neg_mean']:.4f} | gap={_gap:.4f} | "
+            f"gap/T={_gap / _T:.1f} (T={_T:g}) | "
+            f"eff_confusers={2.718 ** _raw_spec:.1f}/{train_stats.get('spectral_neg_pairs', '?')}"
+        )
     logger.info(
         f"  Pairs/batch: "
         f"spec(batch total) pos={train_stats.get('spectral_pos_pairs', 0)} neg={train_stats.get('spectral_neg_pairs', 0)} | "
