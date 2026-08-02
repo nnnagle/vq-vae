@@ -62,7 +62,8 @@ spatial_conv:
 # Discarded at inference — z_type is used directly downstream.
 # VICReg operates on raw z_type (not projected) to guard backbone.
 type_projection:
-  enabled: true
+  enabled: false      # head-free: project_type() is identity; spectral InfoNCE
+                      # runs on raw z_type (see infonce_type_spectral.temperature)
   hidden_dim: 48      # matches z_type_dim; single bottleneck layer
   output_dim: 8       # small: spectral data has ~3-4 significant PCs
   l2_normalize: true
