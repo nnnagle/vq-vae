@@ -381,7 +381,11 @@ add only if trajectories drift but don't reliably return.
   `ysfc==0` mask, or a combination.
 - **Anti-collapse** — rely on the Step-5 contrastive spread only, or add an explicit
   correct-population variance floor as a safety net during co-development.
-- **Monotonicity companion** — include from the start or hold in reserve.
+- **Monotonicity companion** — **hold in reserve, and keep it *soft* if ever added.**
+  Per the OU attractor profile (Step-5 geometry), the inward drift is emergent
+  (radial contraction + basin density) and a *hard* monotonic-radius term would kill
+  the ergodic mature fluctuations and forbid non-monotone recovery. Add only a soft
+  version, only if trajectories drift but don't reliably return.
 - **Robust safety net** — whether to wrap the velocity term in a *saturating*
   `ρ(‖v‖)` (Welsch/Cauchy — bounded; not Huber) as a backstop for disturbance jumps
   the input gate misses, or rely on the gate alone. Default: gate alone, add the
@@ -431,6 +435,31 @@ to the basin.
   of the drift field — allowed discontinuities, held out of the flow by the Step-4
   gate. Tube identity properly **dissolves into the basin** near maturity (a recovered
   forest looks mature regardless of past agent), matching reality.
+
+**Attractor profile — OU-like, a fuzzy basin, not a point.** The radius should pull
+**strongly toward 0 far out** but only **weakly near the origin**, where residual
+**ergodic fluctuation** takes over — a mean-reverting (Ornstein–Uhlenbeck) process,
+not a pin. This falls out of two choices already made, nothing new to enforce:
+- **Radial contraction is the drift.** `E[z_{t+1}] ≈ γ·z_t` makes the *absolute*
+  inward step `(1−γ)·‖z‖` large at large radius and vanishing near the origin — "strong
+  at first, gentle near the center" is just what contraction is (no nonlinear
+  restoring force needed).
+- **The σ-normalization is the noise floor.** Since `a=(x−μ)/σ` with σ = the *mature*
+  scale, a mature forest's normal wiggle is **O(1) by construction** (`‖a‖~1`),
+  disturbances are *many* σ out. So the basin is a **fuzzy ~1σ ball**; the ergodic
+  fluctuation *is* σ. Together: far out contraction dominates (strong pull); near the
+  origin the tiny `γ·z` drift is overwhelmed by the O(1) noise → ergodic wander.
+
+Levers & the trap:
+- **Step-1 σ sets the basin size** (the "allowed fluctuation" radius — the direct knob).
+- **Step-4 smoothness** makes the in-basin wander smooth/ergodic, not white jitter.
+- **Step-5 `σ_flow` must be ≈ the mature fluctuation scale, not larger** — the trap: too
+  large ⇒ all mature timesteps become identical positives and InfoNCE **collapses the
+  ball to a point**, destroying the fluctuation. The variance-floor backstop guards this.
+- **Do *not*** add a hard "radius→0 at maturity" or hard monotonic-progress term — it
+  would kill the fluctuations and forbid non-monotone recovery. Drift is emergent
+  (contraction + basin density); keep any progress pressure *soft* or omit it. The
+  explicit version, if ever wanted, is the deferred drift-field `E[Δz] = −k·z`.
 
 ### CRITICAL: closeness-for-the-loss ≠ the emergent geometry
 
