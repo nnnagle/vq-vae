@@ -35,6 +35,10 @@ disturbance agents (fire vs harvest vs insect), which we don't want.
   joint (type × phase) coordinate** = the deliverable.
 - **ysfc**: demoted from loss *target* → mature-set *selector* (and, optionally, a
   weak within-recovery monotonicity prior only).
+- **Mature-set threshold** `ysfc > mature_ysfc_threshold` is an **input parameter**,
+  not hard-coded. It is region-dependent — forests mature faster in the East than
+  the West. Suggested starting values: **~10–12 in the East, ~20–25 in the West**.
+  Left as a tunable so we can sweep it and (later) set it per-region.
 - **Attention-pool trajectory descriptor head**: deferred (noted in CLAUDE.md).
 
 ## Key risk
@@ -89,9 +93,9 @@ z_phase cluster by change agent? Do the **return trajectories** to maturity clus
 by agent (fast harvest/fire V-shapes vs slow insect L-shapes)? This is a
 *diagnostic*, not a loss — we are checking whether the "few origins + pathways"
 structure emerges on its own.
-- **Data dependency to confirm:** we have ysfc (`scripts/02_extract_years_since_change_to_gcs.py`)
-  but no change-agent field in the bindings. Need to source agent labels (LANDFIRE
-  disturbance / LandTrendr change type / etc.) before D can run.
+- **Data dependency (deferred):** change-agent labels come from **LCMS** (Landscape
+  Change Monitoring System). Not wired in yet — add later as a bindings source and
+  join to the anchor pixels; diagnostic D runs once it's available.
 
 ### E. FIA downstream validation (existing machinery in `frl/analysis/`)
 
@@ -131,7 +135,7 @@ Extract embeddings at FIA plot locations; use kNN in embedding space
 ## Checklist (ordered — de-risking first)
 
 - [ ] 0. Eval harness (A–E above), fit on train / report test, baselined to exp034.
-- [ ] 1. Offline mature-baseline estimator μ/σ using a *frozen* exp034 z_type; check smoothness + per-EVT coverage.
+- [ ] 1. Offline mature-baseline estimator μ/σ using a *frozen* exp034 z_type, mature set = `ysfc > mature_ysfc_threshold` (param; ~10–12 East / ~20–25 West); check smoothness + per-EVT coverage.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ²; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Stage-A retrain (phase-only, frozen z_type) on anomaly input; "does the input alone help?"
 - [ ] 4. Slow-feature/smoothness loss; confirm drift-to-basin + jump-at-disturbance geometry.
@@ -142,6 +146,9 @@ Extract embeddings at FIA plot locations; use kNN in embedding space
 
 ## Open data dependencies
 
-- **Change-agent labels** for diagnostic D — not currently in bindings; source TBD.
+- **Change-agent labels** for diagnostic D — source is **LCMS**; deferred, add as a
+  bindings source and join to anchors later.
 - **FIA attribute join + plot-location extraction** for diagnostic E — machinery
   exists in `frl/analysis/` and `embed_locations.py`; confirm current-model wiring.
+- **`mature_ysfc_threshold`** — region-dependent input parameter (~10–12 East /
+  ~20–25 West); sweep it, and eventually set per-region.
