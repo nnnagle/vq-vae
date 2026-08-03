@@ -192,6 +192,71 @@ co-trained EMA/target-network baseline is deferred to checklist step 7.
 
 ---
 
+## Step 2 — Anomaly input transform (spec)
+
+Goal: turn the bindings-defined phase feature `x_it` into the rethought phase
+encoder input — a **type-conditional anomaly** plus temporal-difference channels
+that make abruptness explicit.
+
+**The transform.**
+- Per-channel anomaly `a_it = (x_it − μ_i) / σ_i`, with **μ_i, σ_i constant over
+  time** for a pixel (indexed by that pixel's `z_type`, broadcast across all T
+  timesteps). Mature ⇒ `a_it ≈ 0`; disturbances ⇒ large excursions that relax back.
+- **Pass-through channels** (e.g. `temporal_position`, and anything the bindings
+  spec marks non-spectral) are *not* anomaly-normalized — they keep their bindings
+  handling and are concatenated as-is.
+- **Correctness constraint (critical):** μ_i/σ_i must be estimated on the **same
+  representation of `x_it`** that the transform later subtracts from. Whatever units
+  the bindings feature builder emits for `x_it` (currently z-scored), the Step-1
+  reference bank must store `x_it` in *those same units*. Otherwise the subtraction
+  is in the wrong space. This couples Step 1's bank construction to the bindings
+  output — build them against the same feature.
+
+**Temporal-difference channels (abruptness).**
+- Append **Δa_it = a_it − a_i,t−1** and optionally **Δ²a_it** to the input. Computed
+  on the **anomaly**, not raw `x` — abruptness of the *departure from type baseline*
+  is the disturbance-onset signal; raw Δ is dominated by type-level seasonal/
+  interannual structure.
+- Boundary + masked timesteps: Δ at t=0 (no predecessor) and across invalid
+  timesteps handled via the existing mask machinery (zero + mark invalid); the TCN
+  is already mask-aware.
+- These distinguish **fast** ejecta (harvest/fire → large |Δ|) from **slow** ejecta
+  (insect → small |Δ| but sustained nonzero `a`), which is exactly the fast/slow
+  distinction we need the encoder to see.
+
+**Where the transform lives — two paths, by stage.**
+- **Stage A (frozen z_type — the near-term path).** μ_i/σ_i are fixed per pixel, so
+  **precompute and cache** them (query the Step-1 estimator once per pixel with the
+  frozen exp034 z_type) and apply the transform as a normalization. Because the
+  phase feature is temporal `[C,T,H,W]` and is consumed only at ~100–300 anchor
+  pixels, it must be built via **`build_feature_at_locations`** at anchor coords
+  (per the CLAUDE.md temporal-feature rule — never full-grid, to avoid OOM). The
+  cached μ/σ are read at those same anchor coords. Bit-stable and cheap.
+- **Stage B (co-trained z_type — deferred to step 7).** μ/σ move with z_type, so
+  compute them **on the fly** in `process_batch`: after the z_type forward, query
+  the (now-parametric, differentiable) estimator at anchor pixels' current z_type,
+  then form `a` and Δ. Gradient policy TBD (likely stop-grad through μ/σ, mirroring
+  the existing FiLM stop-grad discipline) — revisit at step 7.
+
+**Config / plumbing notes.**
+- `phase_in_channels` grows: anomaly channels + Δ (+ Δ²) + pass-through. Update the
+  model config and the phase encoder input wiring.
+- Keep it out of the worker `precompute_features` list (that's spatial-only; this is
+  temporal and anchor-built).
+- FiLM stays at the output and is complementary: anomaly removes type at the input
+  (mature ≈ 0 pre-FiLM for every type), FiLM `beta` re-places each type's manifold
+  in the shared space (point 4). No change to FiLM here.
+
+**Open decisions (to resolve before implementing):**
+- **Δ² or Δ-only.** Δ captures onset abruptness; Δ² adds curvature (distinguishes a
+  sharp V-bottom from a rounded L-turn) at the cost of noise amplification. Lean
+  Δ-only first, add Δ² if the fast/slow separation (diagnostic C/D) is weak.
+- **Scaling of the Δ channels.** Δa is already in σ_i units (since `a` is); decide
+  whether Δ needs its own robust rescale so its dynamic range matches `a` for the
+  TCN, or whether GroupNorm inside the TCN makes that moot.
+
+---
+
 ## Build vs. retire
 
 **Build**
