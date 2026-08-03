@@ -404,13 +404,61 @@ FiLM, the shipped retrieval key). Two samples should be **close iff they match o
 forest, same recovery stage." This loss also **sets z_phase's scale** and so is the
 **anti-collapse partner** for Step 4 (which is scale-free on its own).
 
+### The crystallized geometry (what z_phase *is*)
+
+Think of recovery as a **dynamical system**. Every pixel-time sits either in the
+**mature attractor basin** or on one of several **tubes** (recovery pathways ≈
+disturbance agents) that a disturbance kicked it onto and down which it relaxes back
+to the basin.
+
+- **z_phase is a *lifted, linearizing* phase space.** We choose coordinates in which
+  the (curved, channel-space) recovery flow becomes a simple **radial contraction**
+  toward a **per-type attractor** (the FiLM origin): `E[z_{t+1}] ≈ γ·z_t`. All the
+  differential-channel-rate **curvature is absorbed into the encoder**; in z_phase the
+  tubes are approximately **straight rays**.
+- **Read-out:** **direction** of z_phase (from the type-origin) = **which tube**
+  (globally valid because the ray is straight); **radius** = **progress** along it;
+  **type** = the FiLM origin. One Euclidean kNN captures all three — the deliverable.
+- **Non-crossing = the sufficiency criterion.** A flow is a well-defined function
+  only if trajectories don't cross; they *do* cross in raw channel space (same anomaly
+  can be descending vs. recovering vs. a different tube), so instantaneous `a` is an
+  insufficient state. The fix is to **lift the state** with velocity/history until it
+  self-unfolds (Takens delay-embedding). Practical target/diagnostic:
+  **`Var(Δ | z_phase-neighborhood)` should be small** — same-state points share a
+  future ⇒ the tubes are resolved ⇒ z_phase carries enough context/dimension.
+  (`Var` large ⇒ z_phase is still overlaying distinct trajectories; add context/dim.)
+- **The kicks are exogenous.** Disturbance onsets are stochastic shocks, *not* part
+  of the drift field — allowed discontinuities, held out of the flow by the Step-4
+  gate. Tube identity properly **dissolves into the basin** near maturity (a recovered
+  forest looks mature regardless of past agent), matching reality.
+
+### CRITICAL: closeness-for-the-loss ≠ the emergent geometry
+
+The radial direction=tube / radius=progress structure is what z_phase **emerges
+into**; it is **not** what we compute closeness from (using z_phase's own direction to
+define its positives is circular and collapse-prone). **Loss closeness is computed
+from *observables*:** the type embedding and the **observable flow-state**
+`s = (a, Δa)` (anomaly level + velocity) — the observable shadow of the radial state.
+`(a, Δa)` is precisely the lifted state the non-crossing argument demands. The
+encoder's job is to reproduce that observable closeness as a clean, absolute, radial
+Euclidean metric.
+
+**Tubes are built by chaining, not by a single term.** `k_flow` rewards *same
+location on the same flowline* (same `a`, same `Δa`); "same tube, different progress"
+is **not** a direct positive (different `a`). It emerges transitively: cross-pixel
+local positives (`B@p1 ≈ A@p1`) + Step-4 within-pixel continuity (`A@p1 ≈ A@p2`) ⇒
+`B@p1 ≈ A@p2`. This is why **Steps 4 and 5 are inseparable** — contrastive supplies
+the cross-pixel rungs, continuity the vertical rails; only together do they forge the
+tube along which "same-tube > different-tube" holds.
+
 **Form — soft-supervised InfoNCE, Euclidean, fixed temperature.** One kernel drives
 everything:
 
 ```
 d_type(i,j)  = ‖ẑ_type_i − ẑ_type_j‖         # standardized z_type (per-pixel)
-d_state(i,j) = ‖s_i − s_j‖                    # s = anomaly-window descriptor (level+Δ); NOT ysfc
-p_ij = exp(−d_type²/2σ_type²) · exp(−d_state²/2σ_state²)      # the AND (type ∧ phase)
+s_i          = ( a[n,t], Δa[n,t] )            # OBSERVABLE flow-state: level + velocity; NOT ysfc, NOT z_phase
+d_flow(i,j)  = ‖s_i − s_j‖                    # same place, moving the same way
+p_ij = exp(−d_type²/2σ_type²) · exp(−d_flow²/2σ_flow²)        # the AND (type ∧ flow-state)
 
 ℓ_ij = −‖z_phase_i − z_phase_j‖² / τ_phase   # Euclidean, FIXED τ
 L_i  = − Σ_{j∈pos(i)}  log[ exp(ℓ_ij) / ( exp(ℓ_ij) + Σ_{k∈neg(i)} w_neg(ik) · exp(ℓ_ik) ) ]
@@ -490,8 +538,11 @@ stance). Reuses cross-batch phase pooling, mutual-kNN positive selection, distan
 weighted negatives, and the `gap/T` temperature calibration already in the codebase.
 
 ### Open decisions
-- **State descriptor `s`** — window length around `t` (level only vs. level+Δ vs.
-  short window); long enough to capture direction, short enough to stay local.
+- **Flow-state `s`** — settled as the **observable flow-state `(a, Δa)`** (the lifted,
+  non-crossing state). Remaining knob: window length — just `(a, Δa)`, or add `Δ²a` /
+  a slightly longer window for a more robust flow tangent; long enough to resolve
+  crossings (small `Var(Δ|z_phase)`), short enough to stay local. Type-vs-flow weight
+  (`σ_type` vs `σ_flow`).
 - **Similarity** — negative-squared-Euclidean (recommended, radial) vs. dot-product
   (existing z_type idiom).
 - **Anti-collapse** — rely on fixed-τ InfoNCE alone vs. always-on variance floor.
@@ -506,7 +557,10 @@ weighted negatives, and the `gap/T` temperature calibration already in the codeb
 ### Diagnostics (ties to Step 0)
 Same-stage retrieval AUC (diagnostic A/E), within-type phase separability (can a
 probe read recovery stage off z_phase — the metric the old model failed), the
-"Phase sims gap/T" calibration line, and the collapse check shared with Step 4.
+"Phase sims gap/T" calibration line, the collapse check shared with Step 4, and the
+**flow-functional / non-crossing check `Var(Δ | z_phase-neighborhood)`** — small ⇒
+tubes resolved and z_phase carries enough context; large ⇒ distinct trajectories are
+being overlaid, needs more history/dimension.
 
 ---
 
