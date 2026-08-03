@@ -382,6 +382,12 @@ add only if trajectories drift but don't reliably return.
 - **Anti-collapse** — rely on the Step-5 contrastive spread only, or add an explicit
   correct-population variance floor as a safety net during co-development.
 - **Monotonicity companion** — include from the start or hold in reserve.
+- **Robust safety net** — whether to wrap the velocity term in a *saturating*
+  `ρ(‖v‖)` (Welsch/Cauchy — bounded; not Huber) as a backstop for disturbance jumps
+  the input gate misses, or rely on the gate alone. Default: gate alone, add the
+  saturating `ρ` only if un-gated jumps show up as over-penalized (recovery limbs
+  looking artificially smeared, or the loss spiking at mislabeled/undetected
+  disturbances). Costs one scale hyperparameter (the saturation radius).
 
 **Diagnostics (ties to Step 0).** Jump-at-disturbance separation (diagnostic C),
 mature-basin formation (within-type mature variance ↓, ejecta separation ↑), and a
