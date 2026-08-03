@@ -286,6 +286,16 @@ dense **basin** that trajectories relax back into. This is the loss that turns
 "per-timestep points that move" into a coherent dynamical picture, and it is the
 term the old scale-equivariant losses could never provide.
 
+**Framing: a smoothness constraint on path evolution.** Treat `z_phase[n,·]` as a
+**path through embedding space**; this loss penalizes the *kinetic energy* of that
+path (how fast the state moves), so the trajectory evolves slowly and continuously.
+It is made **edge-preserving in time** — smooth within stable stretches, but preserve
+the "edges" that are disturbances — which is the **temporal analog of the spatial
+`EdgeAwareSmoothingConv2D`** already used in the type pathway (smooth within regions,
+preserve edges/corners). Purpose (see the "why" for each in the discussion): a tight
+mature **basin** (noise suppressed), **connected, ordered recovery pathways** (a
+usable "how far along" coordinate), and the **relaxation dynamics** ("wander back").
+
 **Core term — a robust / gated temporal-difference penalty on z_phase.**
 - Base form: penalize `‖z_phase[t] − z_phase[t−1]‖` within a pixel across time.
 - A *bare* squared penalty would forbid the very jumps we want (and see Collapse
@@ -300,6 +310,35 @@ term the old scale-equivariant losses could never provide.
   transitions. This is a *light* ysfc use (a transition selector, like the mature
   selector), not ysfc-as-target — but leans on CCDC's disturbance calls, so keep it
   secondary to the data-driven gate.
+
+**Recommended mathematical form.** Gated kinetic energy of the path. For pixel `n`,
+transition `t = 1…T−1`:
+
+```
+velocity    v[n,t] = z_phase[n,t] − z_phase[n,t−1]
+input jump  g[n,t] = ‖a[n,t] − a[n,t−1]‖₂            # over anomaly channels (Step-2 Δ)
+gate        w[n,t] = exp(−(g[n,t]/τ)²) · valid[n,t]·valid[n,t−1]   ∈ (0,1]
+
+L_sf = ( Σ_{n,t} w[n,t] · ‖v[n,t]‖² ) / ( Σ_{n,t} w[n,t] )
+```
+
+`w ≈ 1` in stable stretches (smooth hard), `w → 0` at disturbance onset (jump free).
+Choices, with rationale:
+- **L2 (kinetic energy), not L1 (total variation).** L2 spreads change over many
+  small steps → *gradual* recovery (the relaxation limb we want); TV-L1 concentrates
+  change into sparse jumps + flat plateaus, which would collapse recovery into one
+  step. The **sharp onset is handled by the gate**, not the penalty shape, so L1's
+  edge-seeking is unnecessary.
+- **First-order (velocity), not second-order (acceleration).** We want "prefer to
+  stay put in the basin" = small velocity; a curvature penalty would instead permit
+  constant-velocity drift.
+- **Soft exp gate, not a hard threshold** — differentiable, partial credit for
+  medium changes. `τ` = "how big an input change counts as an event"; set from a
+  robust scale of `g` (e.g. median `‖Δa‖` over stable transitions), or tune.
+- **Optional robust safety net** — replace `‖v‖²` with a *saturating* `ρ(‖v‖)`
+  (Welsch/Cauchy — bounded; not Huber, which keeps growing) so a jump the gate
+  *misses* isn't over-penalized. Likely unneeded with a good input gate; keep in
+  reserve.
 
 **Collapse — slow-feature only makes sense paired with cross-pixel spread.**
 `‖Δz‖ → 0` is trivially minimized by a constant embedding (all timesteps, all pixels
