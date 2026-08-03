@@ -159,6 +159,29 @@ co-trained EMA/target-network baseline is deferred to checklist step 7.
   - *Optional stronger form* — fit μ/σ as a **smooth parametric map** (RBF / small
     MLP / spline) over standardized z_type instead of raw kNN. Inherently smooth and
     differentiable — also what step 7's co-trained EMA version will want.
+- **Scale hierarchy vs. the pairwise comparison scale σ_ij.** The mature-baseline
+  bandwidth `h` should be **coarser (larger) than the type-similarity comparison
+  scale σ_ij** used to weight loss pairs. Why: (1) σ_i is a second moment, so its
+  neighborhood must hold many mature samples; (2) consistency — the loss treats
+  pixels within σ_ij as same-type/comparable, so the baseline must be ≈ constant
+  across a σ_ij neighborhood, else "same-type" pixels get different baselines and
+  their anomalies stop being comparable; (3) it gives the smoothness guard headroom.
+  Two caveats:
+  - **Different metric spaces today.** The current pair weight is
+    `w_ij = exp(−‖spec_i − spec_j‖₂ / sigma)`, `sigma = 5.0`
+    (`frl/losses/phase_pairs.py`), defined in **Mahalanobis-whitened spectral**
+    units — *not* z_type units. `h` is in **standardized z_type** units. So
+    `h > σ_ij` is a principle about relative coarseness **on a shared ruler**, not a
+    literal comparison to 5.0. To operationalize it, define the loss's type-
+    similarity scale in the **same standardized-z_type metric** as `h` (which we
+    want for consistency anyway).
+  - **Not too large.** `h ≫ σ_ij` nearly-globalizes the baseline and leaves cross-
+    type differences in the anomaly. Target *moderately* larger: pick `h` by the LOO
+    bias-variance criterion, with `h > σ_ij` only as a lower-bound sanity check.
+  - σ_ij belongs to the soon-to-be-retired soft-neighborhood loss, but the scale
+    concept carries into the **type∧phase contrastive loss** (its positive/negative
+    type-neighborhood scale); the ordering applies against whatever that becomes.
+    Reconcile the two scales onto one z_type metric when specing Steps 4–5.
 
 **Diagnostics for Step 1:**
 - **Smoothness** — leave-one-out μ/σ stability vs. bandwidth; pick the smoothest
