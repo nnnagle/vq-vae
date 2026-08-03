@@ -504,7 +504,10 @@ losses:
   infonce_type_spectral:
     weight: 1.0
     type: infonce
-    temperature: 0.07
+    # Head-free run (type_projection disabled): spectral InfoNCE operates on raw
+    # z_type, so the temperature is calibrated to that scale (like spatial), not
+    # to a unit-norm projected embedding. Was 0.07 with the projection head.
+    temperature: 0.5
     mask:
       - static_mask.aoi
       - static_mask.forest

@@ -68,7 +68,7 @@ PHASE PATHWAY (temporal):
 
 ### Key Design Decisions
 
-- **SimCLR projection head on z_type** (`frl/models/heads.py` — `MLPProjectionHead`) — A small MLP (Linear → BN → ReLU → Linear, optionally L2-normalized) sits between `z_type` and the spectral/spatial InfoNCE losses during training. Following the SimCLR convention, this head absorbs distortions introduced by contrastive training so the backbone embedding stays clean for downstream tasks. It is discarded at inference time — `z_type` is used directly. VICReg operates on raw `z_type` (not projected) to guard against backbone collapse in the original embedding space. Enabled/disabled and sized via `type_projection` in `frl_repr_model_v1.yaml`; default output_dim=8 (small relative to z_type_dim=48, reflecting ~3–4 significant spectral PCs). `embed_locations.py` writes the projected embedding as `g_type_*` columns alongside `z_type_*`.
+- **SimCLR projection head on z_type** (`frl/models/heads.py` — `MLPProjectionHead`) — A small MLP (Linear → BN → ReLU → Linear, optionally L2-normalized) sits between `z_type` and the spectral/spatial InfoNCE losses during training. Following the SimCLR convention, this head absorbs distortions introduced by contrastive training so the backbone embedding stays clean for downstream tasks. It is discarded at inference time — `z_type` is used directly. VICReg operates on raw `z_type` (not projected) to guard against backbone collapse in the original embedding space. Enabled/disabled and sized via `type_projection` in `frl_repr_model_v1.yaml`; default output_dim=8 (small relative to z_type_dim=48, reflecting ~3–4 significant spectral PCs). `embed_locations.py` writes the projected embedding as `g_type_*` columns alongside `z_type_*`. **Currently disabled (`type_projection.enabled: false`) — head-free ablation from exp032 onward:** with the head off, `model.project_type()` is an identity map and the spectral InfoNCE trains directly on raw `z_type` (like the spatial loss), so its temperature was raised 0.07 → 0.5. The **"Spectral sims"** log line (pos/neg similarity, `gap/T`) is the calibration check — target `gap/T ~2-3` like the spatial loss. Re-enable by setting `enabled: true` and reverting the spectral temperature.
 - **Stop-gradient on `z_type` before FiLM** — `z_type` is `.detach()`'d before being passed to `FiLMLayer`. This is intentional to prevent circular conditioning. Do not remove this.
 - **EdgeAwareSmoothingConv2D** (`frl/models/spatial.py`) — replaces `GatedResidualConv2D` starting from exp018. Uses a fixed directional filter bank (K=8: 4 orientations × 2 scales — fine 3×3 and coarse dilated-3×3) with **rank-R factored per-channel mixing weights** predicted from per-channel Sobel gradients. Mixing weights are factored as W[k,c] = Σ_r A[k,r]·B[c,r]: A holds R shared direction-basis patterns (K-way softmax each), B holds per-channel mixture coefficients over those R patterns (R-way softmax per channel). This enforces cross-channel correlation while preserving per-channel flexibility — e.g. topographic channels can load on coarse-scale bases, spectral channels on fine-scale bases. A learned residual gate (`output = smoothed + gate·(x−smoothed)`) preserves features **across** edges and at corners. `GatedResidualConv2D` is retained in `spatial.py` for historical reference.
 - **z_type is unconstrained in magnitude** — `F.normalize()` was removed from `forward_type` (festive-shannon sync). VICReg enforces std ≥ 1 per dimension and decorrelates dimensions, but does not constrain the mean. Downstream users should center z_type (e.g. via `StandardScaler`) before linear probes or clustering. Spatial InfoNCE operates directly on raw z_type (no projection head), so dot-product similarities are in the 10–40 range rather than [-1, 1]; the temperature of 0.07 is calibrated to this scale via the effective loss value, not the raw logit range.
@@ -158,6 +158,35 @@ The training loop applies the following loss components:
 7. **Phase recovery discrimination** — absolute margin loss: within each pixel, embeddings at ysfc ≤ 1 must be at least `margin` apart from embeddings at ysfc ≥ 5. This is the loss that closes the gap between relative ordering and metrically meaningful recovery stage representation.
 8. **Frobenius type-leakage penalty** — `||cov(h, z_type)||_F` penalises type information in the pre-FiLM bottleneck h. Stop-gradient on z_type; active only when phase curriculum weight > 0.
 
+### Code structure & data flow (`frl/training/`)
+
+`train_representation.py` is a thin CLI entry point (~620 lines): argument parsing, config/dataset/model/optimizer wiring, the epoch loop, and per-epoch checkpoint orchestration. All training logic lives in the `frl/training/representation/` subpackage:
+
+| Module | Responsibility |
+|--------|----------------|
+| `step.py` | `process_batch()` — the full per-batch step (data flow below) |
+| `loops.py` | `train_epoch` / `validate_epoch` — iterate the dataloader, call `process_batch`, accumulate + log |
+| `config_builders.py` | Parsed YAML → `loss_config` and the phase / spread / recovery-disc / EVT setup dicts (+ EVT metric & sampler) |
+| `scheduler.py` | `build_scheduler` — warmup / two-phase phase-warmup cosine / plain cosine, + auto-resume state restore |
+| `checkpointing.py` | `CheckpointManager` (last/periodic/top-k save + prune/rename) and `resume_from_checkpoint` |
+| `epoch_logging.py` | `log_epoch` — the per-epoch diagnostic log block |
+| `curriculum.py` | Pure epoch→scalar schedules: input dropout, the shared phase-loss `ramp_weight`, spatial-smoothing gate |
+| `profiling.py` | The `--profile` flag (`set_profile` / `is_profiling`), shared across modules |
+
+Import graph is acyclic: `train_representation.main → loops → step → {curriculum, profiling}`; `main` additionally imports `config_builders`, `scheduler`, `checkpointing`, `epoch_logging`. Two modules pin `logging.getLogger("training.train_representation")` so log records keep their original name after the move.
+
+**Data flow through `process_batch()` (`step.py`)** — one batch of B patches:
+
+1. **Curriculum weights** — `ramp_weight(epoch, …)` sets the phase / spread / recovery-disc loss weights (0 during warmup, ramping to 1).
+2. **PASS 1 — CPU prep, per sample** (fills `prep_list`): sample anchors (grid+supplement, or EVT-stratified when the EVT loss is on), extract the spectral-distance feature at anchors, build spatial-InfoNCE pairs + spectral weights, and build phase pairs (`build_phase_pairs`). The encoder forward is **deferred**. Worker-precomputed spatial pairs are reused when present (see Feature Precomputation).
+3. **BATCHED GPU FORWARD** — a single chunked `[B,C,H,W]` encoder forward over all valid samples → `z_type`, `gate` (chunked by `enc_chunk_size` to bound peak memory).
+4. **PASS 2 — per sample**: extract `z_type` at anchors; compute **spatial InfoNCE**, **VICReg**, **EVT** soft-neighborhood; run the **phase TCN at phase-anchor pixels** (`forward_phase_at_locations`, conditioned on stop-gradient `z_type` via FiLM) → `z_phase` + **phase VICReg**; accumulate cross-batch collectors (`cross_patch_*` for spectral, `cross_phase_*` for phase). Per-patch loss = spatial + vcr + phase_vcr + evt; non-finite samples are skipped.
+5. **CROSS-BATCH SPECTRAL** — pool all anchors across the batch: chunked mutual-kNN positives + random cross-patch negatives (weighted by spectral distance) → **global spectral InfoNCE**, plus the **Spectral sims** kernel-sizing diagnostic (`gap/T`, for the head-free calibration).
+6. **CROSS-BATCH PHASE** — pool all phase anchors: randomized-PCA + kNN in `z_type` space builds a type-local spectral baseline (for demeaning), then the **phase neighborhood**, **spread ranking**, **recovery discrimination**, and **Frobenius type-leakage** losses.
+7. **Backward + optimizer step** (training only), then assemble the stats/timing dict returned to the epoch loop and consumed by `log_epoch`.
+
+Steps 1–4 are per-sample; **steps 5–6 are computed once over the whole batch** — which is why spectral positives can be spectrally-similar pixels from *different* patches (location-invariant forest type). `loops.py` sums these per-batch stat dicts into per-epoch means and forwards the last batch's diagnostic sub-dicts (gate, sims, phase, FiLM, type-leakage) to `log_epoch`.
+
 ### Important: Phase Loss Curriculum
 
 The phase loss uses **curriculum learning** — it is **zero for the first N epochs** (warmup), then ramps up. This is intentional. If you see phase loss = 0 early in training, that is expected behavior, not a bug. The warmup epoch count is set in the training config.
@@ -166,9 +195,9 @@ The phase loss uses **curriculum learning** — it is **zero for the first N epo
 
 `feature_builder.build_feature()` (Mahalanobis whitening + normalization) runs in the DataLoader worker processes, not in the main training loop. This keeps the GPU from sitting idle during CPU-bound preprocessing.
 
-`ForestDatasetV2` is given a `feature_builder` and a `precompute_features` list at construction time (`setup_training()` in `train_representation.py`). Each worker calls `build_feature()` in `__getitem__` and stores the results in the batch dict under `__feat_{name}_data` / `__feat_{name}_mask`. The `_get_feature()` helper in `process_batch()` reads these pre-built arrays from the batch; it falls back to calling `feature_builder.build_feature()` silently if a name is missing — meaning the fallback is correct but slow.
+`ForestDatasetV2` is given a `feature_builder` and a `precompute_features` list at construction time (built in `main()` in `train_representation.py`). Each worker calls `build_feature()` in `__getitem__` and stores the results in the batch dict under `__feat_{name}_data` / `__feat_{name}_mask`. The `_get_feature()` helper in `process_batch()` (`frl/training/representation/step.py`) reads these pre-built arrays from the batch; it falls back to calling `feature_builder.build_feature()` silently if a name is missing — meaning the fallback is correct but slow.
 
-**When adding a new `_get_feature()` call in `process_batch()`, also add the feature name to the `precompute_features` list in `setup_training()`.** Omitting it won't break training, but the feature will be built in the main process and the speedup won't apply.
+**When adding a new `_get_feature()` call in `process_batch()` (`step.py`), also add the feature name to the `precompute_features` list in `main()`.** Omitting it won't break training, but the feature will be built in the main process and the speedup won't apply.
 
 **Only add spatial (2D) features to `precompute_features` — not temporal ones.** Temporal features like `ysfc` and `phase_encoder_feature` are `[C, T, H, W]` arrays; stacking them across a full batch (e.g. 32 samples × 22 channels × 15 years × 256×256 pixels) causes OOM, so they are not precomputed in workers. They are consumed only at ~100–300 anchor pixel locations in `process_batch()`, so instead of building the full grid and extracting, build them **only at the anchor coords** via `FeatureBuilder.build_feature_at_locations(name, sample, coords)`. Because normalization and Mahalanobis whitening use fixed precomputed stats and are pointwise per pixel, this is bit-identical to the full-grid build (verified, `max|diff|=0`) at ~H·W/N (~230×) less cost. Building these features full-grid per sample in the main process used to be the dominant training-step cost — see Performance.
 
@@ -267,7 +296,15 @@ frl/losses/phase_neighborhood.py         Phase temporal loss
 frl/losses/phase_triplet.py              Phase triplet loss
 frl/losses/reconstruction.py             Reconstruction loss
 
-frl/training/train_representation.py          Main training script
+frl/training/train_representation.py                 Training CLI entry point (arg parsing + wiring + epoch loop)
+frl/training/representation/step.py                  process_batch() — the per-batch training/val step
+frl/training/representation/loops.py                 train_epoch / validate_epoch
+frl/training/representation/config_builders.py       YAML → loss_config / phase / spread / recovery-disc / EVT
+frl/training/representation/scheduler.py             build_scheduler (warmup / two-phase cosine / resume)
+frl/training/representation/checkpointing.py         CheckpointManager (top-k save) + resume_from_checkpoint
+frl/training/representation/epoch_logging.py         log_epoch — per-epoch diagnostic logging
+frl/training/representation/curriculum.py            Epoch→scalar schedules (dropout, ramp_weight, smoothing gate)
+frl/training/representation/profiling.py             --profile flag (set_profile / is_profiling)
 frl/training/fit_linear_probe.py              Downstream type embedding linear probe (z_type → FIA targets)
 frl/training/fit_phase_linear_probe.py        Phase embedding linear probe (temporal R²)
 frl/training/fit_gmm_clusters.py              Fit GMM on z_type embeddings
@@ -290,8 +327,8 @@ The codebase is flexible with no rigid extension conventions.
 
 **Add a new loss function:**
 1. Create in `frl/losses/`
-2. Import and call in `frl/training/train_representation.py`
-3. Add loss weight to `frl_training_v1.yaml`
+2. Import and call it inside `process_batch()` in `frl/training/representation/step.py` (per-sample in Pass 2, or once-per-batch in the cross-batch section); thread any new diagnostic through `loops.py` and `epoch_logging.py` if you want it logged
+3. If it needs config, add a builder/keys in `frl/training/representation/config_builders.py`; loss weights are defined in the bindings YAML (`frl_binding_v1.yaml`), not the training YAML
 
 **Add a new encoder component:**
 - Type pathway tensors: `[B, C, H, W]`

@@ -40,7 +40,8 @@ python -m training.train_representation \
     --training config/frl_training_v1.yaml \
     --batch-size 16 \
     --num-workers ${NUM_WORKERS} \
-    --epochs 5 \
+    --epochs 3 \
+    --max-batches 20 \
     --phase-start-epoch 1 \
     --profile \
     --overwrite
