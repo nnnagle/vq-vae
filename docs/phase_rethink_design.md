@@ -145,14 +145,34 @@ as a cheap offline sanity prototype, not the production mechanism.
   (per-epoch, or every few epochs) or a **forgetting / sliding** variant. Reset
   cadence vs. decay is an open decision; whichever we pick, it must keep the
   reservoir fresh relative to the rate z_type is still moving.
-- **Estimator.** μ_i / σ_i = smoothed **kNN / kernel regression** of the mature
-  reservoir onto query `z_type`, recomputed as the reservoir refreshes. z_type is
-  unconstrained in magnitude (per CLAUDE.md), so **standardize z_type before
-  computing distances**. Gaussian kernel over the k nearest mature neighbors;
-  bandwidth from a robust neighbor-distance statistic. μ/σ are treated as a
-  **stop-grad, slowly-moving baseline** (reservoir holds detached z_type; the phase
-  loss does not push z_type through μ/σ — mirrors the existing FiLM stop-grad
-  discipline and keeps type/phase separated).
+- **Estimator form (open decision — two candidates for the same target).** Both
+  estimate the *conditional moments of mature spectral given type*:
+  `x_it_mature ~ N(μ(z_type), σ(z_type)²)`. z_type is unconstrained in magnitude, so
+  **standardize z_type first** either way. μ/σ are a **stop-grad, slowly-moving
+  baseline** fed **detached z_type** — the phase loss never pushes z_type through
+  μ/σ (mirrors FiLM stop-grad; keeps type/phase separated).
+  - **(a) Non-parametric kNN / kernel regression** over the mature reservoir.
+    Robust, interpretable bandwidth (`h > σ_ij`), degrades gracefully to "nearest
+    observed data" in under-sampled z_type regions. Costs: needs the large reservoir
+    + a refresh policy (freshness bullet above); not deployable without shipping the
+    reservoir; O(N_query·N_res·d) per batch.
+  - **(b) Parametric readout** — a small **RBF network** (preferred: smooth by
+    construction, explicit kernel width = the interpretable bandwidth) or a
+    **Lipschitz-controlled MLP** (spectral norm / gradient penalty; the Lipschitz
+    constant `L ≈ 1/h` is the bandwidth analog, so `h > σ_ij` becomes `L < 1/σ_ij`;
+    smooth activations, weight decay). Fit online by **heteroscedastic Gaussian NLL**
+    on mature samples, σ via softplus/exp. Cheap constant-time query, differentiable,
+    deployable. Its staleness is **parameter lag** (weights trailing a
+    slowly-drifting z_type), which tracks better than frozen reservoir snapshots — so
+    the large reservoir can shrink to a **small replay buffer** for variance
+    reduction. Cost: can extrapolate confidently-but-wrongly in low-density z_type
+    regions (mitigate with low capacity / coarse-prior shrinkage / an uncertainty
+    head), and can silently fail (σ→0, μ ignoring type).
+  - **Recommendation:** build **(a) kNN first** as the robust reference/oracle and to
+    de-risk the anomaly-input idea; move production to **(b)** once trusted,
+    **cross-checking (b)'s μ/σ against (a)** on held-out mature pixels to catch
+    silent failure. The parametric form also dissolves most of the reservoir-refresh
+    question (→ replay-buffer size).
 - **Settling via warmup.** Since μ/σ move with z_type early in training, the
   existing **phase-loss curriculum warmup** now does double duty: it lets the
   reservoir-based μ/σ settle before the anomaly-input phase pathway starts learning.
@@ -178,9 +198,9 @@ as a cheap offline sanity prototype, not the production mechanism.
     prior** (EVT-class mean, else global mean) where local support is thin. Ties to
     the per-EVT coverage diagnostic: rare / chronically-disturbed types fall back to
     a stable prior instead of a noisy local fit.
-  - *Optional stronger form* — fit μ/σ as a **smooth parametric map** (RBF / small
-    MLP / spline) over standardized z_type instead of raw kNN. Inherently smooth and
-    differentiable — also what step 7's co-trained EMA version will want.
+  - For the **parametric readout (b)** the smoothness knob is the RBF kernel width
+    or the MLP's Lipschitz bound / weight decay (see "Estimator form"); pick it by
+    the same LOO criterion and cross-check against kNN.
 - **Scale hierarchy vs. the pairwise comparison scale σ_ij.** The mature-baseline
   bandwidth `h` should be **coarser (larger) than the type-similarity comparison
   scale σ_ij** used to weight loss pairs. Why: (1) σ_i is a second moment, so its
@@ -305,7 +325,7 @@ that make abruptness explicit.
 ## Checklist (ordered — de-risking first)
 
 - [ ] 0. Eval harness (A–E above), fit on train / report test, baselined to exp034.
-- [ ] 1. Live reservoir μ/σ estimator: stream `(z_type, mature x_it, ysfc)` into a `ReservoirSampler`, kNN/kernel on standardized z_type, mature set = `ysfc > mature_ysfc_threshold` (param; ~10–12 East / ~20–25 West); pick refresh cadence (reset vs. decay), bandwidth (`h > σ_ij`); check smoothness + per-EVT coverage. *(Optional: frozen-exp034 offline prototype as a sanity check.)*
+- [ ] 1. Live μ/σ estimator of the mature conditional moments `N(μ(z_type),σ(z_type)²)`. Start with **(a) kNN** over a `ReservoirSampler` of `(z_type, mature x_it, ysfc)` on standardized z_type (mature = `ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West; refresh cadence reset-vs-decay; bandwidth `h > σ_ij`) as the robust oracle; then **(b) parametric readout** (RBF / Lipschitz-MLP, heteroscedastic-NLL, detached z_type, small replay buffer) cross-checked against (a). Check smoothness + per-EVT coverage. *(Optional: frozen-exp034 offline prototype as a sanity check.)*
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 4. Slow-feature/smoothness loss; confirm drift-to-basin + jump-at-disturbance geometry.
