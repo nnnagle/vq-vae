@@ -396,6 +396,120 @@ away from 0).
 
 ---
 
+## Step 5 — Type∧phase contrastive loss (spec)
+
+Goal: the metric itself. A sample is `(pixel n, timestep t) → z_phase[n,t]` (post-
+FiLM, the shipped retrieval key). Two samples should be **close iff they match on
+*both* type and phase** — this is what makes kNN in z_phase return "same kind of
+forest, same recovery stage." This loss also **sets z_phase's scale** and so is the
+**anti-collapse partner** for Step 4 (which is scale-free on its own).
+
+**Form — soft-supervised InfoNCE, Euclidean, fixed temperature.** One kernel drives
+everything:
+
+```
+d_type(i,j)  = ‖ẑ_type_i − ẑ_type_j‖         # standardized z_type (per-pixel)
+d_state(i,j) = ‖s_i − s_j‖                    # s = anomaly-window descriptor (level+Δ); NOT ysfc
+p_ij = exp(−d_type²/2σ_type²) · exp(−d_state²/2σ_state²)      # the AND (type ∧ phase)
+
+ℓ_ij = −‖z_phase_i − z_phase_j‖² / τ_phase   # Euclidean, FIXED τ
+L_i  = − Σ_{j∈pos(i)}  log[ exp(ℓ_ij) / ( exp(ℓ_ij) + Σ_{k∈neg(i)} w_neg(ik) · exp(ℓ_ik) ) ]
+```
+
+### Why InfoNCE and not the soft-neighborhood loss used before (honest version)
+
+`KL(p‖q)` and InfoNCE cross-entropy share the *same gradient* given the same target
+and candidate set, so "KL vs InfoNCE" is **not** the real distinction. What gives a
+loss collapse-resistance and an *absolute, shippable metric* is three properties:
+**(1) explicit repulsion** (real negatives pushed apart), **(2) a peaked target**
+("the positive is strictly closest", not "reproduce a graded neighborhood"), and
+**(3) a fixed temperature as an absolute ruler**. The old `soft_neighborhood`
+matched a *diffuse, normalized* target with no explicit repulsion, so a globally
+**contracted** embedding satisfies it (all `d→ε` ⇒ `q→uniform ≈` a diffuse `p`) and
+absolute distance is never supervised — which is exactly why
+`phase_recovery_discrimination_loss` (an absolute margin) had to be bolted on. We
+ship a **metric** (kNN distances for post-stratification), so absolute distance must
+be pinned; only (1)+(2)+(3) do that.
+
+**Caveat that this forces on us:** soft-supervised InfoNCE is only collapse-resistant
+if the **positive target stays peaked and the negatives stay real**. If `σ_type`,
+`σ_state` are too large, the positive set becomes diffuse and this degenerates back
+into soft-neighborhood. So the three ingredients below are non-negotiable.
+
+### Getting the three ingredients
+
+**(1) Peakedness — few, confident, AND-gated positives.**
+- Positives = candidates that are type-close **∩** state-close: top-k / mutual-kNN by
+  `p_ij`, capped at a few per anchor (reuses the spectral mutual-kNN positive logic
+  with a two-factor gate). Selecting a *small set* guarantees peakedness rather than
+  hoping a soft kernel stays sharp.
+- A few reliable cross-pixel positives per step, over many steps, align the whole
+  same-state population by transitive closure — peaked ≠ under-aligned.
+- **Free positives: within-pixel adjacent timesteps** (same pixel ⇒ same type;
+  adjacent stable ⇒ same state). Reliable but **must not dominate**: weight
+  cross-pixel positives **≥** within-pixel, or the loss is minimized by making each
+  pixel a smooth *private* curve with no shared basin — the old "encodes pixel
+  identity" failure.
+- `σ_type`, `σ_state` are the peakedness knobs; calibrate from the distance
+  distributions so "same" is genuinely narrow.
+
+**(2) Negatives — the same-type/different-state set is the whole game.**
+- Base pool: random cross-batch samples (reuse `cross_phase_*`) → general spread.
+- **Hard negatives = same type, different state** — the set that makes recovery
+  stages metrically separable *within* a type (the `phase_recovery_discrimination`
+  job, done natively). **Must be actively mined/quota'd**: same-type samples are a
+  minority of a random pool, so without mining, trivial different-type negatives
+  swamp the gradient and phases quietly re-compress. Guarantee each anchor's negative
+  set includes its type-neighbors (high `k_type`) that are state-far (low `k_state`).
+- **False-negative suppression** via the same kernel: `w_neg(ik) = (1 − p_ik)`
+  clamped (your spectral `1 − exp(−d/σ)` idiom) — an accidental same-type/same-state
+  pair gets ≈0 negative weight. One kernel gives positives (high `p`) and negative
+  weights (`1 − p`).
+
+**(3) Fixed ruler.**
+- **Fixed `τ_phase`** (never learned) = the absolute ruler. Calibrate via a new
+  **"Phase sims gap/T"** diagnostic (pos vs neg similarity gap over τ), kept in the
+  healthy `~2–3` band, mirroring the spectral calibration. Collapse → uniform
+  softmax → loss `= log K` (the maximum), so fixed τ forces a characteristic
+  positive-vs-negative distance.
+- **Euclidean-squared** similarity, not cosine — the ruler must measure *radial*
+  distance so mature≈origin and distance = severity survive. Consistent with Step 4
+  (`‖Δz‖²`).
+- **Variance-floor backstop** — light VICReg-style per-dim std hinge on the
+  **correct population** (across pixels / disturbance–recovery axis, *not* flattened
+  N×T). Bites only below the floor; insurance against τ mis-calibration.
+
+### Scale reconciliation (closes the earlier debt)
+`σ_type` is the type-similarity scale = the `σ_ij` we owed, now on the standardized
+z_type metric. All scales land on one ruler: readout bandwidth `h` (coarsest) >
+`σ_type` — i.e. `h > σ_ij`.
+
+### Mechanics / reuse
+Head-free directly on z_phase (deliverable key; consistent with the head-free z_type
+stance). Reuses cross-batch phase pooling, mutual-kNN positive selection, distance-
+weighted negatives, and the `gap/T` temperature calibration already in the codebase.
+
+### Open decisions
+- **State descriptor `s`** — window length around `t` (level only vs. level+Δ vs.
+  short window); long enough to capture direction, short enough to stay local.
+- **Similarity** — negative-squared-Euclidean (recommended, radial) vs. dot-product
+  (existing z_type idiom).
+- **Anti-collapse** — rely on fixed-τ InfoNCE alone vs. always-on variance floor.
+- **Positive kernel sharpness** — soft top-k weights vs. hard positive selection;
+  and the cross-pixel-vs-within-pixel positive weighting.
+- **Hard-negative mining quota** — how many same-type/different-state negatives per
+  anchor to guarantee.
+- **Fallback** — if the soft product-kernel is fiddly, discretize into
+  (type-cluster × coarse-anomaly-state) buckets and run plain SupCon (cruder;
+  bucketing reintroduces a whiff of ysfc-style discretization).
+
+### Diagnostics (ties to Step 0)
+Same-stage retrieval AUC (diagnostic A/E), within-type phase separability (can a
+probe read recovery stage off z_phase — the metric the old model failed), the
+"Phase sims gap/T" calibration line, and the collapse check shared with Step 4.
+
+---
+
 ## Build vs. retire
 
 **Build**
