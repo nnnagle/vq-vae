@@ -43,10 +43,11 @@ disturbance agents (fire vs harvest vs insect), which we don't want.
 
 ## Key risk
 
-μ()/σ() must be **smooth** functions of z_type (kNN/kernel regression that is not
-too wiggly), and the mature neighborhood depends on the *learned* embedding →
-circularity. Mitigation: stage it (frozen z_type first; EMA/target-network only if
-warranted), regularize smoothness.
+μ()/σ() must be **smooth** functions of z_type (the parametric readout must not be
+too wiggly), and the fit depends on the *learned, drifting* z_type → circularity.
+Mitigation: an explicit smoothness constraint (RBF width / Lipschitz bound), and a
+**warmup** that lets both z_type and the readout settle before the phase losses
+turn on.
 
 ---
 
@@ -116,99 +117,68 @@ Extract embeddings at FIA plot locations; use kNN in embedding space
 Goal: two functions **μ(z_type)** and **σ(z_type)** that, for any pixel's type
 embedding, return the per-channel mean and scale of **mature** forest of that type.
 These define the anomaly input `(x_it − μ_i)/σ_i` used by the rethought phase
-pathway. The estimator is **live during training**: μ/σ are computed from a large
-**reservoir** of mature pixels whose z_type is refreshed as the model trains (see
-"Reservoir mechanism" below). There is **no separate frozen/co-trained split** — it
-is one path. An optional one-off build against a frozen exp034 z_type is kept only
-as a cheap offline sanity prototype, not the production mechanism.
+pathway. The estimator is a small **parametric readout** of z_type, fit **online
+during training** by heteroscedastic Gaussian NLL on mature samples (details below).
+**No reservoir, no kNN** — μ/σ are a function of z_type, trained alongside the model
+and evaluated with one forward per batch.
 
 - **`x_it` is the phase input exactly as defined in the bindings YAML** (currently
   `phase_ccdc`; whatever it evolves to). The estimator is agnostic to the specific
   channel list — it normalizes the bindings-defined phase feature. Any pass-through
   channels (e.g. `temporal_position`) are handled by the bindings spec, not here.
-- **Reservoir mechanism.** A large fixed-capacity **reservoir**
-  (`frl/utils/sampling.py::ReservoirSampler`, Algorithm R) is fed
-  `(z_type_detached, mature x_it, ysfc, evt)` from the anchor pixels **already being
-  embedded each batch** — no separate re-embedding pass. Reference samples are
-  **per mature timestep** (`ysfc > mature_ysfc_threshold`), not per-pixel means:
-  pooling individual mature timesteps preserves the ergodic year-to-year variation
-  of a mature forest, which σ_i is meant to capture. This is a persisted,
-  cross-batch enlargement of the per-batch "randomized-PCA + kNN in z_type space"
-  demeaning pool that already exists in `process_batch` step 6. Data is Virginia
-  (all-East) for now → a single reservoir, threshold ≈ 10–12; region-tagged
-  reservoirs come with the East/West generalization.
-- **Freshness / staleness (design decision).** Vanilla Algorithm R never updates a
-  stored vector after insertion and samples uniformly over *all* history, so a
-  never-reset reservoir accumulates **stale z_type embeddings** (including early bad
-  ones) and μ/σ would reflect a blur of past geometries. Because z_type drifts, the
-  reservoir must track the **current** embedding space: either **periodic reset**
-  (per-epoch, or every few epochs) or a **forgetting / sliding** variant. Reset
-  cadence vs. decay is an open decision; whichever we pick, it must keep the
-  reservoir fresh relative to the rate z_type is still moving.
-- **Estimator form (open decision — two candidates for the same target).** Both
-  estimate the *conditional moments of mature spectral given type*:
-  `x_it_mature ~ N(μ(z_type), σ(z_type)²)`. z_type is unconstrained in magnitude, so
-  **standardize z_type first** either way. μ/σ are a **stop-grad, slowly-moving
-  baseline** fed **detached z_type** — the phase loss never pushes z_type through
-  μ/σ (mirrors FiLM stop-grad; keeps type/phase separated).
-  - **(a) Non-parametric kNN / kernel regression** over the mature reservoir.
-    Robust, interpretable bandwidth (`h > σ_ij`), degrades gracefully to "nearest
-    observed data" in under-sampled z_type regions. Costs: needs the large reservoir
-    + a refresh policy (freshness bullet above); not deployable without shipping the
-    reservoir; O(N_query·N_res·d) per batch.
-  - **(b) Parametric readout** — a small **RBF network** (preferred: smooth by
-    construction, explicit kernel width = the interpretable bandwidth) or a
-    **Lipschitz-controlled MLP** (spectral norm / gradient penalty; the Lipschitz
-    constant `L ≈ 1/h` is the bandwidth analog, so `h > σ_ij` becomes `L < 1/σ_ij`;
-    smooth activations, weight decay). Fit online by **heteroscedastic Gaussian NLL**
-    on mature samples, σ via softplus/exp. Cheap constant-time query, differentiable,
-    deployable. Its staleness is **parameter lag** (weights trailing a
-    slowly-drifting z_type), which tracks better than frozen reservoir snapshots — so
-    the large reservoir can shrink to a **small replay buffer** for variance
-    reduction. Cost: can extrapolate confidently-but-wrongly in low-density z_type
-    regions (mitigate with low capacity / coarse-prior shrinkage / an uncertainty
-    head), and can silently fail (σ→0, μ ignoring type).
-  - **Recommendation:** build **(a) kNN first** as the robust reference/oracle and to
-    de-risk the anomaly-input idea; move production to **(b)** once trusted,
-    **cross-checking (b)'s μ/σ against (a)** on held-out mature pixels to catch
-    silent failure. The parametric form also dissolves most of the reservoir-refresh
-    question (→ replay-buffer size).
-- **Settling via warmup.** Since μ/σ move with z_type early in training, the
-  existing **phase-loss curriculum warmup** now does double duty: it lets the
-  reservoir-based μ/σ settle before the anomaly-input phase pathway starts learning.
-  It likely needs to be **longer** than the current FiLM-stability warmup — μ/σ
-  settling is a stricter condition than z_type merely being non-degenerate.
-- **σ_i = pooled.** The scale pools both the mature **temporal wiggle** (across
-  mature timesteps) and the **between-pixel** spread of mature type-i forests —
-  i.e. the std of the pooled mature-timestep reference in the z_type neighborhood.
-  Rationale: a disturbance should stand out against a mature forest's *normal*
-  wiggle, and per-timestep pooling makes that wiggle part of the reference
-  distribution directly.
-- **Smoothness guard.** μ()/σ() must stay **slowly-varying functions of z_type**
-  (they feed every downstream input; a wiggly μ makes same-type pixels'
-  anomalies incomparable, confuses estimator jitter with real anomalies, and
-  destabilizes the step-7 co-trained target). Mechanisms:
-  - *Primary knob* — neighborhood size (k / kernel bandwidth); bigger = smoother.
-  - *Selection criterion* — leave-one-out prediction of a held-out mature
-    timestep's `x_it` from its neighbors, swept over bandwidth (small → high
-    variance/overfit, large → high bias/types blur). Pick the smoothest setting
-    that still tracks known type differences; **report effective degrees of
-    freedom**.
-  - *Graceful degradation* — minimum-neighbor floor + **shrinkage toward a coarser
-    prior** (EVT-class mean, else global mean) where local support is thin. Ties to
-    the per-EVT coverage diagnostic: rare / chronically-disturbed types fall back to
-    a stable prior instead of a noisy local fit.
-  - For the **parametric readout (b)** the smoothness knob is the RBF kernel width
-    or the MLP's Lipschitz bound / weight decay (see "Estimator form"); pick it by
-    the same LOO criterion and cross-check against kNN.
-- **Scale hierarchy vs. the pairwise comparison scale σ_ij.** The mature-baseline
-  bandwidth `h` should be **coarser (larger) than the type-similarity comparison
-  scale σ_ij** used to weight loss pairs. Why: (1) σ_i is a second moment, so its
-  neighborhood must hold many mature samples; (2) consistency — the loss treats
-  pixels within σ_ij as same-type/comparable, so the baseline must be ≈ constant
-  across a σ_ij neighborhood, else "same-type" pixels get different baselines and
-  their anomalies stop being comparable; (3) it gives the smoothness guard headroom.
-  Two caveats:
+- **Estimator = online heteroscedastic Gaussian NLL readout.** μ/σ are a small
+  **parametric map** of standardized `z_type`, fit to the conditional moments of
+  mature spectral:
+  `x_it_mature ~ N(μ_θ(z_type), σ_θ(z_type)²)`, trained by Gaussian NLL, with σ via
+  `softplus`/`exp` to stay positive. **No reservoir, no kNN.** μ_θ = conditional
+  mean, σ_θ = conditional std — the parametric estimator of the same quantity a kNN
+  would approximate non-parametrically. z_type is unconstrained in magnitude
+  (per CLAUDE.md), so **standardize z_type first**. μ/σ are fed **detached z_type**
+  and are **stop-grad** w.r.t. the phase loss (mirrors FiLM stop-grad; keeps
+  type/phase separated); z_type is shaped only by the type losses, never by the
+  baseline readout.
+- **Form.** Prefer a small **RBF network** (smooth by construction, explicit kernel
+  width = interpretable bandwidth) or a **Lipschitz-controlled MLP** (spectral-norm /
+  gradient penalty + smooth activations + weight decay). The Lipschitz constant is
+  the bandwidth analog, `L ≈ 1/h`, so the scale-hierarchy constraint `h > σ_ij`
+  becomes `L < 1/σ_ij`.
+- **Training data — the current batch's mature anchors, no buffer.** Fit the readout
+  online on the mature timesteps (`ysfc > mature_ysfc_threshold`) of the anchor
+  pixels **already embedded each batch** — one small NLL step per batch alongside the
+  main loss. Per-timestep mature samples make **σ_i pooled** automatically (temporal
+  wiggle across mature years + between-pixel spread of mature type-i forests both
+  enter the NLL). Data is Virginia (all-East) for now → single threshold ≈ 10–12;
+  region-tagged readouts come with the East/West generalization. *(If per-step
+  variance is a problem, an optional small **FIFO** replay buffer of recent
+  `(z_type, mature x_it)` pairs — a plain queue, not an Algorithm-R reservoir — can
+  smooth it; default is no buffer.)*
+- **Staleness = parameter lag, handled by warmup.** The readout's weights trail a
+  drifting z_type rather than storing stale vectors, and continuously re-fit to
+  fresh pairs, so they track a slowly-moving z_type. The existing **phase-loss
+  curriculum warmup** now does double duty: it lets the readout **settle** before the
+  anomaly-input phase pathway starts learning, and likely needs to be **longer** than
+  the current FiLM-stability warmup (μ/σ settling is stricter than z_type merely
+  being non-degenerate).
+- **Smoothness guard.** μ_θ/σ_θ must stay **slowly-varying functions of z_type**
+  (they feed every downstream input; a wiggly μ makes same-type pixels' anomalies
+  incomparable and confuses estimator jitter with real anomalies). Knobs: RBF kernel
+  width, or the MLP's Lipschitz bound / weight decay / capacity / smooth activations.
+  Select by **held-out predictive NLL** on mature pixels (too flexible → overfits
+  noise; too stiff → types blur); report the effective Lipschitz constant.
+- **Failure-mode watch (the price of going parametric).**
+  - *Extrapolation* — the readout can be confidently wrong in low-density z_type
+    regions (rare / chronically-disturbed EVT types). Mitigate with low capacity,
+    **shrinkage toward a coarse prior** (EVT-class mean, else global mean), or an
+    uncertainty head. The **per-EVT coverage diagnostic** watches this.
+  - *Silent collapse* — σ_θ→0 or μ_θ ignoring type. Guard by validating **predictive
+    NLL / R² on held-out mature pixels** and a σ floor.
+- **Scale hierarchy vs. the pairwise comparison scale σ_ij.** The readout's
+  characteristic length scale `h` (RBF width, or `1/L` for a Lipschitz-bounded MLP)
+  should be **coarser (larger) than the type-similarity comparison scale σ_ij** used
+  to weight loss pairs — i.e. `L < 1/σ_ij`. Why: (1) the loss treats pixels within
+  σ_ij as same-type/comparable, so the baseline must be ≈ constant across a σ_ij
+  neighborhood, else "same-type" pixels get different baselines and their anomalies
+  stop being comparable; (2) it gives the smoothness guard headroom. Two caveats:
   - **Different metric spaces today.** The current pair weight is
     `w_ij = exp(−‖spec_i − spec_j‖₂ / sigma)`, `sigma = 5.0`
     (`frl/losses/phase_pairs.py`), defined in **Mahalanobis-whitened spectral**
@@ -218,19 +188,20 @@ as a cheap offline sanity prototype, not the production mechanism.
     similarity scale in the **same standardized-z_type metric** as `h` (which we
     want for consistency anyway).
   - **Not too large.** `h ≫ σ_ij` nearly-globalizes the baseline and leaves cross-
-    type differences in the anomaly. Target *moderately* larger: pick `h` by the LOO
-    bias-variance criterion, with `h > σ_ij` only as a lower-bound sanity check.
+    type differences in the anomaly. Target *moderately* larger: pick `h` by the
+    held-out-NLL criterion, with `h > σ_ij` only as a lower-bound sanity check.
   - σ_ij belongs to the soon-to-be-retired soft-neighborhood loss, but the scale
     concept carries into the **type∧phase contrastive loss** (its positive/negative
     type-neighborhood scale); the ordering applies against whatever that becomes.
     Reconcile the two scales onto one z_type metric when specing Steps 4–5.
 
 **Diagnostics for Step 1:**
-- **Smoothness** — leave-one-out μ/σ stability vs. bandwidth; pick the smoothest
-  setting that still tracks known type differences.
-- **Per-EVT coverage** — mature reference count per EVT class, and the fraction of
-  query pixels with ≥ k mature neighbors. Flags types where the mature baseline is
-  under-supported (rare types, chronically disturbed types).
+- **Smoothness** — held-out predictive NLL vs. the smoothness knob (RBF width /
+  Lipschitz bound); pick the smoothest setting that still tracks known type
+  differences; report the effective Lipschitz constant.
+- **Per-EVT coverage** — mature-sample count per EVT class and predictive NLL/R²
+  stratified by EVT. Flags types where the mature baseline is under-supported (rare
+  types, chronically disturbed types) and the readout may be extrapolating.
 
 ---
 
@@ -249,9 +220,9 @@ that make abruptness explicit.
   handling and are concatenated as-is.
 - **Correctness constraint (critical):** μ_i/σ_i must be estimated on the **same
   representation of `x_it`** that the transform later subtracts from. Whatever units
-  the bindings feature builder emits for `x_it` (currently z-scored), the Step-1
-  reservoir must store `x_it` in *those same units*. Otherwise the subtraction
-  is in the wrong space. This couples Step 1's bank construction to the bindings
+  the bindings feature builder emits for `x_it` (currently z-scored), the Step-1 NLL
+  readout must be **fit on `x_it` in those same units**. Otherwise the subtraction
+  is in the wrong space. This couples Step 1's fit to the bindings
   output — build them against the same feature.
 
 **Temporal-difference channels (abruptness).**
@@ -268,19 +239,15 @@ that make abruptness explicit.
 
 **Where the transform lives — one live path.**
 - The transform is applied in `process_batch` at anchor pixels. After the z_type
-  forward, query the Step-1 **reservoir estimator** at the anchors' current z_type
-  for μ/σ, then form `a` and Δ. Both the query anchors *and* the reservoir contents
-  are embedded in the same forward passes, so there is no frozen/online split — μ/σ
-  are always in step with the current z_type (up to reservoir freshness).
+  forward, query the Step-1 **NLL readout** at the anchors' current (detached)
+  z_type for μ/σ, then form `a` and Δ. One readout forward per batch — no reservoir,
+  no frozen/online split; μ/σ track the current z_type up to parameter lag.
 - The phase feature is temporal `[C,T,H,W]` and is consumed only at ~100–300 anchor
   pixels, so it must be built via **`build_feature_at_locations`** at anchor coords
   (per the CLAUDE.md temporal-feature rule — never full-grid, to avoid OOM). μ/σ are
   evaluated at those same anchor coords.
 - μ/σ are **stop-grad** (see Step 1): the phase loss shapes the TCN, not z_type,
   through the baseline.
-- *(Optional offline sanity prototype only:* precompute per-pixel μ/σ from a frozen
-  exp034 z_type and apply as a static normalization, to test "does the anomaly input
-  help" before wiring the live reservoir. Not the production path.)
 
 **Config / plumbing notes.**
 - `phase_in_channels` grows: anomaly channels + Δ (+ Δ²) + pass-through. Update the
@@ -304,8 +271,9 @@ that make abruptness explicit.
 ## Build vs. retire
 
 **Build**
-1. Type-local mature-baseline estimator μ(z_type), σ(z_type) — smoothed kNN/kernel
-   regression over `ysfc > threshold` pixels.
+1. Type-local mature-baseline μ(z_type), σ(z_type) — an online heteroscedastic
+   Gaussian-NLL readout (RBF / Lipschitz-MLP) fit on mature (`ysfc > threshold`)
+   timesteps. No reservoir/kNN.
 2. Anomaly input transform `(x−μ)/σ` (+ Δ / Δ² channels).
 3. Slow-feature / temporal-smoothness loss (continuity within no-disturbance runs;
    jumps allowed at disturbance) — the term that builds the attractor geometry.
@@ -325,7 +293,7 @@ that make abruptness explicit.
 ## Checklist (ordered — de-risking first)
 
 - [ ] 0. Eval harness (A–E above), fit on train / report test, baselined to exp034.
-- [ ] 1. Live μ/σ estimator of the mature conditional moments `N(μ(z_type),σ(z_type)²)`. Start with **(a) kNN** over a `ReservoirSampler` of `(z_type, mature x_it, ysfc)` on standardized z_type (mature = `ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West; refresh cadence reset-vs-decay; bandwidth `h > σ_ij`) as the robust oracle; then **(b) parametric readout** (RBF / Lipschitz-MLP, heteroscedastic-NLL, detached z_type, small replay buffer) cross-checked against (a). Check smoothness + per-EVT coverage. *(Optional: frozen-exp034 offline prototype as a sanity check.)*
+- [ ] 1. μ/σ NLL readout: small RBF / Lipschitz-MLP on standardized detached z_type, fit online by heteroscedastic Gaussian NLL on the current batch's mature timesteps (`ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West); σ via softplus + floor; smoothness knob set by held-out NLL with `L < 1/σ_ij`; check per-EVT coverage / extrapolation. No reservoir.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 4. Slow-feature/smoothness loss; confirm drift-to-basin + jump-at-disturbance geometry.
