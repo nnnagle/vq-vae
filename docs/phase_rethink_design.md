@@ -510,7 +510,7 @@ be pinned; only (1)+(2)+(3) do that.
 
 **Caveat that this forces on us:** soft-supervised InfoNCE is only collapse-resistant
 if the **positive target stays peaked and the negatives stay real**. If `σ_type`,
-`σ_state` are too large, the positive set becomes diffuse and this degenerates back
+`σ_flow` are too large, the positive set becomes diffuse and this degenerates back
 into soft-neighborhood. So the three ingredients below are non-negotiable.
 
 ### Getting the three ingredients
@@ -527,7 +527,7 @@ into soft-neighborhood. So the three ingredients below are non-negotiable.
   cross-pixel positives **≥** within-pixel, or the loss is minimized by making each
   pixel a smooth *private* curve with no shared basin — the old "encodes pixel
   identity" failure.
-- `σ_type`, `σ_state` are the peakedness knobs; calibrate from the distance
+- `σ_type`, `σ_flow` are the peakedness knobs; calibrate from the distance
   distributions so "same" is genuinely narrow.
 
 **(2) Negatives — the same-type/different-state set is the whole game.**
@@ -537,7 +537,7 @@ into soft-neighborhood. So the three ingredients below are non-negotiable.
   job, done natively). **Must be actively mined/quota'd**: same-type samples are a
   minority of a random pool, so without mining, trivial different-type negatives
   swamp the gradient and phases quietly re-compress. Guarantee each anchor's negative
-  set includes its type-neighbors (high `k_type`) that are state-far (low `k_state`).
+  set includes its type-neighbors (high `k_type`) that are state-far (low `k_flow`).
 - **False-negative suppression** via the same kernel: `w_neg(ik) = (1 − p_ik)`
   clamped (your spectral `1 − exp(−d/σ)` idiom) — an accidental same-type/same-state
   pair gets ≈0 negative weight. One kernel gives positives (high `p`) and negative
