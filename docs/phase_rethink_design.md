@@ -268,6 +268,89 @@ that make abruptness explicit.
 
 ---
 
+## Step 3 — Turn on the anomaly input (procedural)
+
+No new design. Swap the phase encoder input to the Step-2 anomaly + Δ channels,
+extend the phase-loss warmup so the Step-1 readout settles first (per "Staleness"),
+train, and check against exp034 with the Step-0 eval: "does the anomaly input alone
+help?" — *before* adding the new losses. This isolates the input change from the
+loss changes so we know which moved the needle.
+
+---
+
+## Step 4 — Slow-feature loss (spec)
+
+Goal: build the **attractor geometry** — within a pixel, z_phase drifts **smoothly**
+through stable periods and is allowed to **jump** at disturbance; mature becomes the
+dense **basin** that trajectories relax back into. This is the loss that turns
+"per-timestep points that move" into a coherent dynamical picture, and it is the
+term the old scale-equivariant losses could never provide.
+
+**Core term — a robust / gated temporal-difference penalty on z_phase.**
+- Base form: penalize `‖z_phase[t] − z_phase[t−1]‖` within a pixel across time.
+- A *bare* squared penalty would forbid the very jumps we want (and see Collapse
+  below), so it must be **robust**: either a saturating/Huber ρ that stops growing
+  for large steps, **or gated by input abruptness** — weight each transition by
+  `w[t] = exp(−‖Δa[t]‖ / τ)` so the smoothness penalty relaxes exactly where the
+  **input anomaly** jumps. The gated form is preferred: it is **ysfc-free** (the
+  input Δ channel already localizes disturbance onset), and it puts the right
+  division of labor in place — the *input* decides **where** a jump happens, the
+  *loss* merely **permits** it there and enforces smoothness everywhere else.
+- Optional supervision: an `ysfc == 0` mask could instead/also mark jump-allowed
+  transitions. This is a *light* ysfc use (a transition selector, like the mature
+  selector), not ysfc-as-target — but leans on CCDC's disturbance calls, so keep it
+  secondary to the data-driven gate.
+
+**Collapse — slow-feature only makes sense paired with cross-pixel spread.**
+`‖Δz‖ → 0` is trivially minimized by a constant embedding (all timesteps, all pixels
+equal). Classic SFA adds a unit-variance constraint; here the **Step-5 type∧phase
+contrastive loss is the primary anti-collapse** (it repels different types/states),
+so Step 4 and Step 5 are complementary and must land together:
+- **Slow-feature (Step 4)** = *attract in time* — within-pixel temporal continuity.
+- **Contrastive (Step 5)** = *repel across type/state* + align matched states across
+  pixels — the spread that prevents collapse and makes mature-A ≈ mature-B for the
+  same type.
+- If Step 5 lands later, Step 4 needs a temporary explicit variance floor — but on
+  the **right population** (across pixels / across the disturbance–recovery axis),
+  **not** the flattened N×T timesteps that made the old phase VICReg ineffective.
+
+**What creates the basin (and what does *not*).** We do **not** add an explicit
+"pull mature to the origin" term. The mature basin should **emerge**: the Step-2
+anomaly makes mature inputs ≈ 0 (dense, similar), disturbance inputs are rare and
+distinct, so with temporal smoothness + contrastive alignment the mature timesteps
+naturally form the dense attractor and ejecta sit apart. Cross-pixel coincidence of
+mature states ("mature-oak-A ≈ mature-oak-B") is delivered by Step 5's same-type/
+same-state positives, not by Step 4. Keeping the origin implicit avoids fighting the
+FiLM `beta` that places each type's manifold.
+
+**Space & mechanics.**
+- Penalize on **post-FiLM z_phase** (the deliverable space). Note FiLM γ,β are
+  constant over time for a pixel (z_type is atemporal), so `Δz_phase = γ ⊙ Δh` — β
+  cancels in the difference and γ just scales the penalty per type. Acceptable; flag
+  if γ-scaling skews the penalty across types.
+- Respect the temporal validity mask (skip transitions spanning invalid timesteps).
+
+**Optional companion — within-recovery monotonicity.** After a disturbance,
+distance-from-type-origin could be asked to **decrease** with time-since-trough
+("wander back"). This is the "ysfc bucket loss → monotonicity prior" from the retire
+list — a light **ysfc-as-direction** use (ordering, not target). Adds an explicit
+"relax toward maturity" pressure the smoothness term alone doesn't. Keep optional;
+add only if trajectories drift but don't reliably return.
+
+**Open decisions (to resolve before implementing):**
+- **Gating mechanism** — input-Δ gate (preferred, ysfc-free) vs. robust ρ vs.
+  `ysfc==0` mask, or a combination.
+- **Anti-collapse** — rely on the Step-5 contrastive spread only, or add an explicit
+  correct-population variance floor as a safety net during co-development.
+- **Monotonicity companion** — include from the start or hold in reserve.
+
+**Diagnostics (ties to Step 0).** Jump-at-disturbance separation (diagnostic C),
+mature-basin formation (within-type mature variance ↓, ejecta separation ↑), and a
+collapse check (per-dim z_phase variance on the correct population stays bounded
+away from 0).
+
+---
+
 ## Build vs. retire
 
 **Build**
