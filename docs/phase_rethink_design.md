@@ -125,24 +125,40 @@ co-trained EMA/target-network baseline is deferred to checklist step 7.
   channels (e.g. `temporal_position`) are handled by the bindings spec, not here.
 - **Reference bank.** Sweep training-split patches with frozen exp034: at sampled
   pixels collect `z_type` (atemporal) + the phase feature `x_it` + `ysfc`. Keep the
-  **mature** subset (`ysfc > mature_ysfc_threshold`). Store `(z_type, mature x
-  summary, evt, coords)`. Data is Virginia (all-East) for now, so a single bank with
-  threshold ≈ 10–12; region-tagged banks come with the East/West generalization.
+  **mature** subset (`ysfc > mature_ysfc_threshold`). Reference samples are
+  **per mature timestep** (not per-pixel means): pooling the individual mature
+  timesteps preserves the ergodic year-to-year variation of a mature forest, which
+  σ_i is meant to capture. Store `(z_type, mature x_it, evt, coords)` per mature
+  timestep. Data is Virginia (all-East) for now, so a single bank with threshold
+  ≈ 10–12; region-tagged banks come with the East/West generalization.
 - **Estimator.** μ_i / σ_i = smoothed **kNN / kernel regression** of the mature
-  reference summary onto query `z_type`. z_type is unconstrained in magnitude
+  reference timesteps onto query `z_type`. z_type is unconstrained in magnitude
   (per CLAUDE.md), so **standardize z_type before computing distances**. Gaussian
   kernel over the k nearest mature neighbors; bandwidth from a robust neighbor-
   distance statistic.
-- **Smoothness guard.** μ()/σ() must not be too wiggly (they feed every downstream
-  input). The bandwidth / k is the primary smoothness knob; validate that μ varies
-  smoothly across z_type (e.g. leave-one-out stability, effective d.o.f.).
-
-**Open decisions (to resolve before implementing):**
-- **σ_i definition** — pooled (mature temporal wiggle + between-pixel spread),
-  within-pixel temporal only, or between-pixel only. Leaning pooled (disturbance
-  should stand out against a mature forest's *normal* wiggle), but not yet decided.
-- **Reference-sample granularity** — one per-pixel mature-mean summary per mature
-  pixel (cleaner, less noisy) vs. per-mature-timestep samples.
+- **σ_i = pooled.** The scale pools both the mature **temporal wiggle** (across
+  mature timesteps) and the **between-pixel** spread of mature type-i forests —
+  i.e. the std of the pooled mature-timestep reference in the z_type neighborhood.
+  Rationale: a disturbance should stand out against a mature forest's *normal*
+  wiggle, and per-timestep pooling makes that wiggle part of the reference
+  distribution directly.
+- **Smoothness guard.** μ()/σ() must stay **slowly-varying functions of z_type**
+  (they feed every downstream input; a wiggly μ makes same-type pixels'
+  anomalies incomparable, confuses estimator jitter with real anomalies, and
+  destabilizes the step-7 co-trained target). Mechanisms:
+  - *Primary knob* — neighborhood size (k / kernel bandwidth); bigger = smoother.
+  - *Selection criterion* — leave-one-out prediction of a held-out mature
+    timestep's `x_it` from its neighbors, swept over bandwidth (small → high
+    variance/overfit, large → high bias/types blur). Pick the smoothest setting
+    that still tracks known type differences; **report effective degrees of
+    freedom**.
+  - *Graceful degradation* — minimum-neighbor floor + **shrinkage toward a coarser
+    prior** (EVT-class mean, else global mean) where local support is thin. Ties to
+    the per-EVT coverage diagnostic: rare / chronically-disturbed types fall back to
+    a stable prior instead of a noisy local fit.
+  - *Optional stronger form* — fit μ/σ as a **smooth parametric map** (RBF / small
+    MLP / spline) over standardized z_type instead of raw kNN. Inherently smooth and
+    differentiable — also what step 7's co-trained EMA version will want.
 
 **Diagnostics for Step 1:**
 - **Smoothness** — leave-one-out μ/σ stability vs. bandwidth; pick the smoothest
