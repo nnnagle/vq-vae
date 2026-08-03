@@ -116,26 +116,48 @@ Extract embeddings at FIA plot locations; use kNN in embedding space
 Goal: two functions **μ(z_type)** and **σ(z_type)** that, for any pixel's type
 embedding, return the per-channel mean and scale of **mature** forest of that type.
 These define the anomaly input `(x_it − μ_i)/σ_i` used by the rethought phase
-pathway. Built **offline against a frozen exp034 z_type** (Stage A); promotion to a
-co-trained EMA/target-network baseline is deferred to checklist step 7.
+pathway. The estimator is **live during training**: μ/σ are computed from a large
+**reservoir** of mature pixels whose z_type is refreshed as the model trains (see
+"Reservoir mechanism" below). There is **no separate frozen/co-trained split** — it
+is one path. An optional one-off build against a frozen exp034 z_type is kept only
+as a cheap offline sanity prototype, not the production mechanism.
 
 - **`x_it` is the phase input exactly as defined in the bindings YAML** (currently
   `phase_ccdc`; whatever it evolves to). The estimator is agnostic to the specific
   channel list — it normalizes the bindings-defined phase feature. Any pass-through
   channels (e.g. `temporal_position`) are handled by the bindings spec, not here.
-- **Reference bank.** Sweep training-split patches with frozen exp034: at sampled
-  pixels collect `z_type` (atemporal) + the phase feature `x_it` + `ysfc`. Keep the
-  **mature** subset (`ysfc > mature_ysfc_threshold`). Reference samples are
-  **per mature timestep** (not per-pixel means): pooling the individual mature
-  timesteps preserves the ergodic year-to-year variation of a mature forest, which
-  σ_i is meant to capture. Store `(z_type, mature x_it, evt, coords)` per mature
-  timestep. Data is Virginia (all-East) for now, so a single bank with threshold
-  ≈ 10–12; region-tagged banks come with the East/West generalization.
+- **Reservoir mechanism.** A large fixed-capacity **reservoir**
+  (`frl/utils/sampling.py::ReservoirSampler`, Algorithm R) is fed
+  `(z_type_detached, mature x_it, ysfc, evt)` from the anchor pixels **already being
+  embedded each batch** — no separate re-embedding pass. Reference samples are
+  **per mature timestep** (`ysfc > mature_ysfc_threshold`), not per-pixel means:
+  pooling individual mature timesteps preserves the ergodic year-to-year variation
+  of a mature forest, which σ_i is meant to capture. This is a persisted,
+  cross-batch enlargement of the per-batch "randomized-PCA + kNN in z_type space"
+  demeaning pool that already exists in `process_batch` step 6. Data is Virginia
+  (all-East) for now → a single reservoir, threshold ≈ 10–12; region-tagged
+  reservoirs come with the East/West generalization.
+- **Freshness / staleness (design decision).** Vanilla Algorithm R never updates a
+  stored vector after insertion and samples uniformly over *all* history, so a
+  never-reset reservoir accumulates **stale z_type embeddings** (including early bad
+  ones) and μ/σ would reflect a blur of past geometries. Because z_type drifts, the
+  reservoir must track the **current** embedding space: either **periodic reset**
+  (per-epoch, or every few epochs) or a **forgetting / sliding** variant. Reset
+  cadence vs. decay is an open decision; whichever we pick, it must keep the
+  reservoir fresh relative to the rate z_type is still moving.
 - **Estimator.** μ_i / σ_i = smoothed **kNN / kernel regression** of the mature
-  reference timesteps onto query `z_type`. z_type is unconstrained in magnitude
-  (per CLAUDE.md), so **standardize z_type before computing distances**. Gaussian
-  kernel over the k nearest mature neighbors; bandwidth from a robust neighbor-
-  distance statistic.
+  reservoir onto query `z_type`, recomputed as the reservoir refreshes. z_type is
+  unconstrained in magnitude (per CLAUDE.md), so **standardize z_type before
+  computing distances**. Gaussian kernel over the k nearest mature neighbors;
+  bandwidth from a robust neighbor-distance statistic. μ/σ are treated as a
+  **stop-grad, slowly-moving baseline** (reservoir holds detached z_type; the phase
+  loss does not push z_type through μ/σ — mirrors the existing FiLM stop-grad
+  discipline and keeps type/phase separated).
+- **Settling via warmup.** Since μ/σ move with z_type early in training, the
+  existing **phase-loss curriculum warmup** now does double duty: it lets the
+  reservoir-based μ/σ settle before the anomaly-input phase pathway starts learning.
+  It likely needs to be **longer** than the current FiLM-stability warmup — μ/σ
+  settling is a stricter condition than z_type merely being non-degenerate.
 - **σ_i = pooled.** The scale pools both the mature **temporal wiggle** (across
   mature timesteps) and the **between-pixel** spread of mature type-i forests —
   i.e. the std of the pooled mature-timestep reference in the z_type neighborhood.
@@ -208,7 +230,7 @@ that make abruptness explicit.
 - **Correctness constraint (critical):** μ_i/σ_i must be estimated on the **same
   representation of `x_it`** that the transform later subtracts from. Whatever units
   the bindings feature builder emits for `x_it` (currently z-scored), the Step-1
-  reference bank must store `x_it` in *those same units*. Otherwise the subtraction
+  reservoir must store `x_it` in *those same units*. Otherwise the subtraction
   is in the wrong space. This couples Step 1's bank construction to the bindings
   output — build them against the same feature.
 
@@ -224,19 +246,21 @@ that make abruptness explicit.
   (insect → small |Δ| but sustained nonzero `a`), which is exactly the fast/slow
   distinction we need the encoder to see.
 
-**Where the transform lives — two paths, by stage.**
-- **Stage A (frozen z_type — the near-term path).** μ_i/σ_i are fixed per pixel, so
-  **precompute and cache** them (query the Step-1 estimator once per pixel with the
-  frozen exp034 z_type) and apply the transform as a normalization. Because the
-  phase feature is temporal `[C,T,H,W]` and is consumed only at ~100–300 anchor
-  pixels, it must be built via **`build_feature_at_locations`** at anchor coords
-  (per the CLAUDE.md temporal-feature rule — never full-grid, to avoid OOM). The
-  cached μ/σ are read at those same anchor coords. Bit-stable and cheap.
-- **Stage B (co-trained z_type — deferred to step 7).** μ/σ move with z_type, so
-  compute them **on the fly** in `process_batch`: after the z_type forward, query
-  the (now-parametric, differentiable) estimator at anchor pixels' current z_type,
-  then form `a` and Δ. Gradient policy TBD (likely stop-grad through μ/σ, mirroring
-  the existing FiLM stop-grad discipline) — revisit at step 7.
+**Where the transform lives — one live path.**
+- The transform is applied in `process_batch` at anchor pixels. After the z_type
+  forward, query the Step-1 **reservoir estimator** at the anchors' current z_type
+  for μ/σ, then form `a` and Δ. Both the query anchors *and* the reservoir contents
+  are embedded in the same forward passes, so there is no frozen/online split — μ/σ
+  are always in step with the current z_type (up to reservoir freshness).
+- The phase feature is temporal `[C,T,H,W]` and is consumed only at ~100–300 anchor
+  pixels, so it must be built via **`build_feature_at_locations`** at anchor coords
+  (per the CLAUDE.md temporal-feature rule — never full-grid, to avoid OOM). μ/σ are
+  evaluated at those same anchor coords.
+- μ/σ are **stop-grad** (see Step 1): the phase loss shapes the TCN, not z_type,
+  through the baseline.
+- *(Optional offline sanity prototype only:* precompute per-pixel μ/σ from a frozen
+  exp034 z_type and apply as a static normalization, to test "does the anomaly input
+  help" before wiring the live reservoir. Not the production path.)
 
 **Config / plumbing notes.**
 - `phase_in_channels` grows: anomaly channels + Δ (+ Δ²) + pass-through. Update the
@@ -281,14 +305,13 @@ that make abruptness explicit.
 ## Checklist (ordered — de-risking first)
 
 - [ ] 0. Eval harness (A–E above), fit on train / report test, baselined to exp034.
-- [ ] 1. Offline mature-baseline estimator μ/σ using a *frozen* exp034 z_type, mature set = `ysfc > mature_ysfc_threshold` (param; ~10–12 East / ~20–25 West); check smoothness + per-EVT coverage.
-- [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ²; verify mature≈0, fast vs slow disturbances distinct.
-- [ ] 3. Stage-A retrain (phase-only, frozen z_type) on anomaly input; "does the input alone help?"
+- [ ] 1. Live reservoir μ/σ estimator: stream `(z_type, mature x_it, ysfc)` into a `ReservoirSampler`, kNN/kernel on standardized z_type, mature set = `ysfc > mature_ysfc_threshold` (param; ~10–12 East / ~20–25 West); pick refresh cadence (reset vs. decay), bandwidth (`h > σ_ij`); check smoothness + per-EVT coverage. *(Optional: frozen-exp034 offline prototype as a sanity check.)*
+- [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
+- [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 4. Slow-feature/smoothness loss; confirm drift-to-basin + jump-at-disturbance geometry.
-- [ ] 5. Type∧phase contrastive loss; retire soft_neighborhood + recovery-disc + phase VICReg; re-run eval.
+- [ ] 5. Type∧phase contrastive loss; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
 - [ ] 6. (optional) Encoder A/B: biGRU vs TCN for "where am I in the trajectory," with Δ channels.
-- [ ] 7. (only if warranted) Co-trained EMA/target-network μ/σ with smoothness regularization.
-- [ ] 8. Consolidate: CLAUDE.md (architecture + loss table + ysfc-as-selector reframing), diagnostics, config plumbing.
+- [ ] 7. Consolidate: CLAUDE.md (architecture + loss table + ysfc-as-selector reframing), diagnostics, config plumbing.
 
 ## Open data dependencies
 
