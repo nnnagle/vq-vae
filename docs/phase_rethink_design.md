@@ -401,7 +401,7 @@ so Step 4 and Step 5 are complementary and must land together:
   **not** the flattened N×T timesteps that made the old phase VICReg ineffective.
 
 **What creates the basin (and what does *not*).** We do **not** add an explicit
-"pull mature to the origin" term. The mature basin should **emerge**: the Step-2
+"pull mature to its per-type basin" term. The mature basin should **emerge**: the Step-2
 anomaly makes mature inputs ≈ 0 (dense, similar), disturbance inputs are rare and
 distinct, so with temporal smoothness + contrastive alignment the mature timesteps
 naturally form the dense attractor and ejecta sit apart. Cross-pixel coincidence of
@@ -464,12 +464,22 @@ to the basin.
 
 - **z_phase is a *lifted, linearizing* phase space.** We choose coordinates in which
   the (curved, channel-space) recovery flow becomes a simple **radial contraction**
-  toward a **per-type attractor** (the FiLM origin): `E[z_{t+1}] ≈ γ·z_t`. All the
-  differential-channel-rate **curvature is absorbed into the encoder**; in z_phase the
-  tubes are approximately **straight rays**.
-- **Read-out:** **direction** of z_phase (from the type-origin) = **which tube**
-  (globally valid because the ray is straight); **radius** = **progress** along it;
-  **type** = the FiLM origin. One Euclidean kNN captures all three — the deliverable.
+  toward a **per-type attractor** — that type's **FiLM origin `β_i` = β(z_type)**,
+  *not* the coordinate origin. In centered form: `E[z_{t+1} − β_i] ≈ γ·(z_t − β_i)`.
+  All the differential-channel-rate **curvature is absorbed into the encoder**; in
+  z_phase the tubes are approximately **straight rays out of `β_i`**.
+- **The basin is per-type, at `β_i` — the coordinate origin `(0,0)` is not special.**
+  Post-FiLM there are **many basins, one per type**, scattered at their `β_i`. This is
+  *required*: `z_phase` is the joint (type × phase) coord, so mature-oak and
+  mature-pine **must** sit apart (else kNN can't separate types). Forcing a single
+  `(0,0)` basin (β≡0) would collapse all types' mature together and erase type. The
+  InfoNCE metric is translation-invariant (`‖z_i − z_j‖`), so off-origin basins break
+  nothing. "Mature ≈ origin" holds only in the type-agnostic **pre-FiLM `h`** (where
+  `a≈0` for all mature); FiLM then distributes that shared basin to the per-type `β_i`.
+- **Read-out (per-type-centered):** **direction** of `z_phase − β_i` = **which tube**
+  (globally valid because the ray is straight); **radius** `t = ‖z_phase − β_i‖` =
+  **progress** along it; **type** = which `β_i`. One Euclidean kNN captures all three —
+  the deliverable.
 - **Non-crossing = the sufficiency criterion.** A flow is a well-defined function
   only if trajectories don't cross; they *do* cross in raw channel space (same anomaly
   can be descending vs. recovering vs. a different tube), so instantaneous `a` is an
@@ -484,18 +494,18 @@ to the basin.
   forest looks mature regardless of past agent), matching reality.
 
 **Attractor profile — OU-like, a fuzzy basin, not a point.** The radius should pull
-**strongly toward 0 far out** but only **weakly near the origin**, where residual
+**strongly toward `β_i` far out** but only **weakly near `β_i`**, where residual
 **ergodic fluctuation** takes over — a mean-reverting (Ornstein–Uhlenbeck) process,
 not a pin. This falls out of two choices already made, nothing new to enforce:
-- **Radial contraction is the drift.** `E[z_{t+1}] ≈ γ·z_t` makes the *absolute*
-  inward step `(1−γ)·‖z‖` large at large radius and vanishing near the origin — "strong
-  at first, gentle near the center" is just what contraction is (no nonlinear
-  restoring force needed).
+- **Radial contraction is the drift.** With `r = z − β_i` (offset from the per-type
+  basin), `E[r_{t+1}] ≈ γ·r_t` makes the *absolute* inward step `(1−γ)·‖r‖` large at
+  large radius and vanishing near `β_i` — "strong at first, gentle near the center" is
+  just what contraction is (no nonlinear restoring force needed).
 - **The σ-normalization is the noise floor.** Since `a=(x−μ)/σ` with σ = the *mature*
   scale, a mature forest's normal wiggle is **O(1) by construction** (`‖a‖~1`),
-  disturbances are *many* σ out. So the basin is a **fuzzy ~1σ ball**; the ergodic
-  fluctuation *is* σ. Together: far out contraction dominates (strong pull); near the
-  origin the tiny `γ·z` drift is overwhelmed by the O(1) noise → ergodic wander.
+  disturbances are *many* σ out. So the basin is a **fuzzy ~1σ ball** around `β_i`; the
+  ergodic fluctuation *is* σ. Together: far out contraction dominates (strong pull);
+  near `β_i` the tiny `γ·r` drift is overwhelmed by the O(1) noise → ergodic wander.
 
 Levers & the trap:
 - **Step-1 σ sets the basin size** (the "allowed fluctuation" radius — the direct knob).
@@ -597,8 +607,8 @@ into soft-neighborhood. So the three ingredients below are non-negotiable.
   softmax → loss `= log K` (the maximum), so fixed τ forces a characteristic
   positive-vs-negative distance.
 - **Euclidean-squared** similarity, not cosine — the ruler must measure *radial*
-  distance so mature≈origin and distance = severity survive. Consistent with Step 4
-  (`‖Δz‖²`).
+  distance (from the per-type basin `β_i`) so severity = distance survives. Consistent
+  with Step 4 (`‖Δz‖²`).
 - **Variance-floor backstop** — light VICReg-style per-dim std hinge on the
   **correct population** (across pixels / disturbance–recovery axis, *not* flattened
   N×T). Bites only below the floor; insurance against τ mis-calibration.
