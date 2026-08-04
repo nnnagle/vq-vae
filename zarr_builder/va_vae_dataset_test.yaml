@@ -242,7 +242,20 @@ annual:
       bands:
         - id: lcms_ysfc_censored_1985_2024
           path: /data/VA/lcms_ysfc/lcms_ysfc_value_1985_2024.vrt
-  
+
+  # LCMS annual Change product (hard change class per year), from GEE. Byte tif,
+  # 40 bands = years 1985..2024. Band-level `path` → per-band loader (infers years
+  # from year_range, clips to the 2010-2024 window). Categorical change-agent
+  # labels for phase-rethink diagnostic D (docs/phase_rethink_design.md §D).
+  - group: lcms_chg_class
+    years: {start: 1985, end: 2024}
+    data:
+      semantic_type: categorical
+      bands:
+        # TODO(nnnagle): replace the xxxxxxxxxx suffix with the real GEE export name.
+        - id: lcms_chg_class
+          path: /data/lcms/gee/lcms_chg_1985_2024xxxxxxxxxx.tif
+
 irregular:
   - group: naip
     path: /data/VA/naip/naip_{yyyy}.vrt
