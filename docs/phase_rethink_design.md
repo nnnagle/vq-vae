@@ -268,6 +268,53 @@ that make abruptness explicit.
 
 ---
 
+## Encoder architecture — the refactor forces a magnitude-preserving pass
+
+The loss/geometry changes have concrete implications for the *encoder*, not just the
+losses. The phase encoder is `a → TCN → 1×1 bottleneck → FiLM(z_type) → z_phase`.
+
+**TCN = the lifting map.** Its job is now sharply defined: it convolves over a
+**temporal window**, so `z_phase[t]` is a function of a *stretch* of the `(a, Δa)`
+trajectory, not one instant. That windowing **is** the Takens lift that makes the
+state injective / the flow non-crossing (`s` invertible). Requirements: stay
+**bidirectional/acausal** (must see both the pre-disturbance baseline and the forward
+recovery to tell "descending" from "recovering"), and the **receptive field must span
+enough of the trajectory** to resolve crossings (current `[1,2,4]`+k3 → RF≈15≈T is a
+starting point; validate with `Var(Δ|z_phase)`). biGRU is the Step-6 A/B alternative
+(its hidden state accumulates the same history).
+
+**Magnitude must survive — depth→radius is now first-class.** Severity = trough depth
+= `‖a‖` must become the radius; the encoder must **preserve magnitude
+(monotonically/injectively — not necessarily linearly)**. The σ-normalized anomaly is
+already the *right*, globally-meaningful normalization (mature ≈ O(1), disturbance
+many σ); the encoder must not re-normalize it away. Concrete changes:
+- **Remove the pre-FiLM L2-norm.** It puts every timestep on the unit sphere → every
+  timestep at the same radius → destroys the radius/progress axis outright. Mandatory.
+- **Drop/replace per-sample normalization.** The current **GroupNorm** on `[N,C,T]`
+  normalizes over (channels × **T**) **per sample**, dividing each pixel by its own
+  temporal std → a **deep V and a shallow V of the same signature renormalize to the
+  same thing** (depth-independent-of-signature is lost; division by a per-sample scale
+  is non-invertible). Prefer **no internal norm** (the input is already O(1)-scaled;
+  rely on residual connections + init) or a **global/running (batch-statistic) norm**
+  that preserves each pixel's relative magnitude. Avoid per-sample/per-timestep norms
+  (GroupNorm-over-T, InstanceNorm, LayerNorm-over-T, L2).
+- **Optional belt-and-suspenders:** route `‖a[t]‖` (and maybe raw `a[t]`) as a
+  **norm-bypassing skip** to the bottleneck, so depth reaches `z_phase` regardless of
+  internal normalization. Cheap and robust.
+
+**FiLM's role shifts (a consequence of removing the L2-norm).** Currently CLAUDE.md
+says "FiLM gamma owns the scaling" — that was true only because `h` was unit-norm.
+With the L2-norm gone, FiLM is purely **place + reshape per type**: `β` sets the
+per-type attractor origin, `γ` can scale/orient the `(t,u)` axes per type (so "pine
+clearcut recovery" is genuinely its own tube, not a translated copy of oak's). FiLM no
+longer needs to supply the radial magnitude — the bottleneck does.
+
+**Broader lesson:** every per-sample normalization in the phase encoder must be
+audited against "does depth/magnitude survive to become radius?" These were harmless
+under the old *relative* losses and are harmful now.
+
+---
+
 ## Step 3 — Turn on the anomaly input (procedural)
 
 No new design. Swap the phase encoder input to the Step-2 anomaly + Δ channels,
@@ -606,6 +653,8 @@ being overlaid, needs more history/dimension.
    other-state and same-state/other-type negatives); "state" bootstrapped from the
    anomaly trajectory, not CCDC.
 5. Eval harness for Step 0 (A–E), split-disciplined, baselined to exp034.
+6. Magnitude-preserving encoder pass: remove pre-FiLM L2-norm; drop/replace per-sample
+   GroupNorm; optional `‖a‖` norm-bypass skip; keep TCN bidirectional + RF ≥ window.
 
 **Retire / demote**
 - `soft_neighborhood_phase` KL rank-matching (scale-equivariant — the collapse culprit).
@@ -621,6 +670,7 @@ being overlaid, needs more history/dimension.
 - [ ] 1. μ/σ NLL readout: small RBF / Lipschitz-MLP on standardized detached z_type, fit online by heteroscedastic Gaussian NLL on the current batch's mature timesteps (`ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West); σ via softplus + floor; smoothness knob set by held-out NLL with `L < 1/σ_ij`; check per-EVT coverage / extrapolation. No reservoir.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
+- [ ] 3b. Magnitude-preserving encoder pass (see "Encoder architecture"): remove pre-FiLM L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`). Do this with/alongside Step 3 — the anomaly input is pointless if the encoder renormalizes depth away.
 - [ ] 4. Slow-feature/smoothness loss; confirm drift-to-basin + jump-at-disturbance geometry.
 - [ ] 5. Type∧phase contrastive loss; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
 - [ ] 6. (optional) Encoder A/B: biGRU vs TCN for "where am I in the trajectory," with Δ channels.
