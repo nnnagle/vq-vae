@@ -103,6 +103,11 @@ dataset: # These exist in the zarr
         formula: "t / (T - 1)" #T is inferred from time_window
       - {name: ysfc, source: annual/lcms_ysfc/data/lcms_ysfc_value_1985_2024}
       - {name: ysfc_censored, source: annual/lcms_ysfc_censored/data/lcms_ysfc_censored_1985_2024}
+      # LCMS annual Change product — hard change-agent class per year (codes 1-15;
+      # 0 and 16=Non-Processing Area are missing). Integer codes are exact in
+      # float16 (like ysfc). Consumed at anchor pixels for phase-rethink
+      # diagnostic D (change-agent clustering); see frl/training/phase_eval/lcms_agents.py.
+      - {name: lcms_chg_class, source: annual/lcms_chg_class/data/lcms_chg_class}
 
   
   static_categorical:
@@ -395,6 +400,11 @@ features:
     dim: [C,T,H,W]
     channels:
       annual.ysfc: {norm: identity}
+  change_agent:
+    dim: [C,T,H,W]
+    stats_type: categorical
+    channels:
+      annual.lcms_chg_class: {norm: identity}
   target_metrics:
     dim: [C,H,W]
     channels: 
