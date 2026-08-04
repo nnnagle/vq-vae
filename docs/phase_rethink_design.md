@@ -53,6 +53,15 @@ turn on.
 
 ## Step 0 — Evaluation spec (must exist before refactoring)
 
+> **Implementation status.** Diagnostics **A, B, C** are implemented in
+> `frl/training/phase_eval/` (`run_eval.py` writes one `metrics.json` per
+> checkpoint; `compare_eval.py` diffs new-vs-exp034). Fit on train, λ tuned on
+> val, reported on test. **D** (change-agent clustering) is deferred pending LCMS
+> change labels in the zarr; **E** (FIA kNN) reuses `embed_locations.py` +
+> `frl/analysis/*.Rmd` and is a follow-up. Part A's `z_phase → anomaly` sub-probe
+> is a Step-1 seam (`AnomalyTargetProvider.mature_baseline`): only the raw-`x`
+> reconstruction + within-pixel decomposition runs today.
+
 All probes are fit on **train**, tuned on **val**, reported on **test**, using the
 checkerboard split already inside `ForestDatasetV2`. Every metric is reported for
 the **new model vs the exp034 baseline** so "better" is defined. Unless stated,
@@ -617,7 +626,9 @@ being overlaid, needs more history/dimension.
 
 ## Checklist (ordered — de-risking first)
 
-- [ ] 0. Eval harness (A–E above), fit on train / report test, baselined to exp034.
+- [~] 0. Eval harness, fit on train / report test, baselined to exp034.
+      **A/B/C done** (`frl/training/phase_eval/`); **D** deferred (needs LCMS in
+      the zarr); **E** deferred (reuses `embed_locations.py` + `frl/analysis/*.Rmd`).
 - [ ] 1. μ/σ NLL readout: small RBF / Lipschitz-MLP on standardized detached z_type, fit online by heteroscedastic Gaussian NLL on the current batch's mature timesteps (`ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West); σ via softplus + floor; smoothness knob set by held-out NLL with `L < 1/σ_ij`; check per-EVT coverage / extrapolation. No reservoir.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
