@@ -258,9 +258,9 @@ annual:
       semantic_type: categorical
       bands:
         # VRT mosaic of the 4 lcms_chg_*.tif tiles:
-        #   cd /data/VA/lcms && gdalbuildvrt lcms_chg_class_1985_2024.vrt lcms_chg_*.tif
+        #   cd /data/VA/lcms && gdalbuildvrt lcms_chg_1985_2024.vrt lcms_chg_*.tif
         - id: lcms_chg_class
-          path: /data/VA/lcms/lcms_chg_class_1985_2024.vrt
+          path: /data/VA/lcms/lcms_chg_1985_2024.vrt
 
 irregular:
   - group: naip
