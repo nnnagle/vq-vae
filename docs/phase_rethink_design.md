@@ -468,14 +468,29 @@ to the basin.
   *not* the coordinate origin. In centered form: `E[z_{t+1} − β_i] ≈ γ·(z_t − β_i)`.
   All the differential-channel-rate **curvature is absorbed into the encoder**; in
   z_phase the tubes are approximately **straight rays out of `β_i`**.
-- **The basin is per-type, at `β_i` — the coordinate origin `(0,0)` is not special.**
-  Post-FiLM there are **many basins, one per type**, scattered at their `β_i`. This is
-  *required*: `z_phase` is the joint (type × phase) coord, so mature-oak and
-  mature-pine **must** sit apart (else kNN can't separate types). Forcing a single
-  `(0,0)` basin (β≡0) would collapse all types' mature together and erase type. The
-  InfoNCE metric is translation-invariant (`‖z_i − z_j‖`), so off-origin basins break
-  nothing. "Mature ≈ origin" holds only in the type-agnostic **pre-FiLM `h`** (where
-  `a≈0` for all mature); FiLM then distributes that shared basin to the per-type `β_i`.
+- **The basin is per-type, on a continuous mature manifold — the coordinate origin
+  `(0,0)` is not special.** `z_type` is *continuous* and `β(z_type)` is a smooth FiLM
+  function, so the basins are not discrete points but a **continuous "mature manifold"**
+  `{β(z_type)}` — a smooth sheet through z_phase; `β_i = β(z_type_i)` is pixel *i*'s
+  point on it, and nearby types → nearby basins. This spread is *required*: `z_phase`
+  is the joint (type × phase) coord, so mature-oak and mature-pine **must** sit apart
+  (else kNN can't separate types). Forcing a single `(0,0)` basin (β≡0) would collapse
+  the whole manifold to a point and erase type. The InfoNCE metric is
+  translation-invariant (`‖z_i − z_j‖`), so the manifold's location breaks nothing; and
+  `k_type` is a *kernel* on continuous `z_type`, so "same type" everywhere means
+  *nearby in z_type*, never a discrete class. "Mature ≈ origin" holds only in the
+  type-agnostic **pre-FiLM `h`** (where `a≈0` for all mature); FiLM then distributes
+  that shared basin across the per-type manifold.
+- **Continuous-type caveat — tubes can intrude on the manifold.** Because basins are
+  dense on a continuous sheet, a *disturbed* pixel of one type (far out on its ray) can
+  land geometrically near a *different* type's mature basin — sometimes ecologically
+  right (a fresh clearcut can resemble a mature shrub/grass type), but it means
+  `z_phase` alone can occasionally conflate "type-A recovering" with "type-B mature."
+  Mitigations, all already in play: `z_type` comes from robust spatial/spectral context
+  (a recovering pine still embeds as pine → correct `β`); **retrieve on `[z_type,
+  z_phase]` jointly** (Step-0 diagnostic E) so `z_type` pins the manifold location; FiLM
+  `γ` orients each type's tubes differently. Track it via the same-vs-different-type
+  confusion in the retrieval diagnostics.
 - **Read-out (per-type-centered):** **direction** of `z_phase − β_i` = **which tube**
   (globally valid because the ray is straight); **radius** `t = ‖z_phase − β_i‖` =
   **progress** along it; **type** = which `β_i`. One Euclidean kNN captures all three —
