@@ -162,8 +162,8 @@ and evaluated with one forward per batch.
   fresh pairs, so they track a slowly-moving z_type. The existing **phase-loss
   curriculum warmup** now does double duty: it lets the readout **settle** before the
   anomaly-input phase pathway starts learning, and likely needs to be **longer** than
-  the current FiLM-stability warmup (μ/σ settling is stricter than z_type merely
-  being non-degenerate).
+  the current (exp034) warmup (μ/σ settling is stricter than z_type merely being
+  non-degenerate).
 - **Smoothness guard.** μ_θ/σ_θ must stay **slowly-varying functions of z_type**
   (they feed every downstream input; a wiggly μ makes same-type pixels' anomalies
   incomparable and confuses estimator jitter with real anomalies). Knobs: RBF kernel
@@ -479,8 +479,8 @@ non-monotone recovery.
   disturbances). Costs one scale hyperparameter (the saturation radius).
 
 **Diagnostics (ties to Step 0).** Jump-at-disturbance separation (diagnostic C),
-mature-basin formation (within-type mature variance ↓, ejecta separation ↑), and a
-collapse check (per-dim z_phase variance on the correct population stays bounded
+mature-basin formation (mature variance ↓ = tight shared basin, ejecta separation ↑),
+and a collapse check (per-dim z_phase variance on the correct population stays bounded
 away from 0).
 
 ---
@@ -745,7 +745,8 @@ being overlaid, needs more history/dimension.
 - `soft_neighborhood_phase` KL rank-matching (scale-equivariant — the collapse culprit).
 - `phase_recovery_discrimination_loss` hard ysfc-bucket margin.
 - Phase VICReg on flattened timesteps (wrong population).
-- ysfc bucket loss → optional within-recovery monotonicity prior only.
+- ysfc bucket loss → replaced by the soft, gated **OU-drift** (Step 4), not a hard
+  bucket margin.
 
 ---
 
