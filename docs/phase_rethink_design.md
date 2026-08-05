@@ -27,16 +27,19 @@ disturbance agents (fire vs harvest vs insect), which we don't want.
   mature forests wiggle/bounce around 0; disturbances are **ejecta** from the
   origin that relax back over time. Must handle **fast** ejecta (harvest, fire)
   *and* **slow** ejecta (insect).
-- **Output**: **per-timestep** `z_phase[t] = f(a, Δa)` — a **pure-phase** coordinate. A
-  point that drifts toward the **single shared mature origin** (mature `a≈0` anchored to
-  `0`) and is kicked out by disturbance. `‖z_phase‖` = departure-from-maturity;
-  direction = which tube. **No clustering loss** on disturbance regions (density
-  structure is a hypothesis we will *measure*, not impose).
-- **Type modulation → none (no FiLM).** Type already enters via the type-conditional
-  `μ/σ` input normalization, so output modulation is redundant (`γ` a testable
-  fallback). `z_phase` is pure phase; **type lives in `z_type`**; retrieval is on
-  **`[z_type, z_phase]`**. (This supersedes the earlier "joint type×phase / FiLM"
-  framing.)
+- **Output**: **per-timestep** `z_phase[t] = f(a, Δa)` — a **phase** coordinate
+  (**conditional on type**: compared only type-locally, see Step 5). A point that drifts
+  toward the **single shared mature origin** (mature `a≈0` anchored to `0`) and is kicked
+  out by disturbance. `‖z_phase‖` = departure-from-maturity; direction = which tube.
+  **No clustering loss** on disturbance regions (density structure is a hypothesis we
+  will *measure*, not impose).
+- **Type modulation → none at the output (no FiLM).** Type already enters via the
+  type-conditional `μ/σ` input normalization, so output modulation is redundant (`γ` a
+  testable fallback). **Type lives in `z_type`**; the phase *loss* is **type-gated**
+  (`k_type`), so phase is conditional on type and cross-type phase is incommensurate;
+  retrieval is on **`[z_type, z_phase]`**. (This supersedes the earlier "joint
+  type×phase output / FiLM basins" framing — the `∧` now happens at the loss's type
+  gate and at retrieval, not via output modulation.)
 - **ysfc**: demoted from loss *target* → mature-set *selector* (and, optionally, a
   weak soft within-recovery drift; see the OU-drift in Step 4).
 - **Mature-set threshold** `ysfc > mature_ysfc_threshold` is an **input parameter**,
@@ -504,30 +507,34 @@ to the basin.
 > **ARCHITECTURE (current):** `z_phase = f(a, Δa)` — a **type-agnostic encoder** on
 > the **type-conditioned** input. **No FiLM** (see "Encoder architecture"): type
 > already enters via the `μ/σ` input normalization, so output modulation is redundant.
-> `z_phase` is **pure phase** with a **single shared mature origin** (mature anchored
-> to `0`); type is carried by `z_type`; retrieval is on **`[z_type, z_phase]`**. This
-> supersedes the earlier "joint type×phase / per-type FiLM basins" framing.
+> `z_phase` carries **phase**, but the loss is **type-gated** (`k_type`) so phase is
+> **conditional on type** — cross-type phase is *incommensurate* (never compared).
+> Single shared mature origin (mature anchored to `0`); type is carried by `z_type`;
+> retrieval on **`[z_type, z_phase]`**. Supersedes the earlier "joint type×phase output
+> / per-type FiLM basins" framing.
 
 - **z_phase is a *lifted, linearizing* phase space.** We choose coordinates in which
   the (curved, channel-space) recovery flow becomes a simple **radial contraction
   toward the origin** (mature): `E[z_{t+1}] ≈ ρ·z_t`, `ρ<1`. All the
   differential-channel-rate **curvature is absorbed into the encoder**; in z_phase the
   tubes are approximately **straight rays out of the origin**.
-- **A single shared mature origin — mature `a≈0` is gauge-anchored to `0`.** All types'
-  maturity coincides at the origin (a light **anchor loss** pulls mature `z_phase → 0`;
-  see Encoder architecture). So `z_phase` is **pure phase**: two pixels of *different*
-  types at the *same* type-normalized state map to the *same* `z_phase` — "same phase,"
-  with type distinguished by `z_type`. This gives the **tightest mature cluster** (one
-  point, not a per-type manifold) and makes `‖z_phase‖` mean exactly "departure from
-  maturity." Type is continuous, but it lives in `z_type`, **not** as structure in
+- **A single shared mature origin — mature `a≈0` is gauge-anchored to `0`.** The anchor
+  loss pulls every mature pixel's `z_phase → 0` regardless of type, so the origin is the
+  **universal "no-departure" reference** and `‖z_phase‖` means exactly "departure from
+  maturity." This gives the **tightest mature cluster** (one point, not a per-type
+  manifold). Type is continuous, but it lives in `z_type`, **not** as structure in
   `z_phase` (see the tight-maturity note below).
-- **Read-out:** **direction** of `z_phase` = **which tube** (globally valid because the
-  ray is straight); **radius** `‖z_phase‖` = **progress/severity** along it; **type** =
-  `z_type`. Retrieve on `[z_type, z_phase]` (weight type vs. phase as the query needs).
-- **Same-phase-different-type coincidence is fine.** Because tubes fan from one origin,
-  a fresh-burn-pine and fresh-burn-oak at the same type-normalized state land near each
-  other in `z_phase` (both "fresh burn") — correctly, for *phase*; `z_type` separates
-  them. Track same-vs-different-type behavior via the retrieval diagnostics.
+- **Read-out:** **direction** of `z_phase` = **which tube**; **radius** `‖z_phase‖` =
+  **progress/severity** along it; **type** = `z_type`. Retrieve on `[z_type, z_phase]`
+  (weight type vs. phase as the query needs).
+- **Cross-type phase is *incommensurate* — we neither assert nor use it.** `z_phase`
+  comparisons are **type-local**: the loss gates on `k_type`, so only pixels *nearby in
+  `z_type`* are ever compared in phase. Two far-apart types (a fresh-burn *pine* vs. a
+  fresh-burn *oak*) are **never compared** — their `z_type` distance already separates
+  them at retrieval — so their relative `z_phase` position is **meaningless / untrained**.
+  We do **not** require disturbed states of different types to coincide *or* to separate;
+  phase geometry is only defined *within a type neighborhood*. (The direction/tube
+  read-out is therefore also type-local, not a global axis.)
 - **Non-crossing = the sufficiency criterion.** A flow is a well-defined function
   only if trajectories don't cross; they *do* cross in raw channel space (same anomaly
   can be descending vs. recovering vs. a different tube), so instantaneous `a` is an
@@ -614,11 +621,17 @@ everything:
 d_type(i,j)  = ‖ẑ_type_i − ẑ_type_j‖         # standardized z_type (per-pixel)
 s_i          = ( a[n,t], Δa[n,t] )            # OBSERVABLE flow-state: level + velocity; NOT ysfc, NOT z_phase
 d_flow(i,j)  = ‖s_i − s_j‖                    # same place, moving the same way
-p_ij = exp(−d_type²/2σ_type²) · exp(−d_flow²/2σ_flow²)        # the AND (type ∧ flow-state)
+k_type = exp(−d_type²/2σ_type²) ;  k_flow = exp(−d_flow²/2σ_flow²)
+p_ij   = k_type · k_flow                        # positive: the AND (type ∧ flow-state)
+w_neg  = k_type · (1 − k_flow)                  # negative: TYPE-LOCAL — same-type, different-phase
 
 ℓ_ij = −‖z_phase_i − z_phase_j‖² / τ_phase   # Euclidean, FIXED τ
 L_i  = − Σ_{j∈pos(i)}  log[ exp(ℓ_ij) / ( exp(ℓ_ij) + Σ_{k∈neg(i)} w_neg(ik) · exp(ℓ_ik) ) ]
 ```
+Note `w_neg = k_type·(1−k_flow)`: it is high **only** for same-type / different-phase
+pairs. Cross-type pairs get `k_type≈0 → w_neg≈0` — **not pushed apart** (incommensurate);
+same-type / same-phase get `(1−k_flow)≈0` (they're the positives). So both attraction
+and repulsion are **type-local** — phase is conditional on type.
 
 ### Why InfoNCE and not the soft-neighborhood loss used before (honest version)
 
@@ -657,18 +670,20 @@ into soft-neighborhood. So the three ingredients below are non-negotiable.
 - `σ_type`, `σ_flow` are the peakedness knobs; calibrate from the distance
   distributions so "same" is genuinely narrow.
 
-**(2) Negatives — the same-type/different-state set is the whole game.**
-- Base pool: random cross-batch samples (reuse `cross_phase_*`) → general spread.
-- **Hard negatives = same type, different state** — the set that makes recovery
-  stages metrically separable *within* a type (the `phase_recovery_discrimination`
-  job, done natively). **Must be actively mined/quota'd**: same-type samples are a
-  minority of a random pool, so without mining, trivial different-type negatives
-  swamp the gradient and phases quietly re-compress. Guarantee each anchor's negative
-  set includes its type-neighbors (high `k_type`) that are state-far (low `k_flow`).
-- **False-negative suppression** via the same kernel: `w_neg(ik) = (1 − p_ik)`
-  clamped (your spectral `1 − exp(−d/σ)` idiom) — an accidental same-type/same-state
-  pair gets ≈0 negative weight. One kernel gives positives (high `p`) and negative
-  weights (`1 − p`).
+**(2) Negatives — type-local (same-type / different-phase) is the whole game.**
+- Negatives are weighted `w_neg = k_type·(1 − k_flow)`, so the **only** pairs pushed
+  apart are **same-type, different-phase** — the set that makes recovery stages
+  metrically separable *within* a type (the `phase_recovery_discrimination` job, done
+  natively). Cross-type pairs get `w_neg≈0` (**incommensurate — not pushed**); phase is
+  conditional on type.
+- **Must be actively mined.** Since type is continuous, same-type samples are a
+  *minority* of the batch, so guarantee each anchor's negatives include its
+  `z_type`-neighbors (high `k_type`) that are phase-far (low `k_flow`); otherwise the
+  gradient is thin and phases quietly re-compress. (This mining survives from the
+  old design; only the *cross-type* base pool is dropped.)
+- **Anti-collapse spread** now comes from same-type phase-separation + the variance
+  floor — *not* from a cross-type random pool (there is none). Confirm the variance
+  floor is on the correct population (across pixels / phase axis).
 
 **(3) Fixed ruler.**
 - **Fixed `τ_phase`** (never learned) = the absolute ruler. Calibrate via a new
@@ -689,9 +704,10 @@ z_type metric. All scales land on one ruler: readout bandwidth `h` (coarsest) >
 `σ_type` — i.e. `h > σ_ij`.
 
 ### Mechanics / reuse
-Head-free directly on z_phase (deliverable key; consistent with the head-free z_type
-stance). Reuses cross-batch phase pooling, mutual-kNN positive selection, distance-
-weighted negatives, and the `gap/T` temperature calibration already in the codebase.
+Operate **directly on z_phase, no projection head** (consistent with the head-free
+z_type stance). Reuses cross-batch phase pooling, mutual-kNN positive selection,
+distance-weighted negatives, and the `gap/T` temperature calibration already in the
+codebase.
 
 ### Open decisions
 - **Flow-state `s`** — settled as the **observable flow-state `(a, Δa)`** (the lifted,
