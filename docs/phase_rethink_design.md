@@ -27,14 +27,18 @@ disturbance agents (fire vs harvest vs insect), which we don't want.
   mature forests wiggle/bounce around 0; disturbances are **ejecta** from the
   origin that relax back over time. Must handle **fast** ejecta (harvest, fire)
   *and* **slow** ejecta (insect).
-- **Output**: **per-timestep** `z_phase[t]` — a point that drifts toward the mature
-  basin and is kicked out by disturbance. **No clustering loss** on disturbance
-  regions (density structure is a hypothesis we will *measure*, not impose).
-- **Type modulation**: keep `FiLM(stop-grad z_type)` at the output. Its role is now
-  clean — place each type's phase manifold in its own region. **Post-FiLM z_phase =
-  joint (type × phase) coordinate** = the deliverable.
+- **Output**: **per-timestep** `z_phase[t] = f(a, Δa)` — a **pure-phase** coordinate. A
+  point that drifts toward the **single shared mature origin** (mature `a≈0` anchored to
+  `0`) and is kicked out by disturbance. `‖z_phase‖` = departure-from-maturity;
+  direction = which tube. **No clustering loss** on disturbance regions (density
+  structure is a hypothesis we will *measure*, not impose).
+- **Type modulation → none (no FiLM).** Type already enters via the type-conditional
+  `μ/σ` input normalization, so output modulation is redundant (`γ` a testable
+  fallback). `z_phase` is pure phase; **type lives in `z_type`**; retrieval is on
+  **`[z_type, z_phase]`**. (This supersedes the earlier "joint type×phase / FiLM"
+  framing.)
 - **ysfc**: demoted from loss *target* → mature-set *selector* (and, optionally, a
-  weak within-recovery monotonicity prior only).
+  weak soft within-recovery drift; see the OU-drift in Step 4).
 - **Mature-set threshold** `ysfc > mature_ysfc_threshold` is an **input parameter**,
   not hard-coded. It is region-dependent — forests mature faster in the East than
   the West. Suggested starting values: **~10–12 in the East, ~20–25 in the West**.
@@ -56,8 +60,8 @@ turn on.
 All probes are fit on **train**, tuned on **val**, reported on **test**, using the
 checkerboard split already inside `ForestDatasetV2`. Every metric is reported for
 the **new model vs the exp034 baseline** so "better" is defined. Unless stated,
-probe the **post-FiLM z_phase[t]** (the joint type×phase coord); where noted, also
-probe **pre-FiLM h** and **z_type** for contrast.
+probe **`z_phase[t]`** (pure phase) and the concatenation **`[z_type, z_phase]`** (the
+retrieval key); probe **`z_type`** alone for contrast.
 
 ### A. Reconstruction probes — does z_phase retain the anomaly trajectory?
 
@@ -134,7 +138,8 @@ and evaluated with one forward per batch.
   mean, σ_θ = conditional std — the parametric estimator of the same quantity a kNN
   would approximate non-parametrically. z_type is unconstrained in magnitude
   (per CLAUDE.md), so **standardize z_type first**. μ/σ are fed **detached z_type**
-  and are **stop-grad** w.r.t. the phase loss (mirrors FiLM stop-grad; keeps
+  and are **stop-grad** w.r.t. the phase loss (the phase loss shapes the encoder, not
+  z_type, through the baseline; keeps
   type/phase separated); z_type is shaped only by the type losses, never by the
   baseline readout.
 - **Form.** Prefer a small **RBF network** (smooth by construction, explicit kernel
@@ -254,9 +259,9 @@ that make abruptness explicit.
   model config and the phase encoder input wiring.
 - Keep it out of the worker `precompute_features` list (that's spatial-only; this is
   temporal and anchor-built).
-- FiLM stays at the output and is complementary: anomaly removes type at the input
-  (mature ≈ 0 pre-FiLM for every type), FiLM `beta` re-places each type's manifold
-  in the shared space (point 4). No change to FiLM here.
+- **No FiLM** (see Encoder architecture): the anomaly is already type-conditional, so
+  `z_phase = f(a, Δa)` is type-conditioned via the input; output modulation is dropped.
+  Mature `a≈0 → z_phase ≈ 0` (single shared origin, gauge-anchored).
 
 **Open decisions (to resolve before implementing):**
 - **Δ² or Δ-only.** Δ captures onset abruptness; Δ² adds curvature (distinguishes a
@@ -271,7 +276,9 @@ that make abruptness explicit.
 ## Encoder architecture — the refactor forces a magnitude-preserving pass
 
 The loss/geometry changes have concrete implications for the *encoder*, not just the
-losses. The phase encoder is `a → TCN → 1×1 bottleneck → FiLM(z_type) → z_phase`.
+losses. The phase encoder is **`a → TCN → 1×1 bottleneck → z_phase`** — **no FiLM**
+(see "No FiLM" below). `z_type` enters the phase pathway **only** through the `μ/σ`
+input normalization (Step 2), which is already stop-grad/detached.
 
 **TCN = the lifting map.** Its job is now sharply defined: it convolves over a
 **temporal window**, so `z_phase[t]` is a function of a *stretch* of the `(a, Δa)`
@@ -288,8 +295,8 @@ starting point; validate with `Var(Δ|z_phase)`). biGRU is the Step-6 A/B altern
 (monotonically/injectively — not necessarily linearly)**. The σ-normalized anomaly is
 already the *right*, globally-meaningful normalization (mature ≈ O(1), disturbance
 many σ); the encoder must not re-normalize it away. Concrete changes:
-- **Remove the pre-FiLM L2-norm.** It puts every timestep on the unit sphere → every
-  timestep at the same radius → destroys the radius/progress axis outright. Mandatory.
+- **Remove the (old pre-FiLM) L2-norm.** It puts every timestep on the unit sphere →
+  every timestep at the same radius → destroys the radius/progress axis. Mandatory.
 - **Drop/replace per-sample normalization.** The current **GroupNorm** on `[N,C,T]`
   normalizes over (channels × **T**) **per sample**, dividing each pixel by its own
   temporal std → a **deep V and a shallow V of the same signature renormalize to the
@@ -302,12 +309,24 @@ many σ); the encoder must not re-normalize it away. Concrete changes:
   **norm-bypassing skip** to the bottleneck, so depth reaches `z_phase` regardless of
   internal normalization. Cheap and robust.
 
-**FiLM's role shifts (a consequence of removing the L2-norm).** Currently CLAUDE.md
-says "FiLM gamma owns the scaling" — that was true only because `h` was unit-norm.
-With the L2-norm gone, FiLM is purely **place + reshape per type**: `β` sets the
-per-type attractor origin, `γ` can scale/orient the `(t,u)` axes per type (so "pine
-clearcut recovery" is genuinely its own tube, not a translated copy of oak's). FiLM no
-longer needs to supply the radial magnitude — the bottleneck does.
+**No FiLM (default) — type conditioning already happens at the input.** FiLM existed
+in the original design because the phase input was *globally* z-scored (type-blind), so
+type had to be injected at the *output*. Now the input is the **type-conditional
+anomaly** `a = (x−μ(z_type))/σ(z_type)`, so `z_phase = f(a, Δa)` is **already a function
+of `z_type` through the input**. FiLM would be a *second*, redundant conditioning.
+- **`β` (offset) — drop it.** Its job (place types apart so `z_phase` encodes type) is
+  gone: `z_phase` is now **pure phase** with a single shared mature origin; type lives
+  in `z_type`; retrieval is on `[z_type, z_phase]`.
+- **`γ` (per-type reshape) — drop by default; testable fallback.** The type-specific
+  recovery *signature* is already in the type-normalized input, so a type-agnostic
+  encoder captures it. `μ/σ` normalize only moments 1–2, so if recovery *dynamics* are
+  type-specific beyond what the windowed `(a,Δa)` carries, add `γ(z_type)` back (cheap;
+  learns ≈1 if unneeded). Test: does the optimal phase geometry vary by type after input
+  normalization? Default **no**.
+- **Anchor mature to the origin.** A light **anchor loss** `λ·‖z_phase‖²` on mature
+  timesteps (`a≈0`, or `ysfc > threshold`) plus a roughly **bias-free** bottleneck
+  gauge-fixes mature `→ 0` for all types. This makes `‖z_phase‖` = departure-from-
+  maturity and gives the single shared basin.
 
 **Broader lesson:** every per-sample normalization in the phase encoder must be
 audited against "does depth/magnitude survive to become radius?" These were harmless
@@ -387,52 +406,71 @@ Choices, with rationale:
   *misses* isn't over-penalized. Likely unneeded with a good input gate; keep in
   reserve.
 
+**Directed refinement — the OU-drift (recommended, promoted from reserve).** The
+smoothness term above is *undirected* (small step, any direction). Add a **soft,
+gated, directed** term: on non-disturbance transitions, discourage the radius from
+*increasing*:
+```
+L_drift = mean over gated transitions of  softplus( ‖z_phase[n,t]‖ − ‖z_phase[n,t−1]‖ )
+```
+(low weight; same gate `w`). This is the explicit OU inward-drift, and it is the
+**primary guard for the recovery ORDERING** (fresh→mid→mature = far→near), *robust to
+`k_flow` mis-scaling* (see the worked example). Keep it **soft** (a tendency, not a
+pin) so non-monotone recovery is allowed. Division of labor: the **anchor loss** pins
+mature at the origin; **`‖a‖` + magnitude-preserving encoder** set how far out the
+disturbance kick lands (severity); the **drift** orders the return; **`k_flow`
+scaling** is now *secondary* (a mistake is recoverable, not catastrophic). It must be
+paired with the outward forces (kicks + contrastive) or it collapses everything to `0`.
+
+**Worked example (fresh-burn C / slow-recovery B / mature A, same type).** With
+`A=(a≈0,Δa≈0)`, `C=(a large,Δa≈0)`, `B=(a moderate,Δa<0)`, we want `d(A,C)` largest (B
+between A and C). Note `Δa≈0` at *both* A and C, so a `Δa`-dominant metric would
+collapse A≈C and push B out — the inversion. What prevents it: **`‖a‖` makes A,C the
+far-apart extremes** (magnitude-preserving encoder; `a` weighted ≥ `Δa`), and the
+**OU-drift + continuity chain** thread the ordered ray C→B→A so B sits between them.
+Distinguishing recovering-B from mature-A when their instantaneous states nearly
+coincide is the **window's** job (it still sees the burn C came through — "the only way
+from A to C is through B"). The tube **dissolves into the basin** once B recovers
+enough that the burn leaves the window. So the ordering rides on **drift + magnitude +
+window**, with `k_flow` scaling secondary.
+
 **Collapse — slow-feature only makes sense paired with cross-pixel spread.**
 `‖Δz‖ → 0` is trivially minimized by a constant embedding (all timesteps, all pixels
 equal). Classic SFA adds a unit-variance constraint; here the **Step-5 type∧phase
 contrastive loss is the primary anti-collapse** (it repels different types/states),
 so Step 4 and Step 5 are complementary and must land together:
 - **Slow-feature (Step 4)** = *attract in time* — within-pixel temporal continuity.
-- **Contrastive (Step 5)** = *repel across type/state* + align matched states across
-  pixels — the spread that prevents collapse and makes mature-A ≈ mature-B for the
-  same type.
+- **Contrastive (Step 5)** = *repel across state* + align matched *disturbed* states
+  across pixels — the spread that prevents collapse. (Mature coincidence is handled by
+  the anchor loss: all mature → the shared origin.)
 - If Step 5 lands later, Step 4 needs a temporary explicit variance floor — but on
   the **right population** (across pixels / across the disturbance–recovery axis),
   **not** the flattened N×T timesteps that made the old phase VICReg ineffective.
 
-**What creates the basin (and what does *not*).** We do **not** add an explicit
-"pull mature to its per-type basin" term. The mature basin should **emerge**: the Step-2
-anomaly makes mature inputs ≈ 0 (dense, similar), disturbance inputs are rare and
-distinct, so with temporal smoothness + contrastive alignment the mature timesteps
-naturally form the dense attractor and ejecta sit apart. Cross-pixel coincidence of
-mature states ("mature-oak-A ≈ mature-oak-B") is delivered by Step 5's same-type/
-same-state positives, not by Step 4. Keeping the origin implicit avoids fighting the
-FiLM `beta` that places each type's manifold.
+**What creates the single mature origin.** The **anchor loss** (`λ·‖z_phase‖²` on
+mature timesteps; see Encoder architecture) gauge-fixes mature → `0`. Beyond that the
+basin *fills in*: the Step-2 anomaly makes mature inputs ≈ 0 (dense, similar), so with
+temporal smoothness + the OU-drift + contrastive alignment the mature timesteps cluster
+tightly at the origin and ejecta sit far out on rays. Cross-pixel coincidence of mature
+states is delivered by the anchor (all mature → `0`) plus Step-5 positives, not by
+Step-4 smoothness alone.
 
 **Space & mechanics.**
-- Penalize on **post-FiLM z_phase** (the deliverable space). Note FiLM γ,β are
-  constant over time for a pixel (z_type is atemporal), so `Δz_phase = γ ⊙ Δh` — β
-  cancels in the difference and γ just scales the penalty per type. Acceptable; flag
-  if γ-scaling skews the penalty across types.
+- Penalize on **`z_phase`** (there is no FiLM; `z_phase` is the bottleneck output).
 - Respect the temporal validity mask (skip transitions spanning invalid timesteps).
 
-**Optional companion — within-recovery monotonicity.** After a disturbance,
-distance-from-type-origin could be asked to **decrease** with time-since-trough
-("wander back"). This is the "ysfc bucket loss → monotonicity prior" from the retire
-list — a light **ysfc-as-direction** use (ordering, not target). Adds an explicit
-"relax toward maturity" pressure the smoothness term alone doesn't. Keep optional;
-add only if trajectories drift but don't reliably return.
+**The monotonicity companion is now the OU-drift** (above), promoted from reserve and
+kept **soft**. No separate hard monotonic term — a hard "radius→0" would kill
+non-monotone recovery.
 
 **Open decisions (to resolve before implementing):**
 - **Gating mechanism** — input-Δ gate (preferred, ysfc-free) vs. robust ρ vs.
   `ysfc==0` mask, or a combination.
 - **Anti-collapse** — rely on the Step-5 contrastive spread only, or add an explicit
   correct-population variance floor as a safety net during co-development.
-- **Monotonicity companion** — **hold in reserve, and keep it *soft* if ever added.**
-  Per the OU attractor profile (Step-5 geometry), the inward drift is emergent
-  (radial contraction + basin density) and a *hard* monotonic-radius term would kill
-  the ergodic mature fluctuations and forbid non-monotone recovery. Add only a soft
-  version, only if trajectories drift but don't reliably return.
+- **OU-drift weight** — the soft inward-drift is now **in** (not reserve); the open
+  choice is its weight relative to the smoothness term (strong enough to order the
+  recovery, soft enough to allow setbacks).
 - **Robust safety net** — whether to wrap the velocity term in a *saturating*
   `ρ(‖v‖)` (Welsch/Cauchy — bounded; not Huber) as a backstop for disturbance jumps
   the input gate misses, or rely on the gate alone. Default: gate alone, add the
@@ -449,11 +487,12 @@ away from 0).
 
 ## Step 5 — Type∧phase contrastive loss (spec)
 
-Goal: the metric itself. A sample is `(pixel n, timestep t) → z_phase[n,t]` (post-
-FiLM, the shipped retrieval key). Two samples should be **close iff they match on
-*both* type and phase** — this is what makes kNN in z_phase return "same kind of
-forest, same recovery stage." This loss also **sets z_phase's scale** and so is the
-**anti-collapse partner** for Step 4 (which is scale-free on its own).
+Goal: the metric itself. A sample is `(pixel n, timestep t) → z_phase[n,t]` (pure
+phase; the retrieval key is `[z_type, z_phase]`). Two samples should be **close iff
+they match on *both* type and phase** — this is what makes kNN in `[z_type, z_phase]`
+return "same kind of forest, same recovery stage." This loss also **sets z_phase's
+scale** and so is the **anti-collapse partner** for Step 4 (which is scale-free on its
+own).
 
 ### The crystallized geometry (what z_phase *is*)
 
@@ -462,39 +501,33 @@ Think of recovery as a **dynamical system**. Every pixel-time sits either in the
 disturbance agents) that a disturbance kicked it onto and down which it relaxes back
 to the basin.
 
+> **ARCHITECTURE (current):** `z_phase = f(a, Δa)` — a **type-agnostic encoder** on
+> the **type-conditioned** input. **No FiLM** (see "Encoder architecture"): type
+> already enters via the `μ/σ` input normalization, so output modulation is redundant.
+> `z_phase` is **pure phase** with a **single shared mature origin** (mature anchored
+> to `0`); type is carried by `z_type`; retrieval is on **`[z_type, z_phase]`**. This
+> supersedes the earlier "joint type×phase / per-type FiLM basins" framing.
+
 - **z_phase is a *lifted, linearizing* phase space.** We choose coordinates in which
-  the (curved, channel-space) recovery flow becomes a simple **radial contraction**
-  toward a **per-type attractor** — that type's **FiLM origin `β_i` = β(z_type)**,
-  *not* the coordinate origin. In centered form: `E[z_{t+1} − β_i] ≈ γ·(z_t − β_i)`.
-  All the differential-channel-rate **curvature is absorbed into the encoder**; in
-  z_phase the tubes are approximately **straight rays out of `β_i`**.
-- **The basin is per-type, on a continuous mature manifold — the coordinate origin
-  `(0,0)` is not special.** `z_type` is *continuous* and `β(z_type)` is a smooth FiLM
-  function, so the basins are not discrete points but a **continuous "mature manifold"**
-  `{β(z_type)}` — a smooth sheet through z_phase; `β_i = β(z_type_i)` is pixel *i*'s
-  point on it, and nearby types → nearby basins. This spread is *required*: `z_phase`
-  is the joint (type × phase) coord, so mature-oak and mature-pine **must** sit apart
-  (else kNN can't separate types). Forcing a single `(0,0)` basin (β≡0) would collapse
-  the whole manifold to a point and erase type. The InfoNCE metric is
-  translation-invariant (`‖z_i − z_j‖`), so the manifold's location breaks nothing; and
-  `k_type` is a *kernel* on continuous `z_type`, so "same type" everywhere means
-  *nearby in z_type*, never a discrete class. "Mature ≈ origin" holds only in the
-  type-agnostic **pre-FiLM `h`** (where `a≈0` for all mature); FiLM then distributes
-  that shared basin across the per-type manifold.
-- **Continuous-type caveat — tubes can intrude on the manifold.** Because basins are
-  dense on a continuous sheet, a *disturbed* pixel of one type (far out on its ray) can
-  land geometrically near a *different* type's mature basin — sometimes ecologically
-  right (a fresh clearcut can resemble a mature shrub/grass type), but it means
-  `z_phase` alone can occasionally conflate "type-A recovering" with "type-B mature."
-  Mitigations, all already in play: `z_type` comes from robust spatial/spectral context
-  (a recovering pine still embeds as pine → correct `β`); **retrieve on `[z_type,
-  z_phase]` jointly** (Step-0 diagnostic E) so `z_type` pins the manifold location; FiLM
-  `γ` orients each type's tubes differently. Track it via the same-vs-different-type
-  confusion in the retrieval diagnostics.
-- **Read-out (per-type-centered):** **direction** of `z_phase − β_i` = **which tube**
-  (globally valid because the ray is straight); **radius** `t = ‖z_phase − β_i‖` =
-  **progress** along it; **type** = which `β_i`. One Euclidean kNN captures all three —
-  the deliverable.
+  the (curved, channel-space) recovery flow becomes a simple **radial contraction
+  toward the origin** (mature): `E[z_{t+1}] ≈ ρ·z_t`, `ρ<1`. All the
+  differential-channel-rate **curvature is absorbed into the encoder**; in z_phase the
+  tubes are approximately **straight rays out of the origin**.
+- **A single shared mature origin — mature `a≈0` is gauge-anchored to `0`.** All types'
+  maturity coincides at the origin (a light **anchor loss** pulls mature `z_phase → 0`;
+  see Encoder architecture). So `z_phase` is **pure phase**: two pixels of *different*
+  types at the *same* type-normalized state map to the *same* `z_phase` — "same phase,"
+  with type distinguished by `z_type`. This gives the **tightest mature cluster** (one
+  point, not a per-type manifold) and makes `‖z_phase‖` mean exactly "departure from
+  maturity." Type is continuous, but it lives in `z_type`, **not** as structure in
+  `z_phase` (see the tight-maturity note below).
+- **Read-out:** **direction** of `z_phase` = **which tube** (globally valid because the
+  ray is straight); **radius** `‖z_phase‖` = **progress/severity** along it; **type** =
+  `z_type`. Retrieve on `[z_type, z_phase]` (weight type vs. phase as the query needs).
+- **Same-phase-different-type coincidence is fine.** Because tubes fan from one origin,
+  a fresh-burn-pine and fresh-burn-oak at the same type-normalized state land near each
+  other in `z_phase` (both "fresh burn") — correctly, for *phase*; `z_type` separates
+  them. Track same-vs-different-type behavior via the retrieval diagnostics.
 - **Non-crossing = the sufficiency criterion.** A flow is a well-defined function
   only if trajectories don't cross; they *do* cross in raw channel space (same anomaly
   can be descending vs. recovering vs. a different tube), so instantaneous `a` is an
@@ -508,30 +541,52 @@ to the basin.
   gate. Tube identity properly **dissolves into the basin** near maturity (a recovered
   forest looks mature regardless of past agent), matching reality.
 
-**Attractor profile — OU-like, a fuzzy basin, not a point.** The radius should pull
-**strongly toward `β_i` far out** but only **weakly near `β_i`**, where residual
-**ergodic fluctuation** takes over — a mean-reverting (Ornstein–Uhlenbeck) process,
-not a pin. This falls out of two choices already made, nothing new to enforce:
-- **Radial contraction is the drift.** With `r = z − β_i` (offset from the per-type
-  basin), `E[r_{t+1}] ≈ γ·r_t` makes the *absolute* inward step `(1−γ)·‖r‖` large at
-  large radius and vanishing near `β_i` — "strong at first, gentle near the center" is
-  just what contraction is (no nonlinear restoring force needed).
-- **The σ-normalization is the noise floor.** Since `a=(x−μ)/σ` with σ = the *mature*
-  scale, a mature forest's normal wiggle is **O(1) by construction** (`‖a‖~1`),
-  disturbances are *many* σ out. So the basin is a **fuzzy ~1σ ball** around `β_i`; the
-  ergodic fluctuation *is* σ. Together: far out contraction dominates (strong pull);
-  near `β_i` the tiny `γ·r` drift is overwhelmed by the O(1) noise → ergodic wander.
+**Attractor profile — OU-like, mean-reverting to the origin.** The radius should pull
+**strongly toward `0` far out** but only **weakly near the origin**, where residual
+fluctuation takes over — a mean-reverting (Ornstein–Uhlenbeck) process.
+- **Radial contraction is the drift.** `E[z_{t+1}] ≈ ρ·z_t` (`ρ<1`) makes the
+  *absolute* inward step `(1−ρ)·‖z‖` large at large radius and vanishing near the
+  origin — "strong at first, gentle near the center."
+- **Made explicit as a loss (the OU-drift, promoted from "reserve").** On **gated
+  non-disturbance transitions**, softly encourage the radius *not to increase* —
+  `softplus(‖z_{t+1}‖ − ‖z_t‖)`, low weight, same gate as Step-4 smoothness. This is
+  the **primary guard for the recovery ORDERING** (fresh→mid→mature = far→near), robust
+  to `k_flow` mis-scaling (see the worked example); it replaces "hope the observable
+  distance orders the tube." Keep it **soft** (a tendency, not a pin) so non-monotone
+  recovery is allowed; the **anchor loss** (not the drift) pins mature at the origin.
+- **Anti-collapse.** Pure inward drift is minimized by `z ≡ 0`; the **disturbance kicks
+  + contrastive repulsion** are the outward forces that balance it (OU = inward drift ×
+  outward kicks/noise). Ship the drift only with them.
+- **Maturity stays a tight point, not a fuzzy ball — by choice.** Earlier we let the
+  σ-noise floor make the basin a fuzzy ~1σ ball; the tight-maturity decision (below)
+  moves the within-mature *structural* spread into `z_type`, so what's left at the
+  origin is just denoised weather wiggle. So the basin is **as tight as `z_type` is
+  complete** — see the tight-maturity note.
 
-Levers & the trap:
-- **Step-1 σ sets the basin size** (the "allowed fluctuation" radius — the direct knob).
-- **Step-4 smoothness** makes the in-basin wander smooth/ergodic, not white jitter.
-- **Step-5 `σ_flow` must be ≈ the mature fluctuation scale, not larger** — the trap: too
-  large ⇒ all mature timesteps become identical positives and InfoNCE **collapses the
-  ball to a point**, destroying the fluctuation. The variance-floor backstop guards this.
-- **Do *not*** add a hard "radius→0 at maturity" or hard monotonic-progress term — it
-  would kill the fluctuations and forbid non-monotone recovery. Drift is emergent
-  (contraction + basin density); keep any progress pressure *soft* or omit it. The
-  explicit version, if ever wanted, is the deferred drift-field `E[Δz] = −k·z`.
+### Tight maturity — structural spread lives in `z_type`, not `z_phase`
+
+We want a **tight** mature cluster for stratification, *not* a fuzzy ball — much of the
+mature spread is ecological noise we don't want influencing the phase ordering.
+Resolution: the two flavors of mature spread go to different places.
+- **Structural/ecological diversity** (dense vs. sparse mature, site) → **`z_type`**.
+  The type-conditional `μ/σ` are the mature baseline *for that type*, so a structurally
+  off-mean mature pixel still has `a≈0` (departure from its *own* baseline) → it lands
+  at the origin. The variation isn't discarded — it's **relocated to `z_type`** (and
+  available via `[z_type, z_phase]` retrieval). This is the right home for it: dense vs.
+  sparse mature is a *type* distinction, not a *phase* one.
+- **Temporal weather wiggle** → **suppressed** by Step-4 smoothness.
+- So the mature basin is **tight**, and its residual size is a **diagnostic on `z_type`
+  completeness**: a fuzzy mature basin means `z_type` is under-capturing structure that
+  is leaking into `a`.
+- **Knobs (primary → secondary):** `z_type` expressiveness (the real lever); Step-4
+  smoothness; the anchor loss + `σ_flow` at the basin. Because the structure you'd
+  "erode" is safely in `z_type`, you may contract mature **hard** (symmetric contraction
+  / larger `σ_flow` near the origin is *fine* here — the earlier "one-sided only /
+  don't collapse the ball" caution is lifted, since we now *want* a tight point).
+- **Don't over-tighten past the noise floor:** the σ-normalization means departures
+  *smaller* than mature ecological variation are undetectable — appropriate (you can't
+  see a disturbance smaller than natural variation). A basin tighter than that is
+  meaningless.
 
 ### CRITICAL: closeness-for-the-loss ≠ the emergent geometry
 
@@ -622,7 +677,7 @@ into soft-neighborhood. So the three ingredients below are non-negotiable.
   softmax → loss `= log K` (the maximum), so fixed τ forces a characteristic
   positive-vs-negative distance.
 - **Euclidean-squared** similarity, not cosine — the ruler must measure *radial*
-  distance (from the per-type basin `β_i`) so severity = distance survives. Consistent
+  distance (from the shared origin) so severity = `‖z_phase‖` survives. Consistent
   with Step 4 (`‖Δz‖²`).
 - **Variance-floor backstop** — light VICReg-style per-dim std hinge on the
   **correct population** (across pixels / disturbance–recovery axis, *not* flattened
@@ -678,8 +733,13 @@ being overlaid, needs more history/dimension.
    other-state and same-state/other-type negatives); "state" bootstrapped from the
    anomaly trajectory, not CCDC.
 5. Eval harness for Step 0 (A–E), split-disciplined, baselined to exp034.
-6. Magnitude-preserving encoder pass: remove pre-FiLM L2-norm; drop/replace per-sample
-   GroupNorm; optional `‖a‖` norm-bypass skip; keep TCN bidirectional + RF ≥ window.
+6. Magnitude-preserving, FiLM-free encoder pass: **remove FiLM** (`z_phase = f(a,Δa)`;
+   `γ` a testable fallback), remove the old L2-norm, drop/replace per-sample GroupNorm,
+   optional `‖a‖` norm-bypass skip; keep TCN bidirectional + RF ≥ window.
+7. Anchor loss `λ·‖z_phase‖²` on mature timesteps → single shared origin; `[z_type,
+   z_phase]` as the retrieval key.
+8. OU-drift: soft, gated, one-sided radius-non-increase term (Step-4 directed
+   refinement) — primary recovery-ordering guard.
 
 **Retire / demote**
 - `soft_neighborhood_phase` KL rank-matching (scale-equivariant — the collapse culprit).
@@ -695,9 +755,9 @@ being overlaid, needs more history/dimension.
 - [ ] 1. μ/σ NLL readout: small RBF / Lipschitz-MLP on standardized detached z_type, fit online by heteroscedastic Gaussian NLL on the current batch's mature timesteps (`ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West); σ via softplus + floor; smoothness knob set by held-out NLL with `L < 1/σ_ij`; check per-EVT coverage / extrapolation. No reservoir.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
-- [ ] 3b. Magnitude-preserving encoder pass (see "Encoder architecture"): remove pre-FiLM L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`). Do this with/alongside Step 3 — the anomaly input is pointless if the encoder renormalizes depth away.
-- [ ] 4. Slow-feature/smoothness loss; confirm drift-to-basin + jump-at-disturbance geometry.
-- [ ] 5. Type∧phase contrastive loss; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
+- [ ] 3b. FiLM-free, magnitude-preserving encoder (see "Encoder architecture"): **remove FiLM** (`z_phase = f(a,Δa)`), add the **anchor loss** `λ·‖z_phase‖²` on mature → single shared origin, remove old L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`) and mature→origin. Alongside Step 3.
+- [ ] 4. Slow-feature/smoothness loss **+ soft gated OU-drift** (radius-non-increase); confirm drift-to-basin, ordered recovery ray, jump-at-disturbance.
+- [ ] 5. Type∧phase contrastive loss on `[z_type, z_phase]`; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
 - [ ] 6. (optional) Encoder A/B: biGRU vs TCN for "where am I in the trajectory," with Δ channels.
 - [ ] 7. Consolidate: CLAUDE.md (architecture + loss table + ysfc-as-selector reframing), diagnostics, config plumbing.
 
