@@ -41,7 +41,7 @@ disturbance agents (fire vs harvest vs insect), which we don't want.
   type×phase output / FiLM basins" framing — the `∧` now happens at the loss's type
   gate and at retrieval, not via output modulation.)
 - **ysfc**: demoted from loss *target* → mature-set *selector* (and, optionally, a
-  weak soft within-recovery drift; see the OU-drift in Step 4).
+  secondary gate on the OU contraction in Step 4).
 - **Mature-set threshold** `ysfc > mature_ysfc_threshold` is an **input parameter**,
   not hard-coded. It is region-dependent — forests mature faster in the East than
   the West. Suggested starting values: **~10–12 in the East, ~20–25 in the West**.
@@ -347,104 +347,72 @@ loss changes so we know which moved the needle.
 
 ---
 
-## Step 4 — Slow-feature loss (spec)
+## Step 4 — Within-pixel dynamics: the Gaussian OU loss (spec)
 
-Goal: build the **attractor geometry** — within a pixel, z_phase drifts **smoothly**
-through stable periods and is allowed to **jump** at disturbance; mature becomes the
-dense **basin** that trajectories relax back into. This is the loss that turns
-"per-timestep points that move" into a coherent dynamical picture, and it is the
-term the old scale-equivariant losses could never provide.
+Goal: build the **attractor geometry** — within a pixel, z_phase **contracts** toward
+the origin along a **straight ray** through stable periods and is allowed to **jump**
+at disturbance; mature becomes the dense **basin** that trajectories relax back into.
+This is the loss that turns "per-timestep points that move" into a coherent dynamical
+picture, and it is the term the old scale-equivariant losses could never provide.
 
-**Framing: a smoothness constraint on path evolution.** Treat `z_phase[n,·]` as a
-**path through embedding space**; this loss penalizes the *kinetic energy* of that
-path (how fast the state moves), so the trajectory evolves slowly and continuously.
-It is made **edge-preserving in time** — smooth within stable stretches, but preserve
-the "edges" that are disturbances — which is the **temporal analog of the spatial
-`EdgeAwareSmoothingConv2D`** already used in the type pathway (smooth within regions,
-preserve edges/corners). Purpose (see the "why" for each in the discussion): a tight
-mature **basin** (noise suppressed), **connected, ordered recovery pathways** (a
-usable "how far along" coordinate), and the **relaxation dynamics** ("wander back").
+**Framing: a mean-reverting Ornstein–Uhlenbeck process.** Treat `z_phase[n,·]` as a
+**path through embedding space** that, absent a disturbance, drifts inward toward the
+origin (the OU model below). It is made **edge-preserving in time** — smooth/contracting
+within stable stretches, but the disturbance "edges" are held out (gated) — the
+**temporal analog of the spatial `EdgeAwareSmoothingConv2D`**. Purpose (the "why" in the
+discussion): a tight mature **basin** (noise suppressed), **straight, ordered recovery
+rays** (a usable "how far along" coordinate), and the **relaxation dynamics**
+("wander back").
 
-**Core term — a robust / gated temporal-difference penalty on z_phase.**
-- Base form: penalize `‖z_phase[t] − z_phase[t−1]‖` within a pixel across time.
-- A *bare* squared penalty would forbid the very jumps we want (and see Collapse
-  below), so it must be **robust**: either a saturating/Huber ρ that stops growing
-  for large steps, **or gated by input abruptness** — weight each transition by
-  `w[t] = exp(−‖Δa[t]‖ / τ)` so the smoothness penalty relaxes exactly where the
-  **input anomaly** jumps. The gated form is preferred: it is **ysfc-free** (the
-  input Δ channel already localizes disturbance onset), and it puts the right
-  division of labor in place — the *input* decides **where** a jump happens, the
-  *loss* merely **permits** it there and enforces smoothness everywhere else.
-- Optional supervision: an `ysfc == 0` mask could instead/also mark jump-allowed
-  transitions. This is a *light* ysfc use (a transition selector, like the mature
-  selector), not ysfc-as-target — but leans on CCDC's disturbance calls, so keep it
-  secondary to the data-driven gate.
-
-**Recommended mathematical form.** Gated kinetic energy of the path. For pixel `n`,
-transition `t = 1…T−1`:
+**The loss — a single Gaussian OU-NLL** (subsumes smoothness + radius-drift +
+direction-consistency in one formal term). Model recovery as a discrete
+Ornstein–Uhlenbeck process mean-reverting to the origin; the loss is its transition
+negative-log-likelihood on **non-disturbance** transitions:
 
 ```
-velocity    v[n,t] = z_phase[n,t] − z_phase[n,t−1]
-input jump  g[n,t] = ‖a[n,t] − a[n,t−1]‖₂            # over anomaly channels (Step-2 Δ)
-gate        w[n,t] = exp(−(g[n,t]/τ)²) · valid[n,t]·valid[n,t−1]   ∈ (0,1]
+z_phase[n,t] | z_phase[n,t−1]  ~  N( ρ · z_phase[n,t−1],  s²·I ) ,   ρ ∈ (0,1) scalar
 
-L_sf = ( Σ_{n,t} w[n,t] · ‖v[n,t]‖² ) / ( Σ_{n,t} w[n,t] )
+w_dist[n,t] = exp(−(‖Δa[n,t]‖/τ)²) · valid[n,t]·valid[n,t−1]     # ≈0 AT the kick, ≈1 stable
+L_OU = ( Σ_{n,t} w_dist · ‖ z_phase[n,t] − ρ·z_phase[n,t−1] ‖² ) / ( Σ w_dist )
+       [ /(2s²), + (D/2)·log(2πs²) if s is learned ]
 ```
 
-`w ≈ 1` in stable stretches (smooth hard), `w → 0` at disturbance onset (jump free).
-Choices, with rationale:
-- **L2 (kinetic energy), not L1 (total variation).** L2 spreads change over many
-  small steps → *gradual* recovery (the relaxation limb we want); TV-L1 concentrates
-  change into sparse jumps + flat plateaus, which would collapse recovery into one
-  step. The **sharp onset is handled by the gate**, not the penalty shape, so L1's
-  edge-seeking is unnecessary.
-- **First-order (velocity), not second-order (acceleration).** We want "prefer to
-  stay put in the basin" = small velocity; a curvature penalty would instead permit
-  constant-velocity drift.
-- **Soft exp gate, not a hard threshold** — differentiable, partial credit for
-  medium changes. `τ` = "how big an input change counts as an event"; set from a
-  robust scale of `g` (e.g. median `‖Δa‖` over stable transitions), or tune.
-- **Optional robust safety net** — replace `‖v‖²` with a *saturating* `ρ(‖v‖)`
-  (Welsch/Cauchy — bounded; not Huber, which keeps growing) so a jump the gate
-  *misses* isn't over-penalized. Likely unneeded with a good input gate; keep in
-  reserve.
+Because `ρ·z_{t−1}` is "**z_{t−1}, same direction, shorter**," this *one* term does
+everything the earlier three did:
+- **smoothness** (small step) — `ρ=1` is exactly `‖Δz‖²`;
+- **radius contraction** (`ρ<1` → shorter) — the recovery **ordering** (far→near);
+- **direction preservation** (target points along `z_{t−1}`) — **straight rays**.
 
-**Directed refinement — the OU-drift (recommended, promoted from reserve).** The
-smoothness term above is *undirected* (small step, any direction). Add a **soft,
-gated, directed** term: on non-disturbance transitions, discourage the radius from
-*increasing*:
-```
-L_drift = mean over gated transitions of  softplus( ‖z_phase[n,t]‖ − ‖z_phase[n,t−1]‖ )
-```
-(low weight; same gate `w`). This is the explicit OU inward-drift, and it is the
-**primary guard for the recovery ORDERING** (fresh→mid→mature = far→near), *robust to
-`k_flow` mis-scaling* (see the worked example). Keep it **soft** (a tendency, not a
-pin) so non-monotone recovery is allowed. Division of labor: the **anchor loss** pins
-mature at the origin; **`‖a‖` + magnitude-preserving encoder** set how far out the
-disturbance kick lands (severity); the **drift** orders the return; **`k_flow`
-scaling** is now *secondary* (a mistake is recoverable, not catastrophic). It must be
-paired with the outward forces (kicks + contrastive) or it collapses everything to `0`.
+Properties / choices:
+- **Only the disturbance gate `w_dist` is needed** — no separate radius/maturity gate.
+  As `z→0` the target `ρz→0`, so near the origin the loss smoothly becomes `‖z_{t+1}‖²`
+  (a gentle, direction-free pull to the origin), and the direction-sensitivity
+  **auto-scales with `‖z_{t−1}‖`** (strong on a ray, vanishing in the basin) — the thing
+  the old `cos` term needed an explicit `w_rad` gate for. The kick is exogenous (not an
+  OU step) so `w_dist` gates it out; an `ysfc==0` mask is an optional secondary gate.
+- **Scalar `ρ`, one global value — *not* per-type.** Uniform (isotropic) contraction is
+  what keeps a trajectory on a **straight ray**; a diagonal/per-dim `ρ` would decay
+  dimensions unevenly → the direction rotates → curved tubes. And per-type `ρ` is
+  **unidentifiable**: (a) cross-type is never compared (type-local loss), so a per-type
+  rate is an unobserved gauge = a per-type z_phase rescale; (b) the observable recovery
+  *speed* is conflated with the implied decoder `s(z_phase, z_type)→(a,Δa)` — it lives in
+  `s`, not in `ρ`. So `ρ` is a single coordinate *time-scale* (fixed, or one learned
+  scalar; pick it **moderate**, not `→1`); the encoder adapts the rest.
+- **L2 (Gaussian), soft.** A tendency, not a pin → non-monotone recovery and ergodic
+  wander survive. Optional **saturating** robust residual (Welsch/Cauchy) as a backstop
+  for jumps the gate misses. `τ` (the gate scale) from a robust scale of `‖Δa‖`.
+- **`s` (noise scale):** fixed/small (tight maturity); if learned (via the `log s` term)
+  it also learns the basin/wander magnitude.
+- **Anti-collapse:** OU contraction alone is minimized by `z ≡ 0` → pair with the outward
+  forces (disturbance kicks + contrastive repulsion). The **anchor loss** (mature→0) is
+  partly subsumed (OU drags mature in) but kept — it *directly* gauge-fixes the origin
+  rather than waiting for contraction.
 
-**Directed refinement 2 — direction-consistency (the ray-straightness term).** The
-within-pixel "same-pixel ⇒ same ray" statement is *two* soft terms: the OU-drift above
-(radius does not increase) **and** a **direction-consistency** term — consecutive
-`z_phase` share a direction:
-```
-L_dir = ( Σ w_dir[n,t] · (1 − cos(z_phase[n,t], z_phase[n,t−1])) ) / ( Σ w_dir[n,t] )
-w_dir[n,t] = w_dist[n,t] · w_rad[n,t]
-  w_dist = exp(−(‖Δa‖/τ)²)                  # ≈0 AT the disturbance (new tube), ≈1 stable
-  w_rad  ≈ gated min(‖z_t‖, ‖z_{t+1}‖)       # ≈0 AT maturity (direction undefined at origin), ≈1 out on a ray
-```
-So it **bites only on the recovery limb** — *following* a disturbance, *not at* the
-disturbance (direction may swing to the new tube), *not at* maturity (direction is
-meaningless in the basin, and it turns off smoothly as a pixel recovers to the origin).
-Together the two terms are the full OU contraction `E[z_{t+1}] ≈ ρ·z_t` decomposed
-(shorter + same direction) → each pixel's post-disturbance trajectory becomes a
-**straight contracting ray**. This is the strong, reliable signal (same physical pixel),
-and it does double duty: **ray-identity propagation** (below) *and* the linearization we
-wanted. Gating note: `cos` (a *direction* constraint) needs **both** gates (undefined at
-the origin); the OU radius drift (a *magnitude* constraint) needs only the disturbance
-gate. Keep both **soft** and pair with the outward forces.
+This is the exact OU transition likelihood, so it **instantiates** the "recovery is an
+OU process" framing — one principled term, knobs `ρ` and `s` instead of three separate
+weights + two gates. Division of labor unchanged: **anchor** pins the origin, **`‖a‖` +
+magnitude-preserving encoder** set the kick's severity/radius, **`L_OU`** orders and
+straightens the return, **`k_flow` scaling** is secondary.
 
 **Cross-pixel ray identity is a two-link chain (why the descriptor stays deferred).**
 Same-tube pixels at *different* progress (fresh-harvest vs. 10-yr-harvest) align via:
@@ -461,19 +429,20 @@ cross-pixel loss is *light registration*, its real job being repulsion + scale.)
 between A and C). Note `Δa≈0` at *both* A and C, so a `Δa`-dominant metric would
 collapse A≈C and push B out — the inversion. What prevents it: **`‖a‖` makes A,C the
 far-apart extremes** (magnitude-preserving encoder; `a` weighted ≥ `Δa`), and the
-**OU-drift + continuity chain** thread the ordered ray C→B→A so B sits between them.
+**OU contraction** (`ρ<1`, same-direction-but-shorter target) threads the ordered ray
+C→B→A so B sits between them.
 Distinguishing recovering-B from mature-A when their instantaneous states nearly
 coincide is the **window's** job (it still sees the burn C came through — "the only way
 from A to C is through B"). The tube **dissolves into the basin** once B recovers
 enough that the burn leaves the window. So the ordering rides on **drift + magnitude +
 window**, with `k_flow` scaling secondary.
 
-**Collapse — slow-feature only makes sense paired with cross-pixel spread.**
-`‖Δz‖ → 0` is trivially minimized by a constant embedding (all timesteps, all pixels
-equal). Classic SFA adds a unit-variance constraint; here the **Step-5 type∧phase
-contrastive loss is the primary anti-collapse** (it repels different types/states),
-so Step 4 and Step 5 are complementary and must land together:
-- **Slow-feature (Step 4)** = *attract in time* — within-pixel temporal continuity.
+**Collapse — the OU-NLL only makes sense paired with cross-pixel spread.**
+`‖z_{t+1} − ρ·z_t‖² → 0` is trivially minimized by a constant embedding (all timesteps,
+all pixels equal, `ρ=1`). Classic SFA adds a unit-variance constraint; here the
+**Step-5 type∧phase contrastive loss is the primary anti-collapse** (it repels
+different types/states), so Step 4 and Step 5 are complementary and must land together:
+- **OU-NLL (Step 4)** = *attract in time* — within-pixel temporal continuity + contraction.
 - **Contrastive (Step 5)** = *repel across state* + align matched *disturbed* states
   across pixels — the spread that prevents collapse. (Mature coincidence is handled by
   the anchor loss: all mature → the shared origin.)
@@ -484,8 +453,9 @@ so Step 4 and Step 5 are complementary and must land together:
 **What creates the single mature origin.** The **anchor loss** (`λ·‖z_phase‖²` on
 mature timesteps; see Encoder architecture) gauge-fixes mature → `0`. Beyond that the
 basin *fills in*: the Step-2 anomaly makes mature inputs ≈ 0 (dense, similar), so with
-temporal smoothness + the OU-drift + contrastive alignment the mature timesteps cluster
-tightly at the origin and ejecta sit far out on rays. Cross-pixel coincidence of mature
+the OU contraction (which near the origin becomes a gentle pull to `0`) + contrastive
+alignment the mature timesteps cluster tightly at the origin and ejecta sit far out on
+rays. Cross-pixel coincidence of mature
 states is delivered by the anchor (all mature → `0`) plus Step-5 positives, not by
 Step-4 smoothness alone.
 
@@ -493,24 +463,29 @@ Step-4 smoothness alone.
 - Penalize on **`z_phase`** (there is no FiLM; `z_phase` is the bottleneck output).
 - Respect the temporal validity mask (skip transitions spanning invalid timesteps).
 
-**The monotonicity companion is now the OU-drift** (above), promoted from reserve and
-kept **soft**. No separate hard monotonic term — a hard "radius→0" would kill
-non-monotone recovery.
+**Monotonicity is subsumed by the OU contraction** (`ρ<1`), kept **soft**. No separate
+hard monotonic term — a hard "radius→0" would kill non-monotone recovery. The old
+smoothness / OU-drift / direction-consistency triad is now the *single* OU-NLL above.
 
 **Open decisions (to resolve before implementing):**
-- **Gating mechanism** — input-Δ gate (preferred, ysfc-free) vs. robust ρ vs.
-  `ysfc==0` mask, or a combination.
+- **Gating mechanism** — the input-Δ gate `w_dist` (preferred, ysfc-free) alone vs. an
+  optional secondary `ysfc==0` mask on the kick, or a combination.
+- **`ρ`** — fixed scalar vs. one learned global scalar; either way pick it **moderate**
+  (not `→1`). Never per-type / per-dim (identifiability + straightness, above).
+- **`s` (noise scale)** — fixed constant (→ the OU-NLL is just a weighted squared
+  residual) vs. learned. If learned, isotropic-only and **global**; a radius-dependent
+  `s²(‖z‖)=s0²+s1²‖z‖²` (tight at the origin, looser far out) is the form to reach for
+  if the mature basin comes out fuzzy — it delivers tight maturity without modelling the
+  mature fuzz. Radial/transverse anisotropy (`s_⊥≤s_r`) is a straightness fallback only.
+  *(Under discussion — see the `s` analysis; not yet locked.)*
 - **Anti-collapse** — rely on the Step-5 contrastive spread only, or add an explicit
   correct-population variance floor as a safety net during co-development.
-- **OU-drift weight** — the soft inward-drift is now **in** (not reserve); the open
-  choice is its weight relative to the smoothness term (strong enough to order the
-  recovery, soft enough to allow setbacks).
-- **Robust safety net** — whether to wrap the velocity term in a *saturating*
-  `ρ(‖v‖)` (Welsch/Cauchy — bounded; not Huber) as a backstop for disturbance jumps
-  the input gate misses, or rely on the gate alone. Default: gate alone, add the
-  saturating `ρ` only if un-gated jumps show up as over-penalized (recovery limbs
-  looking artificially smeared, or the loss spiking at mislabeled/undetected
-  disturbances). Costs one scale hyperparameter (the saturation radius).
+- **Robust safety net** — whether to wrap the residual in a *saturating* `ρ(‖v‖)`
+  (Welsch/Cauchy — bounded; not Huber) as a backstop for disturbance jumps the input
+  gate misses, or rely on the gate alone. Default: gate alone, add the saturating `ρ`
+  only if un-gated jumps show up as over-penalized (recovery limbs looking artificially
+  smeared, or the loss spiking at mislabeled/undetected disturbances). Costs one scale
+  hyperparameter (the saturation radius).
 
 **Diagnostics (ties to Step 0).** Jump-at-disturbance separation (diagnostic C),
 mature-basin formation (mature variance ↓ = tight shared basin, ejecta separation ↑),
@@ -585,16 +560,16 @@ fluctuation takes over — a mean-reverting (Ornstein–Uhlenbeck) process.
 - **Radial contraction is the drift.** `E[z_{t+1}] ≈ ρ·z_t` (`ρ<1`) makes the
   *absolute* inward step `(1−ρ)·‖z‖` large at large radius and vanishing near the
   origin — "strong at first, gentle near the center."
-- **Made explicit as a loss (the OU-drift, promoted from "reserve").** On **gated
-  non-disturbance transitions**, softly encourage the radius *not to increase* —
-  `softplus(‖z_{t+1}‖ − ‖z_t‖)`, low weight, same gate as Step-4 smoothness. This is
-  the **primary guard for the recovery ORDERING** (fresh→mid→mature = far→near), robust
-  to `k_flow` mis-scaling (see the worked example); it replaces "hope the observable
-  distance orders the tube." Keep it **soft** (a tendency, not a pin) so non-monotone
-  recovery is allowed; the **anchor loss** (not the drift) pins mature at the origin.
+- **Made explicit as the Step-4 OU-NLL.** The `‖z_{t+1} − ρ·z_t‖²` term on **gated
+  non-disturbance transitions** *is* this drift: the `ρ<1` target is same-direction-but-
+  shorter, so it simultaneously orders the recovery (fresh→mid→mature = far→near — the
+  **primary ORDERING guard**, robust to `k_flow` mis-scaling; see the worked example) and
+  straightens the ray, subsuming the retired softplus/cosine terms. Kept **soft** (a
+  tendency, not a pin) so non-monotone recovery is allowed; the **anchor loss** (not the
+  drift) *directly* pins mature at the origin.
 - **Anti-collapse.** Pure inward drift is minimized by `z ≡ 0`; the **disturbance kicks
   + contrastive repulsion** are the outward forces that balance it (OU = inward drift ×
-  outward kicks/noise). Ship the drift only with them.
+  outward kicks/noise). Ship the OU-NLL only with them.
 - **Maturity stays a tight point, not a fuzzy ball — by choice.** Earlier we let the
   σ-noise floor make the basin a fuzzy ~1σ ball; the tight-maturity decision (below)
   moves the within-mature *structural* spread into `z_type`, so what's left at the
@@ -788,8 +763,10 @@ being overlaid, needs more history/dimension.
    Gaussian-NLL readout (RBF / Lipschitz-MLP) fit on mature (`ysfc > threshold`)
    timesteps. No reservoir/kNN.
 2. Anomaly input transform `(x−μ)/σ` (+ Δ / Δ² channels).
-3. Slow-feature / temporal-smoothness loss (continuity within no-disturbance runs;
-   jumps allowed at disturbance) — the term that builds the attractor geometry.
+3. Within-pixel **Gaussian OU-NLL** `‖z_{t+1} − ρ·z_t‖²` on disturbance-gated
+   transitions (`ρ<1` scalar global; jumps allowed at disturbance) — one term that
+   subsumes smoothness + radius contraction + direction preservation and builds the
+   attractor geometry.
 4. Type-local **ranking** InfoNCE on **post-disturbance** pixel-times: positives
    `k_type·k_flow`, negatives `k_type·(1−k_flow)` (same-type/different-phase, mined);
    Euclidean, fixed τ; oversample the disturbed minority; **rank the neighborhood, do
@@ -800,17 +777,15 @@ being overlaid, needs more history/dimension.
    optional `‖a‖` norm-bypass skip; keep TCN bidirectional + RF ≥ window.
 7. Anchor loss `λ·‖z_phase‖²` on mature timesteps → single shared origin; `[z_type,
    z_phase]` as the retrieval key.
-8. Within-pixel ray terms (Step-4 directed refinements), both soft + gated: **OU-drift**
-   (`softplus(‖z_{t+1}‖−‖z_t‖)`, disturbance-gated) for radius ordering, and
-   **direction-consistency** (`1−cos(z_t,z_{t+1})`, gated by `w_dist·w_rad` — recovery
-   limb only) for ray-straightness. Together = the "same-pixel ⇒ same ray" package.
+   *(Radius ordering + ray-straightness + smoothness are all folded into item 3's single
+   OU-NLL — no separate softplus / direction-consistency terms.)*
 
 **Retire / demote**
 - `soft_neighborhood_phase` KL rank-matching (scale-equivariant — the collapse culprit).
 - `phase_recovery_discrimination_loss` hard ysfc-bucket margin.
 - Phase VICReg on flattened timesteps (wrong population).
-- ysfc bucket loss → replaced by the soft, gated **OU-drift** (Step 4), not a hard
-  bucket margin.
+- ysfc bucket loss → replaced by the soft, gated **Gaussian OU-NLL** (Step 4), not a
+  hard bucket margin.
 
 ---
 
@@ -821,7 +796,7 @@ being overlaid, needs more history/dimension.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 3b. FiLM-free, magnitude-preserving encoder (see "Encoder architecture"): **remove FiLM** (`z_phase = f(a,Δa)`), add the **anchor loss** `λ·‖z_phase‖²` on mature → single shared origin, remove old L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`) and mature→origin. Alongside Step 3.
-- [ ] 4. Within-pixel ray terms: smoothness + **OU-drift** (radius-non-increase) + **direction-consistency** (`1−cos`, gated `w_dist·w_rad`, recovery-limb only); confirm drift-to-basin, straight ordered recovery rays, jump-at-disturbance.
+- [ ] 4. Within-pixel **Gaussian OU-NLL**: `‖z_{t+1} − ρ·z_t‖²` on disturbance-gated (`w_dist`) transitions, `ρ<1` scalar global (subsumes smoothness + radius contraction + direction preservation); `s` fixed to start (radius-dependent only if the basin is fuzzy); confirm drift-to-basin, straight ordered recovery rays, jump-at-disturbance.
 - [ ] 5. Type-local **ranking** InfoNCE on **post-disturbance** pixel-times (oversampled): positives `k_type·k_flow`, mined negatives `k_type·(1−k_flow)`, fixed τ, rank-not-regress; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
 - [ ] 6. (optional) Encoder A/B: biGRU vs TCN for "where am I in the trajectory," with Δ channels.
 - [ ] 7. Consolidate: CLAUDE.md (architecture + loss table + ysfc-as-selector reframing), diagnostics, config plumbing.
