@@ -370,12 +370,17 @@ Ornstein–Uhlenbeck process mean-reverting to the origin; the loss is its trans
 negative-log-likelihood on **non-disturbance** transitions:
 
 ```
-z_phase[n,t] | z_phase[n,t−1]  ~  N( ρ · z_phase[n,t−1],  s²·I ) ,   ρ ∈ (0,1) scalar
+z_phase[n,t] | z_phase[n,t−1]  ~  N( ρ · z_phase[n,t−1],  s²(‖z_{t−1}‖)·I )
+    ρ ∈ (0,1) scalar global ;   s²(r) = s0² + s1²·r²   (isotropic, radius-shrinking)
 
 w_dist[n,t] = exp(−(‖Δa[n,t]‖/τ)²) · valid[n,t]·valid[n,t−1]     # ≈0 AT the kick, ≈1 stable
-L_OU = ( Σ_{n,t} w_dist · ‖ z_phase[n,t] − ρ·z_phase[n,t−1] ‖² ) / ( Σ w_dist )
-       [ /(2s²), + (D/2)·log(2πs²) if s is learned ]
+r = ‖z_phase[n,t−1]‖ ;   s²_nt = s0² + s1²·r²
+L_OU = ( Σ_{n,t} w_dist · [ ‖z_phase[n,t] − ρ·z_phase[n,t−1]‖² / (2 s²_nt)
+                            + (D/2)·log(2π s²_nt) ] ) / ( Σ w_dist )
 ```
+With `s1 = 0` (basin not fuzzy) this reduces to the plain weighted squared residual
+`Σ w_dist·‖z_{t}−ρ·z_{t−1}‖² / Σ w_dist` (the `log s` term is constant). Turn on `s1`
+to shrink the noise budget toward the origin for a tighter mature basin.
 
 Because `ρ·z_{t−1}` is "**z_{t−1}, same direction, shorter**," this *one* term does
 everything the earlier three did:
@@ -395,14 +400,25 @@ Properties / choices:
   dimensions unevenly → the direction rotates → curved tubes. And per-type `ρ` is
   **unidentifiable**: (a) cross-type is never compared (type-local loss), so a per-type
   rate is an unobserved gauge = a per-type z_phase rescale; (b) the observable recovery
-  *speed* is conflated with the implied decoder `s(z_phase, z_type)→(a,Δa)` — it lives in
-  `s`, not in `ρ`. So `ρ` is a single coordinate *time-scale* (fixed, or one learned
+  *speed* is conflated with the implied decoder `g(z_phase, z_type)→(a,Δa)` (`g` to avoid
+  the noise-scale `s`) — it lives in `g`, not in `ρ`. So `ρ` is a single coordinate
+  *time-scale* (fixed, or one learned
   scalar; pick it **moderate**, not `→1`); the encoder adapts the rest.
 - **L2 (Gaussian), soft.** A tendency, not a pin → non-monotone recovery and ergodic
   wander survive. Optional **saturating** robust residual (Welsch/Cauchy) as a backstop
   for jumps the gate misses. `τ` (the gate scale) from a robust scale of `‖Δa‖`.
-- **`s` (noise scale):** fixed/small (tight maturity); if learned (via the `log s` term)
-  it also learns the basin/wander magnitude.
+- **`s` (noise scale): isotropic, global, and radius-shrinking — `s²(‖z_{t−1}‖) =
+  s0² + s1²·‖z_{t−1}‖²`.** Co-scaling the noise with the drift `(1−ρ)‖z‖` makes the OU
+  step a *relative* step: near the origin `s→s0` (a small floor), so mature transitions
+  get almost no noise budget → residual wiggle is denoised (relocated to `z_type`) rather
+  than modelled as OU noise → a **tight** basin; far out `s≈s1‖z‖`, so genuinely-variable
+  fresh disturbances aren't over-penalized. This is the heteroscedastic Gaussian with the
+  `log s(‖z_{t−1}‖)` term included. **Not** per-type (unidentifiable, no output handle) and
+  **not** anisotropic by default (radial/transverse `s_⊥≤s_r` is a straightness fallback
+  only, duplicating Step-4 direction preservation + Step-5 ranking). Start with `s`
+  effectively constant (`s1≈0` → the OU-NLL is a weighted squared residual); turn on the
+  radius term if the mature basin comes out fuzzy. `s0` ≥ the σ-normalization noise floor
+  (don't tighten past it).
 - **Anti-collapse:** OU contraction alone is minimized by `z ≡ 0` → pair with the outward
   forces (disturbance kicks + contrastive repulsion). The **anchor loss** (mature→0) is
   partly subsumed (OU drags mature in) but kept — it *directly* gauge-fixes the origin
@@ -472,12 +488,11 @@ smoothness / OU-drift / direction-consistency triad is now the *single* OU-NLL a
   optional secondary `ysfc==0` mask on the kick, or a combination.
 - **`ρ`** — fixed scalar vs. one learned global scalar; either way pick it **moderate**
   (not `→1`). Never per-type / per-dim (identifiability + straightness, above).
-- **`s` (noise scale)** — fixed constant (→ the OU-NLL is just a weighted squared
-  residual) vs. learned. If learned, isotropic-only and **global**; a radius-dependent
-  `s²(‖z‖)=s0²+s1²‖z‖²` (tight at the origin, looser far out) is the form to reach for
-  if the mature basin comes out fuzzy — it delivers tight maturity without modelling the
-  mature fuzz. Radial/transverse anisotropy (`s_⊥≤s_r`) is a straightness fallback only.
-  *(Under discussion — see the `s` analysis; not yet locked.)*
+- **`s` (noise scale) — LOCKED: isotropic, global, radius-shrinking**
+  `s²(‖z‖)=s0²+s1²‖z‖²` (co-scales with the ρ-drift → tight basin without modelling the
+  mature fuzz; see the properties block). Remaining sub-choices: fixed vs. learned
+  `(s0,s1)`; the initial `s1` (start `≈0` = weighted squared residual, raise if the basin
+  is fuzzy). Anisotropy `s_⊥≤s_r` stays a straightness fallback only.
 - **Anti-collapse** — rely on the Step-5 contrastive spread only, or add an explicit
   correct-population variance floor as a safety net during co-development.
 - **Robust safety net** — whether to wrap the residual in a *saturating* `ρ(‖v‖)`
@@ -796,7 +811,7 @@ being overlaid, needs more history/dimension.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 3b. FiLM-free, magnitude-preserving encoder (see "Encoder architecture"): **remove FiLM** (`z_phase = f(a,Δa)`), add the **anchor loss** `λ·‖z_phase‖²` on mature → single shared origin, remove old L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`) and mature→origin. Alongside Step 3.
-- [ ] 4. Within-pixel **Gaussian OU-NLL**: `‖z_{t+1} − ρ·z_t‖²` on disturbance-gated (`w_dist`) transitions, `ρ<1` scalar global (subsumes smoothness + radius contraction + direction preservation); `s` fixed to start (radius-dependent only if the basin is fuzzy); confirm drift-to-basin, straight ordered recovery rays, jump-at-disturbance.
+- [ ] 4. Within-pixel **Gaussian OU-NLL**: `‖z_{t+1} − ρ·z_t‖²` on disturbance-gated (`w_dist`) transitions, `ρ<1` scalar global (subsumes smoothness + radius contraction + direction preservation); **`s` isotropic, global, radius-shrinking `s²(‖z‖)=s0²+s1²‖z‖²`** (start `s1≈0` = weighted squared residual; raise `s1` for a tighter mature basin if fuzzy); confirm drift-to-basin, straight ordered recovery rays, jump-at-disturbance.
 - [ ] 5. Type-local **ranking** InfoNCE on **post-disturbance** pixel-times (oversampled): positives `k_type·k_flow`, mined negatives `k_type·(1−k_flow)`, fixed τ, rank-not-regress; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
 - [ ] 6. (optional) Encoder A/B: biGRU vs TCN for "where am I in the trajectory," with Δ channels.
 - [ ] 7. Consolidate: CLAUDE.md (architecture + loss table + ysfc-as-selector reframing), diagnostics, config plumbing.
