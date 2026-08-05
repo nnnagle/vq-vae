@@ -425,6 +425,37 @@ disturbance kick lands (severity); the **drift** orders the return; **`k_flow`
 scaling** is now *secondary* (a mistake is recoverable, not catastrophic). It must be
 paired with the outward forces (kicks + contrastive) or it collapses everything to `0`.
 
+**Directed refinement 2 — direction-consistency (the ray-straightness term).** The
+within-pixel "same-pixel ⇒ same ray" statement is *two* soft terms: the OU-drift above
+(radius does not increase) **and** a **direction-consistency** term — consecutive
+`z_phase` share a direction:
+```
+L_dir = ( Σ w_dir[n,t] · (1 − cos(z_phase[n,t], z_phase[n,t−1])) ) / ( Σ w_dir[n,t] )
+w_dir[n,t] = w_dist[n,t] · w_rad[n,t]
+  w_dist = exp(−(‖Δa‖/τ)²)                  # ≈0 AT the disturbance (new tube), ≈1 stable
+  w_rad  ≈ gated min(‖z_t‖, ‖z_{t+1}‖)       # ≈0 AT maturity (direction undefined at origin), ≈1 out on a ray
+```
+So it **bites only on the recovery limb** — *following* a disturbance, *not at* the
+disturbance (direction may swing to the new tube), *not at* maturity (direction is
+meaningless in the basin, and it turns off smoothly as a pixel recovers to the origin).
+Together the two terms are the full OU contraction `E[z_{t+1}] ≈ ρ·z_t` decomposed
+(shorter + same direction) → each pixel's post-disturbance trajectory becomes a
+**straight contracting ray**. This is the strong, reliable signal (same physical pixel),
+and it does double duty: **ray-identity propagation** (below) *and* the linearization we
+wanted. Gating note: `cos` (a *direction* constraint) needs **both** gates (undefined at
+the origin); the OU radius drift (a *magnitude* constraint) needs only the disturbance
+gate. Keep both **soft** and pair with the outward forces.
+
+**Cross-pixel ray identity is a two-link chain (why the descriptor stays deferred).**
+Same-tube pixels at *different* progress (fresh-harvest vs. 10-yr-harvest) align via:
+(1) a cross-pixel `(a,Δa)` match at the **young end**, where all disturbed pixels
+overlap in progress → same direction there; (2) within-pixel straightness on each →
+extends that alignment along the whole ray. So the fragile dense chain becomes a robust
+two-link one, and the deferred **trajectory-descriptor head is not needed** unless
+ray-overlap proves too thin. (Attraction is also largely *automatic*: `z_phase = f(a,Δa)`
+is a shared smooth function, so similar `(a,Δa)` → similar `z_phase` for free — the
+cross-pixel loss is *light registration*, its real job being repulsion + scale.)
+
 **Worked example (fresh-burn C / slow-recovery B / mature A, same type).** With
 `A=(a≈0,Δa≈0)`, `C=(a large,Δa≈0)`, `B=(a moderate,Δa<0)`, we want `d(A,C)` largest (B
 between A and C). Note `Δa≈0` at *both* A and C, so a `Δa`-dominant metric would
@@ -606,13 +637,27 @@ from *observables*:** the type embedding and the **observable flow-state**
 encoder's job is to reproduce that observable closeness as a clean, absolute, radial
 Euclidean metric.
 
-**Tubes are built by chaining, not by a single term.** `k_flow` rewards *same
-location on the same flowline* (same `a`, same `Δa`); "same tube, different progress"
-is **not** a direct positive (different `a`). It emerges transitively: cross-pixel
-local positives (`B@p1 ≈ A@p1`) + Step-4 within-pixel continuity (`A@p1 ≈ A@p2`) ⇒
-`B@p1 ≈ A@p2`. This is why **Steps 4 and 5 are inseparable** — contrastive supplies
-the cross-pixel rungs, continuity the vertical rails; only together do they forge the
-tube along which "same-tube > different-tube" holds.
+**Scope: post-disturbance pixel-times, cross-batch, oversampled.** Filter this loss to
+**disturbed** pixel-times (extreme `‖Δa‖` onset + the recovery limb) — the mature
+majority sits at the origin and carries no ray signal, so **oversample the disturbed
+minority** (complement of the mature selector) and normalize by population; optionally a
+small FIFO of recent disturbed states.
+
+**Rank the neighborhood — do *not* regress exact distances.** `k_flow` defines *near/far
+in `(a,Δa)`*; the loss makes near→near, far→far in z_phase at fixed τ. **Do not** instead
+force `d_zphase ≈ d_(a,Δa)` (exact distance regression): that makes z_phase an *isometric
+copy* of `(a,Δa)`, importing its noise **and its curvature** — which would **fight the
+Step-4 straightness term** (curved `(a,Δa)` tubes vs. straight z_phase rays) and undo the
+denoising. Rank/InfoNCE (or a margin-triplet) preserves the neighborhood while leaving
+z_phase free to straighten and denoise.
+
+**Cross-pixel is *light registration*; the ray shape comes from Step 4.** `k_flow`
+rewards *same location on the same flowline*; "same tube, different progress" is not a
+direct positive. Ray identity is delivered by the **Step-4 two-link chain** (young-end
+`(a,Δa)` match + within-pixel straightness), and attraction is largely *automatic*
+(`z_phase = f(a,Δa)` is a shared smooth map). So this loss's real jobs are **repulsion**
+(same-type/different-phase apart) and **scale** (fixed τ) — Steps 4 and 5 remain
+inseparable, but Step 5 is the *registration + ruler*, not the tube-builder.
 
 **Form — soft-supervised InfoNCE, Euclidean, fixed temperature.** One kernel drives
 everything:
@@ -745,17 +790,20 @@ being overlaid, needs more history/dimension.
 2. Anomaly input transform `(x−μ)/σ` (+ Δ / Δ² channels).
 3. Slow-feature / temporal-smoothness loss (continuity within no-disturbance runs;
    jumps allowed at disturbance) — the term that builds the attractor geometry.
-4. Type∧phase contrastive loss (similar-type-similar-state positives; same-type/
-   other-state and same-state/other-type negatives); "state" bootstrapped from the
-   anomaly trajectory, not CCDC.
+4. Type-local **ranking** InfoNCE on **post-disturbance** pixel-times: positives
+   `k_type·k_flow`, negatives `k_type·(1−k_flow)` (same-type/different-phase, mined);
+   Euclidean, fixed τ; oversample the disturbed minority; **rank the neighborhood, do
+   not regress exact distances** (would fight straightness). Light registration + ruler.
 5. Eval harness for Step 0 (A–E), split-disciplined, baselined to exp034.
 6. Magnitude-preserving, FiLM-free encoder pass: **remove FiLM** (`z_phase = f(a,Δa)`;
    `γ` a testable fallback), remove the old L2-norm, drop/replace per-sample GroupNorm,
    optional `‖a‖` norm-bypass skip; keep TCN bidirectional + RF ≥ window.
 7. Anchor loss `λ·‖z_phase‖²` on mature timesteps → single shared origin; `[z_type,
    z_phase]` as the retrieval key.
-8. OU-drift: soft, gated, one-sided radius-non-increase term (Step-4 directed
-   refinement) — primary recovery-ordering guard.
+8. Within-pixel ray terms (Step-4 directed refinements), both soft + gated: **OU-drift**
+   (`softplus(‖z_{t+1}‖−‖z_t‖)`, disturbance-gated) for radius ordering, and
+   **direction-consistency** (`1−cos(z_t,z_{t+1})`, gated by `w_dist·w_rad` — recovery
+   limb only) for ray-straightness. Together = the "same-pixel ⇒ same ray" package.
 
 **Retire / demote**
 - `soft_neighborhood_phase` KL rank-matching (scale-equivariant — the collapse culprit).
@@ -773,8 +821,8 @@ being overlaid, needs more history/dimension.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 3b. FiLM-free, magnitude-preserving encoder (see "Encoder architecture"): **remove FiLM** (`z_phase = f(a,Δa)`), add the **anchor loss** `λ·‖z_phase‖²` on mature → single shared origin, remove old L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`) and mature→origin. Alongside Step 3.
-- [ ] 4. Slow-feature/smoothness loss **+ soft gated OU-drift** (radius-non-increase); confirm drift-to-basin, ordered recovery ray, jump-at-disturbance.
-- [ ] 5. Type∧phase contrastive loss on `[z_type, z_phase]`; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
+- [ ] 4. Within-pixel ray terms: smoothness + **OU-drift** (radius-non-increase) + **direction-consistency** (`1−cos`, gated `w_dist·w_rad`, recovery-limb only); confirm drift-to-basin, straight ordered recovery rays, jump-at-disturbance.
+- [ ] 5. Type-local **ranking** InfoNCE on **post-disturbance** pixel-times (oversampled): positives `k_type·k_flow`, mined negatives `k_type·(1−k_flow)`, fixed τ, rank-not-regress; retire soft_neighborhood + recovery-disc + phase VICReg; reconcile σ_ij onto the z_type metric; re-run eval.
 - [ ] 6. (optional) Encoder A/B: biGRU vs TCN for "where am I in the trajectory," with Δ channels.
 - [ ] 7. Consolidate: CLAUDE.md (architecture + loss table + ysfc-as-selector reframing), diagnostics, config plumbing.
 
