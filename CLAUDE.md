@@ -354,7 +354,18 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 
 The Zarr archive lives on Lustre at `/lustre/isaac24/scratch/nnagle/zarr/` (284 GB, 3.9M files). A pre-built tar archive is at `/lustre/isaac24/scratch/nnagle/zarr.tar` (269 GB) for fast job-start extraction — use this instead of `cp -r`, which takes 90+ minutes due to Lustre metadata overhead on 3.9M files.
 
-**Tar extraction path quirk:** The tar was built from inside the `zarr/` directory, so it extracts with a double-nested path: `zarr/zarr/va_vae_dataset.zarr/`. After extracting to `/dev/shm/` or `/tmp/`, set `ZARR_ROOT` to `/dev/shm/zarr/zarr` (not `/dev/shm/zarr`).
+**Tar extraction layout.** Build the tar so its members are single-nested under
+`zarr/` — extract to `/dev/shm/` (or `/tmp/`) and you get
+`/dev/shm/zarr/va_vae_dataset.zarr`, so `ZARR_ROOT=/dev/shm/zarr`. Reproduce the
+layout without copying the data via GNU tar's `--transform`:
+`cd /data/VA/zarr_v2 && tar -cf zarr_v2.tar --transform='s,^,zarr/,' va_vae_dataset.zarr`.
+The **v2 dataset** (`zarr_v2.tar`, includes `lcms_chg_class`) and
+`train_isaac_ram_v2.sh` use this corrected layout.
+
+*Legacy note:* the original `zarr.tar` was accidentally built double-nested
+(`zarr/zarr/va_vae_dataset.zarr/`), so the original `train_isaac_ram.sh` /
+`train_isaac_dev*.sh` set `ZARR_ROOT=/dev/shm/zarr/zarr`. Those remain paired with
+that old tar; new work should use the v2 tar + `train_isaac_ram_v2.sh`.
 
 **Sidecar files:** Stats files (`*.json`, `*.csv`) are not inside the tar — they are copied separately from Lustre after extraction.
 
@@ -362,10 +373,11 @@ The Zarr archive lives on Lustre at `/lustre/isaac24/scratch/nnagle/zarr/` (284 
 
 | Script | Partition | Data location | Purpose |
 |--------|-----------|---------------|---------|
-| `train_isaac.sh` | campus-gpu-large | Lustre (slow) | Original production script |
-| `train_isaac_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Production, auto-resumes |
-| `train_isaac_dev.sh` | campus-gpu-bigmem | `/tmp` (NVMe) | Dev, `--overwrite` |
-| `train_isaac_dev_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Dev, `--overwrite` |
+| `train_isaac_ram_v2.sh` | campus-gpu-large | `/dev/shm` (RAM) | **v2 dataset** (with `lcms_chg_class`); corrected single-nest tar |
+| `train_isaac.sh` | campus-gpu-large | Lustre (slow) | Original production script (v1) |
+| `train_isaac_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | v1 production, auto-resumes; legacy double-nest tar |
+| `train_isaac_dev.sh` | campus-gpu-bigmem | `/tmp` (NVMe) | v1 dev, `--overwrite`; legacy double-nest tar |
+| `train_isaac_dev_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | v1 dev, `--overwrite`; legacy double-nest tar |
 
 ### Performance
 
