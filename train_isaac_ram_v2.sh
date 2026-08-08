@@ -42,6 +42,16 @@ echo "Running on node: $(hostname)"
 echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# This partition has mixed/mislabeled GPUs — e.g. clrv1103 has a 32 GB V100S AND
+# a 16 GB V100 despite the gpu:v100s:2 GRES tag. Under --exclusive the whole
+# node's GPUs are visible, so pin training to the largest-memory GPU to avoid
+# binding to the 16 GB card and OOMing. CUDA_DEVICE_ORDER=PCI_BUS_ID makes CUDA's
+# device indices match nvidia-smi's.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.total \
+    --format=csv,noheader,nounits | sort -t',' -k2 -nr | head -1 | tr -d ' ' | cut -d',' -f1)
+echo "Pinned to GPU index $CUDA_VISIBLE_DEVICES (largest memory) via CUDA_VISIBLE_DEVICES"
+
 DATA_DIR=/lustre/isaac24/proj/UTK0496/zarr_v2
 
 # /dev/shm is a tmpfs that is NOT cleared between jobs, so a previous (possibly
