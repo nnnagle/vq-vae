@@ -18,7 +18,8 @@
 # /dev/shm/zarr/va_vae_dataset.zarr and ZARR_ROOT=/dev/shm/zarr (no double nest).
 # Build the tar with (see CLAUDE.md → Tar extraction layout):
 #   cd /data/VA/zarr_v2 && tar -cf zarr_v2.tar --transform='s,^,zarr/,' va_vae_dataset.zarr
-# then stage zarr_v2.tar + the v2 stats sidecars on Lustre at the paths below.
+# Data (tar + stats sidecar) is staged on Lustre at:
+#   /lustre/isaac24/proj/UTK0496/zarr_v2/{zarr_v2.tar, va_vae_dataset_stats.json}
 
 module purge
 source /sw/isaac/applications/anaconda3/2024.06/rhel8_cascadelake_binary/anaconda3-2024.06/etc/profile.d/conda.sh
@@ -34,10 +35,11 @@ echo "Running on node: $(hostname)"
 echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+DATA_DIR=/lustre/isaac24/proj/UTK0496/zarr_v2
+
 echo "Extracting v2 Zarr tar to RAM ($(date))..."
-tar xf /lustre/isaac24/scratch/nnagle/zarr_v2.tar -C /dev/shm/
-cp /lustre/isaac24/scratch/nnagle/zarr_v2/*.json /dev/shm/zarr/
-cp /lustre/isaac24/scratch/nnagle/zarr_v2/*.csv /dev/shm/zarr/
+tar xf "$DATA_DIR/zarr_v2.tar" -C /dev/shm/
+cp "$DATA_DIR/va_vae_dataset_stats.json" /dev/shm/zarr/
 echo "Zarr extract complete ($(date))"
 export ZARR_ROOT=/dev/shm/zarr
 
