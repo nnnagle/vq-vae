@@ -4,9 +4,15 @@
 #SBATCH --account=acf-utk0011
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
-#SBATCH --exclude=clrv1101
+# Exclude the smaller-RAM nodes: the ~284 GB zarr is extracted into /dev/shm,
+# which is RAM-backed and capped near 50% of node RAM regardless of --mem. Only
+# the 770 GB campus-gpu-large nodes have a big-enough /dev/shm. clrv1101 (small
+# GPU) and clrv1205 (V100S-32GB, ~512 GB RAM → ~256 GB /dev/shm) are too small.
+#SBATCH --exclude=clrv1101,clrv1205
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=500G
+# --mem>=600G only schedules on the 770 GB nodes (their /dev/shm ~385 GB fits the
+# 284 GB extract); 512 GB nodes are excluded by this alone.
+#SBATCH --mem=600G
 #SBATCH --time=24:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
 #SBATCH --mail-type=END,FAIL
@@ -36,6 +42,17 @@ echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 DATA_DIR=/lustre/isaac24/proj/UTK0496/zarr_v2
+
+# Fail fast if this node's /dev/shm is too small for the ~284 GB extract, rather
+# than dying partway through. Needs ~300 GB free.
+SHM_AVAIL=$(df -B1 --output=avail /dev/shm | tail -1)
+NEED=$((300 * 1024 * 1024 * 1024))
+if [ "${SHM_AVAIL:-0}" -lt "$NEED" ]; then
+    echo "ERROR: /dev/shm on $(hostname) has $(df -h /dev/shm | awk 'NR==2{print $4}')" \
+         "free (< ~300 GB). This node is too small; resubmit (the --mem/--exclude" \
+         "settings should keep it off small nodes)." >&2
+    exit 1
+fi
 
 echo "Extracting v2 Zarr tar to RAM ($(date))..."
 tar xf "$DATA_DIR/zarr_v2.tar" -C /dev/shm/
