@@ -44,15 +44,21 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 DATA_DIR=/lustre/isaac24/proj/UTK0496/zarr_v2
 
-# Fail fast if this node's /dev/shm is too small for the ~284 GB extract, rather
-# than dying partway through. Needs ~300 GB free.
+# /dev/shm is a tmpfs that is NOT cleared between jobs, so a previous (possibly
+# failed) run on this node can leave a stale extract that fills it up. Clean our
+# extract dir before starting, and remove it on exit so we don't strand ~284 GB
+# in tmpfs for the next job. Safe because --exclusive gives us the whole node.
+rm -rf /dev/shm/zarr
+trap 'rm -rf /dev/shm/zarr' EXIT
+
+# Fail fast if /dev/shm still can't hold the ~284 GB extract after cleanup.
 SHM_AVAIL=$(df -B1 --output=avail /dev/shm | tail -1)
 NEED=$((300 * 1024 * 1024 * 1024))
 if [ "${SHM_AVAIL:-0}" -lt "$NEED" ]; then
     echo "ERROR: /dev/shm on $(hostname) has $(df -h /dev/shm | awk 'NR==2{print $4}')" \
-         "free (< ~300 GB). With --exclusive this node should have had the full" \
-         "~385 GB; check for a stale /dev/shm/zarr from a prior run, or a smaller" \
-         "shm mount than expected (df -h /dev/shm)." >&2
+         "free (< ~300 GB) even after cleanup. Likely a smaller shm mount than the" \
+         "50%-of-RAM default, or leftover files owned by another user" \
+         "(df -h /dev/shm; ls -la /dev/shm)." >&2
     exit 1
 fi
 
