@@ -26,9 +26,8 @@
 #   # smoke test (fast, cheapest diagnostic, no MLP):
 #   sbatch eval_isaac_v2.sh runs/frl_v0_exp034/encoder_last.pt \
 #          --which C --max-batches 2 --max-pixels-per-sample 500 --no-mlp
-#   # full A/B/C baseline:
-#   sbatch eval_isaac_v2.sh runs/frl_v0_exp034/encoder_last.pt \
-#          --evt-map /path/to/LF2024_EVT.csv
+#   # full A/B/C baseline (EVT crosswalk is baked in as a default below):
+#   sbatch eval_isaac_v2.sh runs/frl_v0_exp034/encoder_last.pt
 # Compare two runs afterward with training.phase_eval.compare_eval.
 
 # set -eu (not pipefail): several lines below use `... | head -1`, which SIGPIPEs
@@ -86,10 +85,16 @@ export ZARR_ROOT=/dev/shm/zarr
 
 NUM_WORKERS=$(( SLURM_CPUS_PER_TASK - 2 ))
 
+# EVT crosswalk for diagnostic B's recovery-curve labels. Baked in as a default;
+# override by passing your own --evt-map after the checkpoint (argparse takes the
+# last one).
+EVT_MAP=/lustre/isaac24/scratch/nnagle/vq-vae/data/LF2024_EVT.csv
+
 cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
 echo "Evaluating checkpoint: $CKPT"
 python -m training.phase_eval.run_eval \
     --checkpoint "$CKPT" \
     --training config/frl_training_v1.yaml \
+    --evt-map "$EVT_MAP" \
     --num-workers "${NUM_WORKERS}" \
     "$@"
