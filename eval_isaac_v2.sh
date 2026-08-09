@@ -36,8 +36,12 @@ set -eu
 
 CKPT="${1:?usage: sbatch eval_isaac_v2.sh <checkpoint.pt> [extra run_eval args...]}"
 shift || true
+# Resolve to an absolute path NOW, while cwd is still the sbatch submit dir. We cd
+# into the repo before invoking python, so a relative checkpoint path would
+# otherwise be resolved against the wrong directory.
+CKPT="$(realpath -m "$CKPT")"
 if [ ! -e "$CKPT" ]; then
-    echo "ERROR: checkpoint not found: $CKPT" >&2
+    echo "ERROR: checkpoint not found: $CKPT (resolved from submit dir $(pwd))" >&2
     exit 1
 fi
 
