@@ -76,10 +76,32 @@ def _extract_for_curves(batch, ctx, halo, max_pixels, nbr_idx, rng):
     return data, nbr
 
 
+DESIGN_CHOICES = ("phase-only", "type-phase")
+
+
+def _curve_features(data: dict, design: str) -> torch.Tensor:
+    """Per-pixel probe features ``[N, T, F]`` for the chosen design.
+
+    ``phase-only``  → z_phase (the spec default; isolates what z_phase carries).
+    ``type-phase``  → [z_type (broadcast over T), z_phase]. z_type acts as a
+    smooth, type-varying **baseline (intercept surface)** — a legitimate model
+    output, unlike a per-EVT intercept (EVT is diagnostic-only). Tests whether a
+    z_type-dependent baseline removes the per-type offset in the recovery curves.
+    """
+    zp = data["z_phase"]                                   # [N, T, zp]
+    if design == "phase-only":
+        return zp
+    if design == "type-phase":
+        T = zp.shape[1]
+        zt = data["z_type"].unsqueeze(1).expand(-1, T, -1)  # [N, T, dt]
+        return torch.cat([zt, zp], dim=-1)                  # [N, T, dt+zp]
+    raise ValueError(f"unknown recovery design: {design!r} (choices: {DESIGN_CHOICES})")
+
+
 def _fit_phase_nbr_ridge(
-    train_loader, val_loader, ctx, halo, max_pixels, max_batches, nbr_idx,
+    train_loader, val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, design,
 ):
-    """Fit a standardized phase-only ridge z_phase→NBR; select λ on val R²."""
+    """Fit a standardized ridge features→NBR (see ``design``); select λ on val R²."""
     rng = np.random.default_rng(0)
     std: Optional[_Standardizer] = None
     for batch in iter_batches(train_loader, max_batches):
@@ -88,7 +110,7 @@ def _fit_phase_nbr_ridge(
             continue
         data, _ = got
         valid = data["valid_tp"]
-        fv = data["z_phase"][valid]
+        fv = _curve_features(data, design)[valid]
         if std is None:
             std = _Standardizer(fv.shape[1])
         std.update(fv)
@@ -105,7 +127,7 @@ def _fit_phase_nbr_ridge(
             continue
         data, nbr = got
         valid = data["valid_tp"]
-        X = std.apply(data["z_phase"])[valid].double()
+        X = std.apply(_curve_features(data, design))[valid].double()
         Y = nbr[valid].double().unsqueeze(1)
         ones = torch.ones(X.shape[0], 1, dtype=torch.float64)
         Xa = torch.cat([X, ones], dim=1)
@@ -122,7 +144,7 @@ def _fit_phase_nbr_ridge(
     best = (-1e9, None, None, None)
     for lam in RIDGE_LAMBDA_GRID:
         W, b = _solve_ridge(A, B, D, lam)
-        r2 = _val_r2(val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, std, W, b)
+        r2 = _val_r2(val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, std, W, b, design)
         logger.info(f"  [B] λ={lam:g}: val NBR R²={r2:.4f}")
         if r2 > best[0]:
             best = (r2, lam, W, b)
@@ -130,7 +152,7 @@ def _fit_phase_nbr_ridge(
     return std, W, b, lam
 
 
-def _val_r2(val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, std, W, b) -> float:
+def _val_r2(val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, std, W, b, design) -> float:
     rng = np.random.default_rng(1)
     sse = ssum = ssum2 = 0.0
     n = 0
@@ -140,7 +162,7 @@ def _val_r2(val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, std, W, b) 
             continue
         data, nbr = got
         valid = data["valid_tp"]
-        X = std.apply(data["z_phase"])[valid]
+        X = std.apply(_curve_features(data, design))[valid]
         y = nbr[valid].double()
         pred = (X @ W + b).squeeze(1).double()
         sse += float(((pred - y) ** 2).sum())
@@ -202,7 +224,50 @@ def run_recovery_curves(
     output_dir: Path | None = None,
     seed: int = 42,
 ) -> dict:
-    """Fit a phase-only z_phase→NBR probe and produce type-conditional curves."""
+    """Run Diagnostic B under BOTH designs and return metrics keyed by design.
+
+    * ``phase-only`` — z_phase alone (the spec default; isolates z_phase).
+    * ``type-phase`` — [z_type, z_phase]; z_type is a smooth type-varying baseline
+      (intercept surface), the legitimate model-output analog of a per-type
+      intercept (EVT is diagnostic-only, so it is never a probe input).
+
+    Per-design plots/CSVs are written with a ``__<design>`` suffix.
+    """
+    results: Dict[str, dict] = {}
+    for design in DESIGN_CHOICES:
+        results[design] = _run_recovery_design(
+            ctx, train_loader, val_loader, test_loader,
+            evt_code_to_label=evt_code_to_label, top_k_evt=top_k_evt, halo=halo,
+            max_pixels_per_sample=max_pixels_per_sample, max_batches=max_batches,
+            max_ysfc=max_ysfc, max_samples_per_evt=max_samples_per_evt,
+            min_bin_samples=min_bin_samples, output_dir=output_dir, seed=seed,
+            design=design,
+        )
+    logger.info(
+        "[B] shape-agreement mean: "
+        + " | ".join(f"{d}={results[d]['shape_agreement']['mean']:.4f}" for d in DESIGN_CHOICES)
+    )
+    return results
+
+
+def _run_recovery_design(
+    ctx: dict,
+    train_loader,
+    val_loader,
+    test_loader,
+    evt_code_to_label: Dict[int, str] | None = None,
+    top_k_evt: int = 20,
+    halo: int = 16,
+    max_pixels_per_sample: int = 2000,
+    max_batches: int = 0,
+    max_ysfc: float = 30.0,
+    max_samples_per_evt: int = 10_000,
+    min_bin_samples: int = 20,
+    output_dir: Path | None = None,
+    seed: int = 42,
+    design: str = "phase-only",
+) -> dict:
+    """Fit one features→NBR probe (see ``design``) and produce its curves."""
     from training.phase_recovery_curves import (
         EvtReservoir, plot_recovery_curves, save_csv,
     )
@@ -211,9 +276,10 @@ def run_recovery_curves(
     fb = ctx["feature_builder"]
     nbr_idx = _nbr_index(fb)
 
-    logger.info("[B] fitting phase-only z_phase→NBR probe")
+    logger.info(f"[B] fitting {design} →NBR probe")
     std, W, b, lam = _fit_phase_nbr_ridge(
-        train_loader, val_loader, ctx, halo, max_pixels_per_sample, max_batches, nbr_idx,
+        train_loader, val_loader, ctx, halo, max_pixels_per_sample, max_batches,
+        nbr_idx, design,
     )
 
     logger.info("[B] streaming test set into per-EVT reservoir")
@@ -228,7 +294,7 @@ def run_recovery_curves(
         ysfc = data["ysfc"]
         evt = data["evt"]                                # [N]
         N, T = ysfc.shape
-        Xs = std.apply(data["z_phase"]).reshape(N * T, -1)
+        Xs = std.apply(_curve_features(data, design)).reshape(N * T, -1)
         pred = (Xs @ W + b).squeeze(1).reshape(N, T)
         # Keep valid (pixel, timestep) with ysfc in [0, max_ysfc].
         in_range = valid & (ysfc >= 0) & (ysfc <= max_ysfc)
@@ -257,13 +323,15 @@ def run_recovery_curves(
     if output_dir is not None:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        save_csv(reservoir, top_codes, evt_code_to_label, out / "recovery_nbr_by_ysfc_by_evt.csv")
+        save_csv(reservoir, top_codes, evt_code_to_label,
+                 out / f"recovery_nbr_by_ysfc_by_evt__{design}.csv")
         plot_recovery_curves(
             reservoir, top_codes, evt_code_to_label,
-            out / "recovery_curves.png", min_bin_samples=min_bin_samples,
+            out / f"recovery_curves__{design}.png", min_bin_samples=min_bin_samples,
         )
 
     return {
+        "design": design,
         "ridge_lambda": lam,
         "n_observations": reservoir.n_total(),
         "top_evt_codes": top_codes,
