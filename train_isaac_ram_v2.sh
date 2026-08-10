@@ -4,14 +4,17 @@
 #SBATCH --account=acf-utk0011
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
-#SBATCH --exclude=clrv1101
-# /dev/shm is a single node-wide tmpfs shared by every job on the node, and these
-# nodes host 2 GPUs → up to 2 jobs. The ~284 GB zarr extract needs ~284 GB of
-# /dev/shm; a co-tenant's shm usage can leave too little ("No space left on
-# device"). --exclusive reserves the whole node so the full ~385 GB /dev/shm
-# (~50% of 770 GB RAM) is ours alone. All campus-gpu-large nodes are 770 GB, so
-# node size is not the issue and no --mem bump / node exclude is needed.
-#SBATCH --exclusive
+# Node choice is constrained, NOT via --exclusive. --exclusive reserves the whole
+# 2-GPU node, leaving the second GPU idle → the scheduler cancels the job for
+# holding an unused GPU. But plain --gpus=1 on a mixed node can hand us the 16 GB
+# V100 (GRES mislabels it as v100s, so we can't select by type, and the
+# largest-GPU pin only sees the one GPU we were given) → OOM. Fix: restrict to the
+# two UNIFORM 32 GB nodes (clrv1107, clrv1205), where any single GPU is 32 GB and
+# the other 32 GB GPU stays free for a co-tenant (no idle-resource penalty).
+# Excluded: clrv1101 (16 GB) and the mixed 32/16 GB nodes clrv1103/1105/1201.
+# /dev/shm is node-wide, so a co-tenant could still contend for it; the pre-clean
+# + space guard below handle stale extracts and fail fast if too little is free.
+#SBATCH --exclude=clrv1101,clrv1103,clrv1105,clrv1201
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=500G
 #SBATCH --time=24:00:00

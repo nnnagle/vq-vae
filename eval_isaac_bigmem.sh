@@ -24,8 +24,10 @@
 #   sinfo -p campus-bigmem -N -o "%N %c %m"
 # Adjust --partition/--qos/--mem below to match.
 #
-# Self-contained (extract + eval in ONE job — /dev/shm is node-local). If you hit
-# /dev/shm space contention from a co-tenant, add `#SBATCH --exclusive`.
+# Self-contained (extract + eval in ONE job — /dev/shm is node-local). Avoid
+# --exclusive: reserving a whole node but leaving cores/GPUs idle gets the job
+# cancelled for holding unused resources. If a co-tenant contends for /dev/shm,
+# the pre-clean + guard below fail fast; just resubmit (or raise --mem/--cpus).
 #
 # Usage:
 #   sbatch eval_isaac_bigmem.sh /path/to/checkpoint.pt [extra run_eval args...]
@@ -70,7 +72,7 @@ SHM_AVAIL=$(df -B1 --output=avail /dev/shm | tail -1)
 NEED=$((300 * 1024 * 1024 * 1024))
 if [ "${SHM_AVAIL:-0}" -lt "$NEED" ]; then
     echo "ERROR: /dev/shm on $(hostname) has $(df -h /dev/shm | awk 'NR==2{print $4}')" \
-         "free (< ~300 GB). Add '#SBATCH --exclusive' or free the node (df -h /dev/shm)." >&2
+         "free (< ~300 GB). A co-tenant is using it; resubmit (df -h /dev/shm)." >&2
     exit 1
 fi
 

@@ -391,9 +391,12 @@ Supporting changes: `OPENBLAS/MKL/NUMEXPR/OMP_NUM_THREADS=1` in the launch scrip
 ### SLURM Notes
 
 - **Authorized QOS:** `campus`, `campus-bigmem`, `campus-gpu`, `long`, `long-bigmem`, `long-gpu`
-- **Exclude `clrv1101`** — smaller GPU, included in scripts via `--exclude=clrv1101`
+- **campus-gpu-large is GPU-heterogeneous and the GRES tag lies** (all report `gpu:v100s:2`). Actual (from `gpuprobe`): **uniform 32 GB** = `clrv1107`, `clrv1205`; **mixed 32 GB + 16 GB V100** = `clrv1103`, `clrv1105`, `clrv1201`; **`clrv1101`** = 16 GB / degraded. On a mixed node `--gpus=1` can hand you the 16 GB card (→ OOM), and you can't select by type because the 16 GB V100 is mislabeled `v100s`.
+- **Do NOT use `--exclusive`** on these 2-GPU nodes — it idles the second GPU and the scheduler cancels the job for holding an unused GPU. Likewise avoid reserving cores/GPUs you don't use.
+- **GPU launch recipe (`train_isaac_ram_v2.sh`, `eval_isaac_v2.sh`):** `--gpus=1` + `--exclude=clrv1101,clrv1103,clrv1105,clrv1201` (restrict to the uniform-32 GB nodes so any single GPU is 32 GB) + the runtime largest-memory GPU pin (`CUDA_VISIBLE_DEVICES`, defense). `/dev/shm` is node-wide, so the scripts pre-clean `/dev/shm/zarr` and fail-fast if < ~300 GB free (a co-tenant contending) — just resubmit.
 - **campus-gpu-bigmem** (`ilpa1209`, A40 + NVMe `/tmp`) — frequently in maintenance; use campus-gpu-large as fallback
-- **campus-gpu-large** nodes have 770 GB RAM — enough to hold the zarr in `/dev/shm` with `--mem=500G`
+- **campus-gpu-large** nodes have 770 GB RAM — enough to hold the zarr in `/dev/shm` with `--mem=500G` (no `--exclusive` needed)
+- **CPU eval** (`eval_isaac_bigmem.sh`) runs on `campus-bigmem` with `--device cpu` — sidesteps the campus-gpu GPU-utilization watchdog, which cancels the GPU-light Step-0 eval "for not using GPU".
 - **ai-tenn** partition (H100s) requires a separate allocation not currently held
 
 ---
