@@ -447,17 +447,17 @@ class FeatureBuilder:
             # Get channel stats
             channel_stats = self._get_channel_stats(feature_name, channel_ref)
 
-            # Apply normalization based on type
-            if data.ndim == 3:
-                # Static: [C, H, W]
-                normalized_data[c_idx] = self._normalize_array(
-                    data[c_idx], norm_preset, channel_stats
-                )
-            else:
-                # Temporal: [C, T, H, W]
-                normalized_data[c_idx] = self._normalize_array(
-                    data[c_idx], norm_preset, channel_stats
-                )
+            # Normalize the (possibly transformed) channel. Use normalized_data,
+            # NOT data: when a pre-normalization transform (e.g. log) was applied
+            # above it lives in normalized_data[c_idx]; passing raw data[c_idx]
+            # here discards the transform and z-scores raw values against
+            # transform-scale stats, collapsing log/sqrt channels onto the clamp
+            # bound (the dead spectral_velocity bug). For untransformed channels
+            # normalized_data[c_idx] == data[c_idx], so this is a no-op change.
+            # (Static [C,H,W] and temporal [C,T,H,W] took identical branches.)
+            normalized_data[c_idx] = self._normalize_array(
+                normalized_data[c_idx], norm_preset, channel_stats
+            )
 
         return normalized_data
 
