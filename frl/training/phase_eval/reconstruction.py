@@ -63,6 +63,25 @@ def _target_series(data: dict, provider: AnomalyTargetProvider) -> torch.Tensor:
     return tgt.permute(0, 2, 1).contiguous()
 
 
+def _target_channel_names(ctx: dict, kind: str, C: int) -> List[str]:
+    """Human-readable target channel names (falls back to x0..xN-1).
+
+    For the ``raw`` target these are the phase-input feature's channels
+    (e.g. temporal_position, red, nir, ...); the anomaly target keeps the same
+    per-channel layout.
+    """
+    try:
+        from training.phase_eval.common import PHASE_INPUT_FEATURE
+        names = list(ctx["feature_builder"].config.get_feature(PHASE_INPUT_FEATURE).channels.keys())
+        # strip the "annual." group prefix for readability
+        names = [n.split(".", 1)[-1] for n in names]
+        if len(names) == C:
+            return names
+    except Exception:
+        pass
+    return [f"x{c}" for c in range(C)]
+
+
 # ---------------------------------------------------------------------------
 # Standardizer
 # ---------------------------------------------------------------------------
@@ -369,7 +388,7 @@ def run_reconstruction(
                 train_loader, ctx, source, provider, halo,
                 max_pixels_per_sample, max_batches,
             )
-            channels = [f"x{c}" for c in range(C)]
+            channels = _target_channel_names(ctx, kind, C)
 
             # Select ridge λ on val by within-pixel R² (the phase signal).
             best_lam, best_val, best_W, best_b = None, -1e9, None, None
