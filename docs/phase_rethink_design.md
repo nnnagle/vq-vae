@@ -626,9 +626,13 @@ being overlaid, needs more history/dimension.
 
 ## Checklist (ordered — de-risking first)
 
-- [~] 0. Eval harness, fit on train / report test, baselined to exp034.
-      **A/B/C done** (`frl/training/phase_eval/`); **D** deferred (needs LCMS in
-      the zarr); **E** deferred (reuses `embed_locations.py` + `frl/analysis/*.Rmd`).
+- [x] 0. Eval harness, fit on train / report test, baselined to exp034.
+      **A/B/C built** (`frl/training/phase_eval/`) and run on exp035 — findings +
+      next steps in `phase_eval_step0_findings.md`. **D** deferred (LCMS now in
+      `zarr_v2`; scaffolded in `lcms_agents.py`, needs validation in the cube);
+      **E** deferred (reuses `embed_locations.py` + `frl/analysis/*.Rmd`). Note:
+      re-run A/B/C on the exp034 checkpoint with the current (fixed) harness for a
+      clean baseline before Step 1 — see the findings doc's caveats.
 - [ ] 1. μ/σ NLL readout: small RBF / Lipschitz-MLP on standardized detached z_type, fit online by heteroscedastic Gaussian NLL on the current batch's mature timesteps (`ysfc > mature_ysfc_threshold`, param ~10–12 East / ~20–25 West); σ via softplus + floor; smoothness knob set by held-out NLL with `L < 1/σ_ij`; check per-EVT coverage / extrapolation. No reservoir.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp034. Extend the phase-loss warmup as needed for μ/σ settling.

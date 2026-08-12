@@ -249,6 +249,61 @@ python frl/training/fit_linear_probe.py \
     --checkpoint runs/checkpoints/model.pt
 ```
 
+### Step-0 Phase-Pathway Eval Harness (`frl/training/phase_eval/`)
+
+The falsifiable eval for the phase-pathway rethink (`docs/phase_rethink_design.md`
+Step 0). Runs diagnostics **A–C**, **fit on train / λ-tuned on val / reported on
+test**, and writes one `metrics.json` per checkpoint; `compare_eval.py` diffs a new
+run against the exp034/exp035 baseline. See
+`docs/phase_eval_step0_findings.md` for the exp035 results and what Steps 1–5
+should target.
+
+```bash
+# one checkpoint (diagnostics A,B,C)
+PYTHONPATH=frl python -m training.phase_eval.run_eval \
+    --checkpoint runs/frl_v0_exp035/checkpoints/encoder_best_1_epoch_380.pt \
+    --training config/frl_training_v1.yaml --evt-map ../data/LF2024_EVT.csv \
+    --output-dir runs/frl_v0_exp035/phase_eval/
+# new vs baseline
+PYTHONPATH=frl python -m training.phase_eval.compare_eval \
+    --new runs/frl_v0_exp035/phase_eval/metrics.json \
+    --baseline runs/frl_v0_exp034/phase_eval/metrics.json
+```
+
+- **A — reconstruction** (`reconstruction.py`): ridge + MLP-ceiling probes
+  `features → raw phase-input x`, for three feature sources: post-FiLM `z_phase`,
+  **pre-FiLM `h`** (the TCN bottleneck, the FiLM-free contrast), and `z_type`
+  (atemporal control). Reports **total** and **within-pixel** R² (the within-pixel
+  R² is *the phase signal*), as a **variance-weighted aggregate** (pool residual/
+  total SS across channels before the ratio — so low-within-variance channels
+  can't dominate an unweighted mean) plus per-channel R²/variance/MSE. `z_type`
+  within-R² is **0 by construction** (atemporal → broadcast over T → zero
+  within-pixel prediction variance): that is the control, not a bug. The
+  `__summary__` block reports the **h → z_phase within-R² gap** = how much
+  temporal signal FiLM loses. `temporal_position` (the calendar-index target) is
+  excluded via `EXCLUDE_TARGET_CHANNELS` — it is trivially predictable and was
+  inflating the aggregate.
+- **B — recovery curves** (`recovery_curves.py`): `z_phase → NBR` probe, per-EVT
+  actual-vs-predicted recovery curves and a **shape-agreement** metric. Runs two
+  designs: **phase-only** and **type-phase** (`[z_type, z_phase]`) — the latter
+  supplies the type-specific baseline z_phase alone lacks (no per-EVT intercept;
+  EVT is diagnostic only).
+- **C — ejection** (`ejection.py`): jump magnitude `‖z_phase[t] − z_phase[t−1]‖`
+  at disturbance years (`ysfc==0`) vs stable, and the ROC-AUC of disturbance-from-
+  jump.
+
+**Ridge normal equations are averaged by the observation count M** (`A/M`, `B/M`)
+before adding `λI`, so the λ grid is on a dataset-size-independent scale — with
+standardized features `A/M` has a unit diagonal. Without the `1/M`, `A`'s diagonal
+is ~M (10⁷–10⁸) and every `λ≤1` is a ~10⁻⁷ perturbation: the sweep goes flat and
+the fit is silently unregularized. A `_warn_lambda_edge` guard logs a warning when
+the selected λ lands on the grid boundary (optimum outside the grid), skipping
+degenerate flat sweeps (e.g. z_type). **Both A and B fit their own ridge — this
+averaging must hold in both.**
+
+ISAAC launchers: `eval_isaac_v2.sh` (GPU) / `eval_isaac_bigmem.sh` (CPU bigmem,
+sidesteps the GPU-idle watchdog on the light Step-0 eval).
+
 ### Important: Encoder Feature Name
 
 All inference and evaluation scripts must read the encoder feature name from the
@@ -313,6 +368,14 @@ frl/training/visualize_test_patches.py        Visualize model output on test pat
 frl/training/visualize_forest_diagnostics.py  Forest-wide embedding diagnostics
 frl/training/phase_evt_diagnostics.py         EVT-stratified FiLM gamma + z_phase temporal variance
 frl/training/phase_recovery_curves.py         Per-EVT NBR recovery curves vs. ysfc (requires probe)
+
+frl/training/phase_eval/common.py             Step-0 harness plumbing (loaders, extract_pixel_series, variance_decompose)
+frl/training/phase_eval/reconstruction.py     Diagnostic A — z_phase/h/z_type → x reconstruction (within-pixel R²)
+frl/training/phase_eval/recovery_curves.py    Diagnostic B — z_phase→NBR recovery curves (phase-only + type-phase)
+frl/training/phase_eval/ejection.py           Diagnostic C — disturbance-year jump magnitude + ROC-AUC
+frl/training/phase_eval/run_eval.py           Step-0 CLI runner (train-fit / val-tune / test-report → metrics.json)
+frl/training/phase_eval/compare_eval.py       Diff two metrics.json (new vs exp034/exp035 baseline)
+frl/training/phase_eval/lcms_agents.py        LCMS change-agent class codes (Diagnostic D, deferred)
 
 frl/config/frl_repr_model_v1.yaml        Architecture config
 frl/config/frl_binding_v1.yaml           Dataset bindings config
