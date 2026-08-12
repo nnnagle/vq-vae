@@ -235,7 +235,12 @@ def _fit_standardizer_and_normal_eq(
 
     Returns ``(standardizer, A, B, D, C)`` where ``A = [X̃|1]^T[X̃|1]`` and
     ``B = [X̃|1]^T Y`` accumulate the ridge normal equations on standardized
-    features with a bias column.
+    features with a bias column, **averaged over the M observations** (divided by
+    M). Averaging implements the per-sample ridge objective
+    ``(1/M)‖X̃w − y‖² + λ‖w‖²`` so the λ grid is meaningful and independent of
+    dataset size: with standardized features ``A`` then has a unit diagonal, and
+    λ∈[1e-4, 1] spans negligible→strong. Without the 1/M, ``A``'s diagonal is ~M
+    (10⁷–10⁸) and every λ≤1 is a ~10⁻⁷ perturbation — no regularization at all.
     """
     need_h = source == "h"
     rng = np.random.default_rng(0)
@@ -263,6 +268,7 @@ def _fit_standardizer_and_normal_eq(
     rng = np.random.default_rng(0)   # identical pixel subsampling as pass 1
     A = B = None
     D = C = 0
+    M = 0
     for batch in iter_batches(loader, max_batches):
         data = extract_pixel_series(
             batch, ctx, halo, max_pixels_per_sample=max_pixels,
@@ -283,8 +289,13 @@ def _fit_standardizer_and_normal_eq(
             B = torch.zeros(D + 1, C, dtype=torch.float64)
         A += Xa.T @ Xa
         B += Xa.T @ Y
-    if A is None:
+        M += X.shape[0]
+    if A is None or M == 0:
         raise RuntimeError("no valid pixels found while accumulating normal equations")
+    # Average the normal equations so λ is on a dataset-size-independent scale
+    # (see docstring): A/M has a unit diagonal for standardized features.
+    A /= M
+    B /= M
     return std, A, B, D, C
 
 
