@@ -21,7 +21,7 @@ total but low on within-pixel has merely re-encoded type/level.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -89,28 +89,61 @@ def _feature_series(data: dict, source: str) -> torch.Tensor:
     raise ValueError(f"unknown feature source: {source!r}")
 
 
-def _target_series(data: dict, provider: AnomalyTargetProvider) -> torch.Tensor:
-    """Return per-pixel target time series ``[N, T, C]``."""
-    tgt = provider(data["x"], data["z_type"])   # [N, Cx, T]
-    return tgt.permute(0, 2, 1).contiguous()
+# Target channels to drop from the reconstruction. ``temporal_position`` is the
+# calendar/year index — a smooth per-pixel ramp that is trivially predictable and
+# semantically empty for forest dynamics. Post-FiLM z_phase reconstructs it at
+# ~0.92 within-R² and it was inflating the weighted aggregate (~22% of z_phase's
+# score) without reflecting any real temporal signal, so it is excluded from the
+# fit, the evaluation, and the aggregate.
+EXCLUDE_TARGET_CHANNELS = ("temporal_position",)
 
 
-def _target_channel_names(ctx: dict, kind: str, C: int) -> List[str]:
-    """Human-readable target channel names (falls back to x0..xN-1).
-
-    For the ``raw`` target these are the phase-input feature's channels
-    (e.g. temporal_position, red, nir, ...); the anomaly target keeps the same
-    per-channel layout.
-    """
+def _full_target_channel_names(ctx: dict) -> Optional[List[str]]:
+    """Phase-input target channel names from config, or None if unresolvable."""
     try:
         from training.phase_eval.common import PHASE_INPUT_FEATURE
         names = list(ctx["feature_builder"].config.get_feature(PHASE_INPUT_FEATURE).channels.keys())
-        # strip the "annual." group prefix for readability
-        names = [n.split(".", 1)[-1] for n in names]
-        if len(names) == C:
-            return names
+        return [n.split(".", 1)[-1] for n in names]   # strip "annual." group prefix
     except Exception:
-        pass
+        return None
+
+
+def _target_channels_kept(ctx: dict) -> Tuple[Optional[List[str]], Optional[torch.Tensor]]:
+    """Kept target channel names + their column indices after applying the
+    ``EXCLUDE_TARGET_CHANNELS`` filter. Returns ``(None, None)`` when channel names
+    can't be resolved (→ keep all channels; the caller falls back to x0..xN names).
+    """
+    names = _full_target_channel_names(ctx)
+    if names is None:
+        return None, None
+    keep = [i for i, n in enumerate(names) if n not in EXCLUDE_TARGET_CHANNELS]
+    dropped = [n for n in names if n in EXCLUDE_TARGET_CHANNELS]
+    if not dropped:
+        logger.warning(
+            f"[A] EXCLUDE_TARGET_CHANNELS={EXCLUDE_TARGET_CHANNELS} matched none of "
+            f"the target channels {names}; nothing excluded."
+        )
+    else:
+        logger.info(f"[A] excluding target channels {dropped} from reconstruction")
+    return [names[i] for i in keep], torch.tensor(keep, dtype=torch.long)
+
+
+def _target_series(
+    data: dict, provider: AnomalyTargetProvider, keep_idx: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return per-pixel target time series ``[N, T, C]`` (kept channels only)."""
+    tgt = provider(data["x"], data["z_type"])       # [N, Cx, T]
+    tgt = tgt.permute(0, 2, 1).contiguous()          # [N, T, Cx]
+    if keep_idx is not None:
+        tgt = tgt.index_select(2, keep_idx.to(tgt.device))
+    return tgt
+
+
+def _target_channel_names(ctx: dict, kind: str, C: int) -> List[str]:
+    """Human-readable target channel names (falls back to x0..xN-1)."""
+    names = _full_target_channel_names(ctx)
+    if names is not None and len(names) == C:
+        return names
     return [f"x{c}" for c in range(C)]
 
 
@@ -261,7 +294,7 @@ class _R2Accumulator:
 # ---------------------------------------------------------------------------
 
 def _fit_standardizer_and_normal_eq(
-    loader, ctx, source, provider, halo, max_pixels, max_batches,
+    loader, ctx, source, provider, halo, max_pixels, max_batches, keep_idx=None,
 ) -> Tuple[_Standardizer, torch.Tensor, torch.Tensor, int, int]:
     """Two extraction passes over train: (1) feature stats, (2) normal equations.
 
@@ -309,7 +342,7 @@ def _fit_standardizer_and_normal_eq(
         if data is None:
             continue
         feat = _feature_series(data, source)
-        tgt = _target_series(data, provider)
+        tgt = _target_series(data, provider, keep_idx)
         valid = data["valid_tp"]
         X = std.apply(feat)[valid].double()           # [M, D]
         Y = tgt[valid].double()                       # [M, C]
@@ -340,6 +373,7 @@ def _solve_ridge(A: torch.Tensor, B: torch.Tensor, D: int, lam: float) -> Tuple[
 
 def _evaluate(
     loader, ctx, source, provider, std, predict_fn, channels, halo, max_pixels, max_batches,
+    keep_idx=None,
 ) -> dict:
     """Stream a split and compute total + within-pixel R² via ``predict_fn``."""
     need_h = source == "h"
@@ -353,7 +387,7 @@ def _evaluate(
         if data is None:
             continue
         feat = _feature_series(data, source)          # [N, T, D]
-        tgt = _target_series(data, provider)          # [N, T, C]
+        tgt = _target_series(data, provider, keep_idx)  # [N, T, C]
         valid = data["valid_tp"]
         N, T, _ = feat.shape
         Xs = std.apply(feat).reshape(N * T, -1)
@@ -381,7 +415,7 @@ class _MLP(nn.Module):
 
 def _fit_mlp(
     loader, ctx, source, provider, std, halo, max_pixels, max_batches,
-    device, cache_cap=2_000_000, epochs=20, lr=1e-3, seed=0,
+    device, cache_cap=2_000_000, epochs=20, lr=1e-3, seed=0, keep_idx=None,
 ) -> _MLP:
     """Fit the MLP ceiling on a bounded in-memory cache of standardized rows."""
     need_h = source == "h"
@@ -397,7 +431,7 @@ def _fit_mlp(
         if data is None:
             continue
         feat = _feature_series(data, source)
-        tgt = _target_series(data, provider)
+        tgt = _target_series(data, provider, keep_idx)
         valid = data["valid_tp"]
         X = std.apply(feat)[valid]
         Y = tgt[valid]
@@ -461,14 +495,16 @@ def run_reconstruction(
             logger.warning(f"anomaly kind '{kind}' is deferred: {e}")
             results[f"__deferred__{kind}"] = {"deferred": str(e)}
             continue
+        # Target channels are the same across sources; resolve the exclusion once.
+        kept_names, keep_idx = _target_channels_kept(ctx)
         for source in sources:
             key = f"{source}__{kind}"
             logger.info(f"[A] fitting ridge: source={source} target={kind}")
             std, A, B, D, C = _fit_standardizer_and_normal_eq(
                 train_loader, ctx, source, provider, halo,
-                max_pixels_per_sample, max_batches,
+                max_pixels_per_sample, max_batches, keep_idx=keep_idx,
             )
-            channels = _target_channel_names(ctx, kind, C)
+            channels = kept_names if kept_names is not None else _target_channel_names(ctx, kind, C)
 
             # Select ridge λ on val by variance-weighted within-pixel R² (the
             # phase signal, weighted so near-dead channels don't drive the pick).
@@ -479,7 +515,7 @@ def run_reconstruction(
                 predict = lambda Xs, W=W, b=b: Xs @ W + b
                 vm = _evaluate(
                     val_loader, ctx, source, provider, std, predict, channels,
-                    halo, max_pixels_per_sample, max_batches,
+                    halo, max_pixels_per_sample, max_batches, keep_idx=keep_idx,
                 )
                 score = vm["r2_within_weighted"]
                 val_scores.append(score)
@@ -494,7 +530,7 @@ def run_reconstruction(
             predict = lambda Xs, W=best_W, b=best_b: Xs @ W + b
             test_ridge = _evaluate(
                 test_loader, ctx, source, provider, std, predict, channels,
-                halo, max_pixels_per_sample, max_batches,
+                halo, max_pixels_per_sample, max_batches, keep_idx=keep_idx,
             )
             entry = {"ridge_lambda": best_lam, "ridge_test": test_ridge}
             logger.info(
@@ -505,12 +541,12 @@ def run_reconstruction(
             if fit_mlp:
                 mlp = _fit_mlp(
                     train_loader, ctx, source, provider, std, halo,
-                    max_pixels_per_sample, max_batches, ctx["device"],
+                    max_pixels_per_sample, max_batches, ctx["device"], keep_idx=keep_idx,
                 )
                 predict_mlp = lambda Xs, m=mlp: m(Xs.float().to(ctx["device"])).detach().cpu()
                 test_mlp = _evaluate(
                     test_loader, ctx, source, provider, std, predict_mlp, channels,
-                    halo, max_pixels_per_sample, max_batches,
+                    halo, max_pixels_per_sample, max_batches, keep_idx=keep_idx,
                 )
                 entry["mlp_test"] = test_mlp
                 logger.info(
