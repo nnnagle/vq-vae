@@ -121,6 +121,7 @@ def _fit_phase_nbr_ridge(
     rng = np.random.default_rng(0)
     A = B = None
     D = 0
+    M = 0
     for batch in iter_batches(train_loader, max_batches):
         got = _extract_for_curves(batch, ctx, halo, max_pixels, nbr_idx, rng)
         if got is None:
@@ -137,8 +138,15 @@ def _fit_phase_nbr_ridge(
             B = torch.zeros(D + 1, 1, dtype=torch.float64)
         A += Xa.T @ Xa
         B += Xa.T @ Y
-    if A is None:
+        M += X.shape[0]
+    if A is None or M == 0:
         raise RuntimeError("no valid pixels while accumulating the probe normal equations")
+    # Average the normal equations by M so the λ grid is on a meaningful,
+    # dataset-size-independent scale (A/M has a unit diagonal for standardized
+    # features). Without this, A's diagonal is ~M (10⁷–10⁸) and every λ≤1 is a
+    # ~10⁻⁷ perturbation — the sweep is flat because nothing is regularized.
+    A /= M
+    B /= M
 
     # Select λ by validation R² on NBR.
     best = (-1e9, None, None, None)
