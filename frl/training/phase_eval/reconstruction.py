@@ -130,6 +130,7 @@ class _R2Accumulator:
         self.sse_w = torch.zeros(C, dtype=torch.float64)
         self.sst_w = torch.zeros(C, dtype=torch.float64)
         self.n_pix = 0
+        self.m_w = 0                                   # within-pixel valid obs count
         # For the within-pixel variance *fraction* of the target.
         self.sst_total = torch.zeros(C, dtype=torch.float64)
 
@@ -160,6 +161,7 @@ class _R2Accumulator:
             self.sse_w += ((p_anom - t_anom) ** 2).sum(dim=(0, 1))
             self.sst_w += (t_anom ** 2).sum(dim=(0, 1))
             self.n_pix += int(has.sum())
+            self.m_w += int(valid[has].sum())          # within-pixel valid obs
 
     def result(self, channels: List[str]) -> dict:
         def _r2(sse, sst):
@@ -175,15 +177,50 @@ class _R2Accumulator:
             ch: (float(self.sst_w[c]) / float(sst_total[c])) if sst_total[c] > 1e-12 else 0.0
             for c, ch in enumerate(channels)
         }
+        # Per-channel absolute variance (the weight) and MSE (the annotation).
+        # Targets are z-scored per channel, so these are in comparable units and a
+        # near-zero within_variance flags a channel where a wild negative R² is
+        # numerically meaningless (tiny denominator), not a real reconstruction
+        # failure. within_mse == within_variance would mean R²=0 (the mean baseline).
+        within_var = {
+            ch: (float(self.sst_w[c]) / self.m_w) if self.m_w > 0 else 0.0
+            for c, ch in enumerate(channels)
+        }
+        total_var = {
+            ch: float(sst_total[c]) / max(self.n, 1) for c, ch in enumerate(channels)
+        }
+        within_mse = {
+            ch: (float(self.sse_w[c]) / self.m_w) if self.m_w > 0 else 0.0
+            for c, ch in enumerate(channels)
+        }
+        total_mse = {
+            ch: float(self.sse[c]) / max(self.n, 1) for c, ch in enumerate(channels)
+        }
+        # Variance-weighted aggregate R²: pool residual/total SS across channels
+        # *before* the ratio. Identical to weighting each channel's R² by its
+        # within-pixel variance, so low-variance channels with wild negative R²
+        # can no longer dominate the unweighted per-channel mean. This is the
+        # honest headline for "does the embedding retain temporal signal?".
+        sse_w_tot, sst_w_tot = float(self.sse_w.sum()), float(self.sst_w.sum())
+        sse_t_tot, sst_t_tot = float(self.sse.sum()), float(sst_total.sum())
+        r2_within_weighted = (1.0 - sse_w_tot / sst_w_tot) if sst_w_tot > 1e-12 else 0.0
+        r2_total_weighted = (1.0 - sse_t_tot / sst_t_tot) if sst_t_tot > 1e-12 else 0.0
         return {
             "n_observations": self.n,
             "n_pixels": self.n_pix,
+            "n_within_observations": self.m_w,
             "r2_total_per_channel": r2_total,
             "r2_total_mean": float(np.mean(list(r2_total.values()))) if r2_total else 0.0,
+            "r2_total_weighted": r2_total_weighted,
             "r2_within_per_channel": r2_within,
             "r2_within_mean": float(np.mean(list(r2_within.values()))) if r2_within else 0.0,
+            "r2_within_weighted": r2_within_weighted,
             "within_variance_fraction_per_channel": var_frac,
             "within_variance_fraction_mean": float(np.mean(list(var_frac.values()))) if var_frac else 0.0,
+            "within_variance_per_channel": within_var,
+            "total_variance_per_channel": total_var,
+            "within_mse_per_channel": within_mse,
+            "total_mse_per_channel": total_mse,
         }
 
 
@@ -390,7 +427,8 @@ def run_reconstruction(
             )
             channels = _target_channel_names(ctx, kind, C)
 
-            # Select ridge λ on val by within-pixel R² (the phase signal).
+            # Select ridge λ on val by variance-weighted within-pixel R² (the
+            # phase signal, weighted so near-dead channels don't drive the pick).
             best_lam, best_val, best_W, best_b = None, -1e9, None, None
             for lam in RIDGE_LAMBDA_GRID:
                 W, b = _solve_ridge(A, B, D, lam)
@@ -399,8 +437,11 @@ def run_reconstruction(
                     val_loader, ctx, source, provider, std, predict, channels,
                     halo, max_pixels_per_sample, max_batches,
                 )
-                score = vm["r2_within_mean"]
-                logger.info(f"  λ={lam:g}: val within-R²={score:.4f} total-R²={vm['r2_total_mean']:.4f}")
+                score = vm["r2_within_weighted"]
+                logger.info(
+                    f"  λ={lam:g}: val within-R² weighted={score:.4f} "
+                    f"mean={vm['r2_within_mean']:.4f} total={vm['r2_total_weighted']:.4f}"
+                )
                 if score > best_val:
                     best_lam, best_val, best_W, best_b = lam, score, W, b
 
@@ -411,8 +452,8 @@ def run_reconstruction(
             )
             entry = {"ridge_lambda": best_lam, "ridge_test": test_ridge}
             logger.info(
-                f"  [A] {key} RIDGE test: within-R²={test_ridge['r2_within_mean']:.4f} "
-                f"total-R²={test_ridge['r2_total_mean']:.4f}"
+                f"  [A] {key} RIDGE test: within-R² weighted={test_ridge['r2_within_weighted']:.4f} "
+                f"mean={test_ridge['r2_within_mean']:.4f} | total weighted={test_ridge['r2_total_weighted']:.4f}"
             )
 
             if fit_mlp:
@@ -427,8 +468,35 @@ def run_reconstruction(
                 )
                 entry["mlp_test"] = test_mlp
                 logger.info(
-                    f"  [A] {key} MLP  test: within-R²={test_mlp['r2_within_mean']:.4f} "
-                    f"total-R²={test_mlp['r2_total_mean']:.4f}"
+                    f"  [A] {key} MLP  test: within-R² weighted={test_mlp['r2_within_weighted']:.4f} "
+                    f"mean={test_mlp['r2_within_mean']:.4f} | total weighted={test_mlp['r2_total_weighted']:.4f}"
                 )
             results[key] = entry
+
+        # Cross-source summary — the h → z_phase within-pixel R² gap. A positive
+        # gap means pre-FiLM h retains temporal signal that post-FiLM z_phase
+        # loses across the FiLM step (the phase-rethink thesis, quantified). Report
+        # it on both the weighted headline and the unweighted mean, on ridge (and
+        # MLP when fit), so the number is tracked automatically each run.
+        h_key, z_key = f"h__{kind}", f"z_phase__{kind}"
+        if h_key in results and z_key in results:
+            summary = {}
+            for probe in ("ridge_test", "mlp_test"):
+                if probe in results[h_key] and probe in results[z_key]:
+                    h_t, z_t = results[h_key][probe], results[z_key][probe]
+                    tag = probe.split("_")[0]              # "ridge" / "mlp"
+                    summary[f"{tag}_within_r2_gap_weighted"] = (
+                        h_t["r2_within_weighted"] - z_t["r2_within_weighted"])
+                    summary[f"{tag}_within_r2_gap_mean"] = (
+                        h_t["r2_within_mean"] - z_t["r2_within_mean"])
+                    summary[f"{tag}_h_within_r2_weighted"] = h_t["r2_within_weighted"]
+                    summary[f"{tag}_z_phase_within_r2_weighted"] = z_t["r2_within_weighted"]
+            if summary:
+                results[f"__summary__{kind}"] = summary
+                logger.info(
+                    f"  [A] h→z_phase within-R² gap ({kind}): ridge weighted="
+                    f"{summary.get('ridge_within_r2_gap_weighted', float('nan')):.4f} "
+                    f"(h={summary.get('ridge_h_within_r2_weighted', float('nan')):.4f}, "
+                    f"z_phase={summary.get('ridge_z_phase_within_r2_weighted', float('nan')):.4f})"
+                )
     return results

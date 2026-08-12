@@ -65,6 +65,39 @@ def test_r2_accumulator_mean_only_prediction_has_zero_within_r2():
     assert res["r2_within_mean"] == pytest.approx(0.0, abs=1e-6)
 
 
+def test_r2_accumulator_weighted_ignores_dead_low_variance_channel():
+    # The exact pathology the weighted aggregate guards against: channel x0 has
+    # large within-pixel variance and is predicted perfectly (within-R²=1); channel
+    # x1 has tiny within-pixel variance and is predicted anti-correlated
+    # (within-R²=-3). The unweighted mean is dragged to -1, but the
+    # variance-weighted aggregate stays ~1 because x1 has almost no variance to
+    # get wrong. within_variance/within_mse expose x1 as numerically negligible.
+    N, T = 4, 3
+    anom0 = torch.tensor([-10.0, 0.0, 10.0])       # large within-pixel signal
+    anom1 = torch.tensor([-0.01, 0.0, 0.01])       # near-dead within-pixel signal
+    means = torch.arange(N).float().view(N, 1)     # distinct per-pixel levels
+    y = torch.zeros(N, T, 2)
+    y[:, :, 0] = means + anom0.view(1, T)
+    y[:, :, 1] = means * 0.1 + anom1.view(1, T)
+    pred = y.clone()
+    pmean1 = y[:, :, 1].mean(dim=1, keepdim=True)
+    pred[:, :, 1] = 2.0 * pmean1 - y[:, :, 1]      # flip x1 anomaly → R² = -3
+    valid = torch.ones(N, T, dtype=torch.bool)
+    acc = _R2Accumulator(2)
+    acc.update(pred, y, valid)
+    res = acc.result(["x0", "x1"])
+
+    assert res["r2_within_per_channel"]["x0"] == pytest.approx(1.0, abs=1e-9)
+    assert res["r2_within_per_channel"]["x1"] == pytest.approx(-3.0, abs=1e-6)
+    assert res["r2_within_mean"] == pytest.approx(-1.0, abs=1e-6)   # unweighted: misleading
+    assert res["r2_within_weighted"] > 0.99                         # weighted: honest
+    # the per-channel variance column flags x1 as the negligible one
+    wv = res["within_variance_per_channel"]
+    assert wv["x0"] > 1e3 * wv["x1"]
+    assert res["within_mse_per_channel"]["x0"] == pytest.approx(0.0, abs=1e-9)
+    assert res["n_within_observations"] == N * T
+
+
 # ── _Standardizer ──────────────────────────────────────────────────────────
 
 def test_standardizer_produces_unit_scale():
