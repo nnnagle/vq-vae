@@ -39,6 +39,38 @@ FEATURE_SOURCES = ("z_phase", "h", "z_type")
 RIDGE_LAMBDA_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 
 
+def _warn_lambda_edge(best_lam: float, grid, label: str, scores=None) -> None:
+    """Warn if the selected λ sits on the grid boundary.
+
+    A boundary pick means the true optimum is probably *outside* the grid (the
+    validation curve is still improving at the edge), so the reported fit is
+    clamped and the grid should be widened. Interior picks are silent — the
+    optimum is bracketed. Skips single-point grids (no interior to speak of).
+
+    ``scores`` (the per-λ validation scores) lets the guard skip a **degenerate**
+    sweep where λ had no effect (max−min ≈ 0): there the λ pick is arbitrary and a
+    "boundary" warning would be a false alarm — e.g. z_type, whose within-pixel R²
+    is identically 0 by construction, always defaulting the pick to the grid min.
+    """
+    lo, hi = min(grid), max(grid)
+    if len(grid) < 2 or lo == hi:
+        return
+    if scores is not None and len(scores) and (max(scores) - min(scores)) < 1e-9:
+        return
+    if best_lam == lo:
+        logger.warning(
+            f"[{label}] selected λ={best_lam:g} is the grid MINIMUM ({lo:g}); the "
+            f"optimum may be smaller — widen RIDGE_LAMBDA_GRID downward (less "
+            f"regularization / possible overfitting at the reported fit)."
+        )
+    elif best_lam == hi:
+        logger.warning(
+            f"[{label}] selected λ={best_lam:g} is the grid MAXIMUM ({hi:g}); the "
+            f"optimum may be larger — widen RIDGE_LAMBDA_GRID upward (more "
+            f"regularization wanted than the grid allows)."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Feature source + target
 # ---------------------------------------------------------------------------
@@ -441,6 +473,7 @@ def run_reconstruction(
             # Select ridge λ on val by variance-weighted within-pixel R² (the
             # phase signal, weighted so near-dead channels don't drive the pick).
             best_lam, best_val, best_W, best_b = None, -1e9, None, None
+            val_scores = []
             for lam in RIDGE_LAMBDA_GRID:
                 W, b = _solve_ridge(A, B, D, lam)
                 predict = lambda Xs, W=W, b=b: Xs @ W + b
@@ -449,12 +482,14 @@ def run_reconstruction(
                     halo, max_pixels_per_sample, max_batches,
                 )
                 score = vm["r2_within_weighted"]
+                val_scores.append(score)
                 logger.info(
                     f"  λ={lam:g}: val within-R² weighted={score:.4f} "
                     f"mean={vm['r2_within_mean']:.4f} total={vm['r2_total_weighted']:.4f}"
                 )
                 if score > best_val:
                     best_lam, best_val, best_W, best_b = lam, score, W, b
+            _warn_lambda_edge(best_lam, RIDGE_LAMBDA_GRID, f"A:{key}", val_scores)
 
             predict = lambda Xs, W=best_W, b=best_b: Xs @ W + b
             test_ridge = _evaluate(

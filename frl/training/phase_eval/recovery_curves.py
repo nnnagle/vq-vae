@@ -31,7 +31,7 @@ from training.phase_eval.common import (
     extract_pixel_series,
     iter_batches,
 )
-from training.phase_eval.reconstruction import _Standardizer, _solve_ridge
+from training.phase_eval.reconstruction import _Standardizer, _solve_ridge, _warn_lambda_edge
 # ``training.phase_recovery_curves`` and ``fit_phase_linear_probe`` pull the heavy
 # GDAL/matplotlib stack, so they are imported lazily inside the functions that use
 # them (keeps this module importable for unit tests of the pure helpers).
@@ -150,13 +150,16 @@ def _fit_phase_nbr_ridge(
 
     # Select λ by validation R² on NBR.
     best = (-1e9, None, None, None)
+    val_scores = []
     for lam in RIDGE_LAMBDA_GRID:
         W, b = _solve_ridge(A, B, D, lam)
         r2 = _val_r2(val_loader, ctx, halo, max_pixels, max_batches, nbr_idx, std, W, b, design)
+        val_scores.append(r2)
         logger.info(f"  [B] λ={lam:g}: val NBR R²={r2:.4f}")
         if r2 > best[0]:
             best = (r2, lam, W, b)
     _, lam, W, b = best
+    _warn_lambda_edge(lam, RIDGE_LAMBDA_GRID, f"B:{design}", val_scores)
     return std, W, b, lam
 
 

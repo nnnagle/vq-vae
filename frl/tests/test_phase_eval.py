@@ -15,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 
 from training.phase_eval.common import AnomalyTargetProvider, variance_decompose
 from training.phase_eval.ejection import transition_jumps
-from training.phase_eval.reconstruction import _R2Accumulator, _Standardizer
+from training.phase_eval.reconstruction import _R2Accumulator, _Standardizer, _warn_lambda_edge
 from training.phase_eval.recovery_curves import _bin_medians, _shape_agreement
 
 
@@ -96,6 +96,39 @@ def test_r2_accumulator_weighted_ignores_dead_low_variance_channel():
     assert wv["x0"] > 1e3 * wv["x1"]
     assert res["within_mse_per_channel"]["x0"] == pytest.approx(0.0, abs=1e-9)
     assert res["n_within_observations"] == N * T
+
+
+# ── _warn_lambda_edge ──────────────────────────────────────────────────────
+
+_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
+
+
+def test_lambda_edge_interior_pick_is_silent(caplog):
+    with caplog.at_level("WARNING", logger="phase_eval.reconstruction"):
+        _warn_lambda_edge(1e-2, _GRID, "A:test", scores=[0.1, 0.2, 0.3, 0.25, 0.2])
+    assert not caplog.records
+
+
+def test_lambda_edge_min_pick_warns(caplog):
+    with caplog.at_level("WARNING", logger="phase_eval.reconstruction"):
+        _warn_lambda_edge(1e-4, _GRID, "A:test", scores=[0.3, 0.25, 0.2, 0.1, 0.0])
+    assert len(caplog.records) == 1
+    assert "MINIMUM" in caplog.text
+
+
+def test_lambda_edge_max_pick_warns(caplog):
+    with caplog.at_level("WARNING", logger="phase_eval.reconstruction"):
+        _warn_lambda_edge(1.0, _GRID, "A:test", scores=[0.0, 0.1, 0.2, 0.25, 0.3])
+    assert len(caplog.records) == 1
+    assert "MAXIMUM" in caplog.text
+
+
+def test_lambda_edge_flat_sweep_is_silent(caplog):
+    # z_type case: within-R² identically 0 across λ → boundary pick is arbitrary,
+    # not a clamp; the guard must not false-alarm.
+    with caplog.at_level("WARNING", logger="phase_eval.reconstruction"):
+        _warn_lambda_edge(1e-4, _GRID, "A:z_type", scores=[0.0, 0.0, 0.0, 0.0, 0.0])
+    assert not caplog.records
 
 
 # ── _Standardizer ──────────────────────────────────────────────────────────
