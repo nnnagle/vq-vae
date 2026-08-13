@@ -194,9 +194,9 @@ alongside the model and evaluated with one forward per batch.
     from data, which a free gradient head would not). Estimating σ² as `E[x²]−μ²`
     (difference of two moments) instead **collapses** to the floor under a wiggly μ
     → σ→0 → the anomaly divide explodes; the **residual-variance ridge is the stable
-    fix** (recovers the true per-channel noise). As-built = closed-form residual-
-    variance σ; a gradient σ head remains a small drop-in if ever wanted. *(Flagged
-    for confirmation.)*
+    fix** (recovers the true per-channel noise). **LOCKED: closed-form residual-
+    variance σ** (supersedes the earlier "gradient σ"; a gradient head remains a
+    small drop-in if ever needed).
 - **Training data — the current batch's mature anchors, no buffer.** Update the
   readout online from the mature timesteps (`ysfc > mature_ysfc_threshold`) of the
   anchor pixels **already embedded each batch**: fold them into the `A`,`c` EMAs (→
