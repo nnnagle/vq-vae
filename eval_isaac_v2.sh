@@ -7,8 +7,8 @@
 # Restrict to the two UNIFORM 32 GB nodes (any single GPU is 32 GB), rather than
 # --exclusive (idles the 2nd GPU → cancelled for an unused GPU) or plain --gpus=1
 # on a mixed node (SLURM may hand us the 16 GB V100 → OOM; GRES mislabels it so we
-# can't select by type). Excluded: clrv1101 (16 GB) + mixed clrv1103/1105/1201.
-#SBATCH --exclude=clrv1101,clrv1103,clrv1105,clrv1201
+# can't select by type). Excluded: clrv1101 (16 GB). note:  mixed 32/16 are clrv1103/1105/1201.
+#SBATCH --exclude=clrv1101
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=500G
 #SBATCH --time=12:00:00

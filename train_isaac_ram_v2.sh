@@ -11,10 +11,10 @@
 # largest-GPU pin only sees the one GPU we were given) → OOM. Fix: restrict to the
 # two UNIFORM 32 GB nodes (clrv1107, clrv1205), where any single GPU is 32 GB and
 # the other 32 GB GPU stays free for a co-tenant (no idle-resource penalty).
-# Excluded: clrv1101 (16 GB) and the mixed 32/16 GB nodes clrv1103/1105/1201.
+# Excluded: clrv1101 (16 GB). Note: mixed 32/16 GB nodesi are  clrv1103/1105/1201.
 # /dev/shm is node-wide, so a co-tenant could still contend for it; the pre-clean
 # + space guard below handle stale extracts and fail fast if too little is free.
-#SBATCH --exclude=clrv1101,clrv1103,clrv1105,clrv1201
+#SBATCH --exclude=clrv1101
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=500G
 #SBATCH --time=24:00:00
