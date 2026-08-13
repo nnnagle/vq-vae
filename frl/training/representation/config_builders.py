@@ -297,6 +297,11 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'curriculum_ramp_epochs': cur.ramp_epochs if cur else 10,
             # Type-leakage penalty
             'phase_type_leakage_weight': phase_loss_cfg.phase_type_leakage_weight,
+            # Redesign (Step 3): mature selector for the μ/σ readout fit + the anchor
+            # loss, and the anchor-loss weight.  Tunable; defaults are the locked
+            # starting values (12 = East mature ysfc; 0.05 = light origin pin).
+            'mature_ysfc_threshold': getattr(phase_loss_cfg, 'mature_ysfc_threshold', None) or 12.0,
+            'anchor_weight': getattr(phase_loss_cfg, 'anchor_weight', None) or 0.05,
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "

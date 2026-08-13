@@ -136,6 +136,7 @@ def process_batch(
     total_phase_loss = 0.0
     total_phase_spread_loss = 0.0
     total_phase_recovery_disc_loss = 0.0
+    total_phase_anchor_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -177,11 +178,10 @@ def process_batch(
     t_pass2 = 0.0  # whole per-sample loss loop (superset of phase_forward+loss_compute)
     t_temporal_build = 0.0  # subset of pass2: per-sample full-grid phase_ccdc/dynamism builds
 
-    # FiLM data-dependent stats accumulators
-    all_film_gamma = []
-    all_film_beta = []
-    # Pre-FiLM type-leakage accumulators: h mean-pooled over T, and z_type
-    all_pre_film_h_mean = []   # [N, zp] per batch
+    # RFF-bandwidth coverage diagnostic (mean leverage per batch).
+    all_readout_leverage = []
+    # z_phase→z_type leakage guard: z_phase mean-pooled over T, and z_type.
+    all_pre_film_h_mean = []   # [N, zp] per batch (z_phase mean over T; was pre-FiLM h)
     all_z_type_at_phase = []   # [N, z_type_dim] per batch
 
     # Collectors for global spectral loss (pairs built cross-batch after loop)
@@ -209,6 +209,12 @@ def process_batch(
         )
     else:
         curriculum_w = 0.0
+
+    # Mature-timestep selector (readout fit + anchor loss) and anchor-loss weight.
+    mature_ysfc_threshold = (
+        phase_config.get('mature_ysfc_threshold', 12.0) if phase_config else 12.0)
+    anchor_weight = (
+        phase_config.get('anchor_weight', 0.05) if phase_config else 0.05)
 
     if spread_config is not None:
         spread_w = ramp_weight(
@@ -573,80 +579,112 @@ def process_batch(
                 all_pos_sims.append((-(p_a - p_b).pow(2).sum(1) / D).cpu())
                 all_neg_sims.append((-(n_a - n_b).pow(2).sum(1) / D).cpu())
 
-        # Phase encoder (needs z_type from z_full — must stay in Pass 2)
+        # Phase pathway (needs z_type from z_full — must stay in Pass 2).
+        #
+        # Two-part structure (see docs/phase_rethink_design.md Step 3):
+        #   ALWAYS (incl. type-only warmup) — build the anomaly input, settle the
+        #     μ/σ readout on mature timesteps, and let the transform observe the Δ
+        #     scale.  This is what lets the readout settle before the encoder turns on.
+        #   GATED on curriculum_w>0 — run the FiLM-free encoder → z_phase, the anchor
+        #     loss, phase VCR, and the cross-batch phase-loss accumulation.
         phase_loss_val = torch.tensor(0.0, device=device)
         phase_spread_loss_val = torch.tensor(0.0, device=device)
         phase_recovery_disc_loss_val = torch.tensor(0.0, device=device)
         phase_vcr_loss_val = torch.tensor(0.0, device=device)
+        phase_anchor_loss_val = torch.tensor(0.0, device=device)
         pp = prep['phase_prep']
-        if pp is not None and pp['phase_pairs'].shape[0] > 0 and curriculum_w > 0.0:
-                phase_anchors  = pp['phase_anchors']
-                phase_pairs    = pp['phase_pairs']
-                phase_weights  = pp['phase_weights']
-                ysfc_at_anchors = pp['ysfc_at_anchors']
+        if pp is not None:
+                phase_anchors   = pp['phase_anchors']
+                ysfc_at_anchors = pp['ysfc_at_anchors']            # [N, T]
+                phase_anchors_dev = phase_anchors.to(device)
 
+                # Raw phase feature x at anchors (anchor-only build; [N, T, C]).
                 _t_tb = time.perf_counter()
-                # Build the temporal feature only at the anchor pixels. Since
-                # normalization/whitening use fixed stats and are pointwise, this
-                # is identical to building the full grid then extracting — at
-                # ~H*W/N less cost. (This is the bulk of the old Pass 2 time.)
-                phase_ccdc_np, _ = feature_builder.build_feature_at_locations(
+                x_np, _ = feature_builder.build_feature_at_locations(
                     config['phase_encoder_feature'], sample, phase_anchors)   # [N, T, C]
                 t_temporal_build += time.perf_counter() - _t_tb
+                x_tc = torch.from_numpy(x_np).float().to(device)             # [N, T, C]
+                x = x_tc.permute(0, 2, 1)                                    # [N, C, T]
 
-                phase_ccdc_at_anchors = torch.from_numpy(phase_ccdc_np).float().to(device)  # [N, T, C]
-                phase_anchors_dev = phase_anchors.to(device)
-                spec_at_phase_anchors = phase_ccdc_at_anchors
-                phase_ccdc_at_anchors = phase_ccdc_at_anchors.permute(0, 2, 1)  # [N, C, T]
+                # Stop-grad z_type at phase anchors (readout also detaches internally).
+                z_type_at_anchors = extract_at_locations(z_full.detach(), phase_anchors_dev)  # [N, d]
 
-                z_type_at_anchors = extract_at_locations(z_full.detach(), phase_anchors_dev)
+                ysfc_dev = ysfc_at_anchors.to(device)                       # [N, T]
+                mature = ysfc_dev > mature_ysfc_threshold                   # [N, T]
 
+                # μ/σ (pre-update readout) → anomaly [a ; Δa]; the transform observes
+                # the Δ scale during warmup (training & unlocked).  Runs every batch.
+                mu, sigma = model.mature_baseline.predict(z_type_at_anchors)   # [N, C]
                 _t0 = time.perf_counter()
-                z_phase_at_anchors, film_gamma, film_beta, pre_film_h = model.forward_phase_at_locations(
-                    phase_ccdc_at_anchors, z_type_at_anchors,
-                    return_film=True,
-                    return_pre_film=True,
-                )
-                if is_profiling() and device.type == 'cuda':
-                    torch.cuda.synchronize()
+                anomaly_feats, _ = model.anomaly_transform(x, mu, sigma)    # [N, 2C, T]
                 t_phase_forward += time.perf_counter() - _t0
-                all_film_gamma.append(film_gamma.detach())
-                all_film_beta.append(film_beta.detach())
-                all_pre_film_h_mean.append(pre_film_h.mean(dim=2).detach())
-                all_z_type_at_phase.append(z_type_at_anchors.detach())
-                cross_phase_h.append(pre_film_h.mean(dim=2))
 
-                # Phase VCR: prevent dimensional collapse in z_phase (per-patch)
-                phase_vcr_cfg = config.get('phase_vcr_config')
-                if phase_vcr_cfg is not None:
-                    z_phase_flat = z_phase_at_anchors.reshape(-1, 12)
-                    pvcr_total, _, _ = variance_covariance_loss(
-                        z_phase_flat,
-                        variance_weight=phase_vcr_cfg.get('variance_weight', 1.0),
-                        covariance_weight=phase_vcr_cfg.get('covariance_weight', 1.0),
-                        variance_target=phase_vcr_cfg.get('variance_target', 1.0),
-                    )
-                    phase_vcr_loss_val = phase_vcr_cfg.get('weight', 0.1) * curriculum_w * pvcr_total
-                else:
-                    phase_vcr_loss_val = torch.tensor(0.0, device=device)
+                # Settle the readout on this batch's mature timesteps (for next batch;
+                # predict above used the pre-update readout → no within-batch leakage).
+                if training and bool(mature.any()):
+                    T_ = x.shape[2]
+                    z_rep = z_type_at_anchors.unsqueeze(1).expand(-1, T_, -1)   # [N, T, d]
+                    model.mature_baseline.update(z_rep[mature], x_tc[mature])   # [M, d], [M, C]
 
-                # Accumulate for cross-batch phase loss (offset pair indices)
-                ysfc_at_anchors_gpu = ysfc_at_anchors.to(device)
-                cross_phase_z_type.append(z_type_at_anchors)
-                cross_phase_spec.append(spec_at_phase_anchors)
-                cross_phase_embeddings.append(z_phase_at_anchors)
-                cross_phase_ysfc.append(ysfc_at_anchors_gpu)
-                cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
-                cross_phase_weights.append(phase_weights.to(device))
-                cross_phase_n_offset += z_type_at_anchors.shape[0]
+                # RFF-bandwidth coverage diagnostic (mean leverage = prior-reliance).
+                all_readout_leverage.append(
+                    model.mature_baseline.leverage(z_type_at_anchors).mean().detach())
 
-                # Accumulate dynamism for spread loss
-                if spread_config is not None:
-                    _t_tb = time.perf_counter()
-                    dynamism_np, _ = feature_builder.build_feature_at_locations(
-                        'phase_dynamism_supervision', sample, phase_anchors)   # [N, C]
-                    cross_phase_dynamism.append(torch.from_numpy(dynamism_np).float())
-                    t_temporal_build += time.perf_counter() - _t_tb
+                # Encoder + phase losses: gated on the phase curriculum.
+                if pp['phase_pairs'].shape[0] > 0 and curriculum_w > 0.0:
+                    phase_pairs   = pp['phase_pairs']
+                    phase_weights = pp['phase_weights']
+
+                    _t0 = time.perf_counter()
+                    z_phase_at_anchors = model.encode_phase(anomaly_feats)  # [N, T, zp]
+                    if is_profiling() and device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    t_phase_forward += time.perf_counter() - _t0
+
+                    # Anchor loss: pin mature z_phase to the single shared origin.
+                    if bool(mature.any()):
+                        zp_mature = z_phase_at_anchors[mature]              # [M, zp]
+                        phase_anchor_loss_val = (
+                            anchor_weight * curriculum_w
+                            * zp_mature.pow(2).sum(dim=-1).mean()
+                        )
+
+                    # z_phase → z_type leakage guard (was pre-FiLM h; h == z_phase now):
+                    # with the type-agnostic encoder this should stay ≈0.
+                    zphase_mean = z_phase_at_anchors.mean(dim=1)           # [N, zp]
+                    all_pre_film_h_mean.append(zphase_mean.detach())
+                    all_z_type_at_phase.append(z_type_at_anchors.detach())
+                    cross_phase_h.append(zphase_mean)
+
+                    # Phase VCR (per-patch; retired in Step 5).
+                    phase_vcr_cfg = config.get('phase_vcr_config')
+                    if phase_vcr_cfg is not None:
+                        z_phase_flat = z_phase_at_anchors.reshape(-1, model.z_phase_dim)
+                        pvcr_total, _, _ = variance_covariance_loss(
+                            z_phase_flat,
+                            variance_weight=phase_vcr_cfg.get('variance_weight', 1.0),
+                            covariance_weight=phase_vcr_cfg.get('covariance_weight', 1.0),
+                            variance_target=phase_vcr_cfg.get('variance_target', 1.0),
+                        )
+                        phase_vcr_loss_val = phase_vcr_cfg.get('weight', 0.1) * curriculum_w * pvcr_total
+
+                    # Cross-batch phase loss accumulation (offset pair indices). The
+                    # raw feature x_tc is the pair-construction space (unchanged).
+                    cross_phase_z_type.append(z_type_at_anchors)
+                    cross_phase_spec.append(x_tc)
+                    cross_phase_embeddings.append(z_phase_at_anchors)
+                    cross_phase_ysfc.append(ysfc_dev)
+                    cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
+                    cross_phase_weights.append(phase_weights.to(device))
+                    cross_phase_n_offset += z_type_at_anchors.shape[0]
+
+                    # Accumulate dynamism for spread loss.
+                    if spread_config is not None:
+                        _t_tb = time.perf_counter()
+                        dynamism_np, _ = feature_builder.build_feature_at_locations(
+                            'phase_dynamism_supervision', sample, phase_anchors)   # [N, C]
+                        cross_phase_dynamism.append(torch.from_numpy(dynamism_np).float())
+                        t_temporal_build += time.perf_counter() - _t_tb
 
         # Combine per-patch losses (phase losses computed cross-batch after loop)
         _t0 = time.perf_counter()
@@ -654,6 +692,7 @@ def process_batch(
         loss = (spatial_weight * spatial_loss_val
                 + vcr_loss_val
                 + phase_vcr_loss_val
+                + phase_anchor_loss_val
                 + evt_loss_val)
         t_loss_compute += time.perf_counter() - _t0
 
@@ -689,12 +728,14 @@ def process_batch(
             total_spatial_loss += spatial_weight * spatial_loss_val
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
+            total_phase_anchor_loss += phase_anchor_loss_val
             total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
             total_spatial_loss += (spatial_weight * spatial_loss_val).item()
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
+            total_phase_anchor_loss += float(phase_anchor_loss_val)
             total_evt_loss += evt_loss_val.item()
         n_valid += 1
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
@@ -1052,6 +1093,7 @@ def process_batch(
     mean_phase_leakage_loss = _scalar(cross_phase_leakage_val)
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
+    mean_phase_anchor_loss = total_phase_anchor_loss / n_valid
     mean_evt_loss = total_evt_loss / n_valid
 
     if training:
@@ -1097,6 +1139,7 @@ def process_batch(
         mean_phase_leakage_loss = float(mean_phase_leakage_loss)
         mean_vcr_loss = float(mean_vcr_loss)
         mean_phase_vcr_loss = float(mean_phase_vcr_loss)
+        mean_phase_anchor_loss = float(mean_phase_anchor_loss)
         mean_evt_loss = float(mean_evt_loss) if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item()
 
     # Compute distribution statistics for gate values and weights
@@ -1123,21 +1166,16 @@ def process_batch(
             'q75':  torch.quantile(q_input, 0.75).item(),
         }
 
-    # Compute data-dependent FiLM stats
+    # FiLM removed — no gamma/beta stats.  RFF-bandwidth coverage diagnostic:
+    # mean leverage over the epoch's phase anchors (0 = data-pinned, →1 =
+    # prior-dominated; a high value means the readout bandwidth h is leaving many
+    # types under-supported).
     film_stats = None
-    if all_film_gamma:
-        gamma_cat = torch.cat(all_film_gamma, dim=0)  # [total_pixels, 12]
-        beta_cat = torch.cat(all_film_beta, dim=0)    # [total_pixels, 12]
-        film_stats = {
-            'gamma_mean': gamma_cat.mean().item(),
-            'gamma_std': gamma_cat.std().item(),
-            'gamma_per_dim_std': gamma_cat.std(dim=0).mean().item(),
-            'beta_mean': beta_cat.mean().item(),
-            'beta_std': beta_cat.std().item(),
-            'beta_per_dim_std': beta_cat.std(dim=0).mean().item(),
-        }
+    readout_leverage = (
+        torch.stack(all_readout_leverage).mean().item() if all_readout_leverage else 0.0)
 
-    # Type-leakage diagnostics: how much type information is in pre-FiLM h?
+    # Type-leakage diagnostics: how much z_type is linearly recoverable from
+    # z_phase (mean over T)?  With the type-agnostic encoder this should stay ≈0.
     type_leakage_stats = None
     if all_pre_film_h_mean and all_z_type_at_phase:
         h_cat = torch.cat(all_pre_film_h_mean, dim=0).float()   # [N, zp]
@@ -1195,6 +1233,8 @@ def process_batch(
         'phase_leakage_loss': mean_phase_leakage_loss,
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
+        'phase_anchor_loss': mean_phase_anchor_loss,
+        'readout_leverage': readout_leverage,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
         'evt_diag': evt_diag_agg,
         'n_valid': n_valid,

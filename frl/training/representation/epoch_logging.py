@@ -41,7 +41,15 @@ def log_epoch(
         f"rdisc={train_stats.get('phase_recovery_disc_loss', 0.0):.4f} "
         f"leak={train_stats.get('phase_leakage_loss', 0.0):.2e} "
         f"vcr={train_stats['vcr_loss']:.4f} "
-        f"pvcr={train_stats['phase_vcr_loss']:.4f} evt={train_stats['evt_loss']:.4f}"
+        f"pvcr={train_stats['phase_vcr_loss']:.4f} "
+        f"anchor={train_stats.get('phase_anchor_loss', 0.0):.4f} "
+        f"evt={train_stats['evt_loss']:.4f}"
+    )
+    # RFF readout-bandwidth coverage: mean leverage (0=data-pinned, →1=prior-dominated).
+    logger.info(
+        f"  Readout coverage: mean leverage train={train_stats.get('readout_leverage', 0.0):.3f} "
+        f"val={val_stats.get('readout_leverage', 0.0):.3f} "
+        f"(high → readout bandwidth h leaving types under-supported)"
     )
     logger.info(
         f"  Val:   {val_stats['loss']:.4f} "

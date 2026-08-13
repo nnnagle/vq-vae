@@ -77,3 +77,21 @@ phase_tcn:
   dilations: [1, 2, 4]
   dropout: 0.1
   num_groups: 8
+  # Magnitude-preserving norm for the FiLM-free phase pathway (Step 3b): 'none'
+  # (input already O(1)-scaled) or 'batch' (running stats). NOT 'group' — a
+  # per-sample GroupNorm-over-T divides out the depth→radius signal.
+  norm: none
+
+# Step-1 mature-baseline RFF readout μ(z_type), σ(z_type) → the anomaly input.
+# Buffer-only online estimator (no gradient params). See models/mature_baseline.py.
+mature_baseline:
+  n_features: 1024      # RFF dim D; larger → sharper revert-to-prior / leverage
+  bandwidth: 1.0        # RFF length-scale h (standardized z_type units); tune by val-NLL
+  ridge_lambda: 1.0e-3
+  sigma_floor: 1.0e-2
+  ema_decay: 0.99
+
+# Step-2 anomaly input transform a=(x-μ)/σ + Δa. See models/anomaly_transform.py.
+anomaly_transform:
+  delta_only: true      # [a ; Δa]; Δ² deferred
+  scale_decay: 0.99     # EMA decay for the Δ robust scale observed during warmup

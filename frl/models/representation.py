@@ -414,19 +414,31 @@ class RepresentationModel(nn.Module):
         # the anomaly transform [a ; Δa].  Both are grad-free constant inputs.
         mu, sigma = self.mature_baseline.predict(z_type_pixels)          # [N, C]
         feats, _ = self.anomaly_transform(x_phase_pixels, mu, sigma, valid)  # [N, 2C, T]
+        z = self.encode_phase(feats)                                     # [N, T, zp]
+        if return_input:
+            return z, feats
+        return z
 
+    def encode_phase(self, feats: torch.Tensor) -> torch.Tensor:
+        """Encode a pre-built anomaly input into z_phase (TCN → bottleneck, no FiLM).
+
+        Split out from :meth:`forward_phase_at_locations` so the training loop can
+        run the anomaly transform every batch (to settle the readout / observe the
+        Δ scale during warmup) while the encoder itself runs only once the phase
+        curriculum is active.
+
+        Args:
+            feats: ``[N, 2C, T]`` anomaly input ``[a ; Δa]``.
+        Returns:
+            ``z_phase [N, T, z_phase_dim]``.
+        """
         N, _, T = feats.shape
         zp = self.z_phase_dim
-
         h = self.phase_tcn(feats)                                        # [N, tcn_out, T]
         tcn_out = h.shape[1]
         h = h.permute(0, 2, 1).reshape(N * T, tcn_out, 1, 1)
         h = self.phase_head(h)                                           # [N*T, zp, 1, 1]
-        z = h.reshape(N, T, zp)                                          # [N, T, zp]
-
-        if return_input:
-            return z, feats
-        return z
+        return h.reshape(N, T, zp)                                       # [N, T, zp]
 
     # ------------------------------------------------------------------
     # Checkpoint helpers

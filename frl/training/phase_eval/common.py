@@ -293,17 +293,14 @@ def extract_pixel_series(
         h_px = torch.empty(n, T, zp) if need_pre_film else None
         for s in range(0, n, chunk_size):
             e = min(s + chunk_size, n)
-            xin = x_px[s:e].to(device)
-            zin = z_type_px[s:e].detach()
+            xin = x_px[s:e].to(device)              # raw phase feature; anomaly built inside
+            zin = z_type_px[s:e].detach()           # stop-grad z_type
             with torch.no_grad():
-                if need_pre_film:
-                    z_chunk, h_chunk = model.forward_phase_at_locations(
-                        xin, zin, return_pre_film=True,
-                    )
-                    h_px[s:e] = h_chunk.permute(0, 2, 1).cpu()  # [N, zp, T] -> [N, T, zp]
-                else:
-                    z_chunk = model.forward_phase_at_locations(xin, zin)
+                z_chunk = model.forward_phase_at_locations(xin, zin)   # [N, T, zp]
             z_phase_px[s:e] = z_chunk.cpu()
+            if need_pre_film:
+                # FiLM removed → the pre-FiLM bottleneck IS z_phase (no gap).
+                h_px[s:e] = z_chunk.cpu()
 
         # ysfc + per-timestep validity at pixel coords.
         ysfc_grid = torch.from_numpy(ysfc_f.data[0]).float()          # [T, H, W]

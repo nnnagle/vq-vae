@@ -21,6 +21,7 @@ from models import RepresentationModel
 from losses.evt_soft_neighborhood import EvtDiffusionMetric
 from training.representation.profiling import is_profiling
 from training.representation.step import process_batch
+from training.representation.curriculum import ramp_weight
 
 # Keep the original module's logger name so slurm-log records are byte-identical
 # to the pre-refactor inline code (the messages moved, the %(name)s should not).
@@ -56,6 +57,8 @@ def train_epoch(
     total_phase_leakage_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
+    total_phase_anchor_loss = 0.0
+    total_readout_leverage = 0.0
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
     total_spectral_pos_pairs = 0
@@ -63,6 +66,17 @@ def train_epoch(
     total_spatial_pos_pairs = 0
     total_spatial_neg_pairs = 0
     total_batches = 0
+
+    # Lock the anomaly-transform Δ scale once, at the phase-curriculum boundary
+    # (it was observed through the type-only warmup; frozen thereafter).
+    if phase_config is not None and not bool(model.anomaly_transform.scale_locked):
+        if ramp_weight(epoch, phase_config.get('curriculum_start_epoch', 10),
+                       phase_config.get('curriculum_ramp_epochs', 10)) > 0.0:
+            locked = model.anomaly_transform.lock_delta_scale()
+            logger.info(
+                f"[epoch {epoch}] Locked anomaly Δ scale = {locked:.4f} "
+                f"(phase curriculum active; readout μ/σ keep learning)"
+            )
 
     # Keep last batch stats for epoch-level distribution logging
     empty_stats = {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0,
@@ -126,6 +140,8 @@ def train_epoch(
             total_phase_leakage_loss += stats.get('phase_leakage_loss', 0.0)
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
+            total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
+            total_readout_leverage += stats.get('readout_leverage', 0.0)
             total_evt_loss += stats.get('evt_loss', 0.0)
             if stats.get('evt_diag'):
                 all_epoch_evt_diag.append(stats['evt_diag'])
@@ -250,6 +266,7 @@ def train_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'phase_anchor_loss': 0.0, 'readout_leverage': 0.0,
             'evt_loss': 0.0,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -282,6 +299,8 @@ def train_epoch(
         'phase_leakage_loss': total_phase_leakage_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
+        'phase_anchor_loss': total_phase_anchor_loss / total_batches,
+        'readout_leverage': total_readout_leverage / total_batches,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
         'spectral_pos_pairs': total_spectral_pos_pairs // total_batches,
@@ -329,6 +348,8 @@ def validate_epoch(
     total_phase_leakage_loss = 0.0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
+    total_phase_anchor_loss = 0.0
+    total_readout_leverage = 0.0
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
     total_batches = 0
@@ -369,6 +390,8 @@ def validate_epoch(
                 total_phase_leakage_loss += stats.get('phase_leakage_loss', 0.0)
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
+                total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
+                total_readout_leverage += stats.get('readout_leverage', 0.0)
                 total_evt_loss += stats.get('evt_loss', 0.0)
                 if stats.get('evt_diag'):
                     all_epoch_evt_diag.append(stats['evt_diag'])
@@ -397,6 +420,7 @@ def validate_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
+            'phase_anchor_loss': 0.0, 'readout_leverage': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -427,6 +451,8 @@ def validate_epoch(
         'phase_leakage_loss': total_phase_leakage_loss / total_batches,
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
+        'phase_anchor_loss': total_phase_anchor_loss / total_batches,
+        'readout_leverage': total_readout_leverage / total_batches,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
         'batches': total_batches,

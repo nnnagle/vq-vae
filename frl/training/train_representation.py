@@ -369,13 +369,12 @@ def main():
     encoder_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     spatial_params = sum(p.numel() for p in model.spatial_conv.parameters() if p.requires_grad)
     phase_tcn_params = sum(p.numel() for p in model.phase_tcn.parameters() if p.requires_grad)
-    phase_film_params = sum(p.numel() for p in model.phase_film.parameters() if p.requires_grad)
     phase_head_params = sum(p.numel() for p in model.phase_head.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
         f"Trainable parameters: type(encoder={encoder_params:,}, spatial={spatial_params:,}), "
-        f"phase(tcn={phase_tcn_params:,}, film={phase_film_params:,}, head={phase_head_params:,}), "
-        f"total={total_params:,}"
+        f"phase(tcn={phase_tcn_params:,}, head={phase_head_params:,}; FiLM removed, "
+        f"μ/σ readout is buffer-only), total={total_params:,}"
     )
 
     # Create optimizer
