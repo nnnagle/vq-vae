@@ -410,22 +410,33 @@ class AnomalyTargetProvider:
     """Maps the phase input ``x`` to the diagnostic-A regression target.
 
     ``raw`` (live now) returns ``x`` unchanged — the model-agnostic reconstruction
-    target usable on exp034 and the new model alike. ``mature_baseline`` is the
-    Step-1 seam: it will return ``(x − μ(z_type)) / σ(z_type)`` once the online
-    heteroscedastic Gaussian-NLL readout exists; until then it raises so the
-    coupling is explicit rather than silently wrong.
+    target usable on the baseline and the new model alike. ``mature_baseline``
+    returns the type-conditional anomaly ``(x − μ(z_type)) / σ(z_type)`` using the
+    Step-1 :class:`~models.mature_baseline.RFFMatureBaseline` readout, which must be
+    supplied (fitted) via ``baseline``. If ``mature_baseline`` is requested without
+    a readout it raises, so the coupling stays explicit rather than silently wrong.
+
+    Args:
+        kind: ``"raw"`` or ``"mature_baseline"``.
+        baseline: a fitted readout exposing ``predict(z_type) -> (μ, σ)`` with
+            per-channel ``[N, Cx]`` outputs. Required for ``mature_baseline``.
     """
 
-    def __init__(self, kind: str = "raw"):
+    def __init__(self, kind: str = "raw", baseline=None):
         if kind not in ("raw", "mature_baseline"):
             raise ValueError(f"unknown anomaly target kind: {kind!r}")
         self.kind = kind
+        self.baseline = baseline
 
     def __call__(self, x: torch.Tensor, z_type: torch.Tensor) -> torch.Tensor:
         """Args: ``x`` ``[N, Cx, T]``, ``z_type`` ``[N, dt]`` → target ``[N, Cx, T]``."""
         if self.kind == "raw":
             return x
-        raise NotImplementedError(
-            "mature_baseline anomaly target needs the Step-1 μ/σ readout "
-            "(see docs/phase_rethink_design.md, Step 1); not yet implemented."
-        )
+        if self.baseline is None:
+            raise NotImplementedError(
+                "mature_baseline anomaly target needs a fitted Step-1 μ/σ readout "
+                "(models.mature_baseline.RFFMatureBaseline) passed as `baseline` "
+                "(see docs/phase_rethink_design.md, Step 1)."
+            )
+        mu, sigma = self.baseline.predict(z_type)          # each [N, Cx]
+        return (x - mu.unsqueeze(-1)) / sigma.unsqueeze(-1)  # broadcast over T

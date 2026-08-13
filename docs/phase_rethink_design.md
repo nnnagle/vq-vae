@@ -163,25 +163,40 @@ alongside the model and evaluated with one forward per batch.
   never by the baseline readout.
 - **Form — LOCKED: a standard Random Fourier Features (RFF) readout.** A **fixed,
   centerless** random basis `φ(z) = √(2/D)·cos(Ωz + b)`, `Ω ~ N(0, h⁻²)` drawn once,
-  `b ~ U[0,2π]`; `μ(z) = μ_prior + W_μᵀφ(z)`, `σ(z) = softplus(W_σᵀφ(z)) + floor`.
-  Chosen over RBF and Lipschitz-MLP because it gives RBF's **explicit interpretable
-  bandwidth `h`** *without* data-centers (which go stale under a drifting z_type and
-  re-import the reservoir we rejected) and without a wiggly global extrapolation:
-  the basis is smooth global sinusoids (no discrete centers — matches "z_type is
-  globally smooth by construction"), and far from data the readout **reverts toward a
-  flat prior** (bounded, not runaway). Two far-apart data-empty regions therefore
-  revert to the **same** μ_prior/σ_prior — honest ("no data ⇒ no distinct baseline")
-  and *labeled* by the leverage diagnostic below. (A coarse global-trend prior
-  `g(z)` that would distinguish empty regions was considered and **deferred** — flat
-  prior for now.)
-- **Fit — closed-form ridge for μ, gradient for σ, on online sufficient statistics.**
-  Because RFF is **linear in the weights**, keep running EMA accumulators over the
-  batch's mature anchors (kept fresh under drift):
-  `A = EMA[φφᵀ]` (D×D), `c = EMA[φ·xᵀ]` (D×C). Then **μ is closed-form**:
-  `W_μ = (A + λI)⁻¹ c` — more stable than SGD, and the same `A⁻¹` yields the leverage
-  diagnostic for free. σ is nonlinear (heteroscedastic), so **fit it by gradient NLL**
-  on the μ-residuals, with a floor. D is a few hundred → `A` and its periodic inverse
-  are cheap; **no stored samples** (the accumulators are the sufficient statistics).
+  `b ~ U[0,2π]`. Chosen over RBF and Lipschitz-MLP because it gives RBF's **explicit
+  interpretable bandwidth `h`** *without* data-centers (which go stale under a
+  drifting z_type and re-import the reservoir we rejected): the basis is smooth
+  global sinusoids (no discrete centers — matches "z_type is globally smooth by
+  construction"), and where mature data is sparse the ridge readout **reverts toward
+  a flat prior** (bounded, not runaway).
+  - **Finite-D caveat (measured — `frl/tests/test_mature_baseline.py`).** RFF
+    features are periodic, so "far in Euclidean z_type" is not automatically "far in
+    feature space." At finite `D` a sparse-support query reverts only *partway* to
+    the prior (its deviation from the prior is smaller than the in-support signal
+    spread — it collapses toward the prior, doesn't extrapolate wildly), and two
+    distinct far points are **not identical** (each keeps an aliasing residual). Both
+    the revert-to-prior *and* the leverage calibration **sharpen as `D` grows** (`D`
+    is a closer Gaussian-kernel approximation). Hence `D` is generous (default
+    **1024**), not "a few hundred." (A coarse global-trend prior `g(z)` remains
+    **deferred** — flat prior for now.)
+- **Fit — closed-form, on online sufficient statistics; no gradient parameters.**
+  RFF is **linear in the weights**, so keep EMA accumulators over the batch's mature
+  anchors (fresh under drift) and solve in closed form: `A = EMA[φφᵀ]`,
+  `Cx = EMA[φ·xᵀ]` → centered mean ridge `μ(z) = E[x] + (φ(z)−E[φ])ᵀ(Ac+λI)⁻¹cc`.
+  **σ is closed-form too** (see the deviation note): a *second* ridge on the squared
+  residuals of the mean fit, `E[(x−μ)²|z]` (accumulator `Cr2 = EMA[φ·(x−μ)²ᵀ]`),
+  floored — reusing the same `(Ac+λI)`. The whole estimator is **buffer-only**
+  (no `nn.Parameter`, no gradient loss term), inherently stop-grad, updated once per
+  batch. `A` and its inverse are cheap; **no stored samples**.
+  - **Deviation from the lock (σ).** The lock said "closed-form μ + **gradient** σ".
+    Implementing showed the conditional variance is *also* closed-form (a ridge on
+    squared residuals — same machinery, and it reverts to the prior variance far
+    from data, which a free gradient head would not). Estimating σ² as `E[x²]−μ²`
+    (difference of two moments) instead **collapses** to the floor under a wiggly μ
+    → σ→0 → the anomaly divide explodes; the **residual-variance ridge is the stable
+    fix** (recovers the true per-channel noise). As-built = closed-form residual-
+    variance σ; a gradient σ head remains a small drop-in if ever wanted. *(Flagged
+    for confirmation.)*
 - **Training data — the current batch's mature anchors, no buffer.** Update the
   readout online from the mature timesteps (`ysfc > mature_ysfc_threshold`) of the
   anchor pixels **already embedded each batch**: fold them into the `A`,`c` EMAs (→
@@ -213,9 +228,10 @@ alongside the model and evaluated with one forward per batch.
     **per-EVT coverage diagnostic**. Cost: a rare-type mature pixel scored against the
     generic prior picks up a **bounded** spurious anomaly (`‖μ_local−μ_prior‖/σ_prior`);
     optionally **down-weight high-leverage pixels** in the phase losses.
-  - *Silent collapse* — σ→0 or μ ignoring type. Guard by validating **val-split NLL /
-    R²** and a **σ floor** (the prior-revert also keeps σ→σ_prior, not →0, far from
-    data).
+  - *Silent collapse* — σ→0 or μ ignoring type. Guarded by the **residual-variance
+    σ** (stable, reverts to prior variance where data is sparse; the retired
+    `E[x²]−μ²` form was what collapsed), a **σ floor**, and validating **val-split
+    NLL / R²**.
 - **Scale hierarchy vs. the pairwise comparison scale σ_ij.** The RFF **bandwidth
   `h`** should be **coarser (larger) than the type-similarity comparison scale σ_ij**
   used to weight loss pairs — i.e. `L_eff < 1/σ_ij`. Why: (1) the loss treats pixels within
@@ -245,13 +261,14 @@ alongside the model and evaluated with one forward per batch.
 - **Hierarchy guard — `L_eff · σ_type < 1`.** Report `L_eff` (mean/95th-pct `‖∇μ‖`,
   `∇μ = −W_μᵀ(√(2/D)·sin(Ωz+b) ⊙ Ω)`) and check it against the type-similarity scale
   `σ_type` (on the standardized-z_type metric). Fails ⇒ `h` too small ⇒ raise next run.
-- **Per-sample leverage / coverage — `v(z) = φ(z)ᵀ(A + λI)⁻¹φ(z)`** (from the same
-  `A⁻¹` that fits μ; with normalized features `v∈[0,1]` reads as "fraction of the prior
-  still in control": `v≈0` data-pinned, `v≈1` prior-dominated). Cheap fallback: density
-  `m(z) = φ(z)·s`, `s = EMA[Σφ]`. Flags untrustworthy anomalies per pixel; **aggregate
-  `v` per EVT** = the coverage diagnostic (which types chronically fall back to prior).
-  The coverage histogram is *also* an `h` signal (too many prior-dominated ⇒ `h` small;
-  none even for rare types ⇒ `h` over-smoothing).
+- **Per-sample leverage / coverage — `v(z) = λ·f ᵀ(Ac + λI)⁻¹f / (f ᵀf)`**, `f = φ(z)−E[φ]`
+  (from the same solve that fits μ). A **monotone coverage score in `[0,1]`**: higher =
+  leaning more on the prior (μ/σ reverting), lower = data-pinned. Its absolute scale
+  approaches a clean "prior fraction" only as `D` grows (periodic-feature caveat above),
+  but it **orders** samples by support at any `D`. Flags untrustworthy anomalies per
+  pixel; **aggregate `v` per EVT** = the coverage diagnostic (which types chronically
+  fall back to prior). The coverage histogram is *also* an `h` signal (too many
+  high-leverage ⇒ `h` small; none even for rare types ⇒ `h` over-smoothing).
 
 ---
 
@@ -817,7 +834,7 @@ being overlaid, needs more history/dimension.
 
 **Build**
 1. Type-local mature-baseline μ(z_type), σ(z_type) — an **RFF readout** (closed-form
-   `(A,c)`-ridge μ + gradient σ, floor) fit online on mature (`ysfc > threshold`)
+   `(A,c)`-ridge μ + residual-variance-ridge σ, floor) fit online on mature (`ysfc > threshold`)
    timesteps; `h` by val-NLL, leverage `v(z)` for coverage. No reservoir/kNN.
 2. Anomaly input transform `(x−μ)/σ` (+ Δ / Δ² channels).
 3. Within-pixel **Gaussian OU-NLL** `‖z_{t+1} − ρ·z_t‖²` on disturbance-gated
@@ -853,7 +870,7 @@ history — no config flag, per the locked "hard-remove" decision):
 ## Checklist (ordered — de-risking first)
 
 - [x] 0. Eval harness (A/B/C implemented in `frl/training/phase_eval/`; D/E deferred), fit on train / report test, baselined to exp035.
-- [ ] 1. μ/σ **RFF readout** on standardized detached z_type: fixed random basis `φ(z)=√(2/D)cos(Ωz+b)`, `Ω~N(0,h⁻²)`; **closed-form `(A,c)`-ridge μ** (EMA sufficient stats) + **gradient σ** (softplus + floor); mature timesteps `ysfc > mature_ysfc_threshold` (~10–12 East / ~20–25 West); `h` chosen by val-split NLL with `L_eff·σ_type < 1`; per-sample leverage `v(z)=φᵀ(A+λI)⁻¹φ` for coverage. Flat prior. No reservoir/kNN.
+- [~] 1. μ/σ **RFF readout** on standardized detached z_type: fixed random basis `φ(z)=√(2/D)cos(Ωz+b)`, `Ω~N(0,h⁻²)`; **closed-form `(A,c)`-ridge μ** + **residual-variance-ridge σ** (floor) on EMA sufficient stats (buffer-only, no gradient params); `D`=1024 (sharper revert/leverage with `D`); `h` chosen by val-split NLL with `L_eff·σ_type < 1`; per-sample leverage `v(z)=λfᵀ(Ac+λI)⁻¹f/fᵀf` for coverage. Flat prior. No reservoir/kNN. **Module + unit tests done** (`models/mature_baseline.py`, `tests/test_mature_baseline.py`, eval seam wired); mature-selection + training-loop wiring is Steps 2–3.
 - [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp035. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 3b. FiLM-free, magnitude-preserving encoder (see "Encoder architecture"): **remove FiLM** (`z_phase = f(a,Δa)`), add the **anchor loss** `λ·‖z_phase‖²` on mature → single shared origin, remove old L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`) and mature→origin. Alongside Step 3.

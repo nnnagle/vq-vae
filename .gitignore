@@ -32,3 +32,9 @@ runs/
 models/
 out/
 .claude/
+
+# `frl/models` is a source package, not a weights dir — keep its sources tracked
+# (without overriding the __pycache__ / *.pyc rules above).
+!frl/models/
+!frl/models/**/*.py
+!frl/models/**/*.md
