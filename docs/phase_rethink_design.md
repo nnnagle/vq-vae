@@ -325,13 +325,20 @@ that make abruptness explicit.
   `z_phase = f(a, Δa)` is type-conditioned via the input; output modulation is dropped.
   Mature `a≈0 → z_phase ≈ 0` (single shared origin, gauge-anchored).
 
-**Open decisions (to resolve before implementing):**
-- **Δ² or Δ-only.** Δ captures onset abruptness; Δ² adds curvature (distinguishes a
-  sharp V-bottom from a rounded L-turn) at the cost of noise amplification. Lean
-  Δ-only first, add Δ² if the fast/slow separation (diagnostic C/D) is weak.
-- **Scaling of the Δ channels.** Δa is already in σ_i units (since `a` is); decide
-  whether Δ needs its own robust rescale so its dynamic range matches `a` for the
-  TCN, or whether GroupNorm inside the TCN makes that moot.
+**Resolved decisions (implemented — `models/anomaly_transform.py`, tests
+`tests/test_anomaly_transform.py`):**
+- **Δ-only (LOCKED).** Output is `[a ; Δa]` (2C channels). Δ² is a deferred option
+  (`delta_only=False` raises for now) — add it only if the fast/slow separation
+  (diagnostic C/D) is weak.
+- **Δ gets its own locked robust scale (LOCKED).** Since the encoder drops
+  per-sample norms (Step 3b), `Δa` is divided by a single **global robust scale** =
+  EMA of the per-batch **median of `‖Δa‖`**, **observed through the type-only
+  curriculum phase and locked when the phase losses go live** (`lock_delta_scale()`,
+  wired to the curriculum boundary in Step 3). A fixed scale is required by
+  magnitude-preservation — a drifting Δ normalizer would destroy depth→radius.
+  Distinct from μ/σ: the **readout keeps learning all through training** (online
+  EMA); only the Δ scale freezes. `a` itself needs no extra scale (already
+  per-channel unit via the readout's σ).
 
 ---
 
@@ -871,7 +878,7 @@ history — no config flag, per the locked "hard-remove" decision):
 
 - [x] 0. Eval harness (A/B/C implemented in `frl/training/phase_eval/`; D/E deferred), fit on train / report test, baselined to exp035.
 - [~] 1. μ/σ **RFF readout** on standardized detached z_type: fixed random basis `φ(z)=√(2/D)cos(Ωz+b)`, `Ω~N(0,h⁻²)`; **closed-form `(A,c)`-ridge μ** + **residual-variance-ridge σ** (floor) on EMA sufficient stats (buffer-only, no gradient params); `D`=1024 (sharper revert/leverage with `D`); `h` chosen by val-split NLL with `L_eff·σ_type < 1`; per-sample leverage `v(z)=λfᵀ(Ac+λI)⁻¹f/fᵀf` for coverage. Flat prior. No reservoir/kNN. **Module + unit tests done** (`models/mature_baseline.py`, `tests/test_mature_baseline.py`, eval seam wired); mature-selection + training-loop wiring is Steps 2–3.
-- [ ] 2. Anomaly input builder `(x−μ)/σ` + Δ/Δ² at anchors via `build_feature_at_locations`; verify mature≈0, fast vs slow disturbances distinct.
+- [~] 2. Anomaly input transform `(x−μ)/σ` + **Δ-only** (own locked robust MAD scale, frozen at the curriculum boundary; μ keeps learning). **Module + unit tests done** (`models/anomaly_transform.py`, mature≈0 / fast-vs-slow / mask / NaN / scale-lock verified). Anchor-only wiring via `build_feature_at_locations` in the training loop is Step 3.
 - [ ] 3. Turn on anomaly input after warmup; confirm μ/σ settle and "does the input alone help?" vs exp035. Extend the phase-loss warmup as needed for μ/σ settling.
 - [ ] 3b. FiLM-free, magnitude-preserving encoder (see "Encoder architecture"): **remove FiLM** (`z_phase = f(a,Δa)`), add the **anchor loss** `λ·‖z_phase‖²` on mature → single shared origin, remove old L2-norm, drop/replace per-sample GroupNorm (→ none/global), optional `‖a‖` norm-bypass skip; verify depth→radius survives (deep vs shallow V separable in `‖z_phase‖`) and mature→origin. Alongside Step 3.
 - [ ] 4. Within-pixel **Gaussian OU-NLL**: `‖z_{t+1} − ρ·z_t‖²` on disturbance-gated (`w_dist`) transitions, `ρ<1` scalar global (subsumes smoothness + radius contraction + direction preservation); **`s` isotropic, global, radius-shrinking `s²(‖z‖)=s0²+s1²‖z‖²`** (start `s1≈0` = weighted squared residual; raise `s1` for a tighter mature basin if fuzzy); confirm drift-to-basin, straight ordered recovery rays, jump-at-disturbance.
