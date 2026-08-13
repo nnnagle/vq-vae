@@ -4,9 +4,14 @@
 #SBATCH --account=acf-utk0011
 #SBATCH --qos=campus-gpu
 #SBATCH --gpus=1
+# Restrict to the two UNIFORM 32 GB nodes (any single GPU is 32 GB), rather than
+# --exclusive (idles the 2nd GPU → cancelled for an unused GPU) or plain --gpus=1
+# on a mixed node (SLURM may hand us the 16 GB V100 → OOM; GRES mislabels it so we
+# can't select by type). Excluded: clrv1101 (16 GB). note:  mixed 32/16 are clrv1103/1105/1201.
 #SBATCH --exclude=clrv1101
 #SBATCH --cpus-per-task=18
-#SBATCH --mem=120G
+# --mem=500G: enough headroom to hold the v2 zarr in /dev/shm (RAM tmpfs).
+#SBATCH --mem=500G
 #SBATCH --time=02:00:00
 #SBATCH --output=/lustre/isaac24/scratch/nnagle/vq-vae/runs/slurm-%j.log
 #SBATCH --mail-type=END,FAIL
@@ -21,15 +26,45 @@ conda activate /nfs/home/nnagle/.conda/envs/frl
 
 set -euo pipefail
 
-# Reads the zarr from Lustre; BLAS caps keep the dataloader workers single-threaded.
-export ZARR_ROOT=/lustre/isaac24/scratch/nnagle/zarr
+# BLAS caps keep the dataloader workers single-threaded.
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 echo "Running on node: $(hostname)"
+echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+# Mixed/mislabeled GPUs on this partition (some nodes pair a 32 GB V100S with a
+# 16 GB V100). Pin to the largest-memory GPU visible to this job.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.total \
+    --format=csv,noheader,nounits | sort -t',' -k2 -nr | head -1 | tr -d ' ' | cut -d',' -f1)
+echo "Pinned to GPU index $CUDA_VISIBLE_DEVICES (largest memory) via CUDA_VISIBLE_DEVICES"
+
+# Load the v2 zarr into RAM (matches eval_isaac_v2.sh). Single-nest tar extracts to
+# /dev/shm/zarr/va_vae_dataset.zarr, so ZARR_ROOT=/dev/shm/zarr.
+DATA_DIR=/lustre/isaac24/proj/UTK0496/zarr_v2
+
+# /dev/shm is a node-local tmpfs not cleared between jobs — clear a prior run's
+# stale extract, and remove ours on exit.
+rm -rf /dev/shm/zarr
+trap 'rm -rf /dev/shm/zarr' EXIT
+
+SHM_AVAIL=$(df -B1 --output=avail /dev/shm | tail -1)
+NEED=$((300 * 1024 * 1024 * 1024))
+if [ "${SHM_AVAIL:-0}" -lt "$NEED" ]; then
+    echo "ERROR: /dev/shm on $(hostname) has $(df -h /dev/shm | awk 'NR==2{print $4}')" \
+         "free (< ~300 GB) even after cleanup (df -h /dev/shm)." >&2
+    exit 1
+fi
+
+echo "Extracting v2 Zarr tar to RAM ($(date))..."
+tar xf "$DATA_DIR/zarr_v2.tar" -C /dev/shm/
+cp "$DATA_DIR/va_vae_dataset_stats.json" /dev/shm/zarr/
+echo "Zarr extract complete ($(date))"
+export ZARR_ROOT=/dev/shm/zarr
 
 cd /lustre/isaac24/scratch/nnagle/vq-vae/frl
 
