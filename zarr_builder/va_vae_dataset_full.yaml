@@ -244,6 +244,24 @@ annual:
         - id: lcms_ysfc_censored_1985_2024
           path: /data/VA/lcms_ysfc/lcms_ysfc_value_1985_2024.vrt
 
+  # LCMS annual Change product (hard change class per year), from GEE.
+  # VRT mosaic of 4 Byte lcms_chg_*.tif tiles; 40 bands ARE the years
+  # 1985..2024, one variable (see the gdalbuildvrt command below).
+  # A band-level `path` (no group-level `path`) selects the per-band loader
+  # (load_per_band_annual): it infers 1985-2024 from year_range and clips to the
+  # global window (2010-2024) — the same proven path the lcms_chg vrts use.
+  # semantic_type: categorical → stored int16 with a class histogram (change-agent
+  # labels for the phase-rethink diagnostic, docs/phase_rethink_design.md §D).
+  - group: lcms_chg_class
+    years: {start: 1985, end: 2024}
+    data:
+      semantic_type: categorical
+      bands:
+        # VRT mosaic of the 4 lcms_chg_*.tif tiles:
+        #   cd /data/VA/lcms && gdalbuildvrt lcms_chg_1985_2024.vrt lcms_chg_*.tif
+        - id: lcms_chg_class
+          path: /data/VA/lcms/lcms_chg_1985_2024.vrt
+
 irregular:
   - group: naip
     path: /data/VA/naip/naip_{yyyy}.vrt

@@ -249,6 +249,61 @@ python frl/training/fit_linear_probe.py \
     --checkpoint runs/checkpoints/model.pt
 ```
 
+### Step-0 Phase-Pathway Eval Harness (`frl/training/phase_eval/`)
+
+The falsifiable eval for the phase-pathway rethink (`docs/phase_rethink_design.md`
+Step 0). Runs diagnostics **A–C**, **fit on train / λ-tuned on val / reported on
+test**, and writes one `metrics.json` per checkpoint; `compare_eval.py` diffs a new
+run against the exp034/exp035 baseline. See
+`docs/phase_eval_step0_findings.md` for the exp035 results and what Steps 1–5
+should target.
+
+```bash
+# one checkpoint (diagnostics A,B,C)
+PYTHONPATH=frl python -m training.phase_eval.run_eval \
+    --checkpoint runs/frl_v0_exp035/checkpoints/encoder_best_1_epoch_380.pt \
+    --training config/frl_training_v1.yaml --evt-map ../data/LF2024_EVT.csv \
+    --output-dir runs/frl_v0_exp035/phase_eval/
+# new vs baseline
+PYTHONPATH=frl python -m training.phase_eval.compare_eval \
+    --new runs/frl_v0_exp035/phase_eval/metrics.json \
+    --baseline runs/frl_v0_exp034/phase_eval/metrics.json
+```
+
+- **A — reconstruction** (`reconstruction.py`): ridge + MLP-ceiling probes
+  `features → raw phase-input x`, for three feature sources: post-FiLM `z_phase`,
+  **pre-FiLM `h`** (the TCN bottleneck, the FiLM-free contrast), and `z_type`
+  (atemporal control). Reports **total** and **within-pixel** R² (the within-pixel
+  R² is *the phase signal*), as a **variance-weighted aggregate** (pool residual/
+  total SS across channels before the ratio — so low-within-variance channels
+  can't dominate an unweighted mean) plus per-channel R²/variance/MSE. `z_type`
+  within-R² is **0 by construction** (atemporal → broadcast over T → zero
+  within-pixel prediction variance): that is the control, not a bug. The
+  `__summary__` block reports the **h → z_phase within-R² gap** = how much
+  temporal signal FiLM loses. `temporal_position` (the calendar-index target) is
+  excluded via `EXCLUDE_TARGET_CHANNELS` — it is trivially predictable and was
+  inflating the aggregate.
+- **B — recovery curves** (`recovery_curves.py`): `z_phase → NBR` probe, per-EVT
+  actual-vs-predicted recovery curves and a **shape-agreement** metric. Runs two
+  designs: **phase-only** and **type-phase** (`[z_type, z_phase]`) — the latter
+  supplies the type-specific baseline z_phase alone lacks (no per-EVT intercept;
+  EVT is diagnostic only).
+- **C — ejection** (`ejection.py`): jump magnitude `‖z_phase[t] − z_phase[t−1]‖`
+  at disturbance years (`ysfc==0`) vs stable, and the ROC-AUC of disturbance-from-
+  jump.
+
+**Ridge normal equations are averaged by the observation count M** (`A/M`, `B/M`)
+before adding `λI`, so the λ grid is on a dataset-size-independent scale — with
+standardized features `A/M` has a unit diagonal. Without the `1/M`, `A`'s diagonal
+is ~M (10⁷–10⁸) and every `λ≤1` is a ~10⁻⁷ perturbation: the sweep goes flat and
+the fit is silently unregularized. A `_warn_lambda_edge` guard logs a warning when
+the selected λ lands on the grid boundary (optimum outside the grid), skipping
+degenerate flat sweeps (e.g. z_type). **Both A and B fit their own ridge — this
+averaging must hold in both.**
+
+ISAAC launchers: `eval_isaac_v2.sh` (GPU) / `eval_isaac_bigmem.sh` (CPU bigmem,
+sidesteps the GPU-idle watchdog on the light Step-0 eval).
+
 ### Important: Encoder Feature Name
 
 All inference and evaluation scripts must read the encoder feature name from the
@@ -314,6 +369,14 @@ frl/training/visualize_forest_diagnostics.py  Forest-wide embedding diagnostics
 frl/training/phase_evt_diagnostics.py         EVT-stratified FiLM gamma + z_phase temporal variance
 frl/training/phase_recovery_curves.py         Per-EVT NBR recovery curves vs. ysfc (requires probe)
 
+frl/training/phase_eval/common.py             Step-0 harness plumbing (loaders, extract_pixel_series, variance_decompose)
+frl/training/phase_eval/reconstruction.py     Diagnostic A — z_phase/h/z_type → x reconstruction (within-pixel R²)
+frl/training/phase_eval/recovery_curves.py    Diagnostic B — z_phase→NBR recovery curves (phase-only + type-phase)
+frl/training/phase_eval/ejection.py           Diagnostic C — disturbance-year jump magnitude + ROC-AUC
+frl/training/phase_eval/run_eval.py           Step-0 CLI runner (train-fit / val-tune / test-report → metrics.json)
+frl/training/phase_eval/compare_eval.py       Diff two metrics.json (new vs exp034/exp035 baseline)
+frl/training/phase_eval/lcms_agents.py        LCMS change-agent class codes (Diagnostic D, deferred)
+
 frl/config/frl_repr_model_v1.yaml        Architecture config
 frl/config/frl_binding_v1.yaml           Dataset bindings config
 frl/config/frl_training_v1.yaml          Training hyperparameter config
@@ -354,7 +417,18 @@ head = MLPHead(in_dim=64, out_dim=n_classes)  # frl/models/heads.py
 
 The Zarr archive lives on Lustre at `/lustre/isaac24/scratch/nnagle/zarr/` (284 GB, 3.9M files). A pre-built tar archive is at `/lustre/isaac24/scratch/nnagle/zarr.tar` (269 GB) for fast job-start extraction — use this instead of `cp -r`, which takes 90+ minutes due to Lustre metadata overhead on 3.9M files.
 
-**Tar extraction path quirk:** The tar was built from inside the `zarr/` directory, so it extracts with a double-nested path: `zarr/zarr/va_vae_dataset.zarr/`. After extracting to `/dev/shm/` or `/tmp/`, set `ZARR_ROOT` to `/dev/shm/zarr/zarr` (not `/dev/shm/zarr`).
+**Tar extraction layout.** Build the tar so its members are single-nested under
+`zarr/` — extract to `/dev/shm/` (or `/tmp/`) and you get
+`/dev/shm/zarr/va_vae_dataset.zarr`, so `ZARR_ROOT=/dev/shm/zarr`. Reproduce the
+layout without copying the data via GNU tar's `--transform`:
+`cd /data/VA/zarr_v2 && tar -cf zarr_v2.tar --transform='s,^,zarr/,' va_vae_dataset.zarr`.
+The **v2 dataset** (`zarr_v2.tar`, includes `lcms_chg_class`) and
+`train_isaac_ram_v2.sh` use this corrected layout.
+
+*Legacy note:* the original `zarr.tar` was accidentally built double-nested
+(`zarr/zarr/va_vae_dataset.zarr/`), so the original `train_isaac_ram.sh` /
+`train_isaac_dev*.sh` set `ZARR_ROOT=/dev/shm/zarr/zarr`. Those remain paired with
+that old tar; new work should use the v2 tar + `train_isaac_ram_v2.sh`.
 
 **Sidecar files:** Stats files (`*.json`, `*.csv`) are not inside the tar — they are copied separately from Lustre after extraction.
 
@@ -362,10 +436,11 @@ The Zarr archive lives on Lustre at `/lustre/isaac24/scratch/nnagle/zarr/` (284 
 
 | Script | Partition | Data location | Purpose |
 |--------|-----------|---------------|---------|
-| `train_isaac.sh` | campus-gpu-large | Lustre (slow) | Original production script |
-| `train_isaac_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Production, auto-resumes |
-| `train_isaac_dev.sh` | campus-gpu-bigmem | `/tmp` (NVMe) | Dev, `--overwrite` |
-| `train_isaac_dev_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | Dev, `--overwrite` |
+| `train_isaac_ram_v2.sh` | campus-gpu-large | `/dev/shm` (RAM) | **v2 dataset** (with `lcms_chg_class`); corrected single-nest tar |
+| `train_isaac.sh` | campus-gpu-large | Lustre (slow) | Original production script (v1) |
+| `train_isaac_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | v1 production, auto-resumes; legacy double-nest tar |
+| `train_isaac_dev.sh` | campus-gpu-bigmem | `/tmp` (NVMe) | v1 dev, `--overwrite`; legacy double-nest tar |
+| `train_isaac_dev_ram.sh` | campus-gpu-large | `/dev/shm` (RAM) | v1 dev, `--overwrite`; legacy double-nest tar |
 
 ### Performance
 
@@ -379,9 +454,12 @@ Supporting changes: `OPENBLAS/MKL/NUMEXPR/OMP_NUM_THREADS=1` in the launch scrip
 ### SLURM Notes
 
 - **Authorized QOS:** `campus`, `campus-bigmem`, `campus-gpu`, `long`, `long-bigmem`, `long-gpu`
-- **Exclude `clrv1101`** — smaller GPU, included in scripts via `--exclude=clrv1101`
+- **campus-gpu-large is GPU-heterogeneous and the GRES tag lies** (all report `gpu:v100s:2`). Actual (from `gpuprobe`): **uniform 32 GB** = `clrv1107`, `clrv1205`; **mixed 32 GB + 16 GB V100** = `clrv1103`, `clrv1105`, `clrv1201`; **`clrv1101`** = 16 GB / degraded. On a mixed node `--gpus=1` can hand you the 16 GB card (→ OOM), and you can't select by type because the 16 GB V100 is mislabeled `v100s`.
+- **Do NOT use `--exclusive`** on these 2-GPU nodes — it idles the second GPU and the scheduler cancels the job for holding an unused GPU. Likewise avoid reserving cores/GPUs you don't use.
+- **GPU launch recipe (`train_isaac_ram_v2.sh`, `eval_isaac_v2.sh`):** `--gpus=1` + `--exclude=clrv1101,clrv1103,clrv1105,clrv1201` (restrict to the uniform-32 GB nodes so any single GPU is 32 GB) + the runtime largest-memory GPU pin (`CUDA_VISIBLE_DEVICES`, defense). `/dev/shm` is node-wide, so the scripts pre-clean `/dev/shm/zarr` and fail-fast if < ~300 GB free (a co-tenant contending) — just resubmit.
 - **campus-gpu-bigmem** (`ilpa1209`, A40 + NVMe `/tmp`) — frequently in maintenance; use campus-gpu-large as fallback
-- **campus-gpu-large** nodes have 770 GB RAM — enough to hold the zarr in `/dev/shm` with `--mem=500G`
+- **campus-gpu-large** nodes have 770 GB RAM — enough to hold the zarr in `/dev/shm` with `--mem=500G` (no `--exclusive` needed)
+- **CPU eval** (`eval_isaac_bigmem.sh`) runs on `campus-bigmem` with `--device cpu` — sidesteps the campus-gpu GPU-utilization watchdog, which cancels the GPU-light Step-0 eval "for not using GPU".
 - **ai-tenn** partition (H100s) requires a separate allocation not currently held
 
 ---
@@ -401,7 +479,9 @@ Patches that touch the domain boundary or contain heavily masked pixels can have
 
 ~~**TODO: Weight cross-patch negatives by spectral distance.** Currently cross-patch negatives are unweighted (uniform), which accepts false negatives — spectrally similar forests from different patches that get incorrectly pushed apart. A principled fix: compute spectral distances between cross-patch pairs and apply `neg_weights = 1 - exp(-d_spec / tau)`, consistent with how spatial InfoNCE negatives are already weighted (`frl/training/train_representation.py`, spatial weighting block). This requires computing spectral distances for sampled cross-patch pairs only (not the full O(N²B²) matrix).~~ *(implemented)*
 
-**TODO: Improve encoding of temporal variance and variance-like measures (variance_ndvi, spectral_velocity).** These targets have weak linear probe R² (~0.25–0.63). The cause is not clearly an architecture issue — it may be a loss issue: after whitening, these features contribute only ~1/22 of the InfoNCE pair-selection signal, so gradient pressure is weak. Alternatively, low R² may be appropriate for stable forest types and only problematic for dynamic types. Options to investigate:
+**Likely root cause found — feature-normalization bug (fixed).** The weak variance/velocity signal was, at least in large part, a data-pipeline bug, not a loss/architecture issue: `FeatureBuilder._apply_normalization` applied each channel's `log`/`sqrt` transform but then z-scored the **raw** channel against the **transform-scale** stats, pushing every value past the clamp and collapsing all log-transformed channels to a constant ("dead channel"). Exactly the variance-like measures below use `transform: log` — `variance_ndvi`, `variance_*`, `spectral_velocity`, `spectral_distance_per_decade`, etc. — so they were dead in **both** `build_feature` (eval) and `build_feature_at_locations` (training), across model inputs (`phase_ccdc.spectral_velocity`), loss targets (`soft_neighborhood_phase_target`, `phase_dynamism_supervision`), and the InfoNCE pair-selection space (`infonce_type_spectral`). Fixed in `feature_builder._apply_normalization` (normalize the transformed array; regression test in `frl/tests/test_feature_normalization.py`). Re-evaluate these probes after **retraining with the fix** before pursuing the loss/architecture options below.
+
+**TODO: Improve encoding of temporal variance and variance-like measures (variance_ndvi, spectral_velocity).** These targets have weak linear probe R² (~0.25–0.63) *in pre-fix runs (exp034 and earlier)*. The cause is not clearly an architecture issue — it may be a loss issue: after whitening, these features contribute only ~1/22 of the InfoNCE pair-selection signal, so gradient pressure is weak. Alternatively, low R² may be appropriate for stable forest types and only problematic for dynamic types. Options to investigate:
 - Upweight variance-like features in the spectral distance computation
 - Add an auxiliary reconstruction loss targeting these specific channels
 - ~~Stratify probe diagnostics by EVT forest type before concluding the signal is missing~~ *(done — EVT stratification shows weak phase signal is broadly true across types, not just a stable-forest artifact)*
@@ -409,3 +489,5 @@ Patches that touch the domain boundary or contain heavily masked pixels can have
 ~~**TODO: Compute EVT-forest-type-stratified diagnostics for phase signal strength.**~~ *(implemented — see `phase_evt_diagnostics.py` and `phase_recovery_curves.py`; key findings recorded in the FiLM gamma bullet above)*
 
 ~~**TODO: Make z_phase encode recovery stage, not just pixel identity.** The `soft_neighborhood_phase` loss enforced only relative distance ordering (KL-softmax), which is equivariant to uniform scaling of the embedding space. A model could satisfy it perfectly while compressing all recovery stages into an arbitrarily small region. Phase VICReg did not fix this because it operated on the wrong population (N_phase×T flattened timesteps, dominated by within-pixel temporal variation rather than across-pixel recovery-stage variation). The fix — `phase_recovery_discrimination_loss` in `frl/losses/triplet_phase.py` — adds an absolute margin constraint directly between disturbed and recovered timesteps within each pixel.~~ *(implemented in exp017; model considered complete)*
+
+**FUTURE (deferred): attention-pool trajectory descriptor head on the phase pathway.** Alongside the per-timestep `z_phase`, a small temporal attention-pool head could emit a per-pixel trajectory descriptor — a handful of learned query tokens summarizing e.g. {pre-disturbance baseline, trough depth, recovery slope, time-since-trough}. It would serve as an auxiliary conditioning signal for the per-timestep head and/or as a second retrieval key for trajectory-shape similarity. Not needed for the phase-pathway rethink (the primary output stays per-timestep); recorded here as a possible later enhancement and set aside for now.
