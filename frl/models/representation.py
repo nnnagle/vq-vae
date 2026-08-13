@@ -51,10 +51,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .conv2d_encoder import Conv2DEncoder
-from .conditioning import FiLMLayer
 from .heads import MLPProjectionHead
 from .spatial import GatedResidualConv2D, EdgeAwareSmoothingConv2D
 from .tcn import TCNEncoder
+from .mature_baseline import RFFMatureBaseline
+from .anomaly_transform import AnomalyTransform
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,15 @@ class RepresentationModel(nn.Module):
         phase_tcn_dilations: List[int] = (1, 2, 4),
         phase_tcn_dropout: float = 0.1,
         phase_tcn_num_groups: int = 8,
+        phase_tcn_norm: str = "none",
+        # mature-baseline RFF readout (Step 1) + anomaly transform (Step 2)
+        rff_features: int = 1024,
+        rff_bandwidth: float = 1.0,
+        rff_ridge_lambda: float = 1e-3,
+        rff_sigma_floor: float = 1e-2,
+        rff_ema_decay: float = 0.99,
+        anomaly_delta_only: bool = True,
+        anomaly_scale_decay: float = 0.99,
         # type projection head (SimCLR-style; None = disabled)
         type_proj_hidden_dim: Optional[int] = None,
         type_proj_output_dim: Optional[int] = None,
@@ -154,25 +164,38 @@ class RepresentationModel(nn.Module):
             rank=spatial_conv_rank,
         )
 
-        # --- Phase pathway ---
+        # --- Phase pathway (FiLM-free; type enters only via the μ/σ input
+        #     normalization below — see docs/phase_rethink_design.md Steps 1-3b) ---
+        # Step-1 mature-baseline readout μ(z_type), σ(z_type) and Step-2 anomaly
+        # transform a=(x-μ)/σ + Δa.  The TCN consumes the 2*C anomaly input.
+        self.mature_baseline = RFFMatureBaseline(
+            in_dim=z_type_dim,
+            n_channels=phase_in_channels,
+            n_features=rff_features,
+            bandwidth=rff_bandwidth,
+            ridge_lambda=rff_ridge_lambda,
+            sigma_floor=rff_sigma_floor,
+            ema_decay=rff_ema_decay,
+        )
+        self.anomaly_transform = AnomalyTransform(
+            n_channels=phase_in_channels,
+            delta_only=anomaly_delta_only,
+            scale_decay=anomaly_scale_decay,
+        )
         self.phase_tcn = TCNEncoder(
-            in_channels=phase_in_channels,
+            in_channels=self.anomaly_transform.out_channels,   # 2 * phase_in_channels
             channels=list(phase_tcn_channels),
             kernel_size=phase_tcn_kernel_size,
             dilations=list(phase_tcn_dilations),
             dropout_rate=phase_tcn_dropout,
             num_groups=phase_tcn_num_groups,
+            norm=phase_tcn_norm,      # 'none'/'batch': magnitude-preserving (no per-sample GroupNorm-over-T)
             pooling='none',
         )
         tcn_out_dim = list(phase_tcn_channels)[-1]
-        # Bottleneck: project TCN output to final embedding dimension
+        # Bottleneck: project TCN output to final embedding dimension (no FiLM,
+        # no pre-FiLM L2-norm — magnitude must survive to become z_phase radius).
         self.phase_head = nn.Conv2d(tcn_out_dim, z_phase_dim, kernel_size=1)
-        # FiLM: generates gamma/beta from z_type to modulate z_phase_dim-dim output.
-        # Gamma initialized near 1, beta near 0 → near-identity at init.
-        self.phase_film = FiLMLayer(
-            cond_dim=z_type_dim,
-            target_dim=z_phase_dim,
-        )
 
         # --- Type projection head (SimCLR-style) ---
         # Applied between z_type and InfoNCE losses during training.
@@ -232,6 +255,8 @@ class RepresentationModel(nn.Module):
         sc = cfg.get("spatial_conv", {})
         pt = cfg.get("phase_tcn", {})
         tp = cfg.get("type_projection", {})
+        mb = cfg.get("mature_baseline", {})   # Step-1 RFF readout
+        at = cfg.get("anomaly_transform", {})  # Step-2 anomaly transform
 
         # input_dropout may be a scalar (constant) or a schedule dict.
         # At construction time we always use the initial rate:
@@ -272,6 +297,15 @@ class RepresentationModel(nn.Module):
             phase_tcn_dilations=pt.get("dilations", [1, 2, 4]),
             phase_tcn_dropout=pt.get("dropout", 0.1),
             phase_tcn_num_groups=pt.get("num_groups", 8),
+            phase_tcn_norm=pt.get("norm", "none"),
+            # mature-baseline readout + anomaly transform
+            rff_features=mb.get("n_features", 1024),
+            rff_bandwidth=mb.get("bandwidth", 1.0),
+            rff_ridge_lambda=mb.get("ridge_lambda", 1e-3),
+            rff_sigma_floor=mb.get("sigma_floor", 1e-2),
+            rff_ema_decay=mb.get("ema_decay", 0.99),
+            anomaly_delta_only=at.get("delta_only", True),
+            anomaly_scale_decay=at.get("scale_decay", 0.99),
             # type projection head
             type_proj_hidden_dim=tp.get("hidden_dim") if tp.get("enabled", False) else None,
             type_proj_output_dim=tp.get("output_dim") if tp.get("enabled", False) else None,
@@ -338,101 +372,60 @@ class RepresentationModel(nn.Module):
         x_phase: torch.Tensor,
         z_type: torch.Tensor,
     ) -> torch.Tensor:
-        """Phase pathway forward (dense, full spatial grid).
+        """Dense full-grid phase forward — **not yet rewired for the FiLM-free
+        anomaly pathway** (Step 7 consolidates inference).
 
-        .. deprecated::
-            Prefer :meth:`forward_phase_at_locations` for training, which
-            runs the TCN only on sampled anchor pixels.  This dense method
-            is retained for inference when embeddings are needed at every pixel.
-
-        Args:
-            x_phase: Temporal input ``[B, C_phase, T, H, W]`` (phase_ccdc features).
-            z_type: Type embeddings ``[B, z_type_dim, H, W]`` (**caller must
-                stop-grad** before passing in).
-
-        Returns:
-            z_phase: ``[B, z_phase_dim, T, H, W]`` phase embeddings.
+        The training path uses :meth:`forward_phase_at_locations`. Dense
+        inference needs the μ/σ readout + anomaly transform applied over the full
+        grid; that wiring is deferred, so this raises rather than silently
+        returning a FiLM-based embedding that no longer exists.
         """
-        B, C, T, H, W = x_phase.shape
-        zp = self.z_phase_dim
-
-        # TCN along time: [B, C_phase, T, H, W] -> [B, tcn_out, T, H, W]
-        h = self.phase_tcn(x_phase)
-
-        # Bottleneck per-timestep: reshape to [B*T, tcn_out, H, W] for Conv2d
-        tcn_out = h.shape[1]
-        h = h.permute(0, 2, 1, 3, 4).reshape(B * T, tcn_out, H, W)
-        h = self.phase_head(h)  # [B*T, zp, H, W]
-        h = h.reshape(B, T, zp, H, W).permute(0, 2, 1, 3, 4)  # [B, zp, T, H, W]
-
-        # FiLM conditioning
-        gamma, beta = self.phase_film(z_type)  # each [B, zp, H, W]
-        gamma = gamma.unsqueeze(2)  # [B, zp, 1, H, W]
-        beta = beta.unsqueeze(2)    # [B, zp, 1, H, W]
-        z_phase = gamma * h + beta  # [B, zp, T, H, W]
-
-        return z_phase
+        raise NotImplementedError(
+            "forward_phase (dense) is not wired for the FiLM-free anomaly pathway; "
+            "use forward_phase_at_locations. Dense inference is rewired in Step 7."
+        )
 
     def forward_phase_at_locations(
         self,
         x_phase_pixels: torch.Tensor,
         z_type_pixels: torch.Tensor,
-        return_film: bool = False,
-        return_pre_film: bool = False,
+        valid: torch.Tensor | None = None,
+        return_input: bool = False,
     ) -> torch.Tensor | tuple:
-        """Phase pathway forward at sampled pixel locations only.
+        """Phase pathway forward at sampled pixel locations (FiLM-free).
 
-        Runs the same TCN → bottleneck → FiLM pipeline but only on the
-        supplied pixel time-series, avoiding the cost of processing the
-        full spatial grid.  Produces identical results to extracting from
-        the dense ``forward_phase`` output at the same locations.
+        Builds the type-conditional anomaly input from the raw phase feature and
+        the μ/σ readout, then runs the TCN → bottleneck (no FiLM). Type enters
+        **only** through the anomaly normalization; ``z_phase = f(a, Δa)``.
 
         Args:
-            x_phase_pixels: ``[N, C, T]`` temporal features at N pixels.
-            z_type_pixels: ``[N, z_type_dim]`` type embeddings at the same N pixels
-                (**caller must stop-grad**).
-            return_film: If True, also return the data-dependent gamma and
-                beta tensors (useful for diagnostics).
-            return_pre_film: If True, also return the pre-FiLM bottleneck
-                output ``h [N, z_phase_dim, T]`` (post-normalization, pre-FiLM).
-                Useful for monitoring type leakage into the TCN.
+            x_phase_pixels: ``[N, C, T]`` **raw** phase feature at N pixels (the
+                bindings phase feature, e.g. phase_ccdc — *not* pre-normalized).
+            z_type_pixels: ``[N, z_type_dim]`` type embeddings at the same pixels
+                (**caller must stop-grad**; the readout also detaches internally).
+            valid: optional ``[N, T]`` timestep-validity mask.
+            return_input: if True, also return the anomaly input ``[N, 2C, T]``.
 
         Returns:
-            If neither flag is set: ``z_phase_pixels [N, T, z_phase_dim]``.
-            If *return_film* is True: ``(z_phase_pixels, gamma, beta)``
-                where gamma and beta are ``[N, z_phase_dim]``.
-            If *return_pre_film* is True: ``(z_phase_pixels, h)``
-                where h is ``[N, z_phase_dim, T]``.
-            If both are True: ``(z_phase_pixels, gamma, beta, h)``.
+            ``z_phase_pixels [N, T, z_phase_dim]`` (and the anomaly input if
+            *return_input*).
         """
-        N, C, T = x_phase_pixels.shape
+        # μ/σ from the mature-baseline readout (detached z_type → stop-grad), then
+        # the anomaly transform [a ; Δa].  Both are grad-free constant inputs.
+        mu, sigma = self.mature_baseline.predict(z_type_pixels)          # [N, C]
+        feats, _ = self.anomaly_transform(x_phase_pixels, mu, sigma, valid)  # [N, 2C, T]
+
+        N, _, T = feats.shape
         zp = self.z_phase_dim
 
-        # TCN accepts [N, C, T] directly (no spatial reshape needed)
-        h = self.phase_tcn(x_phase_pixels)  # [N, tcn_out, T]
-
-        # Bottleneck: phase_head is Conv2d(tcn_out, zp, 1×1)
-        # Reshape [N, tcn_out, T] -> [N*T, tcn_out, 1, 1] for Conv2d
+        h = self.phase_tcn(feats)                                        # [N, tcn_out, T]
         tcn_out = h.shape[1]
         h = h.permute(0, 2, 1).reshape(N * T, tcn_out, 1, 1)
-        h = self.phase_head(h)  # [N*T, zp, 1, 1]
-        h = h.reshape(N, T, zp).permute(0, 2, 1)  # [N, zp, T]
+        h = self.phase_head(h)                                           # [N*T, zp, 1, 1]
+        z = h.reshape(N, T, zp)                                          # [N, T, zp]
 
-        # FiLM conditioning
-        # FiLMLayer expects [B, cond_dim, H, W]; reshape to [N, z_type_dim, 1, 1]
-        z_cond = z_type_pixels.unsqueeze(-1).unsqueeze(-1)  # [N, z_type_dim, 1, 1]
-        gamma, beta = self.phase_film(z_cond)  # each [N, zp, 1, 1]
-        gamma = gamma.squeeze(-1)  # [N, zp, 1]
-        beta = beta.squeeze(-1)    # [N, zp, 1]
-        z = gamma * h + beta  # [N, zp, T]
-
-        z = z.permute(0, 2, 1)  # [N, T, zp]
-        if return_film and return_pre_film:
-            return z, gamma.squeeze(-1), beta.squeeze(-1), h
-        if return_film:
-            return z, gamma.squeeze(-1), beta.squeeze(-1)
-        if return_pre_film:
-            return z, h
+        if return_input:
+            return z, feats
         return z
 
     # ------------------------------------------------------------------

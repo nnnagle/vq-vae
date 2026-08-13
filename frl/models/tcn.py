@@ -41,6 +41,7 @@ class GatedResidualBlock(nn.Module):
         dropout_rate: float = 0.0,
         num_groups: int = 8,
         projection_channels: Optional[int] = None,
+        norm: str = 'group',
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -61,8 +62,21 @@ class GatedResidualBlock(nn.Module):
             padding=self.padding,
         )
 
-        # GroupNorm (preact placement: apply after conv, before activation)
-        self.norm = nn.GroupNorm(num_groups, out_channels)
+        # Normalization (preact placement: after conv, before activation).
+        #   'group' — GroupNorm over (C/groups × T) per sample (original).
+        #   'batch' — BatchNorm1d: per-channel over the N×T batch (running stats)
+        #             → magnitude-preserving per sample.
+        #   'none'  — Identity (rely on residual + init; for the FiLM-free phase
+        #             pathway whose input is already O(1)-scaled — a per-sample
+        #             GroupNorm-over-T would divide out the depth→radius signal).
+        if norm == 'group':
+            self.norm = nn.GroupNorm(num_groups, out_channels)
+        elif norm == 'batch':
+            self.norm = nn.BatchNorm1d(out_channels)
+        elif norm == 'none':
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(f"unknown norm {norm!r} (expected 'group'|'batch'|'none')")
 
         # Gate path (1x1 conv from pre-activation features)
         self.gate = nn.Conv1d(out_channels, out_channels, kernel_size=1)
@@ -163,6 +177,7 @@ class TCNEncoder(nn.Module):
         pooling: Literal['stats', 'none'] = 'none',
         post_pool_norm: bool = False,
         normalized_shape: Optional[List[int]] = None,
+        norm: str = 'group',
     ):
         super().__init__()
 
@@ -191,6 +206,7 @@ class TCNEncoder(nn.Module):
                     dropout_rate=dropout_rate,
                     num_groups=num_groups,
                     projection_channels=projection_channels,
+                    norm=norm,
                 )
             )
             prev_channels = out_ch
