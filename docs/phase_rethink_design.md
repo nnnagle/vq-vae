@@ -386,12 +386,29 @@ of `z_type` through the input**. FiLM would be a *second*, redundant conditionin
 - **`β` (offset) — drop it.** Its job (place types apart so `z_phase` encodes type) is
   gone: `z_phase` is now **pure phase** with a single shared mature origin; type lives
   in `z_type`; retrieval is on `[z_type, z_phase]`.
-- **`γ` (per-type reshape) — drop by default; testable fallback.** The type-specific
-  recovery *signature* is already in the type-normalized input, so a type-agnostic
-  encoder captures it. `μ/σ` normalize only moments 1–2, so if recovery *dynamics* are
-  type-specific beyond what the windowed `(a,Δa)` carries, add `γ(z_type)` back (cheap;
-  learns ≈1 if unneeded). Test: does the optimal phase geometry vary by type after input
-  normalization? Default **no**.
+- **`γ` (per-type reshape) — drop by default; testable fallback (re-affirmed).** The
+  type-specific recovery *signature* is already in the type-normalized input, so a
+  type-agnostic encoder captures it. `μ/σ` normalize only moments 1–2, so if recovery
+  *dynamics* are type-specific beyond what the windowed `(a,Δa)` carries, add
+  `γ(z_type)` back — but **γ-only (β = 0)**, so mature still `→ 0` for every type
+  (γ·0 = 0): the single origin survives and γ can reshape tubes without relocating the
+  basin (β would make z_phase a type *label* again — the original failure). Cheap;
+  learns ≈1 if unneeded. **Decision: hold FiLM-free.** Rationale: the collision it would
+  fix (two types, same `(a,Δa)`, needing different z_phase) is doubly narrow — `(a,Δa)`
+  is a high-dim per-band level+velocity signature so exact collisions are measure-zero,
+  and interference only bites if the colliding types are *also* `z_type`-adjacent (far
+  types are incommensurate, never compared). The **within-type phase separability**
+  eval is the trip-wire that would trigger the γ fallback.
+  - **Geometry note (the bundle picture).** z_phase is a **type-collapsed shared
+    shadow**: `z_phase = f(a,Δa)` takes no `z_type`, so same-`(a,Δa)`-different-type
+    points project to the same location — harmless because the loss's `k_type` gate
+    never compares them. The honest object is a **fiber bundle over z_type**: `z_type`
+    = which fiber, `z_phase` = position within it, `[z_type, z_phase]` = the full
+    coordinate (which is *why* retrieval uses the concatenation). The bundle's metric is
+    defined **only fiberwise and only implicitly, by `k_type`** — `σ_type` is the reach
+    over which nearby fibers are softly glued; far fibers are incommensurate. "Type-
+    agnostic encoder" is exact iff the fibers are parallel (one shadow serves all); γ is
+    the escape hatch if they're not.
 - **Anchor mature to the origin.** A light **anchor loss** `λ·‖z_phase‖²` on mature
   timesteps (`a≈0`, or `ysfc > threshold`) plus a roughly **bias-free** bottleneck
   gauge-fixes mature `→ 0` for all types. This makes `‖z_phase‖` = departure-from-
