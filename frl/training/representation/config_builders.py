@@ -304,6 +304,13 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'anchor_weight': getattr(phase_loss_cfg, 'anchor_weight', None) or 0.05,
             # Step-4 OU dynamics loss weight.
             'ou_weight': getattr(phase_loss_cfg, 'ou_weight', None) or 1.0,
+            # Step-5 type-local ranking InfoNCE knobs (calibrate σ's / τ via gap/T).
+            'contrastive_tau': getattr(phase_loss_cfg, 'contrastive_tau', None) or 1.0,
+            'contrastive_sigma_type': getattr(phase_loss_cfg, 'contrastive_sigma_type', None) or 1.0,
+            'contrastive_sigma_flow': getattr(phase_loss_cfg, 'contrastive_sigma_flow', None) or 1.0,
+            'contrastive_n_pos': getattr(phase_loss_cfg, 'contrastive_n_pos', None) or 5,
+            'contrastive_n_neg': getattr(phase_loss_cfg, 'contrastive_n_neg', None) or 20,
+            'contrastive_max_samples': getattr(phase_loss_cfg, 'contrastive_max_samples', None) or 2000,
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "

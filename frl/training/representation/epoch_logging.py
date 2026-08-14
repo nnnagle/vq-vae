@@ -61,6 +61,14 @@ def log_epoch(
             f"resid_rms={od.get('resid_rms', 0.0):.3f} "
             f"s0={od.get('s0', 0.0):.3f} n_eff={od.get('n_eff', 0.0):.0f}"
         )
+    # Step-5 contrastive: gap/τ is the fixed-ruler calibration (target ~2–3).
+    cd = train_stats.get('phase_contrastive_diag')
+    if cd:
+        logger.info(
+            f"  Phase contrastive: gap/T={cd.get('gap_over_tau', 0.0):.2f} "
+            f"(pos_d2={cd.get('pos_d2', 0.0):.3f} neg_d2={cd.get('neg_d2', 0.0):.3f}) "
+            f"anchors={cd.get('n_anchors', 0)} n_disturbed={cd.get('n_disturbed', 0)}"
+        )
     logger.info(
         f"  Val:   {val_stats['loss']:.4f} "
         f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "

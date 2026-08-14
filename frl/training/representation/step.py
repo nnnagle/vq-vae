@@ -27,6 +27,7 @@ from losses.phase_neighborhood import (
     phase_neighborhood_loss,
 )
 from losses.triplet_phase import phase_recovery_discrimination_loss
+from losses.type_phase_contrastive import type_phase_contrastive_loss
 from losses.variance_covariance import variance_covariance_loss
 from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
 from utils import (
@@ -200,6 +201,8 @@ def process_batch(
     cross_phase_weights: list[torch.Tensor] = []
     cross_phase_dynamism: list[torch.Tensor] = []
     cross_phase_h: list[torch.Tensor] = []  # non-detached h for Frobenius loss
+    cross_phase_flow: list[torch.Tensor] = []       # [N,T,2C] anomaly (a,Δa) — Step-5 flow-state
+    cross_phase_disturbed: list[torch.Tensor] = []  # [N,T] disturbed pixel-times (Step-5 filter)
     cross_phase_n_offset: int = 0  # running pixel count for pair index remapping
 
     # Hoist epoch-dependent curriculum weights (same for every patch in the batch)
@@ -688,6 +691,9 @@ def process_batch(
                     cross_phase_spec.append(x_tc)
                     cross_phase_embeddings.append(z_phase_at_anchors)
                     cross_phase_ysfc.append(ysfc_dev)
+                    # Step-5 flow-state (a,Δa) per pixel-time + disturbed filter mask.
+                    cross_phase_flow.append(anomaly_feats.permute(0, 2, 1))   # [N, T, 2C]
+                    cross_phase_disturbed.append((~mature) & phase_valid)     # [N, T]
                     cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
                     cross_phase_weights.append(phase_weights.to(device))
                     cross_phase_n_offset += z_type_at_anchors.shape[0]
@@ -945,142 +951,57 @@ def process_batch(
     # once over all patches in the batch. Spectral reference features are demeaned
     # by a type-local baseline computed via SVD rank reduction + kNN in type space.
     cross_phase_loss_val = torch.tensor(0.0, device=device)
-    cross_phase_spread_val = torch.tensor(0.0, device=device)
-    cross_phase_rd_val = torch.tensor(0.0, device=device)
-    cross_phase_leakage_val = torch.tensor(0.0, device=device)
+    cross_phase_spread_val = torch.tensor(0.0, device=device)   # retired (Step 5)
+    cross_phase_rd_val = torch.tensor(0.0, device=device)        # retired (Step 5)
+    cross_phase_leakage_val = torch.tensor(0.0, device=device)   # retired (diagnostic only)
+    phase_contrastive_diag = None
 
     cp_timing: dict[str, float] = {}
-    if cross_phase_embeddings:
+    t_cross_phase = 0.0
+    if cross_phase_embeddings and curriculum_w > 0.0:
         _t0 = time.perf_counter()
-        Z = torch.cat(cross_phase_z_type, dim=0)           # [N_total, z_type_dim]
-        spec_all = torch.cat(cross_phase_spec, dim=0)      # [N_total, T, C]
-        z_phase_all = torch.cat(cross_phase_embeddings, dim=0)  # [N_total, T, 12]
-        ysfc_all = torch.cat(cross_phase_ysfc, dim=0)      # [N_total, T]
-        pairs_all = torch.cat(cross_phase_pairs, dim=0)    # [B_total, 2]
-        weights_all = torch.cat(cross_phase_weights, dim=0)  # [B_total]
-        if is_profiling() and device.type == 'cuda':
-            torch.cuda.synchronize()
+        Z = torch.cat(cross_phase_z_type, dim=0)               # [P, dt]
+        z_phase_all = torch.cat(cross_phase_embeddings, dim=0)  # [P, T, zp]
+        flow_all = torch.cat(cross_phase_flow, dim=0)           # [P, T, 2C]
+        disturbed_all = torch.cat(cross_phase_disturbed, dim=0)  # [P, T]
+        P, T_all, zp = z_phase_all.shape
+
+        # Flatten to pixel-times (n,t); z_type broadcast over T.
+        zphase_flat = z_phase_all.reshape(-1, zp)
+        ztype_flat = Z.unsqueeze(1).expand(-1, T_all, -1).reshape(-1, Z.shape[1])
+        flow_flat = flow_all.reshape(-1, flow_all.shape[-1])
+        pixel_flat = torch.arange(P, device=device).unsqueeze(1).expand(-1, T_all).reshape(-1)
+        dist_flat = disturbed_all.reshape(-1)
+
+        # Filter to disturbed / recovering pixel-times (the mature majority carries
+        # no ray signal), then cap for the O(M²) kernel.
+        sel = dist_flat.nonzero(as_tuple=True)[0]
+        max_samples = phase_config.get('contrastive_max_samples', 2000)
+        if sel.numel() > max_samples:
+            sel = sel[torch.randperm(sel.numel(), device=device)[:max_samples]]
         cp_timing['cat'] = time.perf_counter() - _t0
 
-        # Randomized PCA rank reduction on z_type for stable kNN type baseline.
-        # torch.pca_lowrank uses a randomized algorithm and computes only K components,
-        # making it much faster than full SVD (torch.linalg.svd) for tall narrow matrices.
-        _t0 = time.perf_counter()
-        K = phase_config.get('phase_type_proj_rank', 8)
-        k_nbrs = phase_config.get('phase_type_proj_neighbors', 20)
-        Z_c = Z - Z.mean(0, keepdim=True)
-        U, _, _ = torch.pca_lowrank(Z_c, q=K, center=False)
-        Z_k = U  # [N_total, K] — pca_lowrank already returns the top-K left vectors
-        if is_profiling() and device.type == 'cuda':
-            torch.cuda.synchronize()
-        cp_timing['svd'] = time.perf_counter() - _t0
-
-        # kNN in reduced type space → type-local spectral baseline per pixel
-        _t0 = time.perf_counter()
-        sim = Z_k @ Z_k.T  # [N_total, N_total]
-        sim.fill_diagonal_(float('-inf'))
-        k_nbrs = min(k_nbrs, sim.shape[0] - 1)
-        topk_idx = sim.topk(k_nbrs, dim=1).indices  # [N_total, k_nbrs]
-        S_mean = spec_all.mean(dim=1)                # [N_total, C] — pixel mean over T
-        S_hat = S_mean[topk_idx].mean(dim=1)         # [N_total, C] — type-local baseline
-        spec_demeaned = spec_all - S_hat.unsqueeze(1)  # [N_total, T, C]
-        if is_profiling() and device.type == 'cuda':
-            torch.cuda.synchronize()
-        cp_timing['knn'] = time.perf_counter() - _t0
-
-        # Build aligned distance batch once; reuse for neighborhood + spread losses
-        _t0 = time.perf_counter()
-        phase_batch = build_phase_neighborhood_batch(
-            spectral_features=spec_demeaned,
-            phase_embeddings=z_phase_all,
-            ysfc=ysfc_all,
-            pair_indices=pairs_all,
-            min_overlap=phase_config.get('min_overlap', 3),
-        )
-        if is_profiling() and device.type == 'cuda':
-            torch.cuda.synchronize()
-        cp_timing['build_batch'] = time.perf_counter() - _t0
-
-        # Phase neighborhood loss
-        _t0 = time.perf_counter()
-        p_loss, p_loss_stats = phase_neighborhood_loss(
-            spectral_features=spec_demeaned,
-            phase_embeddings=z_phase_all,
-            ysfc=ysfc_all,
-            pair_indices=pairs_all,
-            pair_weights=weights_all,
-            tau_ref=phase_config.get('tau_ref', 0.1),
-            tau_learned=phase_config.get('tau_learned', 0.1),
-            min_overlap=phase_config.get('min_overlap', 3),
-            min_valid_per_row=phase_config.get('min_valid_per_row', 2),
-            self_similarity_weight=phase_config.get('self_similarity_weight', 1.0),
-            cross_pixel_weight=phase_config.get('cross_pixel_weight', 1.0),
-            _batch=phase_batch,
-        )
-        if is_profiling() and device.type == 'cuda':
-            torch.cuda.synchronize()
-        cp_timing['neighborhood_loss'] = time.perf_counter() - _t0
-        cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * p_loss
-        p_loss_stats['curriculum_w'] = curriculum_w
-        all_phase_loss_stats.append(p_loss_stats)
-
-        # Phase spread ranking loss
-        cp_timing['spread_loss'] = 0.0
-        if spread_config is not None and spread_w > 0.0 and cross_phase_dynamism:
+        if sel.numel() >= phase_config.get('contrastive_min_samples', 32):
             _t0 = time.perf_counter()
-            dynamism_all = torch.cat(cross_phase_dynamism, dim=0)  # [N_total, C]
-            dynamism_ref = dynamism_all.mean(dim=1).to(device)     # [N_total]
-            valid_mask = phase_batch['valid_pair_mask']
-            if valid_mask.any():
-                idx_i_v = pairs_all[valid_mask, 0]
-                idx_j_v = pairs_all[valid_mask, 1]
-                spread_loss, _ = compute_phase_spread_ranking(
-                    batch_result=phase_batch,
-                    idx_i_valid=idx_i_v,
-                    idx_j_valid=idx_j_v,
-                    dynamism_ref=dynamism_ref,
-                    margin=spread_config['margin'],
-                    delta=spread_config['delta'],
-                )
-                cross_phase_spread_val = spread_config['weight'] * spread_w * spread_loss
-            if is_profiling() and device.type == 'cuda':
-                torch.cuda.synchronize()
-            cp_timing['spread_loss'] = time.perf_counter() - _t0
-
-        # Phase recovery discrimination loss
-        cp_timing['rd_loss'] = 0.0
-        if recovery_disc_config is not None and rd_w > 0.0:
-            _t0 = time.perf_counter()
-            rd_loss, _ = phase_recovery_discrimination_loss(
-                z_phase=z_phase_all,
-                ysfc=ysfc_all,
-                margin=recovery_disc_config['margin'],
-                low_ysfc_max=recovery_disc_config['low_ysfc_max'],
-                high_ysfc_min=recovery_disc_config['high_ysfc_min'],
+            zt = ztype_flat[sel]                                # standardize z_type
+            zt = (zt - zt.mean(0, keepdim=True)) / (zt.std(0, keepdim=True) + 1e-6)
+            c_loss, phase_contrastive_diag = type_phase_contrastive_loss(
+                z_phase=zphase_flat[sel],
+                z_type=zt,
+                flow_state=flow_flat[sel],
+                pixel_id=pixel_flat[sel],
+                tau_phase=phase_config.get('contrastive_tau', 1.0),
+                sigma_type=phase_config.get('contrastive_sigma_type', 1.0),
+                sigma_flow=phase_config.get('contrastive_sigma_flow', 1.0),
+                n_pos=phase_config.get('contrastive_n_pos', 5),
+                n_neg=phase_config.get('contrastive_n_neg', 20),
             )
-            cross_phase_rd_val = recovery_disc_config['weight'] * rd_w * rd_loss
+            cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * c_loss
+            if phase_contrastive_diag is not None:
+                phase_contrastive_diag['n_disturbed'] = int(sel.numel())
             if is_profiling() and device.type == 'cuda':
                 torch.cuda.synchronize()
-            cp_timing['rd_loss'] = time.perf_counter() - _t0
-
-        # Frobenius cross-covariance loss: penalise type info in pre-FiLM h.
-        # Stop-gradient on Z so only the TCN (h) receives gradient.
-        # Uses same curriculum_w as phase neighborhood — zero until phase loss enters.
-        cp_timing['leakage'] = 0.0
-        leakage_weight = phase_config.get('phase_type_leakage_weight', 0.0)
-        if leakage_weight > 0.0 and curriculum_w > 0.0 and cross_phase_h:
-            _t0 = time.perf_counter()
-            h_all = torch.cat(cross_phase_h, dim=0).float()  # [N_total, zp]
-            Z_sg = Z.detach()                                 # stop-grad on z_type
-            h_c = h_all - h_all.mean(0, keepdim=True)
-            Z_c = Z_sg - Z_sg.mean(0, keepdim=True)
-            N_h = h_c.shape[0]
-            cross_cov = h_c.T @ Z_c / max(N_h - 1, 1)  # [zp, z_type_dim]
-            frob = cross_cov.pow(2).sum().sqrt()
-            cross_phase_leakage_val = leakage_weight * curriculum_w * frob
-            if is_profiling() and device.type == 'cuda':
-                torch.cuda.synchronize()
-            cp_timing['leakage'] = time.perf_counter() - _t0
+            cp_timing['contrastive_loss'] = time.perf_counter() - _t0
 
         t_cross_phase = sum(cp_timing.values())
 
@@ -1255,6 +1176,7 @@ def process_batch(
         'phase_anchor_loss': mean_phase_anchor_loss,
         'phase_ou_loss': mean_phase_ou_loss,
         'ou_diag': last_ou_diag,
+        'phase_contrastive_diag': phase_contrastive_diag,
         'readout_leverage': readout_leverage,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
         'evt_diag': evt_diag_agg,

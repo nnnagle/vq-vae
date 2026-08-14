@@ -61,6 +61,7 @@ def train_epoch(
     total_phase_ou_loss = 0.0
     total_readout_leverage = 0.0
     last_ou_diag = None
+    last_contrastive_diag = None
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
     total_spectral_pos_pairs = 0
@@ -146,6 +147,8 @@ def train_epoch(
             total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
             if stats.get('ou_diag'):
                 last_ou_diag = stats['ou_diag']
+            if stats.get('phase_contrastive_diag'):
+                last_contrastive_diag = stats['phase_contrastive_diag']
             total_readout_leverage += stats.get('readout_leverage', 0.0)
             total_evt_loss += stats.get('evt_loss', 0.0)
             if stats.get('evt_diag'):
@@ -308,6 +311,7 @@ def train_epoch(
         'phase_anchor_loss': total_phase_anchor_loss / total_batches,
         'phase_ou_loss': total_phase_ou_loss / total_batches,
         'ou_diag': last_ou_diag,
+        'phase_contrastive_diag': last_contrastive_diag,
         'readout_leverage': total_readout_leverage / total_batches,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
@@ -360,6 +364,7 @@ def validate_epoch(
     total_phase_ou_loss = 0.0
     total_readout_leverage = 0.0
     last_ou_diag = None
+    last_contrastive_diag = None
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
     total_batches = 0
@@ -404,6 +409,8 @@ def validate_epoch(
                 total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
                 if stats.get('ou_diag'):
                     last_ou_diag = stats['ou_diag']
+                if stats.get('phase_contrastive_diag'):
+                    last_contrastive_diag = stats['phase_contrastive_diag']
                 total_readout_leverage += stats.get('readout_leverage', 0.0)
                 total_evt_loss += stats.get('evt_loss', 0.0)
                 if stats.get('evt_diag'):
@@ -468,6 +475,7 @@ def validate_epoch(
         'phase_anchor_loss': total_phase_anchor_loss / total_batches,
         'phase_ou_loss': total_phase_ou_loss / total_batches,
         'ou_diag': last_ou_diag,
+        'phase_contrastive_diag': last_contrastive_diag,
         'readout_leverage': total_readout_leverage / total_batches,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
