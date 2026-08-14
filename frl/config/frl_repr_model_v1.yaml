@@ -86,10 +86,11 @@ phase_tcn:
 # Buffer-only online estimator (no gradient params). See models/mature_baseline.py.
 mature_baseline:
   n_features: 1024      # RFF dim D; larger → sharper revert-to-prior / leverage
-  # bandwidth h is in STANDARDIZED z_type units, where typical inter-point distance
-  # is ~sqrt(2*z_type_dim) (~9.7 for dim 48). h=1 is catastrophic in high-D (every
-  # pair kernel-orthogonal → readout can't interpolate, mu_R2<0). Set h ~ the median
-  # pairwise distance (median-heuristic); retune with z_type_dim. Tune by val-NLL.
+  # bandwidth h (standardized z_type units) is a HEURISTIC START only — the readout
+  # observes the median pairwise ‖Δz‖ through warmup and AUTO-LOCKS h to it at the
+  # curriculum boundary (median heuristic; mirrors the Δ-scale lock). Start near
+  # ~sqrt(2*z_type_dim) (~9.7 for dim 48) so the readout fits from epoch 1; the lock
+  # then snaps it to the data scale. Watch the "Readout fit: μ-R²" log line.
   bandwidth: 10.0
   # ridge_lambda must sit BELOW the mean eigenvalue of the (mean-normalized) feature
   # covariance (~1/D ≈ 1e-3 here); at ~1/D it over-regularizes and pins leverage at

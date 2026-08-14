@@ -183,6 +183,9 @@ def process_batch(
 
     # RFF-bandwidth coverage diagnostic (mean leverage per batch).
     all_readout_leverage = []
+    # Held-out readout μ-fit accumulators (pooled R² = 1 − Σss_res/Σss_tot).
+    readout_ss_res = 0.0
+    readout_ss_tot = 0.0
     # z_phase→z_type leakage guard: z_phase mean-pooled over T, and z_type.
     all_pre_film_h_mean = []   # [N, zp] per batch (z_phase mean over T; was pre-FiLM h)
     all_z_type_at_phase = []   # [N, z_type_dim] per batch
@@ -630,12 +633,19 @@ def process_batch(
                 _C = x.shape[1]
                 delta_a_norm = anomaly_feats[:, _C:, :].norm(dim=1)         # [N, T]
 
-                # Settle the readout on this batch's mature timesteps (for next batch;
-                # predict above used the pre-update readout → no within-batch leakage).
-                if training and bool(mature.any()):
+                # Held-out readout fit (μ-R²) on this batch's mature samples, measured
+                # BEFORE folding them in → genuine held-out. R²>0 ⇔ bandwidth is right
+                # (the diagnostic that catches a mis-calibrated h; leverage can't).
+                if bool(mature.any()):
                     T_ = x.shape[2]
                     z_rep = z_type_at_anchors.unsqueeze(1).expand(-1, T_, -1)   # [N, T, d]
-                    model.mature_baseline.update(z_rep[mature], x_tc[mature])   # [M, d], [M, C]
+                    z_m, x_m = z_rep[mature], x_tc[mature]                      # [M, d], [M, C]
+                    _sr, _st = model.mature_baseline.heldout_r2(z_m, x_m)
+                    readout_ss_res += float(_sr); readout_ss_tot += float(_st)
+                    # Settle the readout on these mature samples (training only; the
+                    # predict above used the pre-update readout → no within-batch leak).
+                    if training:
+                        model.mature_baseline.update(z_m, x_m)
 
                 # RFF-bandwidth coverage diagnostic (mean leverage = prior-reliance).
                 all_readout_leverage.append(
@@ -1186,6 +1196,10 @@ def process_batch(
         'ou_diag': last_ou_diag,
         'phase_contrastive_diag': phase_contrastive_diag,
         'readout_leverage': readout_leverage,
+        'readout_ss_res': readout_ss_res,
+        'readout_ss_tot': readout_ss_tot,
+        'readout_median_dz': float(model.mature_baseline.median_dz),
+        'readout_bandwidth': float(model.mature_baseline.active_bandwidth),
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
         'evt_diag': evt_diag_agg,
         'n_valid': n_valid,

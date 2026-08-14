@@ -104,10 +104,19 @@ class RFFMatureBaseline(nn.Module):
 
         # Fixed random basis: Ω ~ N(0, h⁻²), b ~ U[0, 2π).  (buffers, not params)
         g = torch.Generator().manual_seed(seed)
-        omega = torch.randn(in_dim, n_features, generator=g) / self.bandwidth
+        omega = torch.randn(in_dim, n_features, generator=g)   # UNIT scale; h applied in _features
         bias = torch.rand(n_features, generator=g) * (2.0 * math.pi)
         self.register_buffer("omega", omega)
         self.register_buffer("rff_bias", bias)
+
+        # Active bandwidth is a BUFFER so it can be locked to the observed median
+        # ‖Δz‖ (median heuristic) at the curriculum boundary — mirrors the Δ-scale
+        # lock. Starts at the configured heuristic value; the readout fits with the
+        # heuristic through warmup, then h snaps to the data scale and re-settles.
+        self.register_buffer("active_bandwidth", torch.tensor(self.bandwidth))
+        self.register_buffer("_dz_median_ema", torch.zeros(()))   # observed median ‖Δz‖
+        self.register_buffer("_dz_obs", torch.zeros((), dtype=torch.long))
+        self.register_buffer("bandwidth_locked", torch.zeros((), dtype=torch.long))
 
         # EMA sufficient statistics over mature samples (all buffers).
         D, C = n_features, n_channels
@@ -132,9 +141,37 @@ class RFFMatureBaseline(nn.Module):
         return (z - self.z_mean) / torch.sqrt(self.z_var + 1e-6)
 
     def _features(self, z: torch.Tensor) -> torch.Tensor:
-        """z ``[N, d]`` → φ ``[N, D]`` = √(2/D)·cos(Ω z_std + b)."""
-        proj = self._standardize_z(z) @ self.omega + self.rff_bias
+        """z ``[N, d]`` → φ ``[N, D]`` = √(2/D)·cos((z_std / h)·Ω + b)."""
+        proj = (self._standardize_z(z) / self.active_bandwidth) @ self.omega + self.rff_bias
         return math.sqrt(2.0 / self.n_features) * torch.cos(proj)
+
+    # -- median-heuristic bandwidth lifecycle --------------------------------
+
+    @property
+    def median_dz(self) -> float:
+        """Observed EMA median pairwise ‖Δz‖ of standardized z_type (the natural
+        bandwidth scale). 0 until the first update."""
+        return float(self._dz_median_ema.item())
+
+    @torch.no_grad()
+    def lock_bandwidth(self) -> float:
+        """Freeze the bandwidth to the observed median ‖Δz‖ (median heuristic).
+        Call at the curriculum boundary, like the Δ-scale lock."""
+        if int(self._dz_obs.item()) > 0 and self._dz_median_ema > 0:
+            self.active_bandwidth.copy_(self._dz_median_ema)
+        self.bandwidth_locked.fill_(1)
+        return float(self.active_bandwidth.item())
+
+    @torch.no_grad()
+    def heldout_r2(self, z_type: torch.Tensor, x: torch.Tensor):
+        """Held-out μ fit quality on mature (z, x): returns (ss_res, ss_tot) pooled
+        over channels, where ss_tot is vs the prior mean E[x] (readout's x_mean).
+        R² = 1 − Σss_res/Σss_tot > 0 iff the readout beats the flat prior — the
+        direct 'is the bandwidth right' signal (R²<0 ⇒ h mis-calibrated)."""
+        mu, _ = self.predict(z_type)
+        ss_res = (x - mu).pow(2).sum()
+        ss_tot = (x - self.x_mean).pow(2).sum()
+        return ss_res, ss_tot
 
     # -- centered ridge system ----------------------------------------------
 
@@ -180,6 +217,16 @@ class RFFMatureBaseline(nn.Module):
         if self.standardize:
             self.z_mean.mul_(d).add_((1 - d) * z_type.mean(0))
             self.z_var.mul_(d).add_((1 - d) * z_type.var(0, unbiased=False))
+
+        # Observe the median pairwise ‖Δz‖ of standardized z (the median-heuristic
+        # bandwidth scale) until it's locked at the curriculum boundary.
+        if int(self.bandwidth_locked.item()) == 0 and M >= 2:
+            z_std = self._standardize_z(z_type)
+            dz = torch.cdist(z_std, z_std)
+            med = dz[torch.triu(torch.ones_like(dz, dtype=torch.bool), diagonal=1)].median()
+            dm = 0.0 if int(self._dz_obs.item()) == 0 else self.ema_decay
+            self._dz_median_ema.mul_(dm).add_((1 - dm) * med)
+            self._dz_obs += 1
 
         phi = self._features(z_type)                         # [M, D]
 

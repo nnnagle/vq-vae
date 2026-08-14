@@ -29,7 +29,8 @@ def _reference_predict(m: RFFMatureBaseline, z_tr, x_tr, z_q):
 
     def feats(z):
         zs = (z - zmean) / torch.sqrt(zvar + 1e-6)
-        return math.sqrt(2.0 / m.n_features) * torch.cos(zs @ m.omega + m.rff_bias)
+        proj = (zs / m.active_bandwidth) @ m.omega + m.rff_bias
+        return math.sqrt(2.0 / m.n_features) * torch.cos(proj)
 
     phi = feats(z_tr)
     phi_mean, x_mean = phi.mean(0), x_tr.mean(0)

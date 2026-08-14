@@ -46,11 +46,14 @@ def log_epoch(
         f"ou={train_stats.get('phase_ou_loss', 0.0):.4f} "
         f"evt={train_stats['evt_loss']:.4f}"
     )
-    # RFF readout-bandwidth coverage: mean leverage (0=data-pinned, →1=prior-dominated).
+    # RFF readout fit: held-out μ-R² is the "is the bandwidth right" signal (R²>0 ⇔
+    # readout beats the flat prior; R²<0 ⇔ h mis-calibrated). h is the median ‖Δz‖.
     logger.info(
-        f"  Readout coverage: mean leverage train={train_stats.get('readout_leverage', 0.0):.3f} "
-        f"val={val_stats.get('readout_leverage', 0.0):.3f} "
-        f"(high → readout bandwidth h leaving types under-supported)"
+        f"  Readout fit: μ-R²(heldout) train={train_stats.get('readout_r2', 0.0):+.3f} "
+        f"val={val_stats.get('readout_r2', 0.0):+.3f} | "
+        f"h={train_stats.get('readout_bandwidth', 0.0):.2f} "
+        f"median‖Δz‖={train_stats.get('readout_median_dz', 0.0):.2f} | "
+        f"leverage={train_stats.get('readout_leverage', 0.0):.3f}"
     )
     # OU dynamics: ρ (contraction), disturbance-gate mean, gated residual RMS.
     od = train_stats.get('ou_diag')
