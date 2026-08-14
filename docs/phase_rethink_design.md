@@ -710,11 +710,31 @@ from *observables*:** the type embedding and the **observable flow-state**
 encoder's job is to reproduce that observable closeness as a clean, absolute, radial
 Euclidean metric.
 
-**Scope: post-disturbance pixel-times, cross-batch, oversampled.** Filter this loss to
-**disturbed** pixel-times (extreme `‖Δa‖` onset + the recovery limb) — the mature
-majority sits at the origin and carries no ray signal, so **oversample the disturbed
-minority** (complement of the mature selector) and normalize by population; optionally a
-small FIFO of recent disturbed states.
+**Scope: recovery-tube pixel-times (pixel-level ysfc filter), cross-batch.** The pool is
+**all valid timesteps of any pixel disturbed somewhere in the window** (`(ysfc < threshold).any()`
+per pixel) — not just the per-timestep disturbed ones. This is deliberate: it pulls each
+disturbed pixel's **own mature timesteps** (pre-disturbance / recovered) into the pool as
+**origin-anchored negatives**, so the InfoNCE forms the **mature↔disturbed triangle**
+(`w_neg = k_type·(1−k_flow)` is maximal for mature-vs-disturbed → they are pushed farthest)
+and the **fixed τ pins the *ejection radius* in absolute terms**, not merely the
+inter-disturbed spread. Always-mature pixels carry no tube signal and are excluded (the
+mature majority would otherwise dominate). All pool timesteps serve as both anchors and
+candidates; the flow-kernel sorts mature (a≈0) from disturbed automatically. Capped at
+`contrastive_max_samples` for the O(M²) kernel.
+- **Why absolute scale is pinned (the collapse question).** `ℓ_ij = −‖Δz_phase‖²/τ` with
+  **fixed** τ is *not* scale-invariant: a uniform shrink `z→αz` drives all logits → 0 →
+  softmax → uniform → the loss *maximum*. So collapse preserves ordering but is the worst
+  point; the minimizer drives negatives to an absolute distance `~√τ`. Requires **real
+  mature-vs-disturbed negatives** (hence the pixel-level pool) — else τ pins only the
+  inter-disturbed spread. **VCR** (kept) is the backup variance floor; the **`gap/T`**
+  diagnostic (target ~2–3) is the monitor — drifting to 0 ⇒ collapsing ⇒ retune τ.
+- **FUTURE — variance-weighted sampling (deferred).** An alternative/'complement to the
+  ysfc filter: weight or select pixels by their **anomaly temporal variance** (`var_t‖a‖`
+  / peak `‖a‖`) — "variance = dynamism, by definition," and label-free (`a` is σ-normalized
+  so mature≈1, disturbed≫1 → natural threshold, no new feature). Motivation: **discover
+  spectral *declines*** (slow insect/drought) that never trip a sharp `ysfc=0` event but
+  show as anomaly variance — ysfc-only misses these. Kept as ysfc-only for now; revisit if
+  slow-decline tubes are under-represented.
 
 **Rank the neighborhood — do *not* regress exact distances.** `k_flow` defines *near/far
 in `(a,Δa)`*; the loss makes near→near, far→far in z_phase at fixed τ. **Do not** instead

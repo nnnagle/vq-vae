@@ -691,9 +691,17 @@ def process_batch(
                     cross_phase_spec.append(x_tc)
                     cross_phase_embeddings.append(z_phase_at_anchors)
                     cross_phase_ysfc.append(ysfc_dev)
-                    # Step-5 flow-state (a,Δa) per pixel-time + disturbed filter mask.
+                    # Step-5 flow-state (a,Δa) per pixel-time + recovery-tube pool.
                     cross_phase_flow.append(anomaly_feats.permute(0, 2, 1))   # [N, T, 2C]
-                    cross_phase_disturbed.append((~mature) & phase_valid)     # [N, T]
+                    # Pool = ALL valid timesteps of any pixel disturbed somewhere in
+                    # the window (any non-mature ysfc). This pulls each such pixel's
+                    # own mature (pre-disturbance / recovered) timesteps in as
+                    # origin-anchored negatives, so the InfoNCE forms the
+                    # mature↔disturbed triangle and the fixed τ pins the ejection
+                    # radius (not just the inter-disturbed spread). Always-mature
+                    # pixels carry no tube signal and are excluded.
+                    informative = (~mature).any(dim=1, keepdim=True)          # [N, 1]
+                    cross_phase_disturbed.append(informative & phase_valid)   # [N, T]
                     cross_phase_pairs.append(phase_pairs.to(device) + cross_phase_n_offset)
                     cross_phase_weights.append(phase_weights.to(device))
                     cross_phase_n_offset += z_type_at_anchors.shape[0]
