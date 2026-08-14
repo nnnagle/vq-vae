@@ -43,6 +43,7 @@ def log_epoch(
         f"vcr={train_stats['vcr_loss']:.4f} "
         f"pvcr={train_stats['phase_vcr_loss']:.4f} "
         f"anchor={train_stats.get('phase_anchor_loss', 0.0):.4f} "
+        f"ou={train_stats.get('phase_ou_loss', 0.0):.4f} "
         f"evt={train_stats['evt_loss']:.4f}"
     )
     # RFF readout-bandwidth coverage: mean leverage (0=data-pinned, →1=prior-dominated).
@@ -51,6 +52,15 @@ def log_epoch(
         f"val={val_stats.get('readout_leverage', 0.0):.3f} "
         f"(high → readout bandwidth h leaving types under-supported)"
     )
+    # OU dynamics: ρ (contraction), disturbance-gate mean, gated residual RMS.
+    od = train_stats.get('ou_diag')
+    if od:
+        logger.info(
+            f"  OU dynamics: rho={od.get('rho', 0.0):.3f} "
+            f"gate_mean={od.get('gate_mean', 0.0):.3f} "
+            f"resid_rms={od.get('resid_rms', 0.0):.3f} "
+            f"s0={od.get('s0', 0.0):.3f} n_eff={od.get('n_eff', 0.0):.0f}"
+        )
     logger.info(
         f"  Val:   {val_stats['loss']:.4f} "
         f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "

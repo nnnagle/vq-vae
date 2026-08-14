@@ -95,3 +95,12 @@ mature_baseline:
 anomaly_transform:
   delta_only: true      # [a ; Δa]; Δ² deferred
   scale_decay: 0.99     # EMA decay for the Δ robust scale observed during warmup
+
+# Step-4 within-pixel Gaussian OU dynamics. See losses/ou_dynamics.py.
+ou_dynamics:
+  rho_init: 0.9         # contraction ρ∈(0,1), scalar global
+  learn_rho: true       # ρ is a learned sigmoid-constrained scalar
+  s0: 0.5               # base noise scale (basin scale)
+  s1: 0.0               # radius-growth coeff (0 = homoscedastic; enable for tighter basin)
+  learn_s: false        # default: fixed s → weighted squared residual (no log-s collapse magnet)
+  tau: 2.0              # disturbance-gate scale on ‖Δa‖ (locked Δ-scale units)

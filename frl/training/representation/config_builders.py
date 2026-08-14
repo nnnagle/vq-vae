@@ -302,6 +302,8 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             # starting values (12 = East mature ysfc; 0.05 = light origin pin).
             'mature_ysfc_threshold': getattr(phase_loss_cfg, 'mature_ysfc_threshold', None) or 12.0,
             'anchor_weight': getattr(phase_loss_cfg, 'anchor_weight', None) or 0.05,
+            # Step-4 OU dynamics loss weight.
+            'ou_weight': getattr(phase_loss_cfg, 'ou_weight', None) or 1.0,
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "

@@ -137,6 +137,8 @@ def process_batch(
     total_phase_spread_loss = 0.0
     total_phase_recovery_disc_loss = 0.0
     total_phase_anchor_loss = 0.0
+    total_phase_ou_loss = 0.0
+    last_ou_diag = None
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -215,6 +217,8 @@ def process_batch(
         phase_config.get('mature_ysfc_threshold', 12.0) if phase_config else 12.0)
     anchor_weight = (
         phase_config.get('anchor_weight', 0.05) if phase_config else 0.05)
+    ou_weight = (
+        phase_config.get('ou_weight', 1.0) if phase_config else 1.0)
 
     if spread_config is not None:
         spread_w = ramp_weight(
@@ -592,6 +596,7 @@ def process_batch(
         phase_recovery_disc_loss_val = torch.tensor(0.0, device=device)
         phase_vcr_loss_val = torch.tensor(0.0, device=device)
         phase_anchor_loss_val = torch.tensor(0.0, device=device)
+        phase_ou_loss_val = torch.tensor(0.0, device=device)
         pp = prep['phase_prep']
         if pp is not None:
                 phase_anchors   = pp['phase_anchors']
@@ -616,8 +621,11 @@ def process_batch(
                 # the Δ scale during warmup (training & unlocked).  Runs every batch.
                 mu, sigma = model.mature_baseline.predict(z_type_at_anchors)   # [N, C]
                 _t0 = time.perf_counter()
-                anomaly_feats, _ = model.anomaly_transform(x, mu, sigma)    # [N, 2C, T]
+                anomaly_feats, phase_valid = model.anomaly_transform(x, mu, sigma)  # [N, 2C, T], [N, T]
                 t_phase_forward += time.perf_counter() - _t0
+                # ‖Δa‖ per timestep (the Δ block of the anomaly input) — OU gate signal.
+                _C = x.shape[1]
+                delta_a_norm = anomaly_feats[:, _C:, :].norm(dim=1)         # [N, T]
 
                 # Settle the readout on this batch's mature timesteps (for next batch;
                 # predict above used the pre-update readout → no within-batch leakage).
@@ -648,6 +656,12 @@ def process_batch(
                             anchor_weight * curriculum_w
                             * zp_mature.pow(2).sum(dim=-1).mean()
                         )
+
+                    # Step-4 within-pixel OU dynamics (disturbance-gated transition NLL).
+                    ou_raw, ou_diag = model.ou_dynamics(
+                        z_phase_at_anchors, delta_a_norm, phase_valid)
+                    phase_ou_loss_val = ou_weight * curriculum_w * ou_raw
+                    last_ou_diag = ou_diag
 
                     # z_phase → z_type leakage guard (was pre-FiLM h; h == z_phase now):
                     # with the type-agnostic encoder this should stay ≈0.
@@ -693,6 +707,7 @@ def process_batch(
                 + vcr_loss_val
                 + phase_vcr_loss_val
                 + phase_anchor_loss_val
+                + phase_ou_loss_val
                 + evt_loss_val)
         t_loss_compute += time.perf_counter() - _t0
 
@@ -729,6 +744,7 @@ def process_batch(
             total_vcr_loss += vcr_loss_val
             total_phase_vcr_loss += phase_vcr_loss_val
             total_phase_anchor_loss += phase_anchor_loss_val
+            total_phase_ou_loss += phase_ou_loss_val
             total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
@@ -736,6 +752,7 @@ def process_batch(
             total_vcr_loss += vcr_loss_val.item()
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_phase_anchor_loss += float(phase_anchor_loss_val)
+            total_phase_ou_loss += float(phase_ou_loss_val)
             total_evt_loss += evt_loss_val.item()
         n_valid += 1
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
@@ -1094,6 +1111,7 @@ def process_batch(
     mean_vcr_loss = total_vcr_loss / n_valid
     mean_phase_vcr_loss = total_phase_vcr_loss / n_valid
     mean_phase_anchor_loss = total_phase_anchor_loss / n_valid
+    mean_phase_ou_loss = total_phase_ou_loss / n_valid
     mean_evt_loss = total_evt_loss / n_valid
 
     if training:
@@ -1140,6 +1158,7 @@ def process_batch(
         mean_vcr_loss = float(mean_vcr_loss)
         mean_phase_vcr_loss = float(mean_phase_vcr_loss)
         mean_phase_anchor_loss = float(mean_phase_anchor_loss)
+        mean_phase_ou_loss = float(mean_phase_ou_loss)
         mean_evt_loss = float(mean_evt_loss) if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item()
 
     # Compute distribution statistics for gate values and weights
@@ -1234,6 +1253,8 @@ def process_batch(
         'vcr_loss': mean_vcr_loss,
         'phase_vcr_loss': mean_phase_vcr_loss,
         'phase_anchor_loss': mean_phase_anchor_loss,
+        'phase_ou_loss': mean_phase_ou_loss,
+        'ou_diag': last_ou_diag,
         'readout_leverage': readout_leverage,
         'evt_loss': mean_evt_loss if not hasattr(mean_evt_loss, 'item') else mean_evt_loss.item(),
         'evt_diag': evt_diag_agg,

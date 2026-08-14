@@ -56,6 +56,7 @@ from .spatial import GatedResidualConv2D, EdgeAwareSmoothingConv2D
 from .tcn import TCNEncoder
 from .mature_baseline import RFFMatureBaseline
 from .anomaly_transform import AnomalyTransform
+from losses.ou_dynamics import OUDynamics
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,13 @@ class RepresentationModel(nn.Module):
         rff_ema_decay: float = 0.99,
         anomaly_delta_only: bool = True,
         anomaly_scale_decay: float = 0.99,
+        # Step-4 within-pixel OU dynamics
+        ou_rho_init: float = 0.9,
+        ou_learn_rho: bool = True,
+        ou_s0: float = 0.5,
+        ou_s1: float = 0.0,
+        ou_learn_s: bool = False,
+        ou_tau: float = 2.0,
         # type projection head (SimCLR-style; None = disabled)
         type_proj_hidden_dim: Optional[int] = None,
         type_proj_output_dim: Optional[int] = None,
@@ -197,6 +205,12 @@ class RepresentationModel(nn.Module):
         # no pre-FiLM L2-norm — magnitude must survive to become z_phase radius).
         self.phase_head = nn.Conv2d(tcn_out_dim, z_phase_dim, kernel_size=1)
 
+        # Step-4 within-pixel OU dynamics (learnable ρ; loss lives in step.py).
+        self.ou_dynamics = OUDynamics(
+            rho_init=ou_rho_init, learn_rho=ou_learn_rho,
+            s0=ou_s0, s1=ou_s1, learn_s=ou_learn_s, tau=ou_tau,
+        )
+
         # --- Type projection head (SimCLR-style) ---
         # Applied between z_type and InfoNCE losses during training.
         # None when disabled (project_type() acts as identity).
@@ -257,6 +271,7 @@ class RepresentationModel(nn.Module):
         tp = cfg.get("type_projection", {})
         mb = cfg.get("mature_baseline", {})   # Step-1 RFF readout
         at = cfg.get("anomaly_transform", {})  # Step-2 anomaly transform
+        ou = cfg.get("ou_dynamics", {})        # Step-4 within-pixel OU
 
         # input_dropout may be a scalar (constant) or a schedule dict.
         # At construction time we always use the initial rate:
@@ -306,6 +321,13 @@ class RepresentationModel(nn.Module):
             rff_ema_decay=mb.get("ema_decay", 0.99),
             anomaly_delta_only=at.get("delta_only", True),
             anomaly_scale_decay=at.get("scale_decay", 0.99),
+            # OU dynamics
+            ou_rho_init=ou.get("rho_init", 0.9),
+            ou_learn_rho=ou.get("learn_rho", True),
+            ou_s0=ou.get("s0", 0.5),
+            ou_s1=ou.get("s1", 0.0),
+            ou_learn_s=ou.get("learn_s", False),
+            ou_tau=ou.get("tau", 2.0),
             # type projection head
             type_proj_hidden_dim=tp.get("hidden_dim") if tp.get("enabled", False) else None,
             type_proj_output_dim=tp.get("output_dim") if tp.get("enabled", False) else None,

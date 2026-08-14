@@ -58,7 +58,9 @@ def train_epoch(
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_phase_anchor_loss = 0.0
+    total_phase_ou_loss = 0.0
     total_readout_leverage = 0.0
+    last_ou_diag = None
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
     total_spectral_pos_pairs = 0
@@ -141,6 +143,9 @@ def train_epoch(
             total_vcr_loss += stats['vcr_loss']
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
+            total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
+            if stats.get('ou_diag'):
+                last_ou_diag = stats['ou_diag']
             total_readout_leverage += stats.get('readout_leverage', 0.0)
             total_evt_loss += stats.get('evt_loss', 0.0)
             if stats.get('evt_diag'):
@@ -266,7 +271,8 @@ def train_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
-            'phase_anchor_loss': 0.0, 'readout_leverage': 0.0,
+            'phase_anchor_loss': 0.0, 'phase_ou_loss': 0.0, 'ou_diag': None,
+            'readout_leverage': 0.0,
             'evt_loss': 0.0,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -300,6 +306,8 @@ def train_epoch(
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'phase_anchor_loss': total_phase_anchor_loss / total_batches,
+        'phase_ou_loss': total_phase_ou_loss / total_batches,
+        'ou_diag': last_ou_diag,
         'readout_leverage': total_readout_leverage / total_batches,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
@@ -349,7 +357,9 @@ def validate_epoch(
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_phase_anchor_loss = 0.0
+    total_phase_ou_loss = 0.0
     total_readout_leverage = 0.0
+    last_ou_diag = None
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
     total_batches = 0
@@ -391,6 +401,9 @@ def validate_epoch(
                 total_vcr_loss += stats['vcr_loss']
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
+                total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
+                if stats.get('ou_diag'):
+                    last_ou_diag = stats['ou_diag']
                 total_readout_leverage += stats.get('readout_leverage', 0.0)
                 total_evt_loss += stats.get('evt_loss', 0.0)
                 if stats.get('evt_diag'):
@@ -420,7 +433,8 @@ def validate_epoch(
             'loss': 0.0, 'spectral_loss': 0.0, 'spatial_loss': 0.0,
             'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
-            'phase_anchor_loss': 0.0, 'readout_leverage': 0.0,
+            'phase_anchor_loss': 0.0, 'phase_ou_loss': 0.0, 'ou_diag': None,
+            'readout_leverage': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'batches': 0,
             'gate_stats': empty_stats, 'pos_weight_stats': empty_stats,
@@ -452,6 +466,8 @@ def validate_epoch(
         'vcr_loss': total_vcr_loss / total_batches,
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'phase_anchor_loss': total_phase_anchor_loss / total_batches,
+        'phase_ou_loss': total_phase_ou_loss / total_batches,
+        'ou_diag': last_ou_diag,
         'readout_leverage': total_readout_leverage / total_batches,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
