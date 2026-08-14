@@ -258,6 +258,18 @@ alongside the model and evaluated with one forward per batch.
 - **Bandwidth selection — held-out (val-split) NLL**, ideally the in-flight ensemble
   at a few bracketing `h` (the fit is linear, so cheap). The min-val-NLL bracket sets
   the next run's `h`. Primary knob.
+  - **CALIBRATION BUG found in exp036 (fixed).** `h` is in **standardized z_type**
+    units, where the typical inter-point distance is `~√(2·z_type_dim)` (≈9.7 for
+    dim 48). The initial default `h=1` was catastrophic — in 48-D every pair is
+    kernel-orthogonal (`exp(−48)≈0`), so the readout couldn't interpolate at all
+    (`μ_R² < 0`), silently feeding garbage μ/σ → garbage anomalies for the whole run.
+    Set `h ~ median pairwise ‖Δz‖` (median heuristic); it **must scale with
+    `z_type_dim`**. Likewise `ridge_lambda` must sit **below** the mean eigenvalue of
+    the mean-normalized feature covariance (`~1/D`): at `≈1/D` it over-regularizes and
+    **pins the leverage diagnostic at ~0.5** (`v≈λ/(eig+λ)`), which is uninformative.
+    Fixed defaults: `h=10`, `ridge_lambda=1e-4` for dim 48 / D 1024.
+    **FUTURE:** make `h` **auto-adaptive** (set the RFF Ω scale from the online median
+    ‖Δz‖) so it can't be mis-set when `z_type_dim` changes.
 - **Hierarchy guard — `L_eff · σ_type < 1`.** Report `L_eff` (mean/95th-pct `‖∇μ‖`,
   `∇μ = −W_μᵀ(√(2/D)·sin(Ωz+b) ⊙ Ω)`) and check it against the type-similarity scale
   `σ_type` (on the standardized-z_type metric). Fails ⇒ `h` too small ⇒ raise next run.
