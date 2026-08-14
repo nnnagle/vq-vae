@@ -140,6 +140,12 @@ def process_batch(
     total_phase_anchor_loss = 0.0
     total_phase_ou_loss = 0.0
     last_ou_diag = None
+    # Phase-radius diagnostic: RMS ‖z_phase‖ split by recovery state (hub-and-rim
+    # check). Accumulate ΣΣ‖z‖² and counts; loops.py forms the epoch RMS.
+    mature_r2_sum = 0.0
+    mature_r2_count = 0
+    disturbed_r2_sum = 0.0
+    disturbed_r2_count = 0
     total_vcr_loss = 0.0
     total_phase_vcr_loss = 0.0
     total_evt_loss = 0.0
@@ -670,6 +676,20 @@ def process_batch(
                             * zp_mature.pow(2).sum(dim=-1).mean()
                         )
 
+                    # Radius diagnostic: RMS ‖z_phase‖ for mature vs disturbed
+                    # (non-mature) timesteps. Mature should pin toward the origin;
+                    # disturbed should eject. Grad-free; accumulated across samples.
+                    with torch.no_grad():
+                        zp_r2 = z_phase_at_anchors.pow(2).sum(dim=-1)      # [N, T]
+                        m_sel = mature & phase_valid
+                        d_sel = (~mature) & phase_valid
+                        if bool(m_sel.any()):
+                            mature_r2_sum += float(zp_r2[m_sel].sum())
+                            mature_r2_count += int(m_sel.sum())
+                        if bool(d_sel.any()):
+                            disturbed_r2_sum += float(zp_r2[d_sel].sum())
+                            disturbed_r2_count += int(d_sel.sum())
+
                     # Step-4 within-pixel OU dynamics (disturbance-gated transition NLL).
                     ou_raw, ou_diag = model.ou_dynamics(
                         z_phase_at_anchors, delta_a_norm, phase_valid)
@@ -1193,6 +1213,10 @@ def process_batch(
         'phase_vcr_loss': mean_phase_vcr_loss,
         'phase_anchor_loss': mean_phase_anchor_loss,
         'phase_ou_loss': mean_phase_ou_loss,
+        'mature_r2_sum': mature_r2_sum,
+        'mature_r2_count': mature_r2_count,
+        'disturbed_r2_sum': disturbed_r2_sum,
+        'disturbed_r2_count': disturbed_r2_count,
         'ou_diag': last_ou_diag,
         'phase_contrastive_diag': phase_contrastive_diag,
         'readout_leverage': readout_leverage,

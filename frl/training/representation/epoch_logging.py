@@ -64,6 +64,17 @@ def log_epoch(
             f"resid_rms={od.get('resid_rms', 0.0):.3f} "
             f"s0={od.get('s0', 0.0):.3f} n_eff={od.get('n_eff', 0.0):.0f}"
         )
+    # Phase radius: RMS ‖z_phase‖ split by recovery state (hub-and-rim check).
+    # mature_rms should sit near the origin (anchor loss pins it); disturbed_rms is
+    # the ejection radius. neg_d2 ≈ disturbed_rms² + mature_rms² for cross-pixel
+    # negatives, so a floating mature_rms inflates the gap without clean ejection.
+    m_rms = train_stats.get('mature_radius_rms', 0.0)
+    d_rms = train_stats.get('disturbed_radius_rms', 0.0)
+    if m_rms > 0.0 or d_rms > 0.0:
+        ratio = f" (ratio m/d={m_rms / d_rms:.2f})" if d_rms > 0 else ""
+        logger.info(
+            f"  Phase radius: mature_rms={m_rms:.3f} disturbed_rms={d_rms:.3f}{ratio}"
+        )
     # Step-5 contrastive: gap/τ is the fixed-ruler calibration (target ~2–3).
     cd = train_stats.get('phase_contrastive_diag')
     if cd:

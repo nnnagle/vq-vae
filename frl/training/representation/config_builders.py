@@ -299,9 +299,12 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'phase_type_leakage_weight': phase_loss_cfg.phase_type_leakage_weight,
             # Redesign (Step 3): mature selector for the μ/σ readout fit + the anchor
             # loss, and the anchor-loss weight.  Tunable; defaults are the locked
-            # starting values (12 = East mature ysfc; 0.05 = light origin pin).
+            # starting values (12 = East mature ysfc).  anchor_weight raised 0.05→0.15
+            # (exp036): at 0.05 the mature hub floated at RMS radius ~0.59, letting the
+            # contrastive inflate neg_d2 by ejecting the hub rather than the disturbed
+            # states — watch the "Phase radius" log line (mature_rms should drop).
             'mature_ysfc_threshold': getattr(phase_loss_cfg, 'mature_ysfc_threshold', None) or 12.0,
-            'anchor_weight': getattr(phase_loss_cfg, 'anchor_weight', None) or 0.05,
+            'anchor_weight': getattr(phase_loss_cfg, 'anchor_weight', None) or 0.15,
             # Step-4 OU dynamics loss weight.
             'ou_weight': getattr(phase_loss_cfg, 'ou_weight', None) or 1.0,
             # Step-5 type-local ranking InfoNCE knobs (calibrate σ's / τ via gap/T).

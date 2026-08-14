@@ -59,6 +59,10 @@ def train_epoch(
     total_phase_vcr_loss = 0.0
     total_phase_anchor_loss = 0.0
     total_phase_ou_loss = 0.0
+    total_mature_r2_sum = 0.0
+    total_mature_r2_count = 0
+    total_disturbed_r2_sum = 0.0
+    total_disturbed_r2_count = 0
     total_readout_leverage = 0.0
     total_readout_ss_res = 0.0
     total_readout_ss_tot = 0.0
@@ -151,6 +155,10 @@ def train_epoch(
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
             total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
+            total_mature_r2_sum += stats.get('mature_r2_sum', 0.0)
+            total_mature_r2_count += stats.get('mature_r2_count', 0)
+            total_disturbed_r2_sum += stats.get('disturbed_r2_sum', 0.0)
+            total_disturbed_r2_count += stats.get('disturbed_r2_count', 0)
             if stats.get('ou_diag'):
                 last_ou_diag = stats['ou_diag']
             if stats.get('phase_contrastive_diag'):
@@ -326,6 +334,8 @@ def train_epoch(
         'readout_r2': 1.0 - total_readout_ss_res / max(total_readout_ss_tot, 1e-8),
         'readout_median_dz': last_readout_median_dz,
         'readout_bandwidth': last_readout_bandwidth,
+        'mature_radius_rms': (total_mature_r2_sum / max(total_mature_r2_count, 1)) ** 0.5,
+        'disturbed_radius_rms': (total_disturbed_r2_sum / max(total_disturbed_r2_count, 1)) ** 0.5,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
         'spectral_pos_pairs': total_spectral_pos_pairs // total_batches,
@@ -375,6 +385,10 @@ def validate_epoch(
     total_phase_vcr_loss = 0.0
     total_phase_anchor_loss = 0.0
     total_phase_ou_loss = 0.0
+    total_mature_r2_sum = 0.0
+    total_mature_r2_count = 0
+    total_disturbed_r2_sum = 0.0
+    total_disturbed_r2_count = 0
     total_readout_leverage = 0.0
     total_readout_ss_res = 0.0
     total_readout_ss_tot = 0.0
@@ -424,6 +438,10 @@ def validate_epoch(
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
                 total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
+                total_mature_r2_sum += stats.get('mature_r2_sum', 0.0)
+                total_mature_r2_count += stats.get('mature_r2_count', 0)
+                total_disturbed_r2_sum += stats.get('disturbed_r2_sum', 0.0)
+                total_disturbed_r2_count += stats.get('disturbed_r2_count', 0)
                 if stats.get('ou_diag'):
                     last_ou_diag = stats['ou_diag']
                 if stats.get('phase_contrastive_diag'):
@@ -501,6 +519,8 @@ def validate_epoch(
         'readout_r2': 1.0 - total_readout_ss_res / max(total_readout_ss_tot, 1e-8),
         'readout_median_dz': last_readout_median_dz,
         'readout_bandwidth': last_readout_bandwidth,
+        'mature_radius_rms': (total_mature_r2_sum / max(total_mature_r2_count, 1)) ** 0.5,
+        'disturbed_radius_rms': (total_disturbed_r2_sum / max(total_disturbed_r2_count, 1)) ** 0.5,
         'evt_loss': total_evt_loss / total_batches,
         'evt_diag': epoch_evt_diag,
         'batches': total_batches,
