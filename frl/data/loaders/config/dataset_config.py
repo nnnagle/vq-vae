@@ -472,6 +472,19 @@ class LossConfig:
     # --- type-leakage penalty ---
     phase_type_leakage_weight: float = 0.0  # Frobenius ||cov(h, z_type)||_F penalty weight
 
+    # --- phase-pathway redesign knobs (Steps 3-5; consumed by config_builders) ---
+    # All optional; None → the locked code default in config_builders.build_phase_config.
+    mature_ysfc_threshold: Optional[float] = None   # ysfc > this → "mature" (μ/σ fit + anchor)
+    anchor_weight: Optional[float] = None           # λ on ||z_phase_mature||² origin pin
+    ou_weight: Optional[float] = None               # Step-4 OU transition-NLL loss weight
+    contrastive_tau: Optional[float] = None         # Step-5 InfoNCE similarity temperature
+    contrastive_sigma_type: Optional[float] = None  # type-comparability kernel bandwidth
+    contrastive_sigma_flow: Optional[float] = None  # flow-state kernel bandwidth
+    contrastive_n_pos: Optional[int] = None         # positives per anchor
+    contrastive_n_neg: Optional[int] = None         # negatives per anchor
+    contrastive_max_samples: Optional[int] = None   # cap on the O(M²) kernel pool
+    contrastive_min_samples: Optional[int] = None   # skip the loss below this many samples
+
 
 @dataclass
 class BindingsConfig:

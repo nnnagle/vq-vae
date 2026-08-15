@@ -38,3 +38,8 @@ out/
 !frl/models/
 !frl/models/**/*.py
 !frl/models/**/*.md
+
+# `frl/data` is a source package, not a data dir — same exception as frl/models.
+!frl/data/
+!frl/data/**/*.py
+!frl/data/**/*.md

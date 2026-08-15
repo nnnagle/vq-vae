@@ -21,6 +21,12 @@ from __future__ import annotations
 import logging
 
 
+def _first(value, default):
+    """Return ``value`` unless it is None, else ``default``. Unlike ``value or
+    default`` this honors a falsy-but-meaningful setting (e.g. a YAML weight of 0)."""
+    return value if value is not None else default
+
+
 def build_spatial_pair_config(bindings_config, type_encoder_feature: str) -> dict:
     """Spatial-InfoNCE params for DataLoader-worker pair precomputation.
 
@@ -297,23 +303,24 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'curriculum_ramp_epochs': cur.ramp_epochs if cur else 10,
             # Type-leakage penalty
             'phase_type_leakage_weight': phase_loss_cfg.phase_type_leakage_weight,
-            # Redesign (Step 3): mature selector for the μ/σ readout fit + the anchor
-            # loss, and the anchor-loss weight.  Tunable; defaults are the locked
-            # starting values (12 = East mature ysfc).  anchor_weight raised 0.05→0.15
-            # (exp036): at 0.05 the mature hub floated at RMS radius ~0.59, letting the
-            # contrastive inflate neg_d2 by ejecting the hub rather than the disturbed
-            # states — watch the "Phase radius" log line (mature_rms should drop).
-            'mature_ysfc_threshold': getattr(phase_loss_cfg, 'mature_ysfc_threshold', None) or 12.0,
-            'anchor_weight': getattr(phase_loss_cfg, 'anchor_weight', None) or 0.15,
-            # Step-4 OU dynamics loss weight.
-            'ou_weight': getattr(phase_loss_cfg, 'ou_weight', None) or 1.0,
-            # Step-5 type-local ranking InfoNCE knobs (calibrate σ's / τ via gap/T).
-            'contrastive_tau': getattr(phase_loss_cfg, 'contrastive_tau', None) or 1.0,
-            'contrastive_sigma_type': getattr(phase_loss_cfg, 'contrastive_sigma_type', None) or 1.0,
-            'contrastive_sigma_flow': getattr(phase_loss_cfg, 'contrastive_sigma_flow', None) or 1.0,
-            'contrastive_n_pos': getattr(phase_loss_cfg, 'contrastive_n_pos', None) or 5,
-            'contrastive_n_neg': getattr(phase_loss_cfg, 'contrastive_n_neg', None) or 20,
-            'contrastive_max_samples': getattr(phase_loss_cfg, 'contrastive_max_samples', None) or 2000,
+            # Redesign (Steps 3-5): mature selector, anchor pin, OU, and Step-5
+            # contrastive knobs.  All YAML-settable under soft_neighborhood_phase in
+            # frl_binding_v1.yaml; None (absent) → the locked code default below.
+            # `is not None` (not `or`) so a YAML 0 is honored — e.g. ou_weight: 0 or
+            # anchor_weight: 0 to disable that loss.  anchor_weight default raised
+            # 0.05→0.15 (exp036): at 0.05 the mature hub floated at RMS radius ~0.59,
+            # letting the contrastive inflate neg_d2 by ejecting the hub rather than
+            # the disturbed states — watch the "Phase radius" log line.
+            'mature_ysfc_threshold': _first(phase_loss_cfg.mature_ysfc_threshold, 12.0),
+            'anchor_weight': _first(phase_loss_cfg.anchor_weight, 0.15),
+            'ou_weight': _first(phase_loss_cfg.ou_weight, 1.0),
+            'contrastive_tau': _first(phase_loss_cfg.contrastive_tau, 1.0),
+            'contrastive_sigma_type': _first(phase_loss_cfg.contrastive_sigma_type, 1.0),
+            'contrastive_sigma_flow': _first(phase_loss_cfg.contrastive_sigma_flow, 1.0),
+            'contrastive_n_pos': _first(phase_loss_cfg.contrastive_n_pos, 5),
+            'contrastive_n_neg': _first(phase_loss_cfg.contrastive_n_neg, 20),
+            'contrastive_max_samples': _first(phase_loss_cfg.contrastive_max_samples, 2000),
+            'contrastive_min_samples': _first(phase_loss_cfg.contrastive_min_samples, 32),
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "

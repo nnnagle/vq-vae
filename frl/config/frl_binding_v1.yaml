@@ -650,6 +650,27 @@ losses:
     # Stop-gradient on z_type; active only when phase curriculum is active.
     phase_type_leakage_weight: 0.01
 
+    # ── Phase-pathway redesign knobs (Steps 3-5) ──────────────────────────────
+    # Consumed by config_builders.build_phase_config. Values here are the current
+    # code defaults; omit any line to fall back to that default. Set a weight to 0
+    # to disable that loss (honored — the builder uses `is not None`, not `or`).
+    #
+    # Step 3 — mature selector + origin anchor:
+    mature_ysfc_threshold: 12.0   # ysfc > this → "mature" (μ/σ readout fit + anchor pool)
+    anchor_weight: 0.15           # λ on ||z_phase_mature||²; pins the mature hub to origin.
+                                  #   Raised 0.05→0.15 (exp036): at 0.05 mature floated at
+                                  #   RMS radius ~0.59. Watch the "Phase radius" log line.
+    # Step 4 — within-pixel OU dynamics (see ou_dynamics block in frl_repr_model_v1.yaml):
+    ou_weight: 1.0                # OU transition-NLL loss weight
+    # Step 5 — type-local ranking InfoNCE (calibrate via the "Phase contrastive" gap/T ~2-3):
+    contrastive_tau: 1.0          # similarity temperature; lower → sharper push (noisier neg_d2)
+    contrastive_sigma_type: 1.0   # type-comparability kernel bandwidth (standardized z_type units)
+    contrastive_sigma_flow: 1.0   # flow-state kernel bandwidth (recovery-stage separation)
+    contrastive_n_pos: 5          # positives per anchor (same type + same flow state)
+    contrastive_n_neg: 20         # negatives per anchor (same type, different flow state)
+    contrastive_max_samples: 2000 # cap on the O(M²) kernel pool per batch
+    contrastive_min_samples: 32   # skip the contrastive loss below this many pooled samples
+
     # Curriculum: ramp in after type encoder stabilises.
     # start_epoch should align with scheduler.phase_warmup so the LR bump
     # coincides with phase loss entering — keeps the two schedules in sync.

@@ -626,6 +626,17 @@ class DatasetBindingsParser:
             low_ysfc_max=spec.get('low_ysfc_max'),
             high_ysfc_min=spec.get('high_ysfc_min'),
             phase_type_leakage_weight=spec.get('phase_type_leakage_weight', 0.0),
+            # Phase-pathway redesign knobs (None → code default in config_builders).
+            mature_ysfc_threshold=spec.get('mature_ysfc_threshold'),
+            anchor_weight=spec.get('anchor_weight'),
+            ou_weight=spec.get('ou_weight'),
+            contrastive_tau=spec.get('contrastive_tau'),
+            contrastive_sigma_type=spec.get('contrastive_sigma_type'),
+            contrastive_sigma_flow=spec.get('contrastive_sigma_flow'),
+            contrastive_n_pos=spec.get('contrastive_n_pos'),
+            contrastive_n_neg=spec.get('contrastive_n_neg'),
+            contrastive_max_samples=spec.get('contrastive_max_samples'),
+            contrastive_min_samples=spec.get('contrastive_min_samples'),
         )
 
     def _parse_pair_endpoint_strategy(
