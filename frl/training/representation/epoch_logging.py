@@ -12,7 +12,6 @@ to the former inline block.
 from __future__ import annotations
 
 import logging
-import math
 
 
 def fmt_stats(s: dict) -> str:
@@ -213,56 +212,13 @@ def log_epoch(
             f"Weights(sigma={phase_config['sigma']}): {ps['weight_mean']:.3f}±{ps['weight_std']:.3f}"
         )
 
-    # Log phase loss stats
-    pls = train_stats.get('phase_loss_stats')
-    if pls and pls.get('curriculum_w', 0) > 0:
-        logger.info(
-            f"  Phase loss: self={pls['loss_self']:.4f}, cross={pls['loss_cross']:.4f} | "
-            f"Pairs: {pls['n_pairs_input']:.0f} input, "
-            f"{pls['n_pairs_sufficient_overlap']:.0f} with overlap | "
-            f"Curriculum weight: {pls['curriculum_w']:.2f}"
-        )
-        # Reference distance distributions (what tau_ref operates on)
-        logger.info(
-            f"  Phase d_ref_self:  mean={pls['d_ref_self_mean']:.3f}±{pls['d_ref_self_std']:.3f}, "
-            f"[q25={pls['d_ref_self_q25']:.3f}, q50={pls['d_ref_self_q50']:.3f}, q75={pls['d_ref_self_q75']:.3f}]"
-        )
-        logger.info(
-            f"  Phase d_ref_cross: mean={pls['d_ref_cross_mean']:.3f}±{pls['d_ref_cross_std']:.3f}, "
-            f"[q25={pls['d_ref_cross_q25']:.3f}, q50={pls['d_ref_cross_q50']:.3f}, q75={pls['d_ref_cross_q75']:.3f}]"
-        )
-        # Entropy of softmax distributions (0=one-hot, log(M)=uniform)
-        # With mean_overlap~11.5, log(M) ~ log(10) ~ 2.30 nats
-        logger.info(
-            f"  Phase entropy (nats): "
-            f"self p={pls['self_mean_entropy_p']:.3f}, q={pls['self_mean_entropy_q']:.3f} | "
-            f"cross p={pls['cross_mean_entropy_p']:.3f}, q={pls['cross_mean_entropy_q']:.3f} "
-            f"[max~{pls['self_mean_overlap']:.1f} neighbors -> log(M)~{math.log(max(pls['self_mean_overlap'], 1)):.2f}]"
-        )
-    elif pls and phase_config is not None:
-        # Phase loss configured but not yet active (curriculum still ramping in).
-        # When phase_config is None the loss is fully disabled — there is no start
-        # epoch to report, so skip the line rather than indexing a None config.
-        logger.info(
-            f"  Phase loss: inactive (curriculum_w={pls['curriculum_w']:.2f}, "
-            f"starts epoch {phase_config['curriculum_start_epoch']+1})"
-        )
-
-    # Log FiLM diagnostics (data-dependent: actual gamma/beta across pixels)
-    fs = train_stats.get('film_stats')
-    if fs is not None:
-        logger.info(
-            f"  FiLM gamma (data): mean={fs['gamma_mean']:.4f}, "
-            f"std={fs['gamma_std']:.4f}, "
-            f"per_dim_std={fs['gamma_per_dim_std']:.4f}"
-        )
-        logger.info(
-            f"  FiLM beta  (data): mean={fs['beta_mean']:.4f}, "
-            f"std={fs['beta_std']:.4f}, "
-            f"per_dim_std={fs['beta_per_dim_std']:.4f}"
-        )
-    else:
-        logger.info("  FiLM: no data (phase pathway not active yet)")
+    # NOTE: the retired soft-neighborhood "Phase loss" block and the removed-FiLM
+    # diagnostics used to log here. Both reflected retired features — the
+    # soft-neighborhood loss (its phase_loss_stats.curriculum_w is a dead counter,
+    # unrelated to the live anchor/OU/contrastive curriculum) and the FiLM head —
+    # so they printed misleading "inactive" / "no data" lines even when the phase
+    # pathway was fully active. Removed. Live phase state is the "Phase radius",
+    # "OU dynamics", and "Phase contrastive" lines above.
 
     # Log pre-FiLM type-leakage diagnostics
     tls = train_stats.get('type_leakage_stats')
