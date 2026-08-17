@@ -650,27 +650,6 @@ losses:
     # Stop-gradient on z_type; active only when phase curriculum is active.
     phase_type_leakage_weight: 0.01
 
-    # ── Phase-pathway redesign knobs (Steps 3-5) ──────────────────────────────
-    # Consumed by config_builders.build_phase_config. Values here are the current
-    # code defaults; omit any line to fall back to that default. Set a weight to 0
-    # to disable that loss (honored — the builder uses `is not None`, not `or`).
-    #
-    # Step 3 — mature selector + origin anchor:
-    mature_ysfc_threshold: 12.0   # ysfc > this → "mature" (μ/σ readout fit + anchor pool)
-    anchor_weight: 0.15           # λ on ||z_phase_mature||²; pins the mature hub to origin.
-                                  #   Raised 0.05→0.15 (exp036): at 0.05 mature floated at
-                                  #   RMS radius ~0.59. Watch the "Phase radius" log line.
-    # Step 4 — within-pixel OU dynamics (see ou_dynamics block in frl_repr_model_v1.yaml):
-    ou_weight: 1.0                # OU transition-NLL loss weight
-    # Step 5 — type-local ranking InfoNCE (calibrate via the "Phase contrastive" gap/T ~2-3):
-    contrastive_tau: 1.0          # similarity temperature; lower → sharper push (noisier neg_d2)
-    contrastive_sigma_type: 1.0   # type-comparability kernel bandwidth (standardized z_type units)
-    contrastive_sigma_flow: 1.0   # flow-state kernel bandwidth (recovery-stage separation)
-    contrastive_n_pos: 5          # positives per anchor (same type + same flow state)
-    contrastive_n_neg: 20         # negatives per anchor (same type, different flow state)
-    contrastive_max_samples: 2000 # cap on the O(M²) kernel pool per batch
-    contrastive_min_samples: 32   # skip the contrastive loss below this many pooled samples
-
     # Curriculum: ramp in after type encoder stabilises.
     # start_epoch should align with scheduler.phase_warmup so the LR bump
     # coincides with phase loss entering — keeps the two schedules in sync.
@@ -698,6 +677,44 @@ losses:
     variance_weight: 1.0
     covariance_weight: 1.0
     variance_target: 1.0
+
+  # ── Phase-pathway redesign losses (Steps 3-5) ─────────────────────────────
+  # These share the phase curriculum + pair construction defined on the
+  # soft_neighborhood_phase umbrella block above. Each has its own block below;
+  # config_builders.build_phase_config reads them by name (absent → code default).
+  # Set a block's `weight: 0` to disable that loss (honored — the builder uses
+  # `is not None`, not `or`).
+
+  # Step 3 — origin-anchor loss: pin mature z_phase to the shared origin (gauge-fix
+  # the recovery hub). weight is λ on ||z_phase_mature||².  Raised 0.05→0.15
+  # (exp036): at 0.05 the mature hub floated at RMS radius ~0.59, letting the
+  # contrastive inflate neg_d2 by ejecting the hub rather than the disturbed
+  # states — watch the "Phase radius" log line (mature_rms should drop).
+  phase_anchor:
+    weight: 0.15
+    type: phase_anchor
+    mature_ysfc_threshold: 12.0   # ysfc > this → "mature" (also used by μ/σ readout + contrastive pool)
+
+  # Step 4 — within-pixel Gaussian OU dynamics (disturbance-gated transition NLL).
+  # weight scales the OU loss; the ρ/s hyperparameters live in the model config
+  # (frl_repr_model_v1.yaml: ou_dynamics).
+  phase_ou_dynamics:
+    weight: 1.0
+    type: ou_dynamics
+
+  # Step 5 — type-local ranking InfoNCE: the cross-pixel recovery-stage contrastive
+  # that pins the ejection radius. Calibrate via the "Phase contrastive" gap/T
+  # log line (target ~2-3).
+  type_phase_contrastive:
+    weight: 1.0
+    type: type_phase_contrastive
+    tau: 1.0            # similarity temperature; lower → sharper push (noisier neg_d2)
+    sigma_type: 1.0     # type-comparability kernel bandwidth (standardized z_type units)
+    sigma_flow: 1.0     # flow-state kernel bandwidth (recovery-stage separation)
+    n_pos: 5            # positives per anchor (same type + same flow state)
+    n_neg: 20           # negatives per anchor (same type, different flow state)
+    max_samples: 2000   # cap on the O(M²) kernel pool per batch
+    min_samples: 32     # skip the loss below this many pooled samples
 
   # EVT-guided soft neighbourhood loss.
   # Encourages z_type to mirror the network structure of the LANDFIRE EVT

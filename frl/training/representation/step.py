@@ -1034,7 +1034,7 @@ def process_batch(
                 n_pos=phase_config.get('contrastive_n_pos', 5),
                 n_neg=phase_config.get('contrastive_n_neg', 20),
             )
-            cross_phase_loss_val = phase_config.get('weight', 1.0) * curriculum_w * c_loss
+            cross_phase_loss_val = phase_config.get('contrastive_weight', 1.0) * curriculum_w * c_loss
             if phase_contrastive_diag is not None:
                 phase_contrastive_diag['n_disturbed'] = int(sel.numel())
             if is_profiling() and device.type == 'cuda':

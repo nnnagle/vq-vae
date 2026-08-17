@@ -279,55 +279,67 @@ def build_phase_config(bindings_config, logger: logging.Logger):
         )
         phase_sampler = build_anchor_sampler(bindings_config, phase_anchor_pop)
 
-        # Extract pair construction + loss params from parsed config
+        # The soft_neighborhood_phase block is the phase "umbrella": the soft-
+        # neighborhood LOSS is retired (Step 5), but its block still carries the
+        # phase-pair construction params and the shared phase curriculum.
         ps = phase_loss_cfg.pair_strategy
         pw = phase_loss_cfg.pair_weights
         cur = phase_loss_cfg.curriculum
+
+        # Each redesign loss has its own block (like phase_spread_ranking,
+        # variance_covariance_phase, ...); fetch by name. Absent block → code
+        # default. Each loss's strength is its block's common `weight` field.
+        anchor_cfg = bindings_config.get_loss('phase_anchor')
+        ou_cfg = bindings_config.get_loss('phase_ou_dynamics')
+        contr_cfg = bindings_config.get_loss('type_phase_contrastive')
+        # anchor_weight default raised 0.05→0.15 (exp036): at 0.05 the mature hub
+        # floated at RMS radius ~0.59, letting the contrastive inflate neg_d2 by
+        # ejecting the hub rather than the disturbed states — watch "Phase radius".
+        anchor_weight = anchor_cfg.weight if anchor_cfg is not None else 0.15
+        ou_weight = ou_cfg.weight if ou_cfg is not None else 1.0
+        contrastive_weight = contr_cfg.weight if contr_cfg is not None else 1.0
+
         phase_config = {
-            # Pair construction
+            # Pair construction (soft_neighborhood_phase umbrella)
             'k': ps.type_similarity.k if ps and ps.type_similarity else 16,
             'min_overlap': ps.ysfc_overlap.min_overlap if ps and ps.ysfc_overlap else 3,
             'min_pairs': ps.min_pairs if ps else 5,
             'include_self': ps.include_self if ps else True,
             'sigma': pw.sigma if pw else 5.0,
             'self_pair_weight': pw.self_pair_weight if pw else 1.0,
-            # Loss
-            'weight': phase_loss_cfg.weight if phase_loss_cfg.weight is not None else 1.0,
+            # Retired soft-neighborhood loss params (kept: still read by pair code)
             'tau_ref': phase_loss_cfg.tau_ref if phase_loss_cfg.tau_ref is not None else 0.1,
             'tau_learned': phase_loss_cfg.tau_learned if phase_loss_cfg.tau_learned is not None else 0.1,
             'min_valid_per_row': phase_loss_cfg.min_valid_per_row if phase_loss_cfg.min_valid_per_row is not None else 2,
             'self_similarity_weight': phase_loss_cfg.self_similarity_weight if phase_loss_cfg.self_similarity_weight is not None else 1.0,
             'cross_pixel_weight': phase_loss_cfg.cross_pixel_weight if phase_loss_cfg.cross_pixel_weight is not None else 1.0,
-            # Curriculum
+            # Curriculum (soft_neighborhood_phase umbrella; shared by all phase losses)
             'curriculum_start_epoch': cur.start_epoch if cur else 10,
             'curriculum_ramp_epochs': cur.ramp_epochs if cur else 10,
             # Type-leakage penalty
             'phase_type_leakage_weight': phase_loss_cfg.phase_type_leakage_weight,
-            # Redesign (Steps 3-5): mature selector, anchor pin, OU, and Step-5
-            # contrastive knobs.  All YAML-settable under soft_neighborhood_phase in
-            # frl_binding_v1.yaml; None (absent) → the locked code default below.
-            # `is not None` (not `or`) so a YAML 0 is honored — e.g. ou_weight: 0 or
-            # anchor_weight: 0 to disable that loss.  anchor_weight default raised
-            # 0.05→0.15 (exp036): at 0.05 the mature hub floated at RMS radius ~0.59,
-            # letting the contrastive inflate neg_d2 by ejecting the hub rather than
-            # the disturbed states — watch the "Phase radius" log line.
-            'mature_ysfc_threshold': _first(phase_loss_cfg.mature_ysfc_threshold, 12.0),
-            'anchor_weight': _first(phase_loss_cfg.anchor_weight, 0.15),
-            'ou_weight': _first(phase_loss_cfg.ou_weight, 1.0),
-            'contrastive_tau': _first(phase_loss_cfg.contrastive_tau, 1.0),
-            'contrastive_sigma_type': _first(phase_loss_cfg.contrastive_sigma_type, 1.0),
-            'contrastive_sigma_flow': _first(phase_loss_cfg.contrastive_sigma_flow, 1.0),
-            'contrastive_n_pos': _first(phase_loss_cfg.contrastive_n_pos, 5),
-            'contrastive_n_neg': _first(phase_loss_cfg.contrastive_n_neg, 20),
-            'contrastive_max_samples': _first(phase_loss_cfg.contrastive_max_samples, 2000),
-            'contrastive_min_samples': _first(phase_loss_cfg.contrastive_min_samples, 32),
+            # Step-3 origin-anchor loss (block: phase_anchor)
+            'anchor_weight': anchor_weight,
+            'mature_ysfc_threshold': _first(
+                anchor_cfg.mature_ysfc_threshold if anchor_cfg else None, 12.0),
+            # Step-4 OU dynamics loss (block: phase_ou_dynamics; ρ/s in model yaml)
+            'ou_weight': ou_weight,
+            # Step-5 type-local ranking InfoNCE (block: type_phase_contrastive)
+            'contrastive_weight': contrastive_weight,
+            'contrastive_tau': _first(contr_cfg.tau if contr_cfg else None, 1.0),
+            'contrastive_sigma_type': _first(contr_cfg.sigma_type if contr_cfg else None, 1.0),
+            'contrastive_sigma_flow': _first(contr_cfg.sigma_flow if contr_cfg else None, 1.0),
+            'contrastive_n_pos': _first(contr_cfg.n_pos if contr_cfg else None, 5),
+            'contrastive_n_neg': _first(contr_cfg.n_neg if contr_cfg else None, 20),
+            'contrastive_max_samples': _first(contr_cfg.max_samples if contr_cfg else None, 2000),
+            'contrastive_min_samples': _first(contr_cfg.min_samples if contr_cfg else None, 32),
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "
             f"k={phase_config['k']}, min_overlap={phase_config['min_overlap']}, "
             f"min_pairs={phase_config['min_pairs']}, sigma={phase_config['sigma']}, "
-            f"tau_ref={phase_config['tau_ref']}, tau_learned={phase_config['tau_learned']}, "
-            f"weight={phase_config['weight']}, "
+            f"anchor_weight={anchor_weight}, ou_weight={ou_weight}, "
+            f"contrastive_weight={contrastive_weight}, contrastive_tau={phase_config['contrastive_tau']}, "
             f"curriculum=[start={phase_config['curriculum_start_epoch']}, "
             f"ramp={phase_config['curriculum_ramp_epochs']}], "
             f"leakage_weight={phase_config['phase_type_leakage_weight']}"
