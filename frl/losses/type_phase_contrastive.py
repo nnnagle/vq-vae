@@ -60,7 +60,10 @@ def type_phase_contrastive_loss(
     device = z_phase.device
     if M < n_pos + 2:
         z = z_phase.sum() * 0.0
-        return z, {"n_anchors": 0, "gap_over_tau": 0.0, "pos_d2": 0.0, "neg_d2": 0.0}
+        return z, {"n_anchors": 0, "gap_over_tau": 0.0, "pos_d2": 0.0, "neg_d2": 0.0,
+                   "n_pos_mean": 0.0, "n_pos_req": int(n_pos),
+                   "k_type_pos": 0.0, "k_flow_pos": 0.0, "p_pos": 0.0,
+                   "k_type_neg": 0.0, "k_flow_neg": 0.0, "p_neg": 0.0}
 
     z_type = z_type.detach()
     flow_state = flow_state.detach()
@@ -111,11 +114,38 @@ def type_phase_contrastive_loss(
     with torch.no_grad():
         pos_d2 = (d_zp2[rows, pos_idx] * pos_valid).sum() / pos_valid.sum().clamp(min=1)
         neg_d2 = d_zp2[rows, neg_idx].mean()
+
+        # Kernel diagnostics: the observable affinities at the *selected* pairs, so
+        # we can see whether the σ bandwidths are sane. Positives should have high
+        # k_type AND high k_flow (→ large p); negatives high k_type but low k_flow
+        # (→ small p). A tiny mean p_pos / few valid positives ⇒ σ too peaked and
+        # anchors are positive-starved (the pool clears the eps floor too rarely).
+        pos_denom = pos_valid.sum().clamp(min=1)
+        neg_valid = neg_wval > eps                                   # [M, n_neg]
+        neg_denom = neg_valid.sum().clamp(min=1)
+        kt_pos = k_type[rows, pos_idx]
+        kf_pos = k_flow[rows, pos_idx]
+        p_pos_m = p[rows, pos_idx]
+        kt_neg = k_type[rows, neg_idx]
+        kf_neg = k_flow[rows, neg_idx]
+        p_neg_m = p[rows, neg_idx]
+
         diag = {
             "n_anchors": int(has_pos.sum().item()),
             "pos_d2": float(pos_d2),
             "neg_d2": float(neg_d2),
             # gap/τ: how many τ-units separate neg from pos distances (target ~2–3).
             "gap_over_tau": float((neg_d2 - pos_d2) / tau_phase),
+            # mean valid positives per anchor (of n_pos requested) — starvation check.
+            "n_pos_mean": float(pos_valid.sum(dim=1).float().mean()),
+            "n_pos_req": int(n_pos),
+            # observable affinities at selected positive pairs (masked to valid).
+            "k_type_pos": float((kt_pos * pos_valid).sum() / pos_denom),
+            "k_flow_pos": float((kf_pos * pos_valid).sum() / pos_denom),
+            "p_pos": float((p_pos_m * pos_valid).sum() / pos_denom),
+            # observable affinities at selected negative pairs (masked to valid).
+            "k_type_neg": float((kt_neg * neg_valid).sum() / neg_denom),
+            "k_flow_neg": float((kf_neg * neg_valid).sum() / neg_denom),
+            "p_neg": float((p_neg_m * neg_valid).sum() / neg_denom),
         }
     return loss, diag

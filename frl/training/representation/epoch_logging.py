@@ -82,6 +82,16 @@ def log_epoch(
             f"(pos_d2={cd.get('pos_d2', 0.0):.3f} neg_d2={cd.get('neg_d2', 0.0):.3f}) "
             f"anchors={cd.get('n_anchors', 0)} n_disturbed={cd.get('n_disturbed', 0)}"
         )
+        # Kernel health: mean valid positives per anchor (of n_pos) + the observable
+        # affinities at selected pairs. Low n_pos/anchor or tiny p_pos ⇒ σ too peaked
+        # (anchors positive-starved). Negatives want high k_type, low k_flow.
+        logger.info(
+            f"  Phase kernels: n_pos/anchor={cd.get('n_pos_mean', 0.0):.2f}/{cd.get('n_pos_req', 5)} | "
+            f"pos: k_type={cd.get('k_type_pos', 0.0):.3f} k_flow={cd.get('k_flow_pos', 0.0):.3f} "
+            f"p={cd.get('p_pos', 0.0):.2e} | "
+            f"neg: k_type={cd.get('k_type_neg', 0.0):.3f} k_flow={cd.get('k_flow_neg', 0.0):.3f} "
+            f"p={cd.get('p_neg', 0.0):.2e}"
+        )
     logger.info(
         f"  Val:   {val_stats['loss']:.4f} "
         f"spec={val_stats['spectral_loss']:.4f} spat={val_stats['spatial_loss']:.4f} "
