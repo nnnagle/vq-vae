@@ -709,7 +709,11 @@ losses:
     weight: 1.0
     type: type_phase_contrastive
     tau: 1.0            # similarity temperature; lower → sharper push (noisier neg_d2)
-    sigma_type: 1.0     # type-comparability kernel bandwidth (standardized z_type units)
+    sigma_type: 3.0     # type-comparability kernel bandwidth (standardized z_type units).
+                        #   Raised 1.0→3.0 (exp038): at 1.0 in 48-dim standardized z_type
+                        #   the kernel was near-degenerate (typical ‖Δz_type‖~9.7 →
+                        #   k_type~exp(-48)≪eps), starving positives (~35% anchor yield).
+                        #   Watch the "Phase kernels" line: n_pos/anchor and p_pos should rise.
     sigma_flow: 1.0     # flow-state kernel bandwidth (recovery-stage separation)
     n_pos: 5            # positives per anchor (same type + same flow state)
     n_neg: 20           # negatives per anchor (same type, different flow state)
