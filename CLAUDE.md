@@ -284,10 +284,22 @@ PYTHONPATH=frl python -m training.phase_eval.compare_eval \
   excluded via `EXCLUDE_TARGET_CHANNELS` — it is trivially predictable and was
   inflating the aggregate.
 - **B — recovery curves** (`recovery_curves.py`): `z_phase → NBR` probe, per-EVT
-  actual-vs-predicted recovery curves and a **shape-agreement** metric. Runs two
-  designs: **phase-only** and **type-phase** (`[z_type, z_phase]`) — the latter
-  supplies the type-specific baseline z_phase alone lacks (no per-EVT intercept;
-  EVT is diagnostic only).
+  actual-vs-predicted recovery curves and a **shape-agreement** metric. Runs four
+  readouts (`interaction_readouts.py` holds the pure math). Two **additive**
+  (linear): **phase-only** and **type-phase** (`[z_type, z_phase]` concat) — the
+  latter supplies the type-specific baseline z_phase alone lacks. Two
+  **interaction** readouts (type MODULATES the read of phase — z_phase is a
+  type-collapsed shadow, only meaningful conditional on type; an additive concat
+  gives z_phase one global gain and under-reads it, which is a prime suspect for
+  the exp037 amplitude under-shoot): **type-phase-bilinear** — a rank-`r` (default
+  3) whitened-PCA bilinear `(Pᵀz_type)⊗z_phase` with **separate** ridge on the
+  main-effect vs interaction blocks (the interaction is higher-variance, wants more
+  shrinkage; both λ tuned jointly on val); and **type-local-knn** — product-kernel
+  Nadaraya–Watson with type/phase bandwidths tuned **independently** (mirrors the
+  downstream kNN post-stratification use). **Backward-compat:** the two interaction
+  designs are NEW keys under `B_recovery_curves`, absent from exp035-and-earlier
+  `metrics.json`; `compare_eval.py` reports them as new-only (baseline None, no
+  crash). `run_interaction=False` reproduces the additive-only B.
 - **C — ejection** (`ejection.py`): jump magnitude `‖z_phase[t] − z_phase[t−1]‖`
   at disturbance years (`ysfc==0`) vs stable, and the ROC-AUC of disturbance-from-
   jump.
