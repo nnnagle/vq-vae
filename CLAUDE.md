@@ -291,6 +291,18 @@ PYTHONPATH=frl python -m training.phase_eval.compare_eval \
 - **C — ejection** (`ejection.py`): jump magnitude `‖z_phase[t] − z_phase[t−1]‖`
   at disturbance years (`ysfc==0`) vs stable, and the ROC-AUC of disturbance-from-
   jump.
+- **E — type-conditioning leakage (DEFERRED, not yet implemented).** A probe
+  measuring whether the anomaly `a` still encodes `z_type`: R² of `z_type` from the
+  per-pixel mean anomaly `mean_t a` (or `‖cov(mean_t a, z_type)‖_F`). The anomaly is
+  meant to be type-conditional (`a = (x − μ(z_type))/σ(z_type)`, mature ⇒ a≈0), so
+  residual predictability of `z_type` from `a` means `μ` under-removed the type
+  baseline (readout under-fit / bandwidth too smooth) and the contrastive's
+  "conditional on same type" comparison is leaking. This is the **direct**
+  measurement of the `h ≫ σ_type` design constraint (RFF readout bandwidth much
+  smoother than the contrastive type kernel — see the `type_phase_contrastive.sigma_type`
+  comment in `frl_binding_v1.yaml`), better than proxying it by the `h/σ_type` ratio.
+  Cheap to add — reuses the `z_type` + anomaly already extracted in `common.py`.
+  (D = LCMS change-agent clustering, also deferred; see `lcms_agents.py`.)
 
 **Ridge normal equations are averaged by the observation count M** (`A/M`, `B/M`)
 before adding `λI`, so the λ grid is on a dataset-size-independent scale — with

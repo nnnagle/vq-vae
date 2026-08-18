@@ -16,17 +16,6 @@ Usage (on the HPC, where the zarr + checkpoints live)::
         --output-dir runs/<exp>/phase_eval/
 
 Quick smoke test: add ``--max-batches 2 --max-pixels-per-sample 500 --no-mlp``.
-
-TODO (deferred diagnostic — type-conditioning leakage): add a probe measuring
-whether the anomaly ``a`` still encodes ``z_type`` — i.e. R² of ``z_type`` from the
-per-pixel mean anomaly ``mean_t a`` (or ‖cov(mean_t a, z_type)‖_F). The anomaly is
-meant to be type-conditional (``a = (x − μ(z_type))/σ(z_type)`` with mature ⇒ a≈0),
-so residual predictability of ``z_type`` from ``a`` means μ under-removed the type
-baseline (readout under-fit / bandwidth too smooth) and the contrastive's
-"conditional on same type" comparison is leaking. Pairs with the h≫σ_type design
-constraint (see frl_binding_v1.yaml type_phase_contrastive.sigma_type comment):
-this is the direct measurement of that property, better than proxying by the
-h/σ_type ratio. Cheap — reuses the extracted z_type + anomaly already in common.py.
 """
 
 from __future__ import annotations
