@@ -723,7 +723,12 @@ losses:
                         #   rise while k_flow_neg (~0.016) stays low (else stages wash out).
     n_pos: 5            # positives per anchor (same type + same flow state)
     n_neg: 20           # negatives per anchor (same type, different flow state)
-    max_samples: 2000   # cap on the O(M²) kernel pool per batch
+    max_samples: 5000   # cap on the O(M²) kernel pool per batch. 2000→5000 (exp039):
+                        #   2000 was heavily subsampling a ~10-30k-pixel-time available pool,
+                        #   starving positives; more candidates → better co-type/co-stage
+                        #   matches (watch k_type_pos, k_flow_pos, n_pos/anchor rise) + lower-
+                        #   variance gradient. Enriches the pool WITHOUT loosening σ_type.
+                        #   O(M²) mem ~1GB fwd / ~2GB w/ backward at M=5000 — safe on 32GB V100.
     min_samples: 32     # skip the loss below this many pooled samples
 
   # EVT-guided soft neighbourhood loss.
