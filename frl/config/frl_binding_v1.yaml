@@ -709,18 +709,18 @@ losses:
     weight: 1.0
     type: type_phase_contrastive
     tau: 1.0            # similarity temperature; lower → sharper push (noisier neg_d2)
-    sigma_type: 5.0     # type-comparability kernel bandwidth (standardized z_type units).
-                        #   1.0→3.0 (exp038) relieved starvation but positives stayed weak
-                        #   (k_type_pos~0.09, n_pos/anchor 3.14/5). 3.0→5.0 (exp039). Note the
-                        #   natural scale: the RFF readout bandwidth h auto-locks to the median
-                        #   ‖Δz_type‖≈9.46 — the same RBF length scale as this kernel — so ~9.5
-                        #   is the ceiling where "same type" stops being local (median pair
-                        #   k_type→0.61). σ_type=5 sits ~half the cloud scale (median pair
-                        #   k_type≈0.17), still type-local. Watch n_pos/anchor, k_type_pos.
-    sigma_flow: 3.0     # flow-state kernel bandwidth (recovery-stage separation).
-                        #   1.0→3.0 (exp039): at 1.0 k_flow_pos~0.11 (positives barely
-                        #   same-stage → pos_d2 stuck ~0.30, capping gap/T). Headroom: k_flow_neg
-                        #   was ~0.016, so widen until k_flow_pos rises but k_flow_neg stays low.
+    sigma_type: 3.0     # type-comparability kernel bandwidth (standardized z_type units).
+                        #   Kept TIGHT (< the RFF readout bandwidth h≈9.46) on purpose: for the
+                        #   anomaly comparison to be genuinely "conditional on same type", the
+                        #   baseline μ(z_type) must be ~constant within a same-type comparison
+                        #   group, which needs σ_type ≪ h (μ varies on scale h). At σ_type=3 the
+                        #   h/σ_type margin is ~3×. Do NOT raise σ_type toward h to cure positive
+                        #   starvation — that erodes the conditioning; enrich the POOL instead
+                        #   (max_samples ↑, soft-weighting). exp038 tried 5; reverted to 3.
+    sigma_flow: 2.0     # flow-state kernel bandwidth (recovery-stage separation).
+                        #   1.0→2.0: at 1.0 k_flow_pos~0.11 (positives barely same-stage →
+                        #   pos_d2 stuck ~0.30, capping gap/T). Widen modestly; watch k_flow_pos
+                        #   rise while k_flow_neg (~0.016) stays low (else stages wash out).
     n_pos: 5            # positives per anchor (same type + same flow state)
     n_neg: 20           # negatives per anchor (same type, different flow state)
     max_samples: 2000   # cap on the O(M²) kernel pool per batch
