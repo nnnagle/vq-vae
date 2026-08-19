@@ -32,11 +32,27 @@ from training.phase_eval.common import (
     extract_pixel_series,
     iter_batches,
 )
+from training.phase_eval.interaction_readouts import (
+    bilinear_features,
+    block_penalty,
+    solve_block_ridge,
+    whitened_pca,
+)
 
 logger = logging.getLogger("phase_eval.reconstruction")
 
-FEATURE_SOURCES = ("z_phase", "h", "z_type")
+# ``type-phase-bilinear`` is a type-conditional reconstruction source (see the
+# block above ``_run_bilinear_source``); the other three are simple single sources.
+BILINEAR_SOURCE = "type-phase-bilinear"
+FEATURE_SOURCES = ("z_phase", "h", "z_type", BILINEAR_SOURCE)
 RIDGE_LAMBDA_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
+
+# Bilinear source: rank of the type×phase interaction + SEPARATE ridge grids for
+# the main-effect and interaction blocks (interaction is higher-variance ⇒ usually
+# wants more shrinkage), tuned jointly on val within-R².
+BILINEAR_RANK = 3
+BILINEAR_LAMBDA_MAIN_GRID = (1e-3, 1e-2, 1e-1)
+BILINEAR_LAMBDA_INT_GRID = (1e-2, 1e-1, 1.0)
 
 
 def _warn_lambda_edge(best_lam: float, grid, label: str, scores=None) -> None:
@@ -463,6 +479,151 @@ def _fit_mlp(
 
 
 # ---------------------------------------------------------------------------
+# Bilinear source — the type-conditional reconstruction
+# ---------------------------------------------------------------------------
+# z_type is atemporal, so an ADDITIVE [z_type, z_phase] adds exactly zero
+# within-pixel signal (a per-pixel constant drops out of within-pixel variance):
+# the ONLY route by which type can raise the within-pixel reconstruction is by
+# MODULATING z_phase. This source fits
+#   pred = w_type·z_type + w_phase·z_phase + (Pᵀz_type)ᵀ V z_phase
+# (rank-r whitened-PCA interaction; SEPARATE ridge on the main-effect vs
+# interaction blocks) so its within-R² lift over z_phase-alone measures how much
+# the type-conditional reading recovers. No MLP ceiling — the per-source MLPs are
+# already the nonlinear ceiling; this is the interpretable, parsimonious middle.
+
+def _type_phase_series(data) -> torch.Tensor:
+    """[z_type (broadcast over T), z_phase] → [N, T, dt+zp]."""
+    zp = data["z_phase"]
+    T = zp.shape[1]
+    zt = data["z_type"].unsqueeze(1).expand(-1, T, -1)
+    return torch.cat([zt, zp], dim=-1)
+
+
+def _bilinear_series(data, std_tp, P, dt, zp) -> torch.Tensor:
+    """Standardized bilinear design ``[z_type, z_phase, (Pᵀz_type)⊗z_phase]`` →
+    ``[N, T, dt+zp+r*zp]`` (float64). P is whitened so the interaction block is
+    already ~unit-variance (no separate standardizer)."""
+    tp = _type_phase_series(data)
+    N, T, _ = tp.shape
+    Xs = std_tp.apply(tp).reshape(N * T, -1).double()
+    zt_s, zp_s = Xs[:, :dt], Xs[:, dt:dt + zp]
+    return bilinear_features(zt_s, zp_s, P.to(Xs.dtype)).reshape(N, T, -1)
+
+
+def _evaluate_bilinear(loader, ctx, provider, std_tp, P, W, b, channels, dt, zp,
+                       keep_idx, halo, max_pixels, max_batches) -> dict:
+    """Total + within-pixel R² for the bilinear head (no re-standardization: the
+    bilinear features are already on the unit-diagonal scale)."""
+    acc = _R2Accumulator(len(channels))
+    rng = np.random.default_rng(1)
+    for batch in iter_batches(loader, max_batches):
+        data = extract_pixel_series(
+            batch, ctx, halo, max_pixels_per_sample=max_pixels,
+            need_pre_film=False, require_evt=False, rng=rng,
+        )
+        if data is None:
+            continue
+        feat = _bilinear_series(data, std_tp, P, dt, zp)     # [N, T, D]
+        tgt = _target_series(data, provider, keep_idx)       # [N, T, C]
+        valid = data["valid_tp"]
+        N, T, _ = feat.shape
+        pred = (feat.reshape(N * T, -1) @ W + b).reshape(N, T, len(channels))
+        acc.update(pred, tgt, valid)
+    return acc.result(channels)
+
+
+def _run_bilinear_source(ctx, train_loader, val_loader, test_loader, provider, keep_idx,
+                         kept_names, kind, halo, max_pixels, max_batches, rank) -> dict:
+    """Fit the rank-``rank`` bilinear reconstruction with block-separated ridge and
+    report test total/within R² (λ_main, λ_bilinear tuned jointly on val)."""
+    dt = int(ctx["model"].z_type_dim)
+    zp = int(ctx["model"].z_phase_dim)
+
+    # Pass 1 — standardizer over [z_type, z_phase].
+    rng = np.random.default_rng(0)
+    std_tp = None
+    for batch in iter_batches(train_loader, max_batches):
+        data = extract_pixel_series(batch, ctx, halo, max_pixels_per_sample=max_pixels,
+                                    need_pre_film=False, require_evt=False, rng=rng)
+        if data is None:
+            continue
+        fv = _type_phase_series(data)[data["valid_tp"]]
+        if std_tp is None:
+            std_tp = _Standardizer(fv.shape[1])
+        std_tp.update(fv)
+    if std_tp is None:
+        raise RuntimeError("no valid pixels for the bilinear standardizer")
+    std_tp.finalize()
+
+    # Pass 2 — covariance of standardized z_type → whitened rank-r projection.
+    rng = np.random.default_rng(0)
+    Cov = torch.zeros(dt, dt, dtype=torch.float64)
+    Mc = 0
+    for batch in iter_batches(train_loader, max_batches):
+        data = extract_pixel_series(batch, ctx, halo, max_pixels_per_sample=max_pixels,
+                                    need_pre_film=False, require_evt=False, rng=rng)
+        if data is None:
+            continue
+        zt_s = std_tp.apply(_type_phase_series(data)[data["valid_tp"]])[:, :dt].double()
+        Cov += zt_s.t() @ zt_s
+        Mc += zt_s.shape[0]
+    if Mc == 0:
+        raise RuntimeError("no valid pixels for the bilinear z_type covariance")
+    P = whitened_pca(Cov / Mc, rank)
+    r = int(P.shape[1])
+
+    # Pass 3 — block normal equations on bilinear features (multi-output).
+    rng = np.random.default_rng(0)
+    A = B = None
+    C = M = 0
+    for batch in iter_batches(train_loader, max_batches):
+        data = extract_pixel_series(batch, ctx, halo, max_pixels_per_sample=max_pixels,
+                                    need_pre_film=False, require_evt=False, rng=rng)
+        if data is None:
+            continue
+        feat = _bilinear_series(data, std_tp, P, dt, zp)
+        tgt = _target_series(data, provider, keep_idx)
+        valid = data["valid_tp"]
+        X = feat[valid].double()
+        Y = tgt[valid].double()
+        Xa = torch.cat([X, torch.ones(X.shape[0], 1, dtype=torch.float64)], dim=1)
+        if A is None:
+            Dp1, C = X.shape[1] + 1, Y.shape[1]
+            A = torch.zeros(Dp1, Dp1, dtype=torch.float64)
+            B = torch.zeros(Dp1, C, dtype=torch.float64)
+        A += Xa.t() @ Xa
+        B += Xa.t() @ Y
+        M += X.shape[0]
+    if A is None or M == 0:
+        raise RuntimeError("no valid pixels for the bilinear normal equations")
+    A /= M
+    B /= M
+
+    channels = kept_names if kept_names is not None else _target_channel_names(ctx, kind, C)
+
+    # Select (λ_main, λ_bilinear) on val by variance-weighted within-R².
+    best = (-1e9, None, None, None, None)
+    for lm in BILINEAR_LAMBDA_MAIN_GRID:
+        for li in BILINEAR_LAMBDA_INT_GRID:
+            W, b = solve_block_ridge(A, B, block_penalty(dt, zp, r, lm, li))
+            vm = _evaluate_bilinear(val_loader, ctx, provider, std_tp, P, W, b, channels,
+                                    dt, zp, keep_idx, halo, max_pixels, max_batches)
+            score = vm["r2_within_weighted"]
+            logger.info(f"  [A] bilinear λ_main={lm:g} λ_int={li:g}: val within-R² weighted={score:.4f}")
+            if score > best[0]:
+                best = (score, lm, li, W, b)
+    _, lm, li, W, b = best
+
+    test = _evaluate_bilinear(test_loader, ctx, provider, std_tp, P, W, b, channels,
+                              dt, zp, keep_idx, halo, max_pixels, max_batches)
+    logger.info(
+        f"  [A] type-phase-bilinear RIDGE test: within-R² weighted={test['r2_within_weighted']:.4f} "
+        f"mean={test['r2_within_mean']:.4f} | total weighted={test['r2_total_weighted']:.4f}"
+    )
+    return {"rank": r, "lambda_main": lm, "lambda_bilinear": li, "ridge_test": test}
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry
 # ---------------------------------------------------------------------------
 
@@ -498,6 +659,13 @@ def run_reconstruction(
         # Target channels are the same across sources; resolve the exclusion once.
         kept_names, keep_idx = _target_channels_kept(ctx)
         for source in sources:
+            if source == BILINEAR_SOURCE:
+                logger.info(f"[A] fitting bilinear source (rank={BILINEAR_RANK}) target={kind}")
+                results[f"{source}__{kind}"] = _run_bilinear_source(
+                    ctx, train_loader, val_loader, test_loader, provider, keep_idx,
+                    kept_names, kind, halo, max_pixels_per_sample, max_batches, BILINEAR_RANK,
+                )
+                continue
             key = f"{source}__{kind}"
             logger.info(f"[A] fitting ridge: source={source} target={kind}")
             std, A, B, D, C = _fit_standardizer_and_normal_eq(

@@ -271,9 +271,21 @@ PYTHONPATH=frl python -m training.phase_eval.compare_eval \
 ```
 
 - **A — reconstruction** (`reconstruction.py`): ridge + MLP-ceiling probes
-  `features → raw phase-input x`, for three feature sources: post-FiLM `z_phase`,
-  **pre-FiLM `h`** (the TCN bottleneck, the FiLM-free contrast), and `z_type`
-  (atemporal control). Reports **total** and **within-pixel** R² (the within-pixel
+  `features → raw phase-input x`, for four feature sources: post-FiLM `z_phase`,
+  **pre-FiLM `h`** (the TCN bottleneck, the FiLM-free contrast), `z_type`
+  (atemporal control), and **`type-phase-bilinear`** — the type×phase interaction
+  source (rank-`r` whitened-PCA `[z_type, z_phase, (Pᵀz_type)⊗z_phase]`, separate
+  ridge on the main-effect vs interaction blocks; no MLP, the per-source MLPs are
+  the nonlinear ceiling). Because `z_type` is atemporal, an *additive* `[z_type,
+  z_phase]` adds **zero** within-pixel signal — the interaction is the *only* route
+  by which type can raise the within-pixel reconstruction, so this source's
+  within-R² lift over `z_phase` alone measures how much type-conditional reading
+  recovers. **Caveat:** the rank-`r` truncation uses whitened PCA of `z_type`,
+  which on near-isotropic (VICReg'd) standardized `z_type` picks variance-driven
+  rather than supervised directions — so it's a *conservative* (lower-bound)
+  estimate of the interaction benefit; raise `BILINEAR_RANK` or switch to a
+  supervised reduced-rank fit if it looks capped. Reports **total** and
+  **within-pixel** R² (the within-pixel
   R² is *the phase signal*), as a **variance-weighted aggregate** (pool residual/
   total SS across channels before the ratio — so low-within-variance channels
   can't dominate an unweighted mean) plus per-channel R²/variance/MSE. `z_type`

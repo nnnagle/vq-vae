@@ -74,7 +74,8 @@ def main() -> None:
     p.add_argument("--max-pixels-per-sample", type=int, default=2000,
                    help="cap valid pixels sampled per patch (0 = all)")
     p.add_argument("--sources", default=",".join(FEATURE_SOURCES),
-                   help="diagnostic-A feature sources (subset of z_phase,h,z_type)")
+                   help="diagnostic-A feature sources (subset of "
+                        "z_phase,h,z_type,type-phase-bilinear)")
     p.add_argument("--anomaly-kinds", default="raw",
                    help="diagnostic-A targets: 'raw' now; 'mature_baseline' after Step 1")
     p.add_argument("--top-k-evt", type=int, default=20)
