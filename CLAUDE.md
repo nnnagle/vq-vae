@@ -134,6 +134,8 @@ The bindings YAML defines dataset groups:
 | Phase triplet | `phase_triplet.py` | Temporal ordering constraints (defined but not wired into training loop) |
 | Soft neighborhood | `soft_neighborhood.py` | Soft KL matching of relative z_phase distance structure at shared ysfc |
 | Phase recovery discrimination | `triplet_phase.py` | **Absolute** margin between disturbed (ysfc≤1) and recovered (ysfc≥5) embeddings within each pixel — the loss that makes recovery stage metrically separable |
+| OU dynamics | `ou_dynamics.py` | Within-pixel Gaussian OU transition NLL (plug-in ‖z_t−ρz_{t−1}‖²); scalar global ρ. The **joint/complete-data MAP** — biases ρ toward 0 by the reliability ratio (attenuation). Superseded by the Kalman filter below. |
+| Differentiable Kalman filter | `kalman_filter.py` | **Marginal**-likelihood within-pixel AR(1)+noise NLL (state integrated out ⇒ **de-attenuated ρ**). Reduced-rank linear-Gaussian SSM on the anomaly; type-conditional ρ(z_type)/Q; filtered state → z_phase. Outward-jump gating via ysfc reset. See "Phase pathway: differentiable Kalman filter" below. **Built + unit-tested; not yet wired into training (Phase 2).** |
 | Frobenius leakage penalty | (inline in `train_representation.py`) | `\|\|cov(h, z_type)\|\|_F` — discourages type information in the pre-FiLM bottleneck h |
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
 
@@ -157,6 +159,65 @@ The training loop applies the following loss components:
 6. **Phase VICReg** — collapse prevention on z_phase dimensions (note: operates on the wrong population for recovery; see Known Limitations)
 7. **Phase recovery discrimination** — absolute margin loss: within each pixel, embeddings at ysfc ≤ 1 must be at least `margin` apart from embeddings at ysfc ≥ 5. This is the loss that closes the gap between relative ordering and metrically meaningful recovery stage representation.
 8. **Frobenius type-leakage penalty** — `||cov(h, z_type)||_F` penalises type information in the pre-FiLM bottleneck h. Stop-gradient on z_type; active only when phase curriculum weight > 0.
+
+### Phase pathway: differentiable Kalman filter (planned Step 6 — built, not yet wired)
+
+**Motivation (from the exp035↔exp039 downstream analysis).** For FIA kNN, exp039
+regressed on *removals* — a phase-reset / harvest signal where z_phase is the
+**primary** predictor and the neighborhood is type-conditional. exp039's z_phase
+ejects disturbances hard (C jump ratio 41.5) but the disturbance representation
+is not **within-type coherent** (C ROC-AUC fell to 0.815; removals reliable-k
+collapsed 20–40 → 10), because the OU+contrastive replaced the old
+soft-neighborhood's *smooth within-type recovery-state metric* with a within-pixel
+smoothness prior (OU) + ordinal ranking (contrastive). The fix is a
+**type-conditional recovery rate** ρ(z_type) that restores a smooth within-type
+recovery-stage ordering — everything within type (oak and pine harvests stay
+incommensurate).
+
+**The model.** A reduced-rank linear-Gaussian state-space model, per pixel, on
+the anomaly (`losses/kalman_filter.py`):
+`x_t = diag(ρ(z_type)) x_{t−1} + w_t` (Q(z_type)), `a_t = C x_t + v_t` (R), with
+`z_phase = filtered state x_{t|t}`. This **moves the OU from a loss to an
+architecture**: the Kalman gain is the optimal data-driven drive, so there is no
+free `f` to trade off against ρ (the ρ↔f identifiability degeneracy is removed by
+construction), and because the filter integrates the state out the loss is the
+**marginal** likelihood → **ρ is de-attenuated** (the plug-in `ou_dynamics`
+penalty is the joint MAP and biases ρ toward 0 by the reliability ratio
+γ_x/(γ_x+R); unit-tested: true ρ=0.85 → filter 0.85, naive lag-1 0.39).
+
+**Self-pairs only** (native): the filter is purely within-pixel; cross-pixel
+structure stays in the contrastive. Filter NLL ↔ the old soft-neighborhood *self*
+term; contrastive ↔ its *cross* term.
+
+**Outward-jump gating** (the "don't apply over large outward jumps" rule):
+recovery is the *inward* relaxation that identifies ρ; a disturbance is a large
+*outward* jump that is not AR(1)-modelable. Disturbance years (`reset`, from
+ysfc==0 or a ysfc decrease) restart the segment prior and are **assimilated but
+not scored**, so the jump never enters the likelihood — ρ is estimated on the
+recovery regime only. `NIS` (normalized innovation squared, ≈ C_obs when
+calibrated) is logged as the free filter-consistency / identifiability check.
+
+**Decisions in force** (revisit notes for later):
+- **Phase VICReg disabled** — the NLL + emission prevent state collapse.
+- **Filtered** state as z_phase — *revisit: RTS smoother* (better estimate + the
+  lag-1 cross-cov EM sufficient statistic).
+- **ysfc reset gate** — *revisit: add an unlabelled/innovation-threshold gate* to
+  catch disturbances LCMS misses.
+- **Shared emission C** — *revisit: type-conditional C(z_type)*.
+- **d = z_phase_dim = 8** is enough because the dynamics (ρ, Q, prior) vary with
+  z_type — a low-dim state with type-adapted dynamics is expressive.
+- If the Phase-0 fit shows AR(1) is inadequate widely, add **AR(2) / complex-
+  diagonal modes** (damped-oscillatory, for non-monotone recovery).
+
+**Rollout.** Phase 0 = classical per-EVT AR(1)+noise fit for a data prior ρ̂(EVT)
++ AR-order verdict (`analysis/ar1_recovery.py` core, unit-tested;
+`analysis/run_ar1_recovery.py` ISAAC CLI). Phase 1 = the differentiable filter
+module + tests (`losses/kalman_filter.py`, `tests/test_kalman_filter.py` —
+**done**). Phase 2 (next) = type-conditional ρ/Q/C/prior heads on
+`RepresentationModel` + wire the NLL into `process_batch` behind a `phase_kalman`
+config block, filtered state → z_phase, contrastive kept, VCR off. Phase 3 =
+diagnostics (NIS, ρ spread) + ISAAC validation (within-type removals reliable-k,
+C-AUC, recovery curves).
 
 ### Code structure & data flow (`frl/training/`)
 
@@ -385,7 +446,13 @@ frl/losses/pairs.py                      Pair generation strategies
 frl/losses/variance_covariance.py        VICReg loss
 frl/losses/phase_neighborhood.py         Phase temporal loss
 frl/losses/phase_triplet.py              Phase triplet loss
+frl/losses/ou_dynamics.py                Within-pixel OU transition NLL (plug-in; superseded by kalman_filter)
+frl/losses/kalman_filter.py              Differentiable within-pixel Kalman filter + marginal NLL (de-attenuated ρ)
 frl/losses/reconstruction.py             Reconstruction loss
+
+frl/analysis/ar1_recovery.py             Phase-0 classical AR(1)+noise recovery estimator (data prior ρ̂; unit-tested core)
+frl/analysis/run_ar1_recovery.py         Phase-0 ISAAC CLI: per-EVT AR(1)+noise fit on the anomaly
+frl/analysis/fia_knn_models.Rmd          Downstream FIA kNN eval (reliable-k, post-stratification RE/ESS)
 
 frl/training/train_representation.py                 Training CLI entry point (arg parsing + wiring + epoch loop)
 frl/training/representation/step.py                  process_batch() — the per-batch training/val step
