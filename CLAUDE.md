@@ -206,6 +206,12 @@ calibrated) is logged as the free filter-consistency / identifiability check.
 - **Shared emission C** — *revisit: type-conditional C(z_type)*.
 - **d = z_phase_dim = 8** is enough because the dynamics (ρ, Q, prior) vary with
   z_type — a low-dim state with type-adapted dynamics is expressive.
+- **ρ seed = 0.861** — the type-conditional head is initialised (sigmoid bias
+  logit ≈ 1.82, weights ≈ 0) so every pixel starts at ρ≈0.86 and learns
+  type-variation from there. From the assumption "recovery reaches within 5% of
+  mature in 20 annual steps": ρ = 0.05^(1/20). (General: ρ = fraction^(1/years);
+  15 yr→5% ⇒ 0.819, 20 yr→1% ⇒ 0.794.) This replaces Phase-0's ρ̂ prior for
+  *seeding*; Phase-0 is still worth running for the **AR(1)-adequacy verdict**.
 - If the Phase-0 fit shows AR(1) is inadequate widely, add **AR(2) / complex-
   diagonal modes** (damped-oscillatory, for non-monotone recovery).
 
