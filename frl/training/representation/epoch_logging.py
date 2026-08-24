@@ -54,9 +54,19 @@ def log_epoch(
         f"median‖Δz‖={train_stats.get('readout_median_dz', 0.0):.2f} | "
         f"leverage={train_stats.get('readout_leverage', 0.0):.3f}"
     )
-    # OU dynamics: ρ (contraction), disturbance-gate mean, gated residual RMS.
+    # Within-pixel dynamics diagnostics. The Kalman filter (Step 6) reports
+    # mean ρ, NIS (normalized innovation squared — should track n_obs when Q/R
+    # are calibrated; the filter-consistency / identifiability check), and the
+    # scored fraction. The plug-in OU (Step 4) reports ρ, gate mean, resid RMS.
     od = train_stats.get('ou_diag')
-    if od:
+    if od and od.get('nis_mean') is not None:
+        logger.info(
+            f"  Phase Kalman: rho={od.get('rho_mean', 0.0):.3f} "
+            f"nis={od.get('nis_mean', 0.0):.2f} (target {od.get('nis_target', 0.0):.0f}) "
+            f"scored_frac={od.get('scored_frac', 0.0):.3f} "
+            f"n_scored={od.get('n_scored', 0.0):.0f}"
+        )
+    elif od:
         logger.info(
             f"  OU dynamics: rho={od.get('rho', 0.0):.3f} "
             f"gate_mean={od.get('gate_mean', 0.0):.3f} "

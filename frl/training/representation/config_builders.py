@@ -292,6 +292,10 @@ def build_phase_config(bindings_config, logger: logging.Logger):
         anchor_cfg = bindings_config.get_loss('phase_anchor')
         ou_cfg = bindings_config.get_loss('phase_ou_dynamics')
         contr_cfg = bindings_config.get_loss('type_phase_contrastive')
+        # Step-6: presence of a phase_kalman block switches the phase encoder from
+        # the TCN+OU to the type-conditional Kalman filter (model construction is
+        # gated separately by model_cfg.phase_kalman.enabled).
+        kalman_cfg = bindings_config.get_loss('phase_kalman')
         # anchor_weight default raised 0.05→0.15 (exp036): at 0.05 the mature hub
         # floated at RMS radius ~0.59, letting the contrastive inflate neg_d2 by
         # ejecting the hub rather than the disturbed states — watch "Phase radius".
@@ -324,6 +328,10 @@ def build_phase_config(bindings_config, logger: logging.Logger):
                 anchor_cfg.mature_ysfc_threshold if anchor_cfg else None, 12.0),
             # Step-4 OU dynamics loss (block: phase_ou_dynamics; ρ/s in model yaml)
             'ou_weight': ou_weight,
+            # Step-6 Kalman filter (block: phase_kalman; ρ/Q/C/R/prior in model yaml)
+            'use_kalman': kalman_cfg is not None,
+            'kalman_weight': (kalman_cfg.weight if kalman_cfg is not None
+                              and kalman_cfg.weight is not None else 1.0),
             # Step-5 type-local ranking InfoNCE (block: type_phase_contrastive)
             'contrastive_weight': contrastive_weight,
             'contrastive_tau': _first(contr_cfg.tau if contr_cfg else None, 1.0),
@@ -344,6 +352,11 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             f"ramp={phase_config['curriculum_ramp_epochs']}], "
             f"leakage_weight={phase_config['phase_type_leakage_weight']}"
         )
+        if phase_config['use_kalman']:
+            logger.info(
+                f"  Phase encoder = type-conditional Kalman filter (Step 6): "
+                f"kalman_weight={phase_config['kalman_weight']} "
+                f"(replaces TCN+OU; ensure model_cfg.phase_kalman.enabled=true)")
     else:
         logger.info("Phase pair construction disabled (no soft_neighborhood_phase loss in config)")
 

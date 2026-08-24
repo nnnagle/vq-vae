@@ -112,3 +112,17 @@ ou_dynamics:
   s1: 0.0               # radius-growth coeff (0 = homoscedastic; enable for tighter basin)
   learn_s: false        # default: fixed s → weighted squared residual (no log-s collapse magnet)
   tau: 2.0              # disturbance-gate scale on ‖Δa‖ (locked Δ-scale units)
+
+# Step-6 type-conditional differentiable Kalman filter. When enabled it REPLACES
+# the TCN+bottleneck+OU phase encoder: z_phase = filtered state, loss = the
+# marginal NLL (de-attenuated ρ; see models/phase_kalman.py + CLAUDE.md). The loss
+# weight lives in the binding config (phase_kalman block, whose presence also flips
+# the training loop to this path). State dim = z_phase_dim; observation dim =
+# phase_in_channels; emission C and measurement noise R are shared (type-conditional
+# C = later revisit). ρ and Q are type-conditional heads off detached z_type.
+phase_kalman:
+  enabled: true
+  rho_init: 0.861       # 0.05**(1/20): within 5% of mature in 20 annual steps
+  q_init: 0.1           # initial process-noise variance per state mode
+  r_init: 0.25          # initial measurement-noise variance per anomaly channel
+  p0_init: 25.0         # diffuse prior variance (disturbed states assimilated at a reset)

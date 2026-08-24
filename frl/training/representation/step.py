@@ -231,6 +231,11 @@ def process_batch(
         phase_config.get('anchor_weight', 0.05) if phase_config else 0.05)
     ou_weight = (
         phase_config.get('ou_weight', 1.0) if phase_config else 1.0)
+    # Step-6: when the type-conditional Kalman filter is enabled it REPLACES the
+    # TCN encoder + OU loss (z_phase = filtered state, loss = marginal NLL).
+    use_kalman = bool(phase_config.get('use_kalman', False)) if phase_config else False
+    kalman_weight = (
+        phase_config.get('kalman_weight', 1.0) if phase_config else 1.0)
 
     if spread_config is not None:
         spread_w = ramp_weight(
@@ -663,7 +668,15 @@ def process_batch(
                     phase_weights = pp['phase_weights']
 
                     _t0 = time.perf_counter()
-                    z_phase_at_anchors = model.encode_phase(anomaly_feats)  # [N, T, zp]
+                    kalman_nll = None
+                    kalman_diag = None
+                    if use_kalman:
+                        # Step-6: filtered state → z_phase, marginal NLL → loss.
+                        z_phase_at_anchors, kalman_nll, kalman_diag = (
+                            model.phase_kalman_forward(
+                                anomaly_feats, z_type_at_anchors, ysfc_dev, phase_valid))
+                    else:
+                        z_phase_at_anchors = model.encode_phase(anomaly_feats)  # [N, T, zp]
                     if is_profiling() and device.type == 'cuda':
                         torch.cuda.synchronize()
                     t_phase_forward += time.perf_counter() - _t0
@@ -690,11 +703,16 @@ def process_batch(
                             disturbed_r2_sum += float(zp_r2[d_sel].sum())
                             disturbed_r2_count += int(d_sel.sum())
 
-                    # Step-4 within-pixel OU dynamics (disturbance-gated transition NLL).
-                    ou_raw, ou_diag = model.ou_dynamics(
-                        z_phase_at_anchors, delta_a_norm, phase_valid)
-                    phase_ou_loss_val = ou_weight * curriculum_w * ou_raw
-                    last_ou_diag = ou_diag
+                    # Within-pixel dynamics loss: Step-6 Kalman marginal NLL
+                    # (de-attenuated ρ) or the Step-4 plug-in OU transition NLL.
+                    if use_kalman:
+                        phase_ou_loss_val = kalman_weight * curriculum_w * kalman_nll
+                        last_ou_diag = kalman_diag
+                    else:
+                        ou_raw, ou_diag = model.ou_dynamics(
+                            z_phase_at_anchors, delta_a_norm, phase_valid)
+                        phase_ou_loss_val = ou_weight * curriculum_w * ou_raw
+                        last_ou_diag = ou_diag
 
                     # z_phase → z_type leakage guard (was pre-FiLM h; h == z_phase now):
                     # with the type-agnostic encoder this should stay ≈0.

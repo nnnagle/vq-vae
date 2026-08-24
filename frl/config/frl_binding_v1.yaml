@@ -672,7 +672,9 @@ losses:
   # Prevents FiLM from collapsing dimensions in the 12-dim z_phase space.
   # Applied to z_phase embeddings [N_anchors*T, 12], ramped with phase curriculum.
   variance_covariance_phase:
-    weight: 0.1
+    weight: 0.0   # phase VCR DISABLED under the Step-6 Kalman filter (the marginal
+                  # NLL + emission C prevent state collapse). Restore to 0.1 if
+                  # reverting to the TCN+OU phase encoder (remove the phase_kalman block).
     type: variance_covariance
     variance_weight: 1.0
     covariance_weight: 1.0
@@ -730,6 +732,17 @@ losses:
                         #   variance gradient. Enriches the pool WITHOUT loosening σ_type.
                         #   O(M²) mem ~1GB fwd / ~2GB w/ backward at M=5000 — safe on 32GB V100.
     min_samples: 32     # skip the loss below this many pooled samples
+
+  # Step 6 — type-conditional differentiable Kalman filter. PRESENCE of this block
+  # switches the phase encoder from the TCN+OU (Step 4) to the marginal-likelihood
+  # filter: z_phase = filtered state, loss = the Kalman NLL (de-attenuated ρ). The
+  # ρ(z_type)/Q(z_type)/C/R/prior heads live in the model config
+  # (frl_repr_model_v1.yaml: phase_kalman, which must also set enabled: true).
+  # `weight` scales the NLL. When active, phase_ou_dynamics is inert (not called)
+  # and variance_covariance_phase is set to 0 below (NLL+emission prevent collapse).
+  phase_kalman:
+    weight: 1.0
+    type: phase_kalman
 
   # EVT-guided soft neighbourhood loss.
   # Encourages z_type to mirror the network structure of the LANDFIRE EVT

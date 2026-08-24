@@ -56,6 +56,7 @@ from .spatial import GatedResidualConv2D, EdgeAwareSmoothingConv2D
 from .tcn import TCNEncoder
 from .mature_baseline import RFFMatureBaseline
 from .anomaly_transform import AnomalyTransform
+from .phase_kalman import PhaseKalman
 from losses.ou_dynamics import OUDynamics
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,12 @@ class RepresentationModel(nn.Module):
         ou_s1: float = 0.0,
         ou_learn_s: bool = False,
         ou_tau: float = 2.0,
+        # Step-6 type-conditional Kalman filter (replaces the TCN+OU when enabled)
+        phase_kalman_enabled: bool = False,
+        kalman_rho_init: float = 0.861,
+        kalman_q_init: float = 0.1,
+        kalman_r_init: float = 0.25,
+        kalman_p0_init: float = 25.0,
         # type projection head (SimCLR-style; None = disabled)
         type_proj_hidden_dim: Optional[int] = None,
         type_proj_output_dim: Optional[int] = None,
@@ -211,6 +218,17 @@ class RepresentationModel(nn.Module):
             s0=ou_s0, s1=ou_s1, learn_s=ou_learn_s, tau=ou_tau,
         )
 
+        # Step-6 type-conditional Kalman filter. When enabled it REPLACES the
+        # TCN+bottleneck+OU phase encoder: z_phase = filtered state, loss = the
+        # marginal NLL (see phase_kalman.py). None → the TCN path (exp039) runs.
+        self.phase_kalman: Optional[PhaseKalman] = (
+            PhaseKalman(
+                z_type_dim=z_type_dim, n_obs=phase_in_channels, state_dim=z_phase_dim,
+                rho_init=kalman_rho_init, q_init=kalman_q_init,
+                r_init=kalman_r_init, p0_init=kalman_p0_init,
+            ) if phase_kalman_enabled else None
+        )
+
         # --- Type projection head (SimCLR-style) ---
         # Applied between z_type and InfoNCE losses during training.
         # None when disabled (project_type() acts as identity).
@@ -272,6 +290,7 @@ class RepresentationModel(nn.Module):
         mb = cfg.get("mature_baseline", {})   # Step-1 RFF readout
         at = cfg.get("anomaly_transform", {})  # Step-2 anomaly transform
         ou = cfg.get("ou_dynamics", {})        # Step-4 within-pixel OU
+        pk = cfg.get("phase_kalman", {})       # Step-6 type-conditional filter
 
         # input_dropout may be a scalar (constant) or a schedule dict.
         # At construction time we always use the initial rate:
@@ -328,6 +347,12 @@ class RepresentationModel(nn.Module):
             ou_s1=ou.get("s1", 0.0),
             ou_learn_s=ou.get("learn_s", False),
             ou_tau=ou.get("tau", 2.0),
+            # Step-6 Kalman filter
+            phase_kalman_enabled=pk.get("enabled", False),
+            kalman_rho_init=pk.get("rho_init", 0.861),
+            kalman_q_init=pk.get("q_init", 0.1),
+            kalman_r_init=pk.get("r_init", 0.25),
+            kalman_p0_init=pk.get("p0_init", 25.0),
             # type projection head
             type_proj_hidden_dim=tp.get("hidden_dim") if tp.get("enabled", False) else None,
             type_proj_output_dim=tp.get("output_dim") if tp.get("enabled", False) else None,
@@ -461,6 +486,25 @@ class RepresentationModel(nn.Module):
         h = h.permute(0, 2, 1).reshape(N * T, tcn_out, 1, 1)
         h = self.phase_head(h)                                           # [N*T, zp, 1, 1]
         return h.reshape(N, T, zp)                                       # [N, T, zp]
+
+    def phase_kalman_forward(
+        self,
+        anomaly_feats: torch.Tensor,   # [N, 2C, T] from anomaly_transform
+        z_type_pixels: torch.Tensor,   # [N, z_type_dim] (caller stop-grads; head re-detaches)
+        ysfc: torch.Tensor,            # [N, T] raw years since change
+        valid: torch.Tensor,           # [N, T] bool
+    ):
+        """Step-6 phase encoder: run the type-conditional Kalman filter on the
+        anomaly and return ``(z_phase [N, T, zp], nll, diag)``.
+
+        The filter observes the ``a`` block only (the first C anomaly channels);
+        Δa is not part of the observation model (the filter's own dynamics carry
+        the temporal structure). Raises if the Kalman path is disabled.
+        """
+        if self.phase_kalman is None:
+            raise RuntimeError("phase_kalman is disabled; enable phase_kalman in the model config.")
+        a_block = anomaly_feats[:, : self.phase_in_channels, :]          # [N, C, T]
+        return self.phase_kalman(a_block, z_type_pixels, ysfc, valid)
 
     # ------------------------------------------------------------------
     # Checkpoint helpers

@@ -135,7 +135,7 @@ The bindings YAML defines dataset groups:
 | Soft neighborhood | `soft_neighborhood.py` | Soft KL matching of relative z_phase distance structure at shared ysfc |
 | Phase recovery discrimination | `triplet_phase.py` | **Absolute** margin between disturbed (ysfc≤1) and recovered (ysfc≥5) embeddings within each pixel — the loss that makes recovery stage metrically separable |
 | OU dynamics | `ou_dynamics.py` | Within-pixel Gaussian OU transition NLL (plug-in ‖z_t−ρz_{t−1}‖²); scalar global ρ. The **joint/complete-data MAP** — biases ρ toward 0 by the reliability ratio (attenuation). Superseded by the Kalman filter below. |
-| Differentiable Kalman filter | `kalman_filter.py` | **Marginal**-likelihood within-pixel AR(1)+noise NLL (state integrated out ⇒ **de-attenuated ρ**). Reduced-rank linear-Gaussian SSM on the anomaly; type-conditional ρ(z_type)/Q; filtered state → z_phase. Outward-jump gating via ysfc reset. See "Phase pathway: differentiable Kalman filter" below. **Built + unit-tested; not yet wired into training (Phase 2).** |
+| Differentiable Kalman filter | `kalman_filter.py` (+ `models/phase_kalman.py`) | **Marginal**-likelihood within-pixel AR(1)+noise NLL (state integrated out ⇒ **de-attenuated ρ**). Reduced-rank linear-Gaussian SSM on the anomaly; type-conditional ρ(z_type)/Q; filtered state → z_phase. Outward-jump gating via ysfc reset. See "Phase pathway: differentiable Kalman filter" below. **Wired into training (exp040) behind the `phase_kalman` config block — replaces the TCN+OU phase encoder.** |
 | Frobenius leakage penalty | (inline in `train_representation.py`) | `\|\|cov(h, z_type)\|\|_F` — discourages type information in the pre-FiLM bottleneck h |
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
 
@@ -215,15 +215,29 @@ calibrated) is logged as the free filter-consistency / identifiability check.
 - If the Phase-0 fit shows AR(1) is inadequate widely, add **AR(2) / complex-
   diagonal modes** (damped-oscillatory, for non-monotone recovery).
 
+**How it's wired (exp040).** `models/phase_kalman.py::PhaseKalman` holds the
+type-conditional heads (ρ, Q off detached z_type; shared C, R; learned diffuse
+prior P0; m0≡0). `RepresentationModel` constructs it when
+`model_cfg.phase_kalman.enabled` and exposes `phase_kalman_forward(anomaly_feats,
+z_type, ysfc, valid) → (z_phase, nll, diag)` (observes the `a` block only). In
+`process_batch` (`step.py`), presence of the `phase_kalman` **binding** block sets
+`use_kalman`, which routes z_phase through the filter instead of
+`encode_phase`/OU and uses the NLL as the dynamics loss; the contrastive + anchor
+losses are unchanged; phase VCR is set to 0. `epoch_logging` prints a "Phase
+Kalman" line (ρ mean, NIS vs n_obs target, scored fraction).
+
 **Rollout.** Phase 0 = classical per-EVT AR(1)+noise fit for a data prior ρ̂(EVT)
 + AR-order verdict (`analysis/ar1_recovery.py` core, unit-tested;
 `analysis/run_ar1_recovery.py` ISAAC CLI). Phase 1 = the differentiable filter
-module + tests (`losses/kalman_filter.py`, `tests/test_kalman_filter.py` —
-**done**). Phase 2 (next) = type-conditional ρ/Q/C/prior heads on
-`RepresentationModel` + wire the NLL into `process_batch` behind a `phase_kalman`
-config block, filtered state → z_phase, contrastive kept, VCR off. Phase 3 =
-diagnostics (NIS, ρ spread) + ISAAC validation (within-type removals reliable-k,
-C-AUC, recovery curves).
+module + tests (`losses/kalman_filter.py`, `tests/test_kalman_filter.py`) —
+**done**. Phase 2 = type-conditional heads + wiring into `process_batch` behind
+the `phase_kalman` block (VCR off, filtered state → z_phase, contrastive kept) —
+**done** (`models/phase_kalman.py`, `tests/test_phase_kalman.py`; config blocks
+in `frl_repr_model_v1.yaml` + `frl_binding_v1.yaml`). Phase 3 (next) = ISAAC
+train run + validation: NIS calibration (≈ n_obs), ρ(z_type) spread across EVTs,
+within-type removals reliable-k, C-AUC, recovery curves; then per-decision
+revisits (RTS smoother, unlabelled reset gate, type-conditional C, AR(2)/complex
+modes if Phase-0 flags AR(1) inadequacy).
 
 ### Code structure & data flow (`frl/training/`)
 
@@ -437,6 +451,7 @@ frl/models/conv2d_encoder.py              Type pathway: 2D conv encoder
 frl/models/tcn.py                         Phase pathway: TCN encoder
 frl/models/spatial.py                     GatedResidualConv2D
 frl/models/conditioning.py                FiLMLayer
+frl/models/phase_kalman.py                PhaseKalman: type-conditional Kalman phase encoder (Step 6)
 frl/models/heads.py                       Prediction heads (MLP, Linear, Conv2D)
 
 frl/data/loaders/dataset/forest_dataset_v2.py       PyTorch Dataset (Zarr → samples)
