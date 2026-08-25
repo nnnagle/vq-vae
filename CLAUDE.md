@@ -198,7 +198,16 @@ recovery regime only. `NIS` (normalized innovation squared, ≈ C_obs when
 calibrated) is logged as the free filter-consistency / identifiability check.
 
 **Decisions in force** (revisit notes for later):
-- **Phase VICReg disabled** — the NLL + emission prevent state collapse.
+- **RMS-normalized state** — z_phase = filtered state / (detached global RMS) before
+  it feeds the contrastive/anchor (`phase_kalman.normalize_state`). The marginal NLL
+  is observation-space (gauge-invariant to the state scale), so it is unaffected;
+  the norm fixes the scale gauge the unnormalized contrastive would otherwise inflate
+  (exp040 epoch-195 symptom: state RMS ~12–17, contrastive gap/T saturated ~366,
+  NIS stuck ~143). This mirrors the standard SimCLR/InfoNCE convention (and this
+  repo's own z_type projection-head precedent). Preserves relative radius (recovery
+  stage) and direction (flow signature); watch `state_rms` in the "Phase Kalman" log.
+- **Phase VICReg disabled** — the NLL + emission + the RMS state-norm prevent state
+  collapse/explosion (VICReg's one-sided hinge would not have capped the explosion).
 - **Filtered** state as z_phase — *revisit: RTS smoother* (better estimate + the
   lag-1 cross-cov EM sufficient statistic).
 - **ysfc reset gate** — *revisit: add an unlabelled/innovation-threshold gate* to

@@ -64,11 +64,13 @@ class PhaseKalman(nn.Module):
         r_init: float = 0.25,
         p0_init: float = 25.0,
         floor: float = 1e-4,
+        normalize_state: bool = True,
     ) -> None:
         super().__init__()
         self.n_obs = n_obs
         self.state_dim = state_dim
         self.floor = float(floor)
+        self.normalize_state = bool(normalize_state)
 
         # Type-conditional heads (off detached z_type). Init: bias = target,
         # weight = 0 → uniform at init, learns type-variation.
@@ -136,7 +138,18 @@ class PhaseKalman(nn.Module):
             a_ntc, A_diag=rho, Q_diag=Q, C=self.C, R_diag=self.r,
             m0=self.m0, P0_diag=self.p0, valid=valid, reset=reset,
         )
+
+        # RMS-normalize the filtered state before it leaves as z_phase. The NLL
+        # above is in observation space (gauge-invariant to the state scale), so
+        # this does not touch it; it fixes the scale the contrastive/anchor would
+        # otherwise inflate. Detached denominator → a pure rescale to unit RMS,
+        # so inflating ‖x‖ buys nothing. Relative radii (recovery stage) and
+        # directions (flow signature) are preserved (single global scalar).
+        state_rms = x_filt.detach().pow(2).mean().clamp(min=1e-8).sqrt()
+        diag["state_rms"] = float(state_rms)
+        z_phase = x_filt / state_rms if self.normalize_state else x_filt
+
         total = float(valid.sum().clamp(min=1))
         diag["scored_frac"] = diag["n_scored"] / total
         diag["nis_target"] = float(self.n_obs)        # NIS should track n_obs
-        return x_filt, nll, diag
+        return z_phase, nll, diag

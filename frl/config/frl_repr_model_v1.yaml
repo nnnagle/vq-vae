@@ -126,3 +126,6 @@ phase_kalman:
   q_init: 0.1           # initial process-noise variance per state mode
   r_init: 0.25          # initial measurement-noise variance per anomaly channel
   p0_init: 25.0         # diffuse prior variance (disturbed states assimilated at a reset)
+  normalize_state: true # RMS-normalize the filtered state before it leaves as z_phase
+                        # (fixes the scale gauge the contrastive would inflate; NLL is
+                        # observation-space so it's unaffected). Preserves relative radius.

@@ -139,6 +139,7 @@ class RepresentationModel(nn.Module):
         kalman_q_init: float = 0.1,
         kalman_r_init: float = 0.25,
         kalman_p0_init: float = 25.0,
+        kalman_normalize_state: bool = True,
         # type projection head (SimCLR-style; None = disabled)
         type_proj_hidden_dim: Optional[int] = None,
         type_proj_output_dim: Optional[int] = None,
@@ -226,6 +227,7 @@ class RepresentationModel(nn.Module):
                 z_type_dim=z_type_dim, n_obs=phase_in_channels, state_dim=z_phase_dim,
                 rho_init=kalman_rho_init, q_init=kalman_q_init,
                 r_init=kalman_r_init, p0_init=kalman_p0_init,
+                normalize_state=kalman_normalize_state,
             ) if phase_kalman_enabled else None
         )
 
@@ -353,6 +355,7 @@ class RepresentationModel(nn.Module):
             kalman_q_init=pk.get("q_init", 0.1),
             kalman_r_init=pk.get("r_init", 0.25),
             kalman_p0_init=pk.get("p0_init", 25.0),
+            kalman_normalize_state=pk.get("normalize_state", True),
             # type projection head
             type_proj_hidden_dim=tp.get("hidden_dim") if tp.get("enabled", False) else None,
             type_proj_output_dim=tp.get("output_dim") if tp.get("enabled", False) else None,

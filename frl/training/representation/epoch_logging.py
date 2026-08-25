@@ -64,7 +64,8 @@ def log_epoch(
             f"  Phase Kalman: rho={od.get('rho_mean', 0.0):.3f} "
             f"nis={od.get('nis_mean', 0.0):.2f} (target {od.get('nis_target', 0.0):.0f}) "
             f"scored_frac={od.get('scored_frac', 0.0):.3f} "
-            f"n_scored={od.get('n_scored', 0.0):.0f}"
+            f"n_scored={od.get('n_scored', 0.0):.0f} "
+            f"state_rms={od.get('state_rms', 0.0):.2f}"
         )
     elif od:
         logger.info(

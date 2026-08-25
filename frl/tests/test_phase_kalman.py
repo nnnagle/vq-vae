@@ -57,6 +57,24 @@ class TestForward:
         assert math.isfinite(diag["nis_mean"])
         assert 0.0 < diag["scored_frac"] <= 1.0
         assert diag["nis_target"] == 5.0
+        # RMS-normalized state → unit RMS, and the raw scale is reported.
+        assert abs(float(z_phase.detach().pow(2).mean().sqrt()) - 1.0) < 1e-4
+        assert math.isfinite(diag["state_rms"])
+
+    def test_normalize_state_is_scale_invariant_output(self):
+        # Inflating the emission's inverse scale (large raw state) still yields a
+        # unit-RMS z_phase — the contrastive can't be gamed by scale.
+        pk = _kalman()
+        a, z_type, ysfc, valid = self._inputs()
+        z_phase, _, diag = pk(a * 50.0, z_type, ysfc, valid)   # large observations
+        assert abs(float(z_phase.detach().pow(2).mean().sqrt()) - 1.0) < 1e-4
+
+    def test_normalize_off_returns_raw_state(self):
+        pk = _kalman(normalize_state=False)
+        a, z_type, ysfc, valid = self._inputs()
+        z_phase, _, _ = pk(a, z_type, ysfc, valid)
+        # raw filtered state generally does NOT have unit RMS.
+        assert abs(float(z_phase.detach().pow(2).mean().sqrt()) - 1.0) > 1e-3
 
     def test_gradients_flow_to_all_params(self):
         pk = _kalman()
