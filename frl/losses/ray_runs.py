@@ -140,6 +140,7 @@ def runs_kernel_matching_loss(
     tau_metric: float,
     max_points: int,
     min_points: int,
+    type_keep_threshold: float = 0.0,
     generator: torch.Generator | None = None,
 ):
     """Match z_phase similarities to the jump-gated runs-kernel similarity.
@@ -148,7 +149,18 @@ def runs_kernel_matching_loss(
     windowed runs-kernel similarity ``S`` (normalized per overlap), the evidence
     ``E`` (window overlap mass), and the type gate ``k_type``; then pulls the
     z_phase similarity ``L = exp(-‖Δz‖²/τ)`` toward ``S`` with a weighted MSE,
-    weight = evidence × type-gate (self excluded). Returns ``(loss, diag)``.
+    weight = evidence × type-gate (self excluded).
+
+    **Type-threshold pair selection.** z_phase is a type-collapsed *shadow* — type
+    separation is z_type's job, so this loss only ever pulls *same-type* pairs
+    together; it never pushes different types apart. Pairs whose type gate
+    ``k_type < type_keep_threshold`` are dropped from the objective entirely (hard
+    keep-mask), so the O(M²) budget is spent only on close-type neighbors. With
+    ``type_keep_threshold = 0`` the mask is inert (all pairs kept, soft-weighted by
+    ``k_type`` as before). The ``keep_*`` diagnostics report the realized
+    neighborhood *bandwidth* so ``sigma_type`` / the threshold can be tuned.
+
+    Returns ``(loss, diag)``.
     """
     N, T, d = zp.shape
     dev = zp.device
@@ -193,16 +205,28 @@ def runs_kernel_matching_loss(
     L = torch.exp(-dl2 / tau_metric)                            # [M, M] in (0,1]
 
     eye = torch.eye(M, device=dev, dtype=zp.dtype)
-    weight = E * k_type * (1.0 - eye)                           # evidence × type, no self
+    offdiag = 1.0 - eye
+    # Hard keep-mask: only pull same-type pairs together (shadow embedding — never
+    # push types apart). k_type ≥ threshold ⇒ standardized type-distance small.
+    keep = offdiag
+    if type_keep_threshold > 0.0:
+        keep = keep * (k_type >= type_keep_threshold).to(zp.dtype)
+    weight = E * k_type * keep                                  # evidence × type, kept pairs only
     wsum = weight.sum().clamp(min=1e-6)
     loss = (weight * (L - S) ** 2).sum() / wsum
 
     with torch.no_grad():
         # Split diagnostics by type-similar vs type-dissimilar for tuning.
-        same = (k_type > 0.5) * (1.0 - eye)
-        diff = (k_type <= 0.5) * (1.0 - eye)
+        same = (k_type > 0.5) * offdiag
+        diff = (k_type <= 0.5) * offdiag
         def _wmean(x, m):
             return float((x * m).sum() / m.sum().clamp(min=1.0))
+        # --- Bandwidth monitors: realized neighborhood among KEPT pairs ---------
+        n_off = offdiag.sum().clamp(min=1.0)
+        n_keep = keep.sum()
+        keep_frac = float(n_keep / n_off)                       # fraction of pairs surviving threshold
+        # effective same-type neighbors per point (kept pairs / points)
+        nbr_per_pt = float(n_keep / max(M, 1))
         diag = {
             "n_points": M,
             "active": 1.0,
@@ -210,9 +234,14 @@ def runs_kernel_matching_loss(
             "S_diff": _wmean(S, diff),           # runs-sim, diff type
             "L_same": _wmean(L, same),           # z_phase sim, same type
             "L_diff": _wmean(L, diff),           # z_phase sim, diff type
-            "evidence_mean": _wmean(E, 1.0 - eye),
-            "k_type_mean": _wmean(k_type, 1.0 - eye),
-            # calibration: how well L tracks S on same-type (evidence-weighted)
+            "evidence_mean": _wmean(E, offdiag),
+            "k_type_mean": _wmean(k_type, offdiag),
+            # bandwidth of the retained neighborhood (tune sigma_type / threshold):
+            "keep_frac": keep_frac,              # want a small-but-nonzero fraction
+            "nbr_per_pt": nbr_per_pt,            # effective same-type neighbors per point
+            "k_type_kept": _wmean(k_type, keep), # mean type-gate among kept pairs (→1 = very tight)
+            "dt_kept": _wmean(dt2.sqrt(), keep), # mean standardized type-distance among kept pairs
+            # calibration: how well L tracks S on kept pairs (evidence-weighted)
             "match_rmse": float((weight * (L - S) ** 2).sum().div(wsum).sqrt()),
         }
     return loss, diag

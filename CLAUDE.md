@@ -190,6 +190,14 @@ blocks flips the pathway and skips anchor+OU / contrastive):
    MSE `Σ w (L−S)²`, `w = evidence·k_type`. This is the trajectory-similarity term
    *and* the anti-collapse spread; it self-aligns different calendar offsets
    (A's yr5-10 ↔ B's yr10-15) and its evidence weight handles truncated overlaps.
+   **Type-threshold pair selection** (`type_keep_threshold` in `phase_runs_kernel`):
+   z_phase is a type-collapsed *shadow* — type separation is z_type's job, so the
+   loss only ever pulls *same-type* pairs together and never pushes different types
+   apart. Pairs with `k_type < type_keep_threshold` are hard-dropped from the
+   objective, so the O(M²) budget is spent on close-type neighbors instead of
+   cross-type pairs that `k_type` would zero anyway. `0.0` = inert (all pairs kept,
+   soft `k_type` weight only). Tune it alongside `sigma_type` via the bandwidth log
+   (below).
 
 Design rationale worth keeping (from the discussion): the ray's identity is the
 *whole recovery*, not the ejection jump; direction is discriminative at large
@@ -202,8 +210,13 @@ upgrade only if the fixed-ρ rate spread proves too wide.
 ray"** line reports `z_rms` (spread — must not collapse), `resid_rms` (contraction
 fit), `gate_mean`, `mature_frac`; the **"Phase runs"** line reports `S_same/S_diff`
 (runs-sim by type), `L_same/L_diff` (z_phase-sim by type — want L_same≫L_diff),
-`match_rmse` (L tracking S), `evidence`, `k_type`. Anti-collapse also relies on
-phase VICReg (0.1) — watch `z_rms` and `pvcr`.
+`match_rmse` (L tracking S), `evidence`, `k_type`; the **"Phase runs bw"** line is
+the type-threshold **bandwidth monitor** — `keep_frac` (fraction of pooled pairs
+surviving the threshold — want small-but-nonzero; →1 means the threshold is too
+loose / `sigma_type` too wide), `nbr/pt` (effective same-type neighbors per point),
+`k_type_kept`/`dt_kept` (mean type-gate / standardized type-distance among the
+retained pairs). Anti-collapse also relies on phase VICReg (0.1) — watch `z_rms`
+and `pvcr`.
 
 **Status:** wired + unit-tested; **not yet run on ISAAC** — needs a smoke test
 (the runs kernel is O(M²·window); tune `runs_max_points`/`half_window` for cost).

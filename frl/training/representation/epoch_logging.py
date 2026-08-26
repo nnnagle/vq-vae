@@ -102,6 +102,15 @@ def log_epoch(
             f"evidence={rk.get('evidence_mean', 0.0):.3f} k_type={rk.get('k_type_mean', 0.0):.3f} "
             f"n={rk.get('n_points', 0):.0f}"
         )
+        # Type-threshold bandwidth monitor: keep_frac too high (→1) ⇒ threshold too
+        # loose / sigma_type too wide (raise threshold or lower sigma_type); too low
+        # (→0) ⇒ starving the loss of same-type neighbors. dt_kept is the realized
+        # standardized type-distance among retained pairs.
+        logger.info(
+            f"  Phase runs bw: keep_frac={rk.get('keep_frac', 0.0):.3f} "
+            f"nbr/pt={rk.get('nbr_per_pt', 0.0):.1f} | "
+            f"k_type_kept={rk.get('k_type_kept', 0.0):.3f} dt_kept={rk.get('dt_kept', 0.0):.3f}"
+        )
     # Phase radius: RMS ‖z_phase‖ split by recovery state (hub-and-rim check).
     # mature_rms should sit near the origin (anchor loss pins it); disturbed_rms is
     # the ejection radius. neg_d2 ≈ disturbed_rms² + mature_rms² for cross-pixel

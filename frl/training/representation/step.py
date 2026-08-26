@@ -1066,7 +1066,8 @@ def process_batch(
                 sigma_type=phase_config['runs_sigma_type'],
                 tau_metric=phase_config['runs_tau_metric'],
                 max_points=int(phase_config['runs_max_points']),
-                min_points=int(phase_config['runs_min_points']))
+                min_points=int(phase_config['runs_min_points']),
+                type_keep_threshold=phase_config['runs_type_keep_threshold'])
             cross_phase_runs_val = phase_config['runs_weight'] * curriculum_w * rk_loss
             last_runs_diag = phase_runs_diag
             if is_profiling() and device.type == 'cuda':

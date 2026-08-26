@@ -174,3 +174,43 @@ class TestRunsKernelMatching:
             window_sigma=2.0, sigma_flow=0.5, sigma_type=3.0, tau_metric=1.0,
             max_points=100, min_points=8)
         assert loss.item() == 0.0 and diag["active"] == 0.0
+
+    def _two_type_clusters(self, seed=0):
+        """Two well-separated z_type clusters; identical flow so only the type gate
+        differentiates pairs. Used to test the keep-threshold."""
+        g = torch.Generator().manual_seed(seed)
+        N, T, F, d, dt = 8, 12, 2, 3, 5
+        flow = 0.1 * torch.randn(N, T, F, generator=g)
+        da = 0.1 * torch.ones(N, T)
+        z_type = torch.zeros(N, dt)
+        z_type[N // 2:, 0] = 30.0          # cluster B far from cluster A along dim 0
+        valid = torch.ones(N, T, dtype=torch.bool)
+        zp = 0.05 * torch.randn(N, T, d, generator=g)
+        return zp, flow, da, z_type, valid
+
+    def test_threshold_drops_cross_type_pairs(self):
+        zp, flow, da, z_type, valid = self._two_type_clusters()
+        kw = dict(tau_jump=2.0, half_window=3, window_sigma=3.0, sigma_flow=0.5,
+                  sigma_type=1.0, tau_metric=1.0, max_points=200, min_points=8)
+        # No threshold: cross-type pairs are present (soft-weighted only).
+        _, diag_all = runs_kernel_matching_loss(
+            zp, flow, da, z_type, valid, type_keep_threshold=0.0, **kw)
+        # High threshold: cross-type pairs (k_type≈0) are hard-dropped.
+        _, diag_keep = runs_kernel_matching_loss(
+            zp, flow, da, z_type, valid, type_keep_threshold=0.5, **kw)
+        assert diag_keep["keep_frac"] < diag_all["keep_frac"]
+        # Only same-type pairs survive ⇒ kept type gate is tight, distance small.
+        assert diag_keep["k_type_kept"] > diag_all["k_type_kept"]
+        assert diag_keep["dt_kept"] < diag_all["dt_kept"]
+        # Bandwidth monitors are populated and sane.
+        assert 0.0 <= diag_keep["keep_frac"] <= 1.0
+        assert diag_keep["nbr_per_pt"] >= 0.0
+
+    def test_threshold_default_keeps_all(self):
+        zp, flow, da, z_type, valid = self._two_type_clusters(seed=3)
+        kw = dict(tau_jump=2.0, half_window=3, window_sigma=3.0, sigma_flow=0.5,
+                  sigma_type=1.0, tau_metric=1.0, max_points=200, min_points=8)
+        _, diag = runs_kernel_matching_loss(
+            zp, flow, da, z_type, valid, type_keep_threshold=0.0, **kw)
+        # Inert mask: every off-diagonal pair is kept.
+        assert abs(diag["keep_frac"] - 1.0) < 1e-6
