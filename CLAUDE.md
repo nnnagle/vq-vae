@@ -206,8 +206,12 @@ calibrated) is logged as the free filter-consistency / identifiability check.
   NIS stuck ~143). This mirrors the standard SimCLR/InfoNCE convention (and this
   repo's own z_type projection-head precedent). Preserves relative radius (recovery
   stage) and direction (flow signature); watch `state_rms` in the "Phase Kalman" log.
-- **Phase VICReg disabled** — the NLL + emission + the RMS state-norm prevent state
-  collapse/explosion (VICReg's one-sided hinge would not have capped the explosion).
+- **Phase VICReg re-enabled (weight 0.1)** as the per-dimension anti-collapse partner
+  to the RMS state-norm: the RMS-norm fixes only the total scale (overall RMS→1), while
+  VICReg's variance hinge stops each z_phase dim from individually collapsing and its
+  covariance term decorrelates them. The two are consistent (overall RMS=1 with per-dim
+  std→1 share a fixed point). Disabling it (exp040 first pass) was one cause of the
+  collapse/explosion symptoms.
 - **Filtered** state as z_phase — *revisit: RTS smoother* (better estimate + the
   lag-1 cross-cov EM sufficient statistic).
 - **ysfc reset gate** — *revisit: add an unlabelled/innovation-threshold gate* to

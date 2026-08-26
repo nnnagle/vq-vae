@@ -672,9 +672,12 @@ losses:
   # Prevents FiLM from collapsing dimensions in the 12-dim z_phase space.
   # Applied to z_phase embeddings [N_anchors*T, 12], ramped with phase curriculum.
   variance_covariance_phase:
-    weight: 0.0   # phase VCR DISABLED under the Step-6 Kalman filter (the marginal
-                  # NLL + emission C prevent state collapse). Restore to 0.1 if
-                  # reverting to the TCN+OU phase encoder (remove the phase_kalman block).
+    weight: 0.1   # phase VCR RE-ENABLED as the per-dimension anti-collapse partner to
+                  # the Kalman RMS state-norm. The RMS-norm fixes only the TOTAL scale
+                  # (overall RMS→1); VICReg's variance hinge keeps each z_phase dim from
+                  # individually collapsing and the covariance term decorrelates them.
+                  # Consistent with the RMS-norm: overall RMS=1 with per-dim std→1 both
+                  # hold at the same fixed point (exp040 collapse/explosion fix).
     type: variance_covariance
     variance_weight: 1.0
     covariance_weight: 1.0
