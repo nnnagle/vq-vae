@@ -747,6 +747,44 @@ losses:
   #   weight: 1.0
   #   type: phase_kalman
 
+  # Step 7 — Ray / runs-kernel phase objective (ysfc-free successor to
+  # soft_neighborhood_phase + OU + contrastive). PRESENCE of these two blocks flips
+  # the phase pathway to the new objective: phase_ray SUPERSEDES phase_anchor +
+  # phase_ou_dynamics (their code paths are skipped), and phase_runs_kernel SUPERSEDES
+  # type_phase_contrastive. See losses/ray_runs.py + CLAUDE.md. Comment BOTH blocks
+  # out to fall back to the exp039 TCN+OU+contrastive path.
+
+  # Ray geometry: mature (‖a‖≈0) → origin, and fixed-ρ contraction over jump-free
+  # lags (the "collapse to origin" + ray scaffold). ρ is FIXED (rate variation is a
+  # type/site-index attribute carried by z_type). Two separate weights so the origin
+  # pin and the contraction can be tuned independently. Watch the "Phase ray" log:
+  # z_rms (spread — must not collapse), resid_rms (contraction fit), gate_mean.
+  phase_ray:
+    anchor_weight: 1.0      # λ on ‖z_mature‖² (mature → origin)
+    contraction_weight: 1.0 # λ on ‖z_j − ρ^(j-i) z_i‖² over jump-free lags
+    type: phase_ray
+    rho: 0.861              # fixed nominal rate = 0.05**(1/20) (5% of mature in 20 yr)
+    tau_jump: 2.0           # jump-gate scale on max ‖Δa‖ between two timesteps
+    sigma_mature: 0.5       # ‖a‖ scale below which a timestep counts as "mature"
+
+  # Runs-kernel metric: match z_phase similarity to a jump-gated, window-normalized,
+  # evidence-weighted, type-gated (a,Δa) trajectory similarity (a soft substring
+  # kernel over jump-free runs). This is the "similarity of trajectories" term and
+  # the anti-collapse spread. Tuning: the "Phase runs" log reports S_same/S_diff
+  # (runs-sim by type) and L_same/L_diff (z_phase-sim by type) — want L to track S
+  # (match_rmse↓), L_same ≫ L_diff, and evidence_mean healthy.
+  phase_runs_kernel:
+    weight: 1.0
+    type: phase_runs_kernel
+    tau_jump: 2.0           # jump gate (window truncation); keep = phase_ray.tau_jump
+    half_window: 5          # ± window (years) for the runs comparison
+    window_sigma: 3.0       # window decay in offset j
+    sigma_flow: 0.5         # (a,Δa) pointwise kernel bandwidth (recovery-state match)
+    sigma_type: 3.0         # type-gate bandwidth (standardized z_type) — keep TIGHT (same-type only)
+    tau_metric: 1.0         # z_phase similarity temperature exp(-‖Δz‖²/τ)
+    max_points: 2000        # pooled (pixel,time) points/batch — O(M²·window) cost
+    min_points: 64          # skip the loss below this many pooled points
+
   # EVT-guided soft neighbourhood loss.
   # Encourages z_type to mirror the network structure of the LANDFIRE EVT
   # confusion graph, including transitive (multi-hop) similarity via diffusion.

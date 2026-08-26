@@ -636,6 +636,7 @@ class DatasetBindingsParser:
             n_neg=spec.get('n_neg'),
             max_samples=spec.get('max_samples'),
             min_samples=spec.get('min_samples'),
+            params=dict(spec),
         )
 
     def _parse_pair_endpoint_strategy(

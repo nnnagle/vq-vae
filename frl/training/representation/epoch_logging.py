@@ -43,6 +43,8 @@ def log_epoch(
         f"pvcr={train_stats['phase_vcr_loss']:.4f} "
         f"anchor={train_stats.get('phase_anchor_loss', 0.0):.4f} "
         f"ou={train_stats.get('phase_ou_loss', 0.0):.4f} "
+        f"ray={train_stats.get('phase_ray_loss', 0.0):.4f} "
+        f"runs={train_stats.get('phase_runs_loss', 0.0):.4f} "
         f"evt={train_stats['evt_loss']:.4f}"
     )
     # RFF readout fit: held-out μ-R² is the "is the bandwidth right" signal (R²>0 ⇔
@@ -73,6 +75,32 @@ def log_epoch(
             f"gate_mean={od.get('gate_mean', 0.0):.3f} "
             f"resid_rms={od.get('resid_rms', 0.0):.3f} "
             f"s0={od.get('s0', 0.0):.3f} n_eff={od.get('n_eff', 0.0):.0f}"
+        )
+    # Step-7 ray objective: z_rms is the spread (must NOT collapse toward 0);
+    # resid_rms is the fixed-ρ contraction residual (lower = trajectories are rays);
+    # gate_mean is the fraction of lag-pairs kept (low ⇒ many jumps); mature_frac is
+    # the share of timesteps pulled toward the origin.
+    rd = train_stats.get('ray_diag')
+    if rd:
+        logger.info(
+            f"  Phase ray: z_rms={rd.get('z_rms', 0.0):.3f} "
+            f"resid_rms={rd.get('resid_rms', 0.0):.3f} "
+            f"anchor={rd.get('anchor', 0.0):.3f} contraction={rd.get('contraction', 0.0):.3f} "
+            f"gate_mean={rd.get('gate_mean', 0.0):.3f} mature_frac={rd.get('mature_frac', 0.0):.3f} "
+            f"rho={rd.get('rho', 0.0):.3f}"
+        )
+    # Step-7 runs-kernel metric: want L_same≫L_diff (z_phase similar within recovery
+    # class, not across), L tracking S (match_rmse↓), and healthy evidence. If S_same
+    # is near S_diff the flow kernel (sigma_flow) is too wide; if L collapses (L_same≈
+    # L_diff≈high) the spread is failing (check phase VICReg + z_rms above).
+    rk = train_stats.get('runs_diag')
+    if rk and rk.get('active', 0.0) > 0.0:
+        logger.info(
+            f"  Phase runs: S_same={rk.get('S_same', 0.0):.3f} S_diff={rk.get('S_diff', 0.0):.3f} | "
+            f"L_same={rk.get('L_same', 0.0):.3f} L_diff={rk.get('L_diff', 0.0):.3f} | "
+            f"match_rmse={rk.get('match_rmse', 0.0):.3f} "
+            f"evidence={rk.get('evidence_mean', 0.0):.3f} k_type={rk.get('k_type_mean', 0.0):.3f} "
+            f"n={rk.get('n_points', 0):.0f}"
         )
     # Phase radius: RMS ‖z_phase‖ split by recovery state (hub-and-rim check).
     # mature_rms should sit near the origin (anchor loss pins it); disturbed_rms is

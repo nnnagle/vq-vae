@@ -59,6 +59,8 @@ def train_epoch(
     total_phase_vcr_loss = 0.0
     total_phase_anchor_loss = 0.0
     total_phase_ou_loss = 0.0
+    total_phase_ray_loss = 0.0
+    total_phase_runs_loss = 0.0
     total_mature_r2_sum = 0.0
     total_mature_r2_count = 0
     total_disturbed_r2_sum = 0.0
@@ -69,6 +71,8 @@ def train_epoch(
     last_readout_median_dz = 0.0
     last_readout_bandwidth = 0.0
     last_ou_diag = None
+    last_ray_diag = None
+    last_runs_diag = None
     last_contrastive_diag = None
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
@@ -155,12 +159,18 @@ def train_epoch(
             total_phase_vcr_loss += stats['phase_vcr_loss']
             total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
             total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
+            total_phase_ray_loss += stats.get('phase_ray_loss', 0.0)
+            total_phase_runs_loss += stats.get('phase_runs_loss', 0.0)
             total_mature_r2_sum += stats.get('mature_r2_sum', 0.0)
             total_mature_r2_count += stats.get('mature_r2_count', 0)
             total_disturbed_r2_sum += stats.get('disturbed_r2_sum', 0.0)
             total_disturbed_r2_count += stats.get('disturbed_r2_count', 0)
             if stats.get('ou_diag'):
                 last_ou_diag = stats['ou_diag']
+            if stats.get('ray_diag'):
+                last_ray_diag = stats['ray_diag']
+            if stats.get('runs_diag'):
+                last_runs_diag = stats['runs_diag']
             if stats.get('phase_contrastive_diag'):
                 last_contrastive_diag = stats['phase_contrastive_diag']
             total_readout_leverage += stats.get('readout_leverage', 0.0)
@@ -293,6 +303,7 @@ def train_epoch(
             'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'phase_anchor_loss': 0.0, 'phase_ou_loss': 0.0, 'ou_diag': None,
+            'phase_ray_loss': 0.0, 'phase_runs_loss': 0.0, 'ray_diag': None, 'runs_diag': None,
             'readout_leverage': 0.0,
             'evt_loss': 0.0,
             'batches': 0,
@@ -328,7 +339,11 @@ def train_epoch(
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'phase_anchor_loss': total_phase_anchor_loss / total_batches,
         'phase_ou_loss': total_phase_ou_loss / total_batches,
+        'phase_ray_loss': total_phase_ray_loss / total_batches,
+        'phase_runs_loss': total_phase_runs_loss / total_batches,
         'ou_diag': last_ou_diag,
+        'ray_diag': last_ray_diag,
+        'runs_diag': last_runs_diag,
         'phase_contrastive_diag': last_contrastive_diag,
         'readout_leverage': total_readout_leverage / total_batches,
         'readout_r2': 1.0 - total_readout_ss_res / max(total_readout_ss_tot, 1e-8),
@@ -385,6 +400,8 @@ def validate_epoch(
     total_phase_vcr_loss = 0.0
     total_phase_anchor_loss = 0.0
     total_phase_ou_loss = 0.0
+    total_phase_ray_loss = 0.0
+    total_phase_runs_loss = 0.0
     total_mature_r2_sum = 0.0
     total_mature_r2_count = 0
     total_disturbed_r2_sum = 0.0
@@ -395,6 +412,8 @@ def validate_epoch(
     last_readout_median_dz = 0.0
     last_readout_bandwidth = 0.0
     last_ou_diag = None
+    last_ray_diag = None
+    last_runs_diag = None
     last_contrastive_diag = None
     total_evt_loss = 0.0
     all_epoch_evt_diag: list[dict] = []
@@ -438,12 +457,18 @@ def validate_epoch(
                 total_phase_vcr_loss += stats['phase_vcr_loss']
                 total_phase_anchor_loss += stats.get('phase_anchor_loss', 0.0)
                 total_phase_ou_loss += stats.get('phase_ou_loss', 0.0)
+                total_phase_ray_loss += stats.get('phase_ray_loss', 0.0)
+                total_phase_runs_loss += stats.get('phase_runs_loss', 0.0)
                 total_mature_r2_sum += stats.get('mature_r2_sum', 0.0)
                 total_mature_r2_count += stats.get('mature_r2_count', 0)
                 total_disturbed_r2_sum += stats.get('disturbed_r2_sum', 0.0)
                 total_disturbed_r2_count += stats.get('disturbed_r2_count', 0)
                 if stats.get('ou_diag'):
                     last_ou_diag = stats['ou_diag']
+                if stats.get('ray_diag'):
+                    last_ray_diag = stats['ray_diag']
+                if stats.get('runs_diag'):
+                    last_runs_diag = stats['runs_diag']
                 if stats.get('phase_contrastive_diag'):
                     last_contrastive_diag = stats['phase_contrastive_diag']
                 total_readout_leverage += stats.get('readout_leverage', 0.0)
@@ -480,6 +505,7 @@ def validate_epoch(
             'phase_loss': 0.0, 'phase_spread_loss': 0.0, 'phase_recovery_disc_loss': 0.0,
             'vcr_loss': 0.0, 'phase_vcr_loss': 0.0,
             'phase_anchor_loss': 0.0, 'phase_ou_loss': 0.0, 'ou_diag': None,
+            'phase_ray_loss': 0.0, 'phase_runs_loss': 0.0, 'ray_diag': None, 'runs_diag': None,
             'readout_leverage': 0.0,
             'evt_loss': 0.0, 'evt_diag': _empty_evt_diag,
             'batches': 0,
@@ -513,7 +539,11 @@ def validate_epoch(
         'phase_vcr_loss': total_phase_vcr_loss / total_batches,
         'phase_anchor_loss': total_phase_anchor_loss / total_batches,
         'phase_ou_loss': total_phase_ou_loss / total_batches,
+        'phase_ray_loss': total_phase_ray_loss / total_batches,
+        'phase_runs_loss': total_phase_runs_loss / total_batches,
         'ou_diag': last_ou_diag,
+        'ray_diag': last_ray_diag,
+        'runs_diag': last_runs_diag,
         'phase_contrastive_diag': last_contrastive_diag,
         'readout_leverage': total_readout_leverage / total_batches,
         'readout_r2': 1.0 - total_readout_ss_res / max(total_readout_ss_tot, 1e-8),

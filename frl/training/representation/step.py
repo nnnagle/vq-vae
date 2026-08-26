@@ -28,6 +28,7 @@ from losses.phase_neighborhood import (
 )
 from losses.triplet_phase import phase_recovery_discrimination_loss
 from losses.type_phase_contrastive import type_phase_contrastive_loss
+from losses.ray_runs import ray_contraction_anchor_loss, runs_kernel_matching_loss
 from losses.variance_covariance import variance_covariance_loss
 from losses.evt_soft_neighborhood import EvtDiffusionMetric, evt_soft_neighborhood_loss
 from utils import (
@@ -139,7 +140,10 @@ def process_batch(
     total_phase_recovery_disc_loss = 0.0
     total_phase_anchor_loss = 0.0
     total_phase_ou_loss = 0.0
+    total_phase_ray_loss = 0.0
     last_ou_diag = None
+    last_ray_diag = None
+    last_runs_diag = None
     # Phase-radius diagnostic: RMS ‖z_phase‖ split by recovery state (hub-and-rim
     # check). Accumulate ΣΣ‖z‖² and counts; loops.py forms the epoch RMS.
     mature_r2_sum = 0.0
@@ -236,6 +240,10 @@ def process_batch(
     use_kalman = bool(phase_config.get('use_kalman', False)) if phase_config else False
     kalman_weight = (
         phase_config.get('kalman_weight', 1.0) if phase_config else 1.0)
+    # Step-7: ray/runs-kernel objective. use_ray supersedes the anchor + OU losses;
+    # use_runs_kernel supersedes the cross-pixel contrastive.
+    use_ray = bool(phase_config.get('use_ray', False)) if phase_config else False
+    use_runs_kernel = bool(phase_config.get('use_runs_kernel', False)) if phase_config else False
 
     if spread_config is not None:
         spread_w = ramp_weight(
@@ -614,6 +622,7 @@ def process_batch(
         phase_vcr_loss_val = torch.tensor(0.0, device=device)
         phase_anchor_loss_val = torch.tensor(0.0, device=device)
         phase_ou_loss_val = torch.tensor(0.0, device=device)
+        phase_ray_loss_val = torch.tensor(0.0, device=device)   # Step-7 ray anchor+contraction
         pp = prep['phase_prep']
         if pp is not None:
                 phase_anchors   = pp['phase_anchors']
@@ -681,8 +690,21 @@ def process_batch(
                         torch.cuda.synchronize()
                     t_phase_forward += time.perf_counter() - _t0
 
-                    # Anchor loss: pin mature z_phase to the single shared origin.
-                    if bool(mature.any()):
+                    # Step-7 ray objective (supersedes the anchor + OU losses):
+                    # mature (‖a‖≈0) → origin + fixed-ρ contraction over jump-free lags.
+                    if use_ray:
+                        a_block_norm = anomaly_feats[:, :_C, :].norm(dim=1)   # [N, T] ‖a‖
+                        ray_anchor, ray_contract, ray_diag = ray_contraction_anchor_loss(
+                            z_phase_at_anchors, a_block_norm, delta_a_norm, phase_valid,
+                            rho=phase_config['ray_rho'], tau_jump=phase_config['ray_tau_jump'],
+                            sigma_mature=phase_config['ray_sigma_mature'])
+                        phase_ray_loss_val = curriculum_w * (
+                            phase_config['ray_anchor_weight'] * ray_anchor
+                            + phase_config['ray_contraction_weight'] * ray_contract)
+                        last_ray_diag = ray_diag
+
+                    # Legacy anchor loss (skipped under use_ray): pin mature z_phase to origin.
+                    if not use_ray and bool(mature.any()):
                         zp_mature = z_phase_at_anchors[mature]              # [M, zp]
                         phase_anchor_loss_val = (
                             anchor_weight * curriculum_w
@@ -703,16 +725,17 @@ def process_batch(
                             disturbed_r2_sum += float(zp_r2[d_sel].sum())
                             disturbed_r2_count += int(d_sel.sum())
 
-                    # Within-pixel dynamics loss: Step-6 Kalman marginal NLL
-                    # (de-attenuated ρ) or the Step-4 plug-in OU transition NLL.
-                    if use_kalman:
-                        phase_ou_loss_val = kalman_weight * curriculum_w * kalman_nll
-                        last_ou_diag = kalman_diag
-                    else:
-                        ou_raw, ou_diag = model.ou_dynamics(
-                            z_phase_at_anchors, delta_a_norm, phase_valid)
-                        phase_ou_loss_val = ou_weight * curriculum_w * ou_raw
-                        last_ou_diag = ou_diag
+                    # Within-pixel dynamics loss (skipped under use_ray, which owns
+                    # contraction): Step-6 Kalman marginal NLL or Step-4 OU NLL.
+                    if not use_ray:
+                        if use_kalman:
+                            phase_ou_loss_val = kalman_weight * curriculum_w * kalman_nll
+                            last_ou_diag = kalman_diag
+                        else:
+                            ou_raw, ou_diag = model.ou_dynamics(
+                                z_phase_at_anchors, delta_a_norm, phase_valid)
+                            phase_ou_loss_val = ou_weight * curriculum_w * ou_raw
+                            last_ou_diag = ou_diag
 
                     # z_phase → z_type leakage guard (was pre-FiLM h; h == z_phase now):
                     # with the type-agnostic encoder this should stay ≈0.
@@ -770,6 +793,7 @@ def process_batch(
                 + phase_vcr_loss_val
                 + phase_anchor_loss_val
                 + phase_ou_loss_val
+                + phase_ray_loss_val
                 + evt_loss_val)
         t_loss_compute += time.perf_counter() - _t0
 
@@ -807,6 +831,7 @@ def process_batch(
             total_phase_vcr_loss += phase_vcr_loss_val
             total_phase_anchor_loss += phase_anchor_loss_val
             total_phase_ou_loss += phase_ou_loss_val
+            total_phase_ray_loss += phase_ray_loss_val
             total_evt_loss += evt_loss_val
         else:
             total_loss += loss.item()
@@ -815,6 +840,7 @@ def process_batch(
             total_phase_vcr_loss += phase_vcr_loss_val.item()
             total_phase_anchor_loss += float(phase_anchor_loss_val)
             total_phase_ou_loss += float(phase_ou_loss_val)
+            total_phase_ray_loss += float(phase_ray_loss_val)
             total_evt_loss += evt_loss_val.item()
         n_valid += 1
         total_spatial_pos_pairs += spatial_pos_pairs.shape[0]
@@ -1007,10 +1033,12 @@ def process_batch(
     # once over all patches in the batch. Spectral reference features are demeaned
     # by a type-local baseline computed via SVD rank reduction + kNN in type space.
     cross_phase_loss_val = torch.tensor(0.0, device=device)
+    cross_phase_runs_val = torch.tensor(0.0, device=device)     # Step-7 runs-kernel metric
     cross_phase_spread_val = torch.tensor(0.0, device=device)   # retired (Step 5)
     cross_phase_rd_val = torch.tensor(0.0, device=device)        # retired (Step 5)
     cross_phase_leakage_val = torch.tensor(0.0, device=device)   # retired (diagnostic only)
     phase_contrastive_diag = None
+    phase_runs_diag = None
 
     cp_timing: dict[str, float] = {}
     t_cross_phase = 0.0
@@ -1021,6 +1049,29 @@ def process_batch(
         flow_all = torch.cat(cross_phase_flow, dim=0)           # [P, T, 2C]
         disturbed_all = torch.cat(cross_phase_disturbed, dim=0)  # [P, T]
         P, T_all, zp = z_phase_all.shape
+
+        # Step-7 runs-kernel metric (supersedes the contrastive): match z_phase
+        # similarity to the jump-gated windowed (a,Δa) trajectory similarity. Uses the
+        # per-pixel [P,T,·] tensors and pools/subsamples internally.
+        if use_runs_kernel:
+            _t0 = time.perf_counter()
+            _Ck = flow_all.shape[-1] // 2
+            da_all = flow_all[:, :, _Ck:].norm(dim=-1)             # [P, T] ‖Δa‖
+            rk_loss, phase_runs_diag = runs_kernel_matching_loss(
+                z_phase_all, flow_all, da_all, Z, disturbed_all,
+                tau_jump=phase_config['runs_tau_jump'],
+                half_window=int(phase_config['runs_half_window']),
+                window_sigma=phase_config['runs_window_sigma'],
+                sigma_flow=phase_config['runs_sigma_flow'],
+                sigma_type=phase_config['runs_sigma_type'],
+                tau_metric=phase_config['runs_tau_metric'],
+                max_points=int(phase_config['runs_max_points']),
+                min_points=int(phase_config['runs_min_points']))
+            cross_phase_runs_val = phase_config['runs_weight'] * curriculum_w * rk_loss
+            last_runs_diag = phase_runs_diag
+            if is_profiling() and device.type == 'cuda':
+                torch.cuda.synchronize()
+            cp_timing['runs_kernel'] = time.perf_counter() - _t0
 
         # Flatten to pixel-times (n,t); z_type broadcast over T.
         zphase_flat = z_phase_all.reshape(-1, zp)
@@ -1037,7 +1088,7 @@ def process_batch(
             sel = sel[torch.randperm(sel.numel(), device=device)[:max_samples]]
         cp_timing['cat'] = time.perf_counter() - _t0
 
-        if sel.numel() >= phase_config.get('contrastive_min_samples', 32):
+        if (not use_runs_kernel) and sel.numel() >= phase_config.get('contrastive_min_samples', 32):
             _t0 = time.perf_counter()
             zt = ztype_flat[sel]                                # standardize z_type
             zt = (zt - zt.mean(0, keepdim=True)) / (zt.std(0, keepdim=True) + 1e-6)
@@ -1068,6 +1119,7 @@ def process_batch(
         mean_loss = (total_loss / n_valid
                      + spectral_weight * global_spectral_loss_val
                      + cross_phase_loss_val
+                     + cross_phase_runs_val
                      + cross_phase_spread_val
                      + cross_phase_rd_val
                      + cross_phase_leakage_val)
@@ -1076,12 +1128,15 @@ def process_batch(
         mean_loss = (total_loss / n_valid
                      + spectral_weight * _scalar(global_spectral_loss_val)
                      + _scalar(cross_phase_loss_val)
+                     + _scalar(cross_phase_runs_val)
                      + _scalar(cross_phase_spread_val)
                      + _scalar(cross_phase_rd_val)
                      + _scalar(cross_phase_leakage_val))
         mean_spectral_loss = spectral_weight * _scalar(global_spectral_loss_val)
     mean_spatial_loss = total_spatial_loss / n_valid
     mean_phase_loss = _scalar(cross_phase_loss_val)
+    mean_phase_runs_loss = _scalar(cross_phase_runs_val)
+    mean_phase_ray_loss = total_phase_ray_loss / n_valid
     mean_phase_spread_loss = _scalar(cross_phase_spread_val)
     mean_phase_recovery_disc_loss = _scalar(cross_phase_rd_val)
     mean_phase_leakage_loss = _scalar(cross_phase_leakage_val)
@@ -1231,11 +1286,15 @@ def process_batch(
         'phase_vcr_loss': mean_phase_vcr_loss,
         'phase_anchor_loss': mean_phase_anchor_loss,
         'phase_ou_loss': mean_phase_ou_loss,
+        'phase_ray_loss': mean_phase_ray_loss,
+        'phase_runs_loss': mean_phase_runs_loss,
         'mature_r2_sum': mature_r2_sum,
         'mature_r2_count': mature_r2_count,
         'disturbed_r2_sum': disturbed_r2_sum,
         'disturbed_r2_count': disturbed_r2_count,
         'ou_diag': last_ou_diag,
+        'ray_diag': last_ray_diag,
+        'runs_diag': last_runs_diag,
         'phase_contrastive_diag': phase_contrastive_diag,
         'readout_leverage': readout_leverage,
         'readout_ss_res': readout_ss_res,

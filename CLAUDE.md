@@ -135,6 +135,8 @@ The bindings YAML defines dataset groups:
 | Soft neighborhood | `soft_neighborhood.py` | Soft KL matching of relative z_phase distance structure at shared ysfc |
 | Phase recovery discrimination | `triplet_phase.py` | **Absolute** margin between disturbed (ysfc≤1) and recovered (ysfc≥5) embeddings within each pixel — the loss that makes recovery stage metrically separable |
 | OU dynamics | `ou_dynamics.py` | Within-pixel Gaussian OU transition NLL (plug-in ‖z_t−ρz_{t−1}‖²); scalar global ρ. The **joint/complete-data MAP** — biases ρ toward 0 by the reliability ratio (attenuation). Superseded by the Kalman filter below. |
+| Ray contraction + anchor | `ray_runs.py` | **Step-7 (active).** Mature (‖a‖≈0) → origin + fixed-ρ contraction over jump-free lags (pairwise max-‖Δa‖ gate). The cone/ray scaffold. Supersedes `phase_anchor` + OU when the `phase_ray` block is present. |
+| Runs-kernel metric | `ray_runs.py` | **Step-7 (active).** Jump-gated, window-normalized, evidence-weighted, type-gated (a,Δa) trajectory similarity matched into z_phase — a soft substring kernel over jump-free recovery runs; self-aligns calendar offsets (ysfc-free). Supersedes the contrastive when the `phase_runs_kernel` block is present. |
 | Differentiable Kalman filter | `kalman_filter.py` (+ `models/phase_kalman.py`) | **DISABLED — dead end.** Ran a LINEAR SSM on the raw anomaly and bypassed the TCN, so z_phase was linear in the anomaly — too weak for nonlinear recovery (NIS≈190≫n_obs, irreducible mis-specification in exp040). Code retained/tested but turned off in config; superseded by the ray/runs-kernel design. See "Phase pathway: differentiable Kalman filter" below. |
 | Frobenius leakage penalty | (inline in `train_representation.py`) | `\|\|cov(h, z_type)\|\|_F` — discourages type information in the pre-FiLM bottleneck h |
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
@@ -159,6 +161,52 @@ The training loop applies the following loss components:
 6. **Phase VICReg** — collapse prevention on z_phase dimensions (note: operates on the wrong population for recovery; see Known Limitations)
 7. **Phase recovery discrimination** — absolute margin loss: within each pixel, embeddings at ysfc ≤ 1 must be at least `margin` apart from embeddings at ysfc ≥ 5. This is the loss that closes the gap between relative ordering and metrically meaningful recovery stage representation.
 8. **Frobenius type-leakage penalty** — `||cov(h, z_type)||_F` penalises type information in the pre-FiLM bottleneck h. Stop-gradient on z_type; active only when phase curriculum weight > 0.
+
+### Phase pathway: ray / runs-kernel objective (Step 7 — active, exp041+)
+
+**The ysfc-free successor to soft_neighborhood_phase / OU / contrastive** — a
+*metric-first* objective (not a generative model), built from the exp035↔exp040
+design discussion. z_phase = TCN(anomaly) (nonlinear encoder kept); the losses
+shape a **cone** in which the type steady state is the origin, disturbances eject
+outward, and recovery is a radial contraction back along a **ray** whose direction
+is the disturbance identity. `losses/ray_runs.py` (pure, unit-tested in
+`tests/test_ray_runs.py`); wired in `step.py`, config in `frl_binding_v1.yaml`.
+
+**Everything reads from `a`, `Δa`, and `z_type` — no ysfc.** Maturity = ‖a‖≈0;
+segmentation/ejection = a large ‖Δa‖; stage-alignment = the self-aligning runs
+kernel; recovery *rate* is fixed (nominal ρ=0.861) because rate variation is a
+*type/site-index* attribute carried by z_type.
+
+Three terms (config blocks `phase_ray` + `phase_runs_kernel`; presence of the
+blocks flips the pathway and skips anchor+OU / contrastive):
+
+1. **Pairwise jump gate** `G[n,i,j]=exp(-(max_{i<s≤j}‖Δa_s‖/τ)²)` — closes for any
+   pair with a disturbance *between* them (not just adjacent); segmentation-free.
+2. **Ray contraction + anchor** — pin ‖a‖≈0 timesteps to the origin, and require
+   every `G`-gated jump-free lag to be a fixed-ρ decay `‖z_{t'}−ρ^{t'-t}z_t‖²`.
+3. **Runs-kernel metric** — a jump-gated, window-normalized, **evidence-weighted**,
+   **type-gated** windowed `(a,Δa)` similarity `S` (a soft substring kernel over
+   jump-free runs), matched by z_phase similarity `L=exp(-‖Δz‖²/τ)` via a weighted
+   MSE `Σ w (L−S)²`, `w = evidence·k_type`. This is the trajectory-similarity term
+   *and* the anti-collapse spread; it self-aligns different calendar offsets
+   (A's yr5-10 ↔ B's yr10-15) and its evidence weight handles truncated overlaps.
+
+Design rationale worth keeping (from the discussion): the ray's identity is the
+*whole recovery*, not the ejection jump; direction is discriminative at large
+radius and drifts near the origin (Euclidean distance ≈ r·θ handles this for
+free); "start-apart-end-together" is a *reset onto a shared ray*, not dynamical
+merging; the runs kernel is a rigid (non-warped) substring kernel — DTW is the
+upgrade only if the fixed-ρ rate spread proves too wide.
+
+**Tuning logs** (per epoch): the loss line adds `ray=` and `runs=`; the **"Phase
+ray"** line reports `z_rms` (spread — must not collapse), `resid_rms` (contraction
+fit), `gate_mean`, `mature_frac`; the **"Phase runs"** line reports `S_same/S_diff`
+(runs-sim by type), `L_same/L_diff` (z_phase-sim by type — want L_same≫L_diff),
+`match_rmse` (L tracking S), `evidence`, `k_type`. Anti-collapse also relies on
+phase VICReg (0.1) — watch `z_rms` and `pvcr`.
+
+**Status:** wired + unit-tested; **not yet run on ISAAC** — needs a smoke test
+(the runs kernel is O(M²·window); tune `runs_max_points`/`half_window` for cost).
 
 ### Phase pathway: differentiable Kalman filter (Step 6 — built, wired, then DISABLED as a dead end)
 
@@ -482,6 +530,7 @@ frl/losses/pairs.py                      Pair generation strategies
 frl/losses/variance_covariance.py        VICReg loss
 frl/losses/phase_neighborhood.py         Phase temporal loss
 frl/losses/phase_triplet.py              Phase triplet loss
+frl/losses/ray_runs.py                   Step-7 ray/runs-kernel objective (jump gate, contraction+anchor, runs-kernel metric)
 frl/losses/ou_dynamics.py                Within-pixel OU transition NLL (plug-in; superseded by kalman_filter)
 frl/losses/kalman_filter.py              Differentiable within-pixel Kalman filter + marginal NLL (de-attenuated ρ)
 frl/losses/reconstruction.py             Reconstruction loss

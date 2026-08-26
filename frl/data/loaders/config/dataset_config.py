@@ -486,6 +486,12 @@ class LossConfig:
     max_samples: Optional[int] = None      # cap on the O(M²) kernel pool
     min_samples: Optional[int] = None      # skip the loss below this many pooled samples
 
+    # --- generic catch-all ---
+    # Raw block dict, so new loss types (e.g. phase_ray, phase_runs_kernel — Step 7)
+    # can read arbitrary hyperparameters via `params.get(...)` without adding a typed
+    # field per knob. Existing losses keep their typed fields above.
+    params: Optional[dict] = None
+
 
 @dataclass
 class BindingsConfig:

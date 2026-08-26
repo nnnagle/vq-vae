@@ -27,6 +27,13 @@ def _first(value, default):
     return value if value is not None else default
 
 
+def _rp(cfg, key):
+    """Read a raw block param (``LossConfig.params``); None if the block or key is absent."""
+    if cfg is None or cfg.params is None:
+        return None
+    return cfg.params.get(key)
+
+
 def build_spatial_pair_config(bindings_config, type_encoder_feature: str) -> dict:
     """Spatial-InfoNCE params for DataLoader-worker pair precomputation.
 
@@ -296,6 +303,10 @@ def build_phase_config(bindings_config, logger: logging.Logger):
         # the TCN+OU to the type-conditional Kalman filter (model construction is
         # gated separately by model_cfg.phase_kalman.enabled).
         kalman_cfg = bindings_config.get_loss('phase_kalman')
+        # Step-7: presence of phase_ray / phase_runs_kernel flips the phase pathway
+        # to the ysfc-free ray/runs-kernel objective (supersedes anchor+OU / contrastive).
+        ray_cfg = bindings_config.get_loss('phase_ray')
+        runs_cfg = bindings_config.get_loss('phase_runs_kernel')
         # anchor_weight default raised 0.05→0.15 (exp036): at 0.05 the mature hub
         # floated at RMS radius ~0.59, letting the contrastive inflate neg_d2 by
         # ejecting the hub rather than the disturbed states — watch "Phase radius".
@@ -341,6 +352,25 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'contrastive_n_neg': _first(contr_cfg.n_neg if contr_cfg else None, 20),
             'contrastive_max_samples': _first(contr_cfg.max_samples if contr_cfg else None, 2000),
             'contrastive_min_samples': _first(contr_cfg.min_samples if contr_cfg else None, 32),
+            # Step-7 ray / runs-kernel objective (blocks phase_ray, phase_runs_kernel).
+            # Presence flips the phase pathway: use_ray supersedes anchor+OU,
+            # use_runs_kernel supersedes the contrastive.
+            'use_ray': ray_cfg is not None,
+            'ray_anchor_weight': _first(_rp(ray_cfg, 'anchor_weight'), 1.0),
+            'ray_contraction_weight': _first(_rp(ray_cfg, 'contraction_weight'), 1.0),
+            'ray_rho': _first(_rp(ray_cfg, 'rho'), 0.861),
+            'ray_tau_jump': _first(_rp(ray_cfg, 'tau_jump'), 2.0),
+            'ray_sigma_mature': _first(_rp(ray_cfg, 'sigma_mature'), 0.5),
+            'use_runs_kernel': runs_cfg is not None,
+            'runs_weight': _first(runs_cfg.weight if runs_cfg else None, 1.0),
+            'runs_tau_jump': _first(_rp(runs_cfg, 'tau_jump'), 2.0),
+            'runs_half_window': _first(_rp(runs_cfg, 'half_window'), 5),
+            'runs_window_sigma': _first(_rp(runs_cfg, 'window_sigma'), 3.0),
+            'runs_sigma_flow': _first(_rp(runs_cfg, 'sigma_flow'), 0.5),
+            'runs_sigma_type': _first(_rp(runs_cfg, 'sigma_type'), 3.0),
+            'runs_tau_metric': _first(_rp(runs_cfg, 'tau_metric'), 1.0),
+            'runs_max_points': _first(_rp(runs_cfg, 'max_points'), 2000),
+            'runs_min_points': _first(_rp(runs_cfg, 'min_points'), 64),
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "
