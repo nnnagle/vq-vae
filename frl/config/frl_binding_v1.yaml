@@ -736,16 +736,16 @@ losses:
                         #   O(M²) mem ~1GB fwd / ~2GB w/ backward at M=5000 — safe on 32GB V100.
     min_samples: 32     # skip the loss below this many pooled samples
 
-  # Step 6 — type-conditional differentiable Kalman filter. PRESENCE of this block
-  # switches the phase encoder from the TCN+OU (Step 4) to the marginal-likelihood
-  # filter: z_phase = filtered state, loss = the Kalman NLL (de-attenuated ρ). The
-  # ρ(z_type)/Q(z_type)/C/R/prior heads live in the model config
-  # (frl_repr_model_v1.yaml: phase_kalman, which must also set enabled: true).
-  # `weight` scales the NLL. When active, phase_ou_dynamics is inert (not called)
-  # and variance_covariance_phase is set to 0 below (NLL+emission prevent collapse).
-  phase_kalman:
-    weight: 1.0
-    type: phase_kalman
+  # Step 6 — DISABLED (dead end). The type-conditional Kalman filter ran a LINEAR
+  # state-space model on the RAW anomaly and bypassed the TCN entirely, so z_phase
+  # was a linear function of the anomaly — too weak for nonlinear recovery, which
+  # showed up as NIS≈190≫n_obs (irreducible mis-specification). Superseded by the
+  # ray/runs-kernel design (nonlinear encoder; jump-gated runs kernel; fixed-ρ
+  # contraction; a/Δa/z_type-driven, ysfc-free). Re-enable only to reproduce exp040:
+  # uncomment this block AND set phase_kalman.enabled: true in the model config.
+  # phase_kalman:
+  #   weight: 1.0
+  #   type: phase_kalman
 
   # EVT-guided soft neighbourhood loss.
   # Encourages z_type to mirror the network structure of the LANDFIRE EVT

@@ -135,7 +135,7 @@ The bindings YAML defines dataset groups:
 | Soft neighborhood | `soft_neighborhood.py` | Soft KL matching of relative z_phase distance structure at shared ysfc |
 | Phase recovery discrimination | `triplet_phase.py` | **Absolute** margin between disturbed (ysfc≤1) and recovered (ysfc≥5) embeddings within each pixel — the loss that makes recovery stage metrically separable |
 | OU dynamics | `ou_dynamics.py` | Within-pixel Gaussian OU transition NLL (plug-in ‖z_t−ρz_{t−1}‖²); scalar global ρ. The **joint/complete-data MAP** — biases ρ toward 0 by the reliability ratio (attenuation). Superseded by the Kalman filter below. |
-| Differentiable Kalman filter | `kalman_filter.py` (+ `models/phase_kalman.py`) | **Marginal**-likelihood within-pixel AR(1)+noise NLL (state integrated out ⇒ **de-attenuated ρ**). Reduced-rank linear-Gaussian SSM on the anomaly; type-conditional ρ(z_type)/Q; filtered state → z_phase. Outward-jump gating via ysfc reset. See "Phase pathway: differentiable Kalman filter" below. **Wired into training (exp040) behind the `phase_kalman` config block — replaces the TCN+OU phase encoder.** |
+| Differentiable Kalman filter | `kalman_filter.py` (+ `models/phase_kalman.py`) | **DISABLED — dead end.** Ran a LINEAR SSM on the raw anomaly and bypassed the TCN, so z_phase was linear in the anomaly — too weak for nonlinear recovery (NIS≈190≫n_obs, irreducible mis-specification in exp040). Code retained/tested but turned off in config; superseded by the ray/runs-kernel design. See "Phase pathway: differentiable Kalman filter" below. |
 | Frobenius leakage penalty | (inline in `train_representation.py`) | `\|\|cov(h, z_type)\|\|_F` — discourages type information in the pre-FiLM bottleneck h |
 | Reconstruction | `reconstruction.py` | Optional L1/L2/Huber reconstruction |
 
@@ -160,7 +160,9 @@ The training loop applies the following loss components:
 7. **Phase recovery discrimination** — absolute margin loss: within each pixel, embeddings at ysfc ≤ 1 must be at least `margin` apart from embeddings at ysfc ≥ 5. This is the loss that closes the gap between relative ordering and metrically meaningful recovery stage representation.
 8. **Frobenius type-leakage penalty** — `||cov(h, z_type)||_F` penalises type information in the pre-FiLM bottleneck h. Stop-gradient on z_type; active only when phase curriculum weight > 0.
 
-### Phase pathway: differentiable Kalman filter (planned Step 6 — built, not yet wired)
+### Phase pathway: differentiable Kalman filter (Step 6 — built, wired, then DISABLED as a dead end)
+
+**STATUS: disabled in config (`phase_kalman.enabled: false`; binding block commented out) — the active phase encoder is again the TCN (`encode_phase`) + OU/phase losses.** The Kalman-on-the-raw-anomaly was a wrong turn: it made z_phase a *linear* function of the anomaly and never used the TCN, so it could not represent nonlinear recovery — the NIS stayed ≈190≫n_obs (irreducible mis-specification, not a tuning problem). The design discussion that followed replaced it with a metric-first **ray / runs-kernel** objective (nonlinear encoder → zp; origin-anchor + fixed-ρ contraction; a jump-gated, normalized, evidence-weighted, type-gated **runs kernel** matching zp-distances to (a,Δa) trajectory similarity; maturity from ‖a‖, ejection/segmentation from max ‖Δa‖ over intervening times, rate assigned to z_type — all ysfc-free). Code below is retained for reference/reuse of the differentiable-filter core, but is off. The remainder of this section documents the (now-disabled) filter.
 
 **Motivation (from the exp035↔exp039 downstream analysis).** For FIA kNN, exp039
 regressed on *removals* — a phase-reset / harvest signal where z_phase is the

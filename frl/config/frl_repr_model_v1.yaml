@@ -121,7 +121,9 @@ ou_dynamics:
 # phase_in_channels; emission C and measurement noise R are shared (type-conditional
 # C = later revisit). ρ and Q are type-conditional heads off detached z_type.
 phase_kalman:
-  enabled: true
+  enabled: false        # DISABLED (dead end — linear SSM on the raw anomaly, TCN
+                        # bypassed, NIS≈190 mis-specification). See the binding config
+                        # note. z_phase falls back to the TCN encoder (encode_phase).
   rho_init: 0.861       # 0.05**(1/20): within 5% of mature in 20 annual steps
   q_init: 0.1           # initial process-noise variance per state mode
   r_init: 0.25          # initial measurement-noise variance per anomaly channel
