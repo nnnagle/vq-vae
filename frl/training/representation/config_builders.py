@@ -361,6 +361,7 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'ray_rho': _first(_rp(ray_cfg, 'rho'), 0.861),
             'ray_tau_jump': _first(_rp(ray_cfg, 'tau_jump'), 2.0),
             'ray_sigma_mature': _first(_rp(ray_cfg, 'sigma_mature'), 0.5),
+            'ray_mature_quantile': _first(_rp(ray_cfg, 'mature_quantile'), 0.0),
             'use_runs_kernel': runs_cfg is not None,
             'runs_weight': _first(runs_cfg.weight if runs_cfg else None, 1.0),
             'runs_tau_jump': _first(_rp(runs_cfg, 'tau_jump'), 2.0),

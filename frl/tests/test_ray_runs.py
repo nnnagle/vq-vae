@@ -81,6 +81,23 @@ class TestContractionAnchor:
         assert anchor.item() > 0                      # mature z≠0 penalized
         assert 0.0 < diag["mature_frac"] < 1.0
 
+    def test_mature_quantile_self_calibrates(self):
+        # ‖a‖ never approaches the absolute sigma_mature=0.5 → fixed threshold pins
+        # nothing; the quantile threshold still pins the least-anomalous timesteps.
+        N, T, d = 4, 8, 3
+        zp = torch.ones(N, T, d)
+        a_norm = 3.0 + torch.rand(N, T)               # ‖a‖ ∈ [3,4], all ≫ 0.5
+        da = 0.1 * torch.ones(N, T)
+        valid = torch.ones(N, T, dtype=torch.bool)
+        _, _, d_abs = ray_contraction_anchor_loss(
+            zp, a_norm, da, valid, 0.86, 2.0, 0.5, mature_quantile=0.0)
+        _, _, d_q = ray_contraction_anchor_loss(
+            zp, a_norm, da, valid, 0.86, 2.0, 0.5, mature_quantile=0.3)
+        assert d_abs["mature_frac"] < 1e-3            # absolute threshold dead
+        assert d_q["mature_frac"] > 0.05              # quantile threshold pins ~least ‖a‖
+        # effective sigma tracks the batch ‖a‖ (near its 30th percentile), not 0.5.
+        assert d_q["sigma_mature_eff"] > 1.0
+
     def test_contraction_gated_across_jump(self):
         # A disturbance mid-window: cross-jump lags must not be scored.
         N, T, d = 2, 8, 4

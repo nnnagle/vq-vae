@@ -206,20 +206,40 @@ free); "start-apart-end-together" is a *reset onto a shared ray*, not dynamical
 merging; the runs kernel is a rigid (non-warped) substring kernel — DTW is the
 upgrade only if the fixed-ρ rate spread proves too wide.
 
+**Mature anchor self-calibration** (`mature_quantile` in `phase_ray`): the mature
+weight is `exp(-(‖a‖/σ)²)`; with `mature_quantile>0` σ is set to that quantile of
+the batch's own valid ‖a‖ instead of the absolute `sigma_mature`. Fixes the exp041
+symptom `mature_frac=0.000` — the readout only reaches μ-R²~0.73, so ‖a‖ never
+drops near the absolute 0.5 and the origin anchor never fired (z_phase inflated
+into a growing ball: `mature_rms` climbing, no hub-and-rim). The quantile pins a
+controlled fraction (~0.3) of the least-anomalous timesteps regardless of the
+residual floor. Watch `mature_frac` (want ~0.2-0.3), `sig_mat`/`a_med` (the
+effective σ vs ‖a‖ median), and Phase-radius `mature_rms` (should fall toward 0).
+
+**Type-grouped pooling** (`n_seeds`/`group_size` in `phase_runs_kernel`): the runs
+kernel pools same-type anchor groups (z_type-kNN, all timesteps — the exp035
+neighbor structure, ysfc-free) rather than a random point subsample. Random pooling
+gave `nbr/pt≈1.6`, `keep_frac=0.001` (99.9% of the O(M²) budget on cross-type pairs
+the threshold drops); grouping concentrates it on same-type pairs. `n_seeds=0`
+restores random pooling.
+
 **Tuning logs** (per epoch): the loss line adds `ray=` and `runs=`; the **"Phase
 ray"** line reports `z_rms` (spread — must not collapse), `resid_rms` (contraction
-fit), `gate_mean`, `mature_frac`; the **"Phase runs"** line reports `S_same/S_diff`
-(runs-sim by type), `L_same/L_diff` (z_phase-sim by type — want L_same≫L_diff),
-`match_rmse` (L tracking S), `evidence`, `k_type`; the **"Phase runs bw"** line is
-the type-threshold **bandwidth monitor** — `keep_frac` (fraction of pooled pairs
-surviving the threshold — want small-but-nonzero; →1 means the threshold is too
-loose / `sigma_type` too wide), `nbr/pt` (effective same-type neighbors per point),
-`k_type_kept`/`dt_kept` (mean type-gate / standardized type-distance among the
-retained pairs). Anti-collapse also relies on phase VICReg (0.1) — watch `z_rms`
-and `pvcr`.
+fit), `gate_mean`, `mature_frac`, `sig_mat`/`a_med` (effective mature σ vs ‖a‖
+median); the **"Phase runs"** line reports `S_same/S_diff` (runs-sim by type),
+`L_same/L_diff` (z_phase-sim by type — want L_same≫L_diff), `match_rmse` (L tracking
+S), `evidence`, `k_type`; the **"Phase runs bw"** line is the type-threshold
+**bandwidth monitor** — `keep_frac` (fraction of pooled pairs surviving the
+threshold — want small-but-nonzero; →1 means the threshold is too loose /
+`sigma_type` too wide), `nbr/pt` (effective same-type neighbors per point), `pix`
+(distinct anchor pixels pooled), `k_type_kept`/`dt_kept` (mean type-gate /
+standardized type-distance among the retained pairs). Anti-collapse also relies on
+phase VICReg (0.1) — watch `z_rms` and `pvcr`.
 
-**Status:** wired + unit-tested; **not yet run on ISAAC** — needs a smoke test
-(the runs kernel is O(M²·window); tune `runs_max_points`/`half_window` for cost).
+**Status:** wired + unit-tested (15 tests); **exp041 rerun** with the mature-anchor
+self-calibration + type-grouped pooling — watch `mature_frac`/`mature_rms` and
+`nbr/pt`/`keep_frac` early to confirm both fixes bite. The runs kernel is
+O(M²·window); tune `runs_max_points`/`half_window`/`group_size` for cost.
 
 ### Phase pathway: differentiable Kalman filter (Step 6 — built, wired, then DISABLED as a dead end)
 

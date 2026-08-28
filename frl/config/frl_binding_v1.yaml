@@ -765,7 +765,13 @@ losses:
     type: phase_ray
     rho: 0.861              # fixed nominal rate = 0.05**(1/20) (5% of mature in 20 yr)
     tau_jump: 2.0           # jump-gate scale on max ‖Δa‖ between two timesteps
-    sigma_mature: 0.5       # ‖a‖ scale below which a timestep counts as "mature"
+    sigma_mature: 0.5       # absolute ‖a‖ scale for "mature" — used only if mature_quantile=0
+    # Self-calibrate the mature threshold to a quantile of the batch's own ‖a‖, so a
+    # controlled fraction of the least-anomalous timesteps get pinned to the origin
+    # regardless of the readout residual floor. Fixes exp041 mature_frac=0.000 (the
+    # readout only reaches R²~0.73, so ‖a‖ never drops near the absolute 0.5). Watch
+    # mature_frac (want ~0.2-0.3), sigma_mature_eff, and Phase radius mature_rms.
+    mature_quantile: 0.3
 
   # Runs-kernel metric: match z_phase similarity to a jump-gated, window-normalized,
   # evidence-weighted, type-gated (a,Δa) trajectory similarity (a soft substring

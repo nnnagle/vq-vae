@@ -87,6 +87,7 @@ def log_epoch(
             f"resid_rms={rd.get('resid_rms', 0.0):.3f} "
             f"anchor={rd.get('anchor', 0.0):.3f} contraction={rd.get('contraction', 0.0):.3f} "
             f"gate_mean={rd.get('gate_mean', 0.0):.3f} mature_frac={rd.get('mature_frac', 0.0):.3f} "
+            f"sig_mat={rd.get('sigma_mature_eff', 0.0):.2f} a_med={rd.get('a_norm_med', 0.0):.2f} "
             f"rho={rd.get('rho', 0.0):.3f}"
         )
     # Step-7 runs-kernel metric: want L_same≫L_diff (z_phase similar within recovery

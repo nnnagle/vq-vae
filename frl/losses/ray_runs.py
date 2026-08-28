@@ -62,8 +62,16 @@ def ray_contraction_anchor_loss(
     rho: float,
     tau_jump: float,
     sigma_mature: float,
+    mature_quantile: float = 0.0,
 ):
     """Mature-anchor + fixed-ρ contraction over jump-free lags.
+
+    The mature weight is ``exp(-(‖a‖/σ)²)``. With ``mature_quantile>0``, σ is set
+    to that quantile of the batch's own valid ‖a‖ (self-calibrating), so a
+    controlled fraction of the least-anomalous timesteps get pinned to the origin
+    regardless of how well the readout centers ‖a‖ — a fixed absolute
+    ``sigma_mature`` mis-fires (mature_frac→0) whenever the readout residual floor
+    sits above it. ``mature_quantile=0`` uses the absolute ``sigma_mature``.
 
     Returns ``(anchor_loss, contraction_loss, diag)``. The caller weights each
     (they are reported separately so they can be tuned independently).
@@ -73,7 +81,11 @@ def ray_contraction_anchor_loss(
     vf = valid.to(zp.dtype)
 
     # --- Anchor: where ‖a‖≈0 (mature), pin ‖z‖→0 (label-free origin). ----------
-    w_mat = torch.exp(-(a_norm / sigma_mature) ** 2) * vf          # [N, T]
+    if mature_quantile > 0.0 and bool(valid.any()):
+        sig = torch.quantile(a_norm[valid].detach(), mature_quantile).clamp(min=1e-6)
+    else:
+        sig = a_norm.new_tensor(float(sigma_mature))
+    w_mat = torch.exp(-(a_norm / sig) ** 2) * vf                   # [N, T]
     zr2 = zp.pow(2).sum(-1)                                        # [N, T]
     anchor = (w_mat * zr2).sum() / w_mat.sum().clamp(min=1.0)
 
@@ -98,6 +110,8 @@ def ray_contraction_anchor_loss(
             "contraction": float(contraction.detach()),
             "gate_mean": float(gate_mean),
             "mature_frac": float((w_mat.sum() / vf.sum().clamp(min=1.0)).detach()),
+            "sigma_mature_eff": float(sig.detach()),
+            "a_norm_med": float(a_norm[valid].median().detach()) if bool(valid.any()) else 0.0,
             "resid_rms": float(((w * resid2).sum() / wsum).sqrt().detach()),
             "z_rms": float((zr2 * vf).sum().div(vf.sum().clamp(min=1.0)).sqrt().detach()),
         }

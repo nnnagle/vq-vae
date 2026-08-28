@@ -697,7 +697,8 @@ def process_batch(
                         ray_anchor, ray_contract, ray_diag = ray_contraction_anchor_loss(
                             z_phase_at_anchors, a_block_norm, delta_a_norm, phase_valid,
                             rho=phase_config['ray_rho'], tau_jump=phase_config['ray_tau_jump'],
-                            sigma_mature=phase_config['ray_sigma_mature'])
+                            sigma_mature=phase_config['ray_sigma_mature'],
+                            mature_quantile=phase_config['ray_mature_quantile'])
                         phase_ray_loss_val = curriculum_w * (
                             phase_config['ray_anchor_weight'] * ray_anchor
                             + phase_config['ray_contraction_weight'] * ray_contract)
