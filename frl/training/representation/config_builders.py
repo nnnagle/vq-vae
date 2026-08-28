@@ -372,6 +372,8 @@ def build_phase_config(bindings_config, logger: logging.Logger):
             'runs_max_points': _first(_rp(runs_cfg, 'max_points'), 2000),
             'runs_min_points': _first(_rp(runs_cfg, 'min_points'), 64),
             'runs_type_keep_threshold': _first(_rp(runs_cfg, 'type_keep_threshold'), 0.0),
+            'runs_n_seeds': _first(_rp(runs_cfg, 'n_seeds'), 0),
+            'runs_group_size': _first(_rp(runs_cfg, 'group_size'), 8),
         }
         logger.info(
             f"Phase loss enabled: sampler={phase_anchor_pop}, "

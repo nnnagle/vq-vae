@@ -104,6 +104,42 @@ def ray_contraction_anchor_loss(
     return anchor, contraction, diag
 
 
+def _type_grouped_pool(valid, z_type, n_seeds, group_size, max_points, generator):
+    """Pool (pixel, time) points in ``z_type``-kNN pixel groups (the exp035 neighbor
+    selection, ysfc-free): pick ``n_seeds`` seed pixels, take each seed's
+    ``group_size`` nearest neighbors in standardized ``z_type`` (its forest-type
+    twins), and return **all valid timesteps** of the selected pixels. This
+    concentrates the O(M²) budget on same-type pairs — every point then has
+    ~(group_size-1)·T same-type partners across *other* pixels (the cross-pixel
+    recovery comparisons the kernel rewards), instead of the ~1-2 that random
+    pooling yields. Returns ``(n_idx, t_idx)`` over the selected points."""
+    dev = valid.device
+    pix = valid.any(dim=1).nonzero(as_tuple=False).squeeze(1)     # candidate pixels
+    C = int(pix.numel())
+    if C == 0:
+        return pix.new_zeros(0), pix.new_zeros(0)
+    g = min(group_size, C)
+    zt = z_type[pix]
+    zt = (zt - zt.mean(0, keepdim=True)) / zt.std(0, keepdim=True).clamp(min=1e-6)
+    D = torch.cdist(zt, zt)                                       # [C, C] type distances
+    n_s = min(n_seeds, C)
+    seed_local = torch.randperm(C, device=dev, generator=generator)[:n_s]
+    knn = D[seed_local].topk(g, dim=1, largest=False).indices     # [n_s, g] local idx (incl self)
+    sel_local = torch.unique(knn.reshape(-1))
+    # Budget by whole pixels (preserve group structure): keep pixels until the
+    # pooled point count would exceed max_points.
+    counts = valid[pix[sel_local]].sum(dim=1)                     # valid points per selected pixel
+    order = torch.randperm(int(sel_local.numel()), device=dev, generator=generator)
+    sel_local, counts = sel_local[order], counts[order]
+    keep = torch.cumsum(counts, 0) <= max_points
+    if not bool(keep.any()):
+        keep[0] = True
+    sel_pix = pix[sel_local[keep]]
+    vmask = valid[sel_pix]                                        # [S, T]
+    nz = vmask.nonzero(as_tuple=False)                            # [M, 2] (local pixel, t)
+    return sel_pix[nz[:, 0]], nz[:, 1]
+
+
 def _extract_windows(flow, G, valid, n_idx, t_idx, half_window, window_sigma):
     """Per pooled point (n_idx[m], t_idx[m]): the ±half_window flow window and its
     weight = window-decay × jump-survival × validity. Returns win [M, 2W+1, F],
@@ -141,13 +177,17 @@ def runs_kernel_matching_loss(
     max_points: int,
     min_points: int,
     type_keep_threshold: float = 0.0,
+    n_seeds: int = 0,
+    group_size: int = 8,
     generator: torch.Generator | None = None,
 ):
     """Match z_phase similarities to the jump-gated runs-kernel similarity.
 
-    Pools all valid (pixel, time) points, subsamples to ``max_points``, forms the
-    windowed runs-kernel similarity ``S`` (normalized per overlap), the evidence
-    ``E`` (window overlap mass), and the type gate ``k_type``; then pulls the
+    Pools valid (pixel, time) points (``n_seeds>0`` ⇒ z_type-kNN pixel groups,
+    the exp035 neighbor structure — see ``_type_grouped_pool``; else a legacy random
+    subsample to ``max_points``), forms the windowed runs-kernel similarity ``S``
+    (normalized per overlap), the evidence ``E`` (window overlap mass), and the type
+    gate ``k_type``; then pulls the
     z_phase similarity ``L = exp(-‖Δz‖²/τ)`` toward ``S`` with a weighted MSE,
     weight = evidence × type-gate (self excluded).
 
@@ -164,16 +204,27 @@ def runs_kernel_matching_loss(
     """
     N, T, d = zp.shape
     dev = zp.device
-    # --- Pool valid points -----------------------------------------------------
-    nz = valid.nonzero(as_tuple=False)                           # [P, 2] (n, t)
-    P = nz.shape[0]
-    if P < min_points:
-        return zp.sum() * 0.0, {"n_points": P, "active": 0.0}
-    if P > max_points:
-        perm = torch.randperm(P, device=dev, generator=generator)[:max_points]
-        nz = nz[perm]
-    n_idx, t_idx = nz[:, 0], nz[:, 1]
-    M = n_idx.shape[0]
+    # --- Pool (pixel, time) points --------------------------------------------
+    # n_seeds>0: z_type-kNN pixel groups (all timesteps) — spends the O(M²) budget
+    # on same-type pairs (the exp035 neighbor structure, ysfc-free). Else: legacy
+    # random subsample (each point finds ~1-2 same-type partners; budget wasted).
+    if n_seeds > 0:
+        n_idx, t_idx = _type_grouped_pool(
+            valid, z_type, n_seeds, group_size, max_points, generator)
+        M = int(n_idx.shape[0])
+        if M < min_points:
+            return zp.sum() * 0.0, {"n_points": M, "active": 0.0}
+    else:
+        nz = valid.nonzero(as_tuple=False)                       # [P, 2] (n, t)
+        P = nz.shape[0]
+        if P < min_points:
+            return zp.sum() * 0.0, {"n_points": P, "active": 0.0}
+        if P > max_points:
+            perm = torch.randperm(P, device=dev, generator=generator)[:max_points]
+            nz = nz[perm]
+        n_idx, t_idx = nz[:, 0], nz[:, 1]
+        M = n_idx.shape[0]
+    n_pixels = int(torch.unique(n_idx).numel())
 
     G = pairwise_jump_gate(delta_a_norm, tau_jump)               # [N, T, T]
     win, gate = _extract_windows(flow, G, valid, n_idx, t_idx, half_window, window_sigma)
@@ -229,6 +280,7 @@ def runs_kernel_matching_loss(
         nbr_per_pt = float(n_keep / max(M, 1))
         diag = {
             "n_points": M,
+            "n_pixels": n_pixels,                # distinct anchor pixels in the pool
             "active": 1.0,
             "S_same": _wmean(S, same),           # runs-sim, same type (want high for neighbors)
             "S_diff": _wmean(S, diff),           # runs-sim, diff type

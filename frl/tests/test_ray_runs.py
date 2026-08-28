@@ -206,6 +206,31 @@ class TestRunsKernelMatching:
         assert 0.0 <= diag_keep["keep_frac"] <= 1.0
         assert diag_keep["nbr_per_pt"] >= 0.0
 
+    def test_type_grouped_pool_raises_neighbor_density(self):
+        # Many small type clusters; random pooling starves same-type neighbors,
+        # type-grouped pooling concentrates them.
+        g = torch.Generator().manual_seed(7)
+        n_clusters, per, T, F, d, dt = 20, 6, 12, 2, 3, 5
+        N = n_clusters * per
+        centers = 40.0 * torch.randn(n_clusters, dt, generator=g)
+        z_type = centers.repeat_interleave(per, 0) + 0.1 * torch.randn(N, dt, generator=g)
+        flow = 0.1 * torch.randn(N, T, F, generator=g)
+        da = 0.1 * torch.ones(N, T)
+        valid = torch.ones(N, T, dtype=torch.bool)
+        zp = 0.05 * torch.randn(N, T, d, generator=g)
+        kw = dict(tau_jump=2.0, half_window=3, window_sigma=3.0, sigma_flow=0.5,
+                  sigma_type=1.0, tau_metric=1.0, max_points=400, min_points=8,
+                  type_keep_threshold=0.5)
+        gg = torch.Generator().manual_seed(0)
+        _, d_rand = runs_kernel_matching_loss(
+            zp, flow, da, z_type, valid, n_seeds=0, generator=gg, **kw)
+        _, d_grp = runs_kernel_matching_loss(
+            zp, flow, da, z_type, valid, n_seeds=6, group_size=per, generator=gg, **kw)
+        # Type-grouped pooling gives each point many more same-type neighbors.
+        assert d_grp["nbr_per_pt"] > 1.5 * d_rand["nbr_per_pt"]
+        assert d_grp["keep_frac"] > d_rand["keep_frac"]
+        assert d_grp["n_pixels"] > 0
+
     def test_threshold_default_keeps_all(self):
         zp, flow, da, z_type, valid = self._two_type_clusters(seed=3)
         kw = dict(tau_jump=2.0, half_window=3, window_sigma=3.0, sigma_flow=0.5,

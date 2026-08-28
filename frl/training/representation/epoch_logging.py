@@ -108,7 +108,7 @@ def log_epoch(
         # standardized type-distance among retained pairs.
         logger.info(
             f"  Phase runs bw: keep_frac={rk.get('keep_frac', 0.0):.3f} "
-            f"nbr/pt={rk.get('nbr_per_pt', 0.0):.1f} | "
+            f"nbr/pt={rk.get('nbr_per_pt', 0.0):.1f} pix={rk.get('n_pixels', 0):.0f} | "
             f"k_type_kept={rk.get('k_type_kept', 0.0):.3f} dt_kept={rk.get('dt_kept', 0.0):.3f}"
         )
     # Phase radius: RMS ‖z_phase‖ split by recovery state (hub-and-rim check).

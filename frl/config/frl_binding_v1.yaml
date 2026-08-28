@@ -784,6 +784,13 @@ losses:
     tau_metric: 1.0         # z_phase similarity temperature exp(-‖Δz‖²/τ)
     max_points: 2000        # pooled (pixel,time) points/batch — O(M²·window) cost
     min_points: 64          # skip the loss below this many pooled points
+    # Type-grouped pooling (restores exp035's neighbor structure, ysfc-free): pick
+    # n_seeds seed anchors, take each seed's group_size z_type-nearest twins, pool
+    # ALL their timesteps. Concentrates the M² budget on same-type pairs so every
+    # point has ~(group_size-1)·T same-type partners (vs ~1.6 for random pooling).
+    # n_seeds=0 ⇒ legacy random pooling. Budget: n_seeds·group_size·T ≲ max_points.
+    n_seeds: 16
+    group_size: 8
     # Hard keep-threshold on the type gate: pairs with k_type < this are DROPPED
     # from the objective (z_phase is a shadow — never push different types apart,
     # only pull same-type together). 0.0 = keep all (soft k_type weight only).
