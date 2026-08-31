@@ -223,6 +223,25 @@ gave `nbr/pt≈1.6`, `keep_frac=0.001` (99.9% of the O(M²) budget on cross-type
 the threshold drops); grouping concentrates it on same-type pairs. `n_seeds=0`
 restores random pooling.
 
+**Flow-kernel bandwidth `sigma_flow`** (in `phase_runs_kernel`): the `(a,Δa)`
+pointwise kernel is `S = exp(-‖Δflow‖²/2σ_flow²)`, so σ_flow must be on the order
+of the typical pairwise flow distance (≈√2·‖a‖, and `a_med~3.8`) for `S` to have
+dynamic range. The exp041 rerun's `sigma_flow=0.5` was ~10× too tight: `S_same`
+saturated at 0.07 (`S_diff=0.000`), so the runs loss was **all-push** — it drove
+`z_phase` apart to match a near-zero target, inflating `z_rms` and lifting
+`mature_rms` off the origin (the cone never formed, `m/d` stuck ~0.63 even after the
+mature anchor was firing at `mature_frac~0.22`). Set to **4.0** (median pair → `S≈0.4`,
+comparable to `L_same`, so `match_rmse` closes by lifting the target rather than
+inflating z). **Revisit — self-calibrate:** this is the one bandwidth worth pinning
+to the data rather than the config, because (1) its scale is set by the readout, not
+known a priori, (2) it drifts as the readout R² slides (`a_med` 3.94→3.77 over a
+run), and (3) `flow` is *input*-space, so tracking it has no z_phase feedback loop
+(unlike `tau_metric`, an output-space bandwidth that would chase its own tail). The
+planned form mirrors `mature_quantile`: a `flow_quantile` flag that sets σ_flow from
+a quantile of the batch's own pooled per-offset flow distances, with `sig_flow`
+logged as a bandwidth monitor. `sigma_type` stays fixed config (z_type is VICReg'd
+to a stable scale and is the keep-threshold space).
+
 **Tuning logs** (per epoch): the loss line adds `ray=` and `runs=`; the **"Phase
 ray"** line reports `z_rms` (spread — must not collapse), `resid_rms` (contraction
 fit), `gate_mean`, `mature_frac`, `sig_mat`/`a_med` (effective mature σ vs ‖a‖

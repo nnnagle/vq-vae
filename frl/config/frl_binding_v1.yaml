@@ -785,7 +785,15 @@ losses:
     tau_jump: 2.0           # jump gate (window truncation); keep = phase_ray.tau_jump
     half_window: 5          # ± window (years) for the runs comparison
     window_sigma: 3.0       # window decay in offset j
-    sigma_flow: 0.5         # (a,Δa) pointwise kernel bandwidth (recovery-state match)
+    sigma_flow: 4.0         # (a,Δa) pointwise kernel bandwidth (recovery-state match).
+                            # ~order of the typical pairwise flow distance (√2·‖a‖,
+                            # a_med~3.8) so the kernel has dynamic range. exp041's 0.5
+                            # was ~10× too tight: S saturated near 0 (S_same=0.07), so
+                            # the loss was all-push → z_phase inflated, cone never
+                            # formed. TODO: self-calibrate to a quantile of the batch's
+                            # own pooled flow distances (safe — flow is input-space, no
+                            # z_phase feedback) instead of this fixed value, which goes
+                            # stale as the readout drifts (a_med 3.94→3.77 over a run).
     sigma_type: 3.0         # type-gate bandwidth (standardized z_type) — keep TIGHT (same-type only)
     tau_metric: 1.0         # z_phase similarity temperature exp(-‖Δz‖²/τ)
     max_points: 2000        # pooled (pixel,time) points/batch — O(M²·window) cost
