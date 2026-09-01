@@ -760,7 +760,12 @@ losses:
   # pin and the contraction can be tuned independently. Watch the "Phase ray" log:
   # z_rms (spread — must not collapse), resid_rms (contraction fit), gate_mean.
   phase_ray:
-    anchor_weight: 1.0      # λ on ‖z_mature‖² (mature → origin)
+    anchor_weight: 3.0      # λ on ‖z_mature‖² (mature → origin). Raised 1.0→3.0 for
+                            # exp042: at 1.0 the origin pin lost the back-half tug-of-war
+                            # vs runs (1.0) + phase VICReg (0.1) — exp041 cone formed by
+                            # ep175 (m/d=0.52, mature_rms=1.85) then slid off its apex by
+                            # ep400 (m/d=0.66, mature_rms=3.42, anchor loss 0.012→0.031).
+                            # Watch mature_rms should fall / stay low and m/d keep dropping.
     contraction_weight: 1.0 # λ on ‖z_j − ρ^(j-i) z_i‖² over jump-free lags
     type: phase_ray
     rho: 0.861              # fixed nominal rate = 0.05**(1/20) (5% of mature in 20 yr)
