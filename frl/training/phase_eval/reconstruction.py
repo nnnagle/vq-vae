@@ -44,7 +44,14 @@ logger = logging.getLogger("phase_eval.reconstruction")
 # ``type-phase-bilinear`` is a type-conditional reconstruction source (see the
 # block above ``_run_bilinear_source``); the other three are simple single sources.
 BILINEAR_SOURCE = "type-phase-bilinear"
-FEATURE_SOURCES = ("z_phase", "h", "z_type", BILINEAR_SOURCE)
+# ``type_phase`` ([z_type, z_phase] concatenated) is the type-conditioned probe that
+# flows through the STANDARD ridge **and MLP** pipeline — unlike BILINEAR_SOURCE,
+# which has its own ridge-only rank-R path. The MLP is the point: a rank-R bilinear
+# ridge is too constrained to express sigma(z_type)*f(z_phase), which is exactly what
+# recovering raw x from an anomaly-normalized z_phase requires (see _feature_series).
+# Compare against the "z_type" control: type_phase minus z_type within-R² is the
+# phase pathway's genuine contribution once the probe can apply the per-pixel scale.
+FEATURE_SOURCES = ("z_phase", "h", "z_type", BILINEAR_SOURCE, "type_phase")
 RIDGE_LAMBDA_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 
 # Bilinear source: rank of the type×phase interaction + SEPARATE ridge grids for
@@ -102,6 +109,22 @@ def _feature_series(data: dict, source: str) -> torch.Tensor:
     if source == "z_type":
         T = data["z_phase"].shape[1]
         return data["z_type"].unsqueeze(1).expand(-1, T, -1).contiguous()
+    # Type-conditioned phase sources. REQUIRED for a fair test of anomaly-based
+    # representations (the ray/runs designs from exp040+): those encode
+    # a = (x - mu(z_type))/sigma(z_type), so within-pixel
+    #     x_within = sigma(z_type) * a_within.
+    # Recovering raw x therefore needs a PER-PIXEL scale the probe never sees from
+    # z_phase alone — a global ridge cannot represent it, and rank-3 bilinear is
+    # too restrictive. Concatenating z_type and running the MLP head lets the probe
+    # learn sigma(z_type)*f(z_phase), so a low score means "the embedding lacks the
+    # signal" rather than "the head can't un-normalize". Without this, diagnostic A
+    # is biased against every anomaly-normalized representation.
+    if source in ("type_phase", "type_h"):
+        inner = "z_phase" if source == "type_phase" else "h"
+        zp = _feature_series(data, inner)                    # [N, T, D]
+        T = zp.shape[1]
+        zt = data["z_type"].unsqueeze(1).expand(-1, T, -1)   # [N, T, dt]
+        return torch.cat([zt, zp], dim=-1).contiguous()
     raise ValueError(f"unknown feature source: {source!r}")
 
 
@@ -741,6 +764,23 @@ def run_reconstruction(
                         h_t["r2_within_mean"] - z_t["r2_within_mean"])
                     summary[f"{tag}_h_within_r2_weighted"] = h_t["r2_within_weighted"]
                     summary[f"{tag}_z_phase_within_r2_weighted"] = z_t["r2_within_weighted"]
+
+            # Type-conditioned lift: (type_phase - z_type) within-R². z_type's
+            # within-R² is 0 by construction (atemporal), so this IS the phase
+            # pathway's contribution measured by a head that can apply the
+            # per-pixel scale. THIS is the number to compare across runs for
+            # anomaly-normalized embeddings — the bare z_phase within-R² is
+            # confounded by the head's inability to un-normalize.
+            tp_key, zt_key = f"type_phase__{kind}", f"z_type__{kind}"
+            if tp_key in results and zt_key in results:
+                for probe in ("ridge_test", "mlp_test"):
+                    if probe in results[tp_key] and probe in results[zt_key]:
+                        tp_t, zt_t = results[tp_key][probe], results[zt_key][probe]
+                        tag = probe.split("_")[0]
+                        summary[f"{tag}_type_phase_within_r2_weighted"] = tp_t["r2_within_weighted"]
+                        summary[f"{tag}_type_phase_lift_weighted"] = (
+                            tp_t["r2_within_weighted"] - zt_t["r2_within_weighted"])
+
             if summary:
                 results[f"__summary__{kind}"] = summary
                 logger.info(
@@ -749,4 +789,11 @@ def run_reconstruction(
                     f"(h={summary.get('ridge_h_within_r2_weighted', float('nan')):.4f}, "
                     f"z_phase={summary.get('ridge_z_phase_within_r2_weighted', float('nan')):.4f})"
                 )
+                if "mlp_type_phase_lift_weighted" in summary:
+                    logger.info(
+                        f"  [A] type-conditioned lift ({kind}): MLP weighted="
+                        f"{summary['mlp_type_phase_lift_weighted']:.4f} "
+                        f"(type_phase={summary['mlp_type_phase_within_r2_weighted']:.4f}) "
+                        f"— fair head for anomaly-normalized z_phase"
+                    )
     return results
